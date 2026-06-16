@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pdf
+*.png
+*.zip
+*.key
+*.eml
+drawings/
+email_*.txt
+compose_url*.txt
+*_url*.txt
