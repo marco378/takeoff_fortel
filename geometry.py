@@ -25,7 +25,17 @@ def measure_regions(regions, k, holes=None):
         raise ValueError("scale required — calibrate per viewport (scale bar / known dimension)")
     holes = holes or {}
     flags = []
-    polys = [_valid(Polygon(v, holes.get(i, [])), i, flags) for i, v in enumerate(regions)]
+    polys = []
+    for i, v in enumerate(regions):
+        if len(v) < 3:
+            flags.append(f"region {i}: <3 vertices — skipped (degenerate trace)")
+            continue
+        p = _valid(Polygon(v, holes.get(i, [])), i, flags)
+        if p.area < 1:                       # < 1 pt^2 -> sliver / near-zero (bad trace)
+            flags.append(f"region {i}: near-zero area — likely a sliver/bad trace; flag for re-trace")
+        polys.append(p)
+    if not polys:
+        return 0.0, flags + ["no valid regions"]
     u = unary_union(polys)
     naive = sum(p.area for p in polys)
     if u.area < naive * 0.999:

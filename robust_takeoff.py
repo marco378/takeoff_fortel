@@ -15,17 +15,19 @@ Breaks found by adversarial testing and how they're handled:
 """
 import fitz, re
 from shapely.geometry import Polygon
+from markup import parse_area_m2
 
 
 def read_marked(pdf):
-    """MARKED path: sum the Bluebeam area markups (exact, multi-region, NO scale needed)."""
+    """MARKED path: sum the Bluebeam area markups (exact, multi-region, NO scale needed).
+    Uses robust label parsing (m²/Area=/imperial sq ft)."""
     p = fitz.open(pdf)[0]
     areas = []
     for a in (p.annots() or []):
         if a.type[1] == "Polygon":
-            m = re.search(r"A\s*=\s*([\d,]+\.?\d*)\s*sq m", a.info.get("content", "") or "")
-            if m:
-                areas.append(float(m.group(1).replace(",", "")))
+            v = parse_area_m2(a.info.get("content", "") or "")
+            if v is not None:
+                areas.append(v)
     return round(sum(areas), 1), len(areas)
 
 
