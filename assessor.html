@@ -1,0 +1,69 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Fortel AI Takeoff — Assessor Review</title>
+<style>
+ :root{color-scheme:light}
+ body{font:14px/1.4 system-ui,sans-serif;margin:0;background:#f6f7f9;color:#111}
+ header{background:#13294b;color:#fff;padding:10px 16px}
+ header b{font-size:16px}
+ .bar{padding:8px 16px;background:#fff;border-bottom:1px solid #ddd;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+ button{padding:6px 10px;border:1px solid #ccc;background:#fff;border-radius:6px;cursor:pointer}
+ button.on{background:#13294b;color:#fff;border-color:#13294b}
+ #readout{margin-left:auto;font-weight:600}
+ canvas{display:block;margin:12px auto;border:1px solid #ccc;background:#fff;max-width:98%}
+ .hint{padding:4px 16px;color:#555}
+ code{background:#eef;padding:1px 4px;border-radius:3px}
+</style></head>
+<body>
+<header><b>Fortel AI Takeoff — Assessor Review</b> &nbsp; <span style="opacity:.8">confirm / nudge the AI's slab boundary, set scale, read area</span></header>
+<div class="bar">
+  <label>Drawing: <input type="file" id="img" accept="image/*"></label>
+  <button id="mCal">1) Calibrate scale</button>
+  <button id="mTrace" class="on">2) Trace / nudge slab</button>
+  <button id="undo">Undo point</button>
+  <button id="clear">Clear</button>
+  <button id="exp">Export JSON</button>
+  <span id="readout">area: — &nbsp; scale: not set</span>
+</div>
+<div class="hint">Calibrate: click two points on a scale bar / known dimension, then enter its real length in metres. Trace: click to add vertices, drag to nudge. The AI's proposed polygon loads here for one-click confirm.</div>
+<canvas id="c" width="1000" height="700"></canvas>
+<script>
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+let img=null, mode='trace', poly=[], cal=[], mpp=null, drag=-1;
+const R=()=>document.getElementById('readout');
+function shoelace(p){let s=0;for(let i=0;i<p.length;i++){const a=p[i],b=p[(i+1)%p.length];s+=a.x*b.y-b.x*a.y;}return Math.abs(s)/2;}
+function area(){ if(!mpp||poly.length<3) return null; return shoelace(poly)*mpp*mpp; }
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(img) ctx.drawImage(img,0,0,cv.width,cv.height);
+  // polygon
+  if(poly.length){ctx.beginPath();poly.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.closePath();
+    ctx.fillStyle='rgba(0,170,90,.25)';ctx.fill();ctx.strokeStyle='#e0007a';ctx.lineWidth=2;ctx.stroke();
+    poly.forEach(p=>{ctx.fillStyle='#e0007a';ctx.fillRect(p.x-4,p.y-4,8,8);});}
+  // calibration
+  if(cal.length){ctx.strokeStyle='#0066ff';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(cal[0].x,cal[0].y);if(cal[1])ctx.lineTo(cal[1].x,cal[1].y);ctx.stroke();
+    cal.forEach(p=>{ctx.fillStyle='#0066ff';ctx.fillRect(p.x-4,p.y-4,8,8);});}
+  const a=area();
+  R().textContent=`area: ${a?a.toLocaleString(undefined,{maximumFractionDigits:0})+' m²':'—'}   scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}   vertices: ${poly.length}`;
+}
+function pos(e){const r=cv.getBoundingClientRect();return {x:(e.clientX-r.left)*cv.width/r.width,y:(e.clientY-r.top)*cv.height/r.height};}
+cv.addEventListener('mousedown',e=>{const p=pos(e);
+  if(mode==='cal'){ if(cal.length>=2)cal=[]; cal.push(p); if(cal.length===2){const px=Math.hypot(cal[1].x-cal[0].x,cal[1].y-cal[0].y);const m=parseFloat(prompt('Real length of this line in metres:','50'));if(m>0)mpp=m/px;} draw(); return;}
+  // trace: grab nearest vertex to drag, else add
+  drag=poly.findIndex(q=>Math.hypot(q.x-p.x,q.y-p.y)<8);
+  if(drag<0){poly.push(p);} draw();
+});
+cv.addEventListener('mousemove',e=>{if(drag>=0){poly[drag]=pos(e);draw();}});
+window.addEventListener('mouseup',()=>drag=-1);
+document.getElementById('img').onchange=e=>{const f=e.target.files[0];if(!f)return;const u=new Image();u.onload=()=>{img=u;cv.width=Math.min(1200,u.width);cv.height=cv.width*u.height/u.width;draw();};u.src=URL.createObjectURL(f);};
+document.getElementById('mCal').onclick=()=>{mode='cal';setOn('mCal');};
+document.getElementById('mTrace').onclick=()=>{mode='trace';setOn('mTrace');};
+document.getElementById('undo').onclick=()=>{poly.pop();draw();};
+document.getElementById('clear').onclick=()=>{poly=[];cal=[];draw();};
+document.getElementById('exp').onclick=()=>{const a=area();const out={vertices:poly.map(p=>[Math.round(p.x),Math.round(p.y)]),m_per_px:mpp,area_m2:a?Math.round(a):null};
+  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const x=document.createElement('a');x.href=url;x.download='takeoff_review.json';x.click();};
+function setOn(id){['mCal','mTrace'].forEach(i=>document.getElementById(i).classList.toggle('on',i===id));}
+// load an AI-proposed polygon if provided via ?poly=[[x,y],...]
+try{const q=new URLSearchParams(location.search).get('poly');if(q){poly=JSON.parse(q).map(p=>({x:p[0],y:p[1]}));}}catch(e){}
+draw();
+</script>
+</body></html>
