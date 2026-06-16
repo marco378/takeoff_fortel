@@ -12,10 +12,11 @@ Fortel AI Takeoff — FINAL consolidated pipeline.
 
 Measured area -> price_zone (deterministic, validated) -> GBP.
 """
-import math, json, io, contextlib
+import math, json, io, contextlib, fitz
 from router import classify
 from robust_takeoff import read_marked
 from geometry import measure_regions
+from scale import detect_scale_bar, user_unit
 with contextlib.redirect_stdout(io.StringIO()):       # costing self-validates on import; mute its receipt
     from costing import rate_buildup, MESH_KG
 
@@ -43,12 +44,32 @@ def takeoff(pdf, vision=None):
         area, n = read_marked(pdf)
         r.update({"area_m2": area, "regions": n})
     elif typ == "UNMARKED vector" and vision:
-        sr = vision["scale_ref"]; k = sr[2] / math.dist(sr[0], sr[1])
-        area, gflags = measure_regions(vision["regions"], k, vision.get("voids"))
-        r.update({"area_m2": area, "scale_k": round(k, 4), "flags": gflags + ["assessor: confirm extent + scale"]})
+        uu = user_unit(pdf)
+        if vision.get("scale_ref"):
+            sr = vision["scale_ref"]; k = sr[2] / math.dist(sr[0], sr[1]) * uu; ksrc = "vision scale_ref"
+        else:
+            kb, info = detect_scale_bar(pdf); k = (kb * uu) if kb else None; ksrc = f"auto scale-bar: {info}"
+        if k is None:
+            r["flags"] = ["no scale (no scale_ref, no detectable bar) -> assessor must supply scale"]
+        else:
+            area, gflags = measure_regions(vision["regions"], k, vision.get("voids"))
+            r.update({"area_m2": area, "scale_k": round(k, 4), "scale_src": ksrc,
+                      "flags": gflags + ["assessor: confirm extent + scale"]})
     else:
         r["flags"] = ["needs vision {regions, voids, scale_ref}; raster/flattened -> mandatory human"]
     return r
+
+
+def takeoff_pack(pdf):
+    """Multi-page tender pack: classify EVERY page (never assume page 0)."""
+    d = fitz.open(pdf); out = []
+    for i in range(d.page_count):
+        p = d[i]
+        vec = len(p.get_drawings())
+        nmark = sum(1 for a in (p.annots() or []) if a.type[1] == "Polygon")
+        kind = "raster" if vec < 50 else ("marked" if nmark else "unmarked/context")
+        out.append({"page": i, "kind": kind, "vector_paths": vec, "area_markups": nmark})
+    return out
 
 
 if __name__ == "__main__":
