@@ -13,15 +13,24 @@ import sys, os, json, base64, fitz
 from shapely.geometry import Polygon
 from PIL import Image, ImageDraw
 
-PROMPT = """You are a concrete-takeoff estimator. The image is a site/GA plan with a red
-coordinate grid labelled in PDF points (every 250). Identify the extent of the {zone}
-concrete slab we price: follow the kerbs / site boundary; INCLUDE the hardstanding, aprons
-and parking; EXCLUDE landscaping, the roundabout, roads outside the hardstanding, and any
-gatehouse/kerb islands (per the estimating handbook). ALSO trace any VOIDS to deduct
-(dock-leveller voids, pits) and a SCALE REFERENCE (two points on a scale bar, or a known
-labelled dimension, plus its real length in metres) so area can be calibrated per-viewport.
+PROMPT = """You are a concrete-takeoff estimator working a construction / external-works drawing
+(NOT a generic 'site plan'). The image has a red coordinate grid labelled in PDF points (every 250).
+This mirrors how Fortel's estimators actually work:
+
+STEP 1 - read the LEGEND/key. Find which hatch is the priced CONCRETE service/external yard
+(named 'service yard', 'Type C', 'GV areas', 'external yard construction' - it varies per drawing).
+Distinguish it from tarmac/bituminous, car park, and landscaping.
+
+STEP 2 - trace the boundary of the CONCRETE-hatch area ONLY (the priced slab). Exclude tarmac,
+landscaping, the roundabout, and anything outside that hatch. Trace any VOIDS to deduct.
+
+STEP 3 - give a SCALE-CHECK feature so the scale can be VERIFIED against a known real size (Fortel
+verify every drawing this way, because the PDF is often not at its stated scale): the two corners of a
+CAR-PARKING BAY (real width 2.5 m), or a printed DIMENSION line + value, or a SCALE BAR + its metres.
+
 Reply with ONLY JSON:
-{{"vertices": [[x,y],...], "voids": [[[x,y],...], ...], "scale_ref": [[x1,y1],[x2,y2], metres]}}
+{{"vertices": [[x,y],...], "voids": [[[x,y],...], ...],
+  "scale_check": {{"feature": "parking_bay|dimension|scale_bar", "p1": [x,y], "p2": [x,y], "metres": 2.5}}}}
 — PDF-point coordinates, boundary clockwise, 15-25 points."""
 
 

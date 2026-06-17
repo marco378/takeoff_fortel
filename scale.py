@@ -67,3 +67,49 @@ def scale_consensus(refs, tol=0.10):
                       "MIXED-SCALE sheet; use the slab's OWN viewport (scale bar) or assessor confirms. "
                       "DO NOT auto-pick a dimension."]
     return sum(ks) / len(ks), [f"scale consensus k={sum(ks)/len(ks):.4f} ({len(ks)} refs agree within {int(tol*100)}%)"]
+
+
+# ---- Fortel's method (from the estimation call): VERIFY scale against a known real-world feature ----
+UK_PARKING_BAY_M = 2.5   # UK standard car-parking bay width — Fortel's go-to scale check
+PT_PER_M = 0.0254 / 72   # 1 PDF point in metres of paper
+
+
+def title_block_k(denominator):
+    """k (m/pt) implied by a stated drawing scale 1:N. Fortel enter '1 mm = N/1000 m'."""
+    return denominator * PT_PER_M if denominator else None
+
+
+def scale_from_bay(bay_width_pt, bay_m=UK_PARKING_BAY_M):
+    """Calibrate m/pt from a measured car-parking bay (UK standard 2.5 m)."""
+    return bay_m / bay_width_pt if bay_width_pt else None
+
+
+def verify_against_feature(k, span_pt, real_m, tol=0.05):
+    """Check scale k against a known feature (bay 2.5 m / printed dimension / scale bar).
+    Returns flags ([] == verified). THIS is the step that would have caught 95,463 m²."""
+    if not (k and span_pt and real_m):
+        return ["cannot verify — no known feature measured"]
+    got = k * span_pt
+    if abs(got - real_m) / real_m > tol:
+        return [f"SCALE UNVERIFIED: a {real_m} m feature reads {got:.2f} m ({got/real_m:.2f}x) — "
+                "scale is wrong (likely a stale title-block scale); recalibrate from the feature"]
+    return []
+
+
+def calibrate_verified(title_denominator=None, bay_width_pt=None, dim_span_pt=None, dim_m=None):
+    """Fortel's method: take the title-block scale, then VERIFY against a known feature; the feature
+    WINS on conflict (the PDF is often not at its stated scale). Returns (k_m_per_pt, flags)."""
+    k_title = title_block_k(title_denominator)
+    k_feat, feat = None, None
+    if bay_width_pt:
+        k_feat, feat = scale_from_bay(bay_width_pt), f"parking bay 2.5 m / {bay_width_pt:.0f} pt"
+    elif dim_span_pt and dim_m:
+        k_feat, feat = dim_m / dim_span_pt, f"dimension {dim_m} m / {dim_span_pt:.0f} pt"
+    if k_feat is None:
+        return k_title, (["scale from title block ONLY — UNVERIFIED; measure a parking bay (2.5 m) "
+                          "or a printed dimension before trusting the area"] if k_title else ["no scale reference"])
+    flags = [f"scale VERIFIED from {feat}: k={k_feat:.4f}"]
+    if k_title and abs(k_title - k_feat) / k_feat > 0.05:
+        flags.insert(0, f"title-block scale (k={k_title:.4f}) DISAGREES with the verified feature "
+                        f"(k={k_feat:.4f}) -> PDF not at its stated scale; using the feature scale")
+    return k_feat, flags
