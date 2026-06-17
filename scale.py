@@ -51,3 +51,19 @@ def scale_for(pdf, page=0):
     if k is None:
         return None, [f"no verifiable scale ({info}) — assessor must confirm; title-block is unreliable"]
     return k * user_unit(pdf, page), [f"scale bar: {info}; UserUnit={user_unit(pdf, page)}"]
+
+
+def scale_consensus(refs, tol=0.10):
+    """refs: list of (real_metres, span_units) from a scale bar / dimensions. -> (k, flags).
+    If references DISAGREE beyond tol the sheet is MIXED-SCALE -> return None + flag (never emit).
+    This is the direct fix for the 95,463 m² incident: the flow auto-picked one dimension
+    (257.2 m @ 1:500) to scale a slab drawn at 1:306, a different viewport — 2.67x too big."""
+    ks = [m / s for m, s in refs if s]
+    if not ks:
+        return None, ["no usable scale reference"]
+    lo, hi = min(ks), max(ks)
+    if hi / lo - 1 > tol:
+        return None, [f"scale references DISAGREE ({lo:.4f}..{hi:.4f} m/unit, {hi/lo:.2f}x spread) -> "
+                      "MIXED-SCALE sheet; use the slab's OWN viewport (scale bar) or assessor confirms. "
+                      "DO NOT auto-pick a dimension."]
+    return sum(ks) / len(ks), [f"scale consensus k={sum(ks)/len(ks):.4f} ({len(ks)} refs agree within {int(tol*100)}%)"]

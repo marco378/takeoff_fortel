@@ -17,6 +17,7 @@ from router import classify
 from robust_takeoff import read_marked
 from geometry import measure_regions
 from scale import detect_scale_bar, user_unit
+from sanity import plausible
 with contextlib.redirect_stdout(io.StringIO()):       # costing self-validates on import; mute its receipt
     from costing import rate_buildup, MESH_KG
 
@@ -53,8 +54,9 @@ def takeoff(pdf, vision=None):
             r["flags"] = ["no scale (no scale_ref, no detectable bar) -> assessor must supply scale"]
         else:
             area, gflags = measure_regions(vision["regions"], k, vision.get("voids"))
+            sflags = plausible(area, site_m2=vision.get("site_m2"))   # blocks impossible numbers (95,463 incident)
             r.update({"area_m2": area, "scale_k": round(k, 4), "scale_src": ksrc,
-                      "flags": gflags + ["assessor: confirm extent + scale"]})
+                      "flags": gflags + sflags + ["assessor: confirm extent + scale"]})
     else:
         r["flags"] = ["needs vision {regions, voids, scale_ref}; raster/flattened -> mandatory human"]
     return r

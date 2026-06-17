@@ -33,5 +33,13 @@ tot, rows = price_project([{"name":"Yard","area_m2":26080,"depth_mm":190,"conc_r
 ck("yard slab line GBP1,170,731.20", rows[0][5] == 1170731.20)
 ck("unknown mesh handled", slab_rate({"depth_mm":150,"conc_rate":128,"mesh":"A999","layers":1,"steel_rate_t":850,"margin":0.11})[0] is None)
 
+print("guards (95,463 m² incident)")
+from scale import scale_consensus
+from sanity import plausible
+ck("mixed-scale dimensions flagged (no auto-pick)", scale_consensus([(257.2,710),(166,420),(50,75),(35,80)])[0] is None)
+ck("consistent dimensions accepted", abs(scale_consensus([(100,1000),(50,500)])[0] - 0.1) < 1e-6)
+ck("impossible area blocked", len(plausible(95463, site_m2=34329)) >= 1)
+ck("correct area passes", plausible(26080, site_m2=34329) == [])
+
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)
