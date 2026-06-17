@@ -5,17 +5,53 @@ Robust takeoff geometry — hardened against adversarial failures found in testi
   - slab with voids (SOP: omit voids)-> subtract void rings (Polygon holes)
   - overlapping multi-region slabs   -> union, not sum (no double-count)
   - missing scale                    -> raise (never hardcode / never silently guess)
+  - hole outside outer ring          -> difference() per-hole (Polygon constructor + make_valid
+                                        silently adds area when hole lies outside the ring)
 """
+import math
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 from shapely.ops import unary_union
 from shapely.validation import make_valid
 
 
-def _valid(poly, idx, flags):
-    if not poly.is_valid:
-        poly = make_valid(poly)
+def _build_region(outer_verts, hole_verts_list, idx, flags):
+    """Build a single region polygon with holes correctly subtracted.
+
+    IMPORTANT: we do NOT pass holes to the Polygon() constructor, because when a hole
+    lies outside the outer ring Shapely marks the polygon as invalid, and make_valid()
+    then turns BOTH the outer ring and the escaped hole into separate filled polygons —
+    adding area instead of subtracting it.  Instead we build the outer ring first,
+    validate it, then subtract each hole individually via .difference(), which is safe
+    regardless of whether the hole is inside, partially outside, or entirely outside.
+    """
+    if len(outer_verts) < 3:
+        flags.append(f"region {idx}: <3 vertices — skipped (degenerate trace)")
+        return None
+    if any(not (math.isfinite(x) and math.isfinite(y)) for x, y in outer_verts):
+        flags.append(f"region {idx}: non-finite coord (NaN/Inf) — skipped (bad trace)")
+        return None
+    p = Polygon(outer_verts)
+    if not p.is_valid:
+        p = make_valid(p)
         flags.append(f"region {idx}: invalid trace (self-intersection) repaired — verify by IoU")
-    return poly
+    if p.is_empty:
+        flags.append(f"region {idx}: invalid outer trace — skipped")
+        return None
+    if p.area < 1:
+        flags.append(f"region {idx}: near-zero area — likely a sliver/bad trace; flag for re-trace")
+    # Subtract each void individually via difference(); this is safe whether the hole is
+    # inside, partially overlapping, or entirely outside the outer ring.
+    for h in hole_verts_list:
+        if len(h) < 3:
+            continue
+        hp = Polygon(h)
+        if not hp.is_valid:
+            hp = make_valid(hp)
+        if not hp.is_empty:
+            p = p.difference(hp)
+    if not p.is_valid:
+        p = make_valid(p)
+    return p
 
 
 def measure_regions(regions, k, holes=None):
@@ -27,13 +63,9 @@ def measure_regions(regions, k, holes=None):
     flags = []
     polys = []
     for i, v in enumerate(regions):
-        if len(v) < 3:
-            flags.append(f"region {i}: <3 vertices — skipped (degenerate trace)")
-            continue
-        p = _valid(Polygon(v, holes.get(i, [])), i, flags)
-        if p.area < 1:                       # < 1 pt^2 -> sliver / near-zero (bad trace)
-            flags.append(f"region {i}: near-zero area — likely a sliver/bad trace; flag for re-trace")
-        polys.append(p)
+        p = _build_region(v, holes.get(i, []), i, flags)
+        if p is not None:
+            polys.append(p)
     if not polys:
         return 0.0, flags + ["no valid regions"]
     u = unary_union(polys)
@@ -63,3 +95,8 @@ if __name__ == "__main__":
     quads = [[(x, 0), (x + 400, 0), (x + 400, 400), (x, 400)] for x in (0, 600, 1200, 1800)]
     a, f = measure_regions(quads, K)
     print(f"D 4 clean slabs:  {a:,.0f} m2 (true 6,400)  flags={f}")
+    # E: hole outside outer ring (bug fix check)
+    outer_e = [(0, 0), (1000, 0), (1000, 1000), (0, 1000)]
+    outside_hole = [(2000, 2000), (3000, 2000), (3000, 3000), (2000, 3000)]
+    a, f = measure_regions([outer_e], K, holes={0: [outside_hole]})
+    print(f"E hole-outside:   {a:,.0f} m2 (true 10,000 — hole is outside ring)  flags={f}")

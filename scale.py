@@ -58,7 +58,7 @@ def scale_consensus(refs, tol=0.10):
     If references DISAGREE beyond tol the sheet is MIXED-SCALE -> return None + flag (never emit).
     This is the direct fix for the 95,463 m² incident: the flow auto-picked one dimension
     (257.2 m @ 1:500) to scale a slab drawn at 1:306, a different viewport — 2.67x too big."""
-    ks = [m / s for m, s in refs if s]
+    ks = [m / s for m, s in refs if (s and s > 0 and m is not None and m > 0)]
     if not ks:
         return None, ["no usable scale reference"]
     lo, hi = min(ks), max(ks)
