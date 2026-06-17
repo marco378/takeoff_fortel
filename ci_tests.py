@@ -48,5 +48,10 @@ k_v, _ = calibrate_verified(title_denominator=500, bay_width_pt=2.5/0.108)  # ve
 ck("parking-bay verify flips wrong title scale to truth", abs(geom*k_v*k_v - 26080) < 50)
 ck("title-only scale flagged as a lie", len(verify_against_feature(title_block_k(500), 2.5/0.108, 2.5)) >= 1)
 
+print("drawing selection (from the call)")
+from router import drawing_priority
+ck("construction/kerbing drawing beats site plan",
+   drawing_priority("RIBVE-XX-DR-CE-0750 construction kerbing") > drawing_priority("Proposed Site Plan"))
+
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)

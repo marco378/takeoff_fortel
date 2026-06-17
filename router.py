@@ -27,6 +27,22 @@ def classify(path):
                                   site_boundary=has_red, scales=scales)
 
 
+def drawing_priority(name, text=""):
+    """Score a drawing's suitability for the concrete takeoff. From the Fortel call: use the
+    CONSTRUCTION / external-works / surfacing / kerbing drawing (it carries the concrete-vs-tarmac
+    legend) — NOT a 'Proposed Site Plan' / location plan. Pick the highest-scoring sheet in a pack."""
+    s = (str(name) + " " + str(text)).lower()
+    score = 0
+    for w in ("construction", "external works", "external surfacing", "surfacing", "kerb",
+              "thickness", "-dr-c-", "-dr-ce-", "pavement", "hardstanding"):
+        if w in s:
+            score += 2
+    for w in ("proposed site plan", "site plan", "location plan", "site layout"):
+        if w in s:
+            score -= 2
+    return score
+
+
 if __name__ == "__main__":
     for f in sorted(glob.glob("drawings/*.pdf")):
         t, route, conf, meta = classify(f)
