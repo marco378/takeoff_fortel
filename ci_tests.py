@@ -52,6 +52,22 @@ print("drawing selection (from the call)")
 from router import drawing_priority
 ck("construction/kerbing drawing beats site plan",
    drawing_priority("RIBVE-XX-DR-CE-0750 construction kerbing") > drawing_priority("Proposed Site Plan"))
+ck("engineer external-works beats architect hard-landscaping",
+   drawing_priority("External Construction Thickness Layout", source="engineer")
+   > drawing_priority("Unit 1 Hard Landscaping", source="architect"))
+
+print("unmarked pipeline (legend-anchored colour segmentation)")
+import numpy as _np
+from takeoff_unmarked import segment_hatch
+_im = _np.full((200, 300, 3), 255, _np.uint8); _im[50:150, 60:210] = (216, 216, 216)  # 100x150 grey
+_comp = segment_hatch(_im, (216, 216, 216))
+ck("segment grey hatch ~15,000 px", _comp is not None and abs(int(_comp.sum()) - 15000) < 900)
+ck("segment ignores white background", int(_comp.sum()) < 200 * 300 * 0.4)
+_px = int(_comp.sum()); _area = _px * (1 / 2.0) ** 2 * 0.1 * 0.1   # S=2 (1px=0.5pt), k=0.1 m/pt
+ck("unmarked area math (px->m2)", abs(_area - _px * 0.0025) < 1e-6)
+ck("white-segmentation blowup blocked by plausibility", len(plausible(279905)) >= 1)
+_w = segment_hatch(_im, (255, 0, 0))   # colour not present
+ck("absent hatch colour -> no region", _w is None or int(_w.sum()) == 0)
 
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)

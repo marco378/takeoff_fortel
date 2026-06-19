@@ -27,20 +27,65 @@ def classify(path):
                                   site_boundary=has_red, scales=scales)
 
 
-def drawing_priority(name, text=""):
-    """Score a drawing's suitability for the concrete takeoff. From the Fortel call: use the
-    CONSTRUCTION / external-works / surfacing / kerbing drawing (it carries the concrete-vs-tarmac
-    legend) — NOT a 'Proposed Site Plan' / location plan. Pick the highest-scoring sheet in a pack."""
+# Designer-folder → discipline. From the standup: "SGP is the architect; if BWB is the engineer they
+# name the folder BWB." Engineer (civil & structural) drawings are PREFERRED; architect is the fallback.
+ENGINEER_HINTS = ("civil", "structural", "civil and structural", "civil & structural", "bwb",
+                  "-dr-c-", "-dr-ce-", "-dr-s-", "engineer")
+ARCHITECT_HINTS = ("architect", "sgp", "hard landscaping", "landscaping", "-dr-a-")
+
+# Drawing-name keywords the estimator dictated, in the order he searches them.
+AREA_KEYWORDS = ("external surfacing", "external pavements", "external pavement", "external works",
+                 "external construction thickness", "construction thickness layout",
+                 "construction thickness", "surfacing", "hardstanding", "hard landscaping",
+                 "kerb", "pavement", "external construction")
+DETAIL_KEYWORDS = ("external construction details", "construction details", "build-up", "buildup",
+                   "typical detail", "slab detail")
+DEPRIORITISE = ("proposed site plan", "site plan", "location plan", "site layout",
+                "roof plan", "elevation", "section", "boundary treatment", "critical areas")
+
+
+def source_discipline(path_or_name):
+    """Classify a drawing/folder as 'engineer' (preferred) or 'architect' (fallback → assume build-up)."""
+    s = str(path_or_name).lower()
+    if any(h in s for h in ENGINEER_HINTS):
+        return "engineer"
+    if any(h in s for h in ARCHITECT_HINTS):
+        return "architect"
+    return "unknown"
+
+
+def drawing_priority(name, text="", source=None):
+    """Score a drawing's suitability for the concrete takeoff. Fortel's dictated order:
+    ENGINEER civil/structural first → the external surfacing / pavements / works / construction-thickness
+    sheet (it carries the concrete-vs-tarmac legend) → architect hard-landscaping as fallback.
+    A 'site plan' / location plan is last resort. `source` ('engineer'/'architect') tilts the score."""
     s = (str(name) + " " + str(text)).lower()
     score = 0
-    for w in ("construction", "external works", "external surfacing", "surfacing", "kerb",
-              "thickness", "-dr-c-", "-dr-ce-", "pavement", "hardstanding"):
+    for w in AREA_KEYWORDS:
         if w in s:
             score += 2
-    for w in ("proposed site plan", "site plan", "location plan", "site layout"):
+    for w in ("construction", "thickness", "-dr-c-", "-dr-ce-"):
+        if w in s:
+            score += 1
+    for w in DEPRIORITISE:
         if w in s:
             score -= 2
+    src = source or source_discipline(name)
+    if src == "engineer":
+        score += 3          # engineer drawing preferred (exact build-up available)
+    elif src == "architect":
+        score -= 1          # usable, but ~5% tolerance + assumed build-up
     return score
+
+
+def buildup_source(name, text="", source=None):
+    """Is there a construction-details sheet (engineer) giving thickness/mesh, or must we ASSUME
+    (architect)?  Returns ('detail'|'assume', note)."""
+    s = (str(name) + " " + str(text)).lower()
+    if any(w in s for w in DETAIL_KEYWORDS) and (source or source_discipline(name)) != "architect":
+        return "detail", "construction-details sheet present — read thickness/mesh for costing"
+    return "assume", ("architect/no construction details — ASSUME build-up (e.g. 190mm/A252) and state "
+                      "the assumption in the quote; ~5% area tolerance vs an engineer drawing")
 
 
 if __name__ == "__main__":

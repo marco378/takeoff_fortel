@@ -1,11 +1,19 @@
 # Fortel AI Takeoff — Working Demo 2 (TRULY UNMARKED engineer drawings)
 
 *Companion to `DEMO.md`. Demo 1 ran the flow on the **marked** Winvic drawings (estimator's Bluebeam
-markup already on the sheet). This demo runs on the **Hemington / SGP tender** — real engineer PDFs
-**exactly as Fortel receives them: no markup, no CAD layers, flattened vector**. Here the AI has to do
-the estimator's job itself: read the legend, find the concrete, trace it, scale it, price it. Every
-number and every red region below comes from running the pipeline on the actual PDF — nothing is
-hand-placed.*
+markup already on the sheet). This demo runs on the **Hemington / SGP tender** — real PDFs **exactly as
+Fortel receives them: no markup, no CAD layers, flattened vector**. Here the AI does the estimator's job
+itself: read the legend, find the concrete, trace it, scale it, price it. Every number and every red
+region below comes from running the pipeline (`takeoff_unmarked.py`) on the actual PDF — nothing is
+hand-placed, and the same script reproduces these numbers (regression `test_sgp_units.py`).*
+
+> **From the 19 Jun standup (see `LEARNINGS_STANDUP.md`):** SGP is the **architect**, so this is the
+> *architect-drawing path* Fortel use when there's no engineer pack — which the estimator said is **~60%
+> of enquiries**. On that path the build-up (slab thickness/mesh) has no construction-details sheet, so
+> Fortel **assume it and state the assumption in the quote**; the area also carries a **~5% tolerance**
+> vs an engineer drawing. Our £'s below follow exactly that method: measured area × an **assumed**
+> 190 mm / A252 build-up, flagged as an assumption. The LLM piece is real and proven — Claude vision read
+> this tender's legend back as *"Concrete Service Yard construction"* on the live API.
 
 ## The system in one line
 ```
