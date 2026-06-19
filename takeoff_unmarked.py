@@ -91,10 +91,15 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
 
 # ---------------------------------------------------------------- segmentation
 def segment_hatch(im_rgb, rgb, tol=14, close=9):
-    """Largest filled connected region whose colour matches `rgb` within tol (greyscale-aware)."""
+    """Largest filled connected region whose colour matches `rgb` within tol.
+    For a GREY target we use a luminance band + greyscale test (more robust to anti-aliasing, and
+    identical to the validated Claude-session method); for a coloured target, per-channel tol."""
     r, g, b = im_rgb[..., 0].astype(int), im_rgb[..., 1].astype(int), im_rgb[..., 2].astype(int)
     R, G, B = rgb
-    mask = (np.abs(r - R) <= tol) & (np.abs(g - G) <= tol) & (np.abs(b - B) <= tol)
+    if max(rgb) - min(rgb) <= 6:                       # grey hatch
+        mask = (np.abs(r - g) < 12) & (np.abs(g - b) < 12) & (r >= R - tol) & (r <= R + tol)
+    else:
+        mask = (np.abs(r - R) <= tol) & (np.abs(g - G) <= tol) & (np.abs(b - B) <= tol)
     if mask.sum() == 0:
         return None
     lab, n = ndi.label(ndi.binary_closing(mask, structure=np.ones((close, close))))
@@ -136,7 +141,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # CONFIRM the concrete-yard entry exists and that its swatch is grey (the anchor). Reading an
     # arbitrary swatch pixel as the segmentation colour proved fragile (grabbed green/white on other
     # units → absurd areas), so the grey convention is primary; --api can override for non-SGP packs.
-    GREY = (216, 216, 216)
+    GREY = (214, 214, 214)   # band center; with tol=14 -> grey [200,228], matching the validated session
     rgb = GREY
     swatch, label = find_concrete_swatch_rgb(pdf, im=im, S=S)
     if label and swatch:
