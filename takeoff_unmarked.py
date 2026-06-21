@@ -90,10 +90,13 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
 
 
 # ---------------------------------------------------------------- segmentation
-def segment_hatch(im_rgb, rgb, tol=14, close=9):
-    """Largest filled connected region whose colour matches `rgb` within tol.
-    For a GREY target we use a luminance band + greyscale test (more robust to anti-aliasing, and
-    identical to the validated Claude-session method); for a coloured target, per-channel tol."""
+def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0):
+    """Largest connected region of the concrete-yard hatch.
+    For a GREY target we use a luminance band + greyscale test (robust to anti-aliasing); for a
+    coloured target, per-channel tol. A small `close` bridges thin paint lines (bay markings) so the
+    slab under the paint is counted. We then fill ONLY small interior holes (paint blocks, text) and
+    LEAVE large white pockets — dock-bay door recesses, landscaped islands — as deductions (team
+    feedback: filling the dock bays over-measured D77 by ~68 m²)."""
     r, g, b = im_rgb[..., 0].astype(int), im_rgb[..., 1].astype(int), im_rgb[..., 2].astype(int)
     R, G, B = rgb
     if max(rgb) - min(rgb) <= 6:                       # grey hatch
@@ -104,8 +107,31 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9):
         return None
     lab, n = ndi.label(ndi.binary_closing(mask, structure=np.ones((close, close))))
     sizes = ndi.sum(np.ones_like(lab), lab, range(1, n + 1))
-    comp = ndi.binary_fill_holes(lab == int(np.argmax(sizes)) + 1)
+    comp = lab == int(np.argmax(sizes)) + 1            # largest component, NOT hole-filled
+    # size-limited fill: paint/text holes (small) get filled; dock bays / islands (large) stay out
+    if k:
+        px_per_m2 = 1.0 / ((1.0 / S) ** 2 * k * k)
+        filled = ndi.binary_fill_holes(comp)
+        hl, hn = ndi.label(filled & ~comp)
+        if hn:
+            hsz = ndi.sum(np.ones_like(hl), hl, range(1, hn + 1))
+            small = np.isin(hl, [i + 1 for i in range(hn) if hsz[i] < max_void_m2 * px_per_m2])
+            comp = comp | small
     return comp
+
+
+# ---------------------------------------------------------------- drawing style guard
+def drawing_style(im, white_thresh=233, thresh=0.03):
+    """Colour-coded (solid fills, e.g. SGP architect) vs line/hatch (engineer kerbing drawings: mostly
+    white with thin coloured lines + diagonal hatching). Team feedback: solid-fill colour segmentation
+    gives 'entirely wrong area' on line/hatch sheets, so we detect and refuse rather than guess.
+    Metric = fraction of SOLID fill (erode 2px: solid fills survive, thin lines/hatching vanish). This
+    is robust to white margin — a small colour-coded drawing on a sparse 1:750 sheet still passes,
+    whereas dense line-art does not. Returns (style, solid_fill_fraction)."""
+    r, g, b = im[..., 0], im[..., 1], im[..., 2]
+    nonwhite = ~((r > white_thresh) & (g > white_thresh) & (b > white_thresh))
+    solid = float(ndi.binary_erosion(nonwhite, iterations=2).mean())
+    return ("colour-coded" if solid > thresh else "line/hatch"), solid
 
 
 # ---------------------------------------------------------------- scale
@@ -134,6 +160,16 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     pg = fitz.open(pdf)[0]
     pix = pg.get_pixmap(matrix=fitz.Matrix(S, S))
     im = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[..., :3]
+
+    # --- drawing-style guard (team feedback #2: don't give a wrong number on non-colour-coded sheets) ---
+    style, solid = drawing_style(im)
+    flags.append(f"drawing style: {style} (solid-fill {solid*100:.0f}%)")
+    if style == "line/hatch":
+        return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
+                "flags": flags + [
+                    "NON-COLOUR-CODED (line/hatch) drawing — solid-fill colour segmentation does NOT apply "
+                    "(it scrapes stray grey -> wrong area). Route to hatch-mode / Claude vision / assessor "
+                    "trace. No area emitted (this is the fix for the 'entirely wrong area' the team hit)."]}
 
     # --- region colour ---
     # The priced "Concrete Service Yard construction" hatch on SGP architect sheets is a light grey
@@ -167,17 +203,18 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         except Exception as e:
             flags.append(f"vision legend read skipped: {e}")
 
-    comp = segment_hatch(im, rgb)
-    if comp is None or comp.sum() == 0:
-        return {"pdf": pdf, "area_m2": None, "flags": flags + ["no hatch pixels matched — assessor must trace"]}
-    px = int(comp.sum())
-    flags.append("interior voids filled (bay markings/text); if the yard encloses a building/island, assessor deducts it")
-
-    # --- scale + measure ---
+    # --- scale FIRST (segmentation needs k for scale-aware dock-bay/void handling) ---
     k, verified, note = scale_for(pdf)
     flags.append(note)
     if k is None:
         return {"pdf": pdf, "area_m2": None, "flags": flags + ["no scale — cannot measure"]}
+
+    comp = segment_hatch(im, rgb, k=k, S=S)
+    if comp is None or comp.sum() == 0:
+        return {"pdf": pdf, "area_m2": None, "flags": flags + ["no hatch pixels matched — assessor must trace"]}
+    px = int(comp.sum())
+    flags.append("dock-bay recesses & interior islands kept as DEDUCTIONS (not filled); thin paint bridged by closing")
+
     area = round(px * (1.0 / S) ** 2 * k * k, 0)
 
     # --- plausibility (BLOCKS, not just flags) ---

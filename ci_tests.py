@@ -69,5 +69,21 @@ ck("white-segmentation blowup blocked by plausibility", len(plausible(279905)) >
 _w = segment_hatch(_im, (255, 0, 0))   # colour not present
 ck("absent hatch colour -> no region", _w is None or int(_w.sum()) == 0)
 
+print("team feedback fixes (DEMO4)")
+from takeoff_unmarked import drawing_style
+# (a) drawing-style guard: solid fill = colour-coded; thin lines = line/hatch (don't guess on engineer sheets)
+_solid = _np.full((300, 300, 3), 255, _np.uint8); _solid[40:260, 40:260] = (120, 170, 90)
+ck("colour-coded sheet detected", drawing_style(_solid)[0] == "colour-coded")
+_lines = _np.full((300, 300, 3), 255, _np.uint8)
+for _i in range(0, 300, 12):
+    _lines[:, _i] = (80, 80, 80)
+ck("line/hatch sheet detected", drawing_style(_lines)[0] == "line/hatch")
+# (b) dock-bay/void fix: a large interior void is kept as a DEDUCTION, not filled (team: D77 dock bays)
+_v = _np.full((400, 400, 3), 255, _np.uint8); _v[40:360, 40:360] = (214, 214, 214); _v[150:250, 150:250] = 255
+_kept = segment_hatch(_v, (214, 214, 214), k=0.05, S=2.0, max_void_m2=1.0)   # void=6.25 m² > 1 -> kept out
+_fill = segment_hatch(_v, (214, 214, 214), k=0.05, S=2.0, max_void_m2=999)   # huge thresh -> filled
+ck("large interior void kept as deduction", int(_kept.sum()) < int(_fill.sum()))
+ck("void filled only when below threshold", int(_fill.sum()) - int(_kept.sum()) > 8000)
+
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)
