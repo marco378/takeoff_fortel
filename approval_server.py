@@ -24,7 +24,7 @@ Environment:
   APPROVAL_PORT   default 5001
   APPROVAL_HOST   default 0.0.0.0 (set to 127.0.0.1 for local-only)
 """
-import os, json, io, datetime, traceback, uuid, re
+import os, json, io, datetime, traceback, uuid, re, threading
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
 
@@ -34,6 +34,8 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
 JOBS_FILE    = Path(__file__).parent / "approval_jobs.json"
 TRAINING_LOG = Path(__file__).parent / "training_log.jsonl"
 PORTAL_HTML  = Path(__file__).parent / "assessor_portal.html"
+
+_jobs_lock = threading.Lock()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -135,24 +137,26 @@ def approve(job_id):
     if request.method == "POST" and request.is_json:
         data = request.get_json(silent=True) or {}
 
-    jobs = load_jobs()
-    jobs[job_id].update({
-        "status":     "approved",
-        "decision":   "approved",
-        "decided_at": now_iso(),
-        "note":       data.get("note", ""),
-    })
-    save_jobs(jobs)
+    with _jobs_lock:
+        jobs = load_jobs()
+        jobs[job_id].update({
+            "status":     "approved",
+            "decision":   "approved",
+            "decided_at": now_iso(),
+            "note":       data.get("note", ""),
+        })
+        save_jobs(jobs)
 
     # Trigger costing with the AI's area
     res = j.get("result", {})
     costing_result = _run_costing(res.get("area_m2"), res)
-    jobs = load_jobs()
-    jobs[job_id]["costing"] = costing_result
     # Auto-generate and save quotation
     quotation_paths = _save_quotation(job_id, res, costing_result)
-    jobs[job_id]["quotation_paths"] = quotation_paths
-    save_jobs(jobs)
+    with _jobs_lock:
+        jobs = load_jobs()
+        jobs[job_id]["costing"] = costing_result
+        jobs[job_id]["quotation_paths"] = quotation_paths
+        save_jobs(jobs)
 
     log_training({
         "event":      "approve",
@@ -178,14 +182,15 @@ def reject(job_id):
     if request.method == "POST" and request.is_json:
         data = request.get_json(silent=True) or {}
 
-    jobs = load_jobs()
-    jobs[job_id].update({
-        "status":     "rejected",
-        "decision":   "rejected",
-        "decided_at": now_iso(),
-        "note":       data.get("note", "rejected via portal"),
-    })
-    save_jobs(jobs)
+    with _jobs_lock:
+        jobs = load_jobs()
+        jobs[job_id].update({
+            "status":     "rejected",
+            "decision":   "rejected",
+            "decided_at": now_iso(),
+            "note":       data.get("note", "rejected via portal"),
+        })
+        save_jobs(jobs)
 
     res = j.get("result", {})
     log_training({
@@ -231,21 +236,22 @@ def adjust(job_id):
 
     costing_result = _run_costing(area_m2, j.get("result", {})) if area_m2 else None
 
-    jobs = load_jobs()
-    jobs[job_id].update({
-        "status":      "adjusted",
-        "decision":    "adjusted",
-        "decided_at":  now_iso(),
-        "adjusted": {
-            "vertices": vertices,
-            "scale_k":  scale_k,
-            "area_m2":  area_m2,
-            "flags":    gflags,
-            "note":     note,
-        },
-        "costing": costing_result,
-    })
-    save_jobs(jobs)
+    with _jobs_lock:
+        jobs = load_jobs()
+        jobs[job_id].update({
+            "status":      "adjusted",
+            "decision":    "adjusted",
+            "decided_at":  now_iso(),
+            "adjusted": {
+                "vertices": vertices,
+                "scale_k":  scale_k,
+                "area_m2":  area_m2,
+                "flags":    gflags,
+                "note":     note,
+            },
+            "costing": costing_result,
+        })
+        save_jobs(jobs)
 
     res = j.get("result", {})
     log_training({
@@ -448,6 +454,39 @@ def status():
 
 # ── Upload endpoint ───────────────────────────────────────────────────────────
 
+def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str):
+    """Background thread: run takeoff pipeline and update job record when done."""
+    try:
+        import takeoff_pipeline
+        result = takeoff_pipeline.takeoff(pdf_path, project_name=project_name, project_ref=project_ref)
+        with _jobs_lock:
+            jobs = load_jobs()
+            jobs[job_id].update({
+                "project_name":     result.get("project_name", project_name),
+                "project_ref":      result.get("project_ref",  project_ref),
+                "type":             result.get("type"),
+                "method":           result.get("method"),
+                "confidence":       result.get("confidence"),
+                "source_discipline": result.get("source_discipline"),
+                "area_m2":          result.get("area_m2"),
+                "scale_verified":   result.get("scale_verified"),
+                "scale_src":        result.get("scale_src"),
+                "scale_sources":    result.get("scale_sources"),
+                "costing":          result.get("costing"),
+                "flags":            result.get("flags", []),
+                "polygon_pts":      result.get("polygon_pts"),
+                "result":           result,
+                "status":           "pending",
+            })
+            save_jobs(jobs)
+    except Exception as e:
+        with _jobs_lock:
+            jobs = load_jobs()
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["flags"]  = [str(e)]
+            save_jobs(jobs)
+
+
 def _sanitise_filename(name: str) -> str:
     """Strip dangerous characters; keep alphanumeric, dash, underscore, dot."""
     name = name.replace(" ", "_")
@@ -502,45 +541,44 @@ def upload():
     # ── Save the PDF
     pdf_file.save(str(dest_path))
 
-    # ── Run the takeoff pipeline
-    try:
-        from takeoff_pipeline import takeoff
-        result = takeoff(str(dest_path), project_name=project_name, project_ref=project_ref)
-    except Exception:
-        return jsonify({"error": traceback.format_exc()}), 500
-
-    # ── Build job record (mirrors existing approval_jobs.json structure)
+    # ── Create a stub job record immediately (status=processing)
     job_id = str(uuid.uuid4())
     job = {
         "id":               job_id,
         "pdf_path":         str(dest_path),
-        "project_name":     result.get("project_name", project_name),
-        "project_ref":      result.get("project_ref",  project_ref),
-        "type":             result.get("type"),
-        "method":           result.get("method"),
-        "confidence":       result.get("confidence"),
-        "source_discipline": result.get("source_discipline"),
-        "area_m2":          result.get("area_m2"),
-        "scale_verified":   result.get("scale_verified"),
-        "scale_src":        result.get("scale_src"),
-        "scale_sources":    result.get("scale_sources"),
-        "costing":          result.get("costing"),
-        "flags":            result.get("flags", []),
-        "polygon_pts":      result.get("polygon_pts"),
-        "status":           "pending",
+        "project_name":     project_name,
+        "project_ref":      project_ref,
+        "type":             None,
+        "method":           None,
+        "confidence":       None,
+        "source_discipline": None,
+        "area_m2":          None,
+        "scale_verified":   None,
+        "scale_src":        None,
+        "scale_sources":    None,
+        "costing":          None,
+        "flags":            [],
+        "polygon_pts":      None,
+        "status":           "processing",
         "created_at":       datetime.datetime.utcnow().isoformat(),
         "decision":         None,
         "adjusted":         None,
-        # Keep the full result blob for snapshot / portal use
-        "result":           result,
+        "result":           {},
     }
 
-    # ── Persist
-    jobs = load_jobs()
-    jobs[job_id] = job
-    save_jobs(jobs)
+    with _jobs_lock:
+        jobs = load_jobs()
+        jobs[job_id] = job
+        save_jobs(jobs)
 
-    return jsonify({"job_id": job_id, "status": "ok"}), 201
+    # ── Launch takeoff in background; portal polls /jobs every 15 s
+    threading.Thread(
+        target=_run_takeoff,
+        args=(job_id, str(dest_path), project_name, project_ref),
+        daemon=True,
+    ).start()
+
+    return jsonify({"job_id": job_id, "status": "processing"}), 202
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

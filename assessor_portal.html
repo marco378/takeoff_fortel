@@ -284,6 +284,11 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 
 <script>
 // ─────────────────────────────────────────────────
+// HTML escape helper — use for all server string fields injected into innerHTML
+// ─────────────────────────────────────────────────
+const esc = s => s == null ? '—' : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// ─────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────
 const BASE = window.location.origin;   // e.g. http://localhost:5001
@@ -336,12 +341,12 @@ function renderJobList(jobs) {
     const badge  = `<span class="badge ${j.status||'pending'}">${j.status||'pending'}</span>`;
     const area   = j.result && j.result.area_m2 ? `${(+j.result.area_m2).toLocaleString()} m²` : '—';
     const ts      = j.created ? j.created.substring(0,16).replace('T',' ') : '';
-    const ref     = j.project_ref  ? `<span style="opacity:.8;font-size:10px">#${j.project_ref} · </span>` : '';
-    const pname   = j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${j.project_name}</div>` : '';
+    const ref     = j.project_ref  ? `<span style="opacity:.8;font-size:10px">#${esc(j.project_ref)} · </span>` : '';
+    const pname   = j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
     return `<div class="job-item ${active}" onclick="selectJob('${j.id}')">
       ${pname}
       <div class="jid">${j.id} &nbsp;${badge}</div>
-      <div class="jfile">${j.result&&j.result.file||j.id}</div>
+      <div class="jfile">${esc(j.result&&j.result.file||j.id)}</div>
       <div class="jmeta">${area} · ${ts}</div>
     </div>`;
   }).join('');
@@ -406,17 +411,17 @@ function renderJobDetails(job) {
   const res = job.result || {};
   const projRow = (job.project_ref || job.project_name) ? `
     <div class="kv" style="background:#eef3fa;border-radius:5px;padding:5px 8px;margin-bottom:4px">
-      ${job.project_ref ? `<span class="k" style="color:#13294b;font-weight:700">#${job.project_ref}</span>` : ''}
-      ${job.project_name ? `<span class="v" style="color:#13294b;font-weight:700;font-size:13px">${job.project_name}</span>` : ''}
+      ${job.project_ref ? `<span class="k" style="color:#13294b;font-weight:700">#${esc(job.project_ref)}</span>` : ''}
+      ${job.project_name ? `<span class="v" style="color:#13294b;font-weight:700;font-size:13px">${esc(job.project_name)}</span>` : ''}
     </div>` : '';
   document.getElementById('jobDetails').innerHTML = `
     ${projRow}
-    <div class="kv"><span class="k">File</span><span class="v">${res.file||'—'}</span></div>
-    <div class="kv"><span class="k">Type</span><span class="v">${res.type||'—'}</span></div>
-    <div class="kv"><span class="k">Source</span><span class="v">${res.source_discipline||'—'}</span></div>
-    <div class="kv"><span class="k">Confidence</span><span class="v">${res.confidence||'—'}</span></div>
+    <div class="kv"><span class="k">File</span><span class="v">${esc(res.file)}</span></div>
+    <div class="kv"><span class="k">Type</span><span class="v">${esc(res.type)}</span></div>
+    <div class="kv"><span class="k">Source</span><span class="v">${esc(res.source_discipline)}</span></div>
+    <div class="kv"><span class="k">Confidence</span><span class="v">${esc(res.confidence)}</span></div>
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
-    <div class="kv"><span class="k">Scale src</span><span class="v">${res.scale_src||res.scale_k||'—'}</span></div>
+    <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
   `;
   renderCosting(res.costing || job.costing);
 }
@@ -439,7 +444,7 @@ function renderCosting(c) {
       <div style="color:#aec3e0;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT)</div>
       <div style="color:#fff;font-size:26px;font-weight:800">£${(+c.total_gbp).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
       <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${c.rate}/m²</div>
-      <div style="color:#8fa8cc;font-size:11px">${spec.depth_mm||190}mm ${spec.conc_mix||'C32/40'} / ${spec.layers||1}× ${spec.mesh||'A252'}</div>
+      <div style="color:#8fa8cc;font-size:11px">${spec.depth_mm||190}mm ${esc(spec.conc_mix||'C32/40')} / ${spec.layers||1}× ${esc(spec.mesh||'A252')}</div>
     </div>
     <div class="kv"><span class="k" style="font-size:11px">Rate breakdown (per m²)</span></div>
     ${rows}
@@ -456,7 +461,7 @@ function renderFlags(flags) {
   el.innerHTML = flags.map(f => {
     const cls = /IMPOSSIBLE|UNVERIFIED|MIXED/.test(f) ? 'err' :
                 /ASSUMED|confirm/.test(f) ? 'warn' : 'warn';
-    return `<div class="flag ${cls}">⚠ ${f}</div>`;
+    return `<div class="flag ${cls}">⚠ ${esc(f)}</div>`;
   }).join('');
 }
 
@@ -468,8 +473,8 @@ function renderDecision(job) {
     ql.style.display = 'none';
     return;
   }
-  el.innerHTML = `<div class="decision-banner ${job.decision}">
-    ${job.decision.toUpperCase()} · ${(job.decided_at||'').substring(0,16).replace('T',' ')}
+  el.innerHTML = `<div class="decision-banner ${esc(job.decision)}">
+    ${esc(job.decision).toUpperCase()} · ${(job.decided_at||'').substring(0,16).replace('T',' ')}
   </div>`;
   // Quotation links (shown after approval / adjustment)
   if (job.decision === 'approved' || job.decision === 'adjusted') {
@@ -874,15 +879,15 @@ function renderLineItemsTable(items) {
   let grandTotal = 0;
 
   for (const [sec, rows] of Object.entries(sections)) {
-    html += `<tr class="li-section-hdr"><td colspan="5">${sec}</td></tr>`;
+    html += `<tr class="li-section-hdr"><td colspan="5">${esc(sec)}</td></tr>`;
     let subtotal = 0;
     for (const it of rows) {
       const val = typeof it.value === 'number' ? it.value : 0;
       subtotal += val;
       html += `<tr>
-        <td>${it.description || '—'}</td>
+        <td>${esc(it.description)}</td>
         <td class="num">${fmtQty(it.qty)}</td>
-        <td>${it.unit || '—'}</td>
+        <td>${esc(it.unit)}</td>
         <td class="num">${fmt(it.rate)}</td>
         <td class="num">${fmt(it.value)}</td>
       </tr>`;
@@ -890,7 +895,7 @@ function renderLineItemsTable(items) {
     grandTotal += subtotal;
     if (Object.keys(sections).length > 1) {
       html += `<tr class="li-subtotal">
-        <td colspan="4">Subtotal — ${sec}</td>
+        <td colspan="4">Subtotal — ${esc(sec)}</td>
         <td class="num">£${fmt(subtotal)}</td>
       </tr>`;
     }
