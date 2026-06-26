@@ -44,6 +44,8 @@ header span{opacity:.7;font-size:12px}
 .badge.approved{background:#27ae60;color:#fff}
 .badge.rejected{background:#c0392b;color:#fff}
 .badge.adjusted{background:#2980b9;color:#fff}
+.badge.processing{background:#6c757d;color:#fff}
+.badge.error{background:#dc3545;color:#fff}
 .no-jobs{padding:24px 16px;opacity:.5;font-size:13px;text-align:center}
 
 /* ── Main panel ──────────────────────────── */
@@ -293,6 +295,9 @@ const esc = s => s == null ? '—' : String(s).replace(/&/g,'&amp;').replace(/</
 // ─────────────────────────────────────────────────
 const BASE = window.location.origin;   // e.g. http://localhost:5001
 let currentJob = null;
+let selectedJobId = null;   // BUG 5: track which job is open
+let _jobs = [];             // BUG 5: last fetched job list
+let _lastRenderedStatus = null;  // BUG 5: status at last renderJobUI call
 let canvas = null, ctx = null;
 let img = null;
 let mode = 'trace';       // 'trace' | 'cal'
@@ -321,7 +326,15 @@ async function loadJobList() {
   try {
     const r = await fetch(`${BASE}/jobs`);
     const jobs = await r.json();
+    _jobs = Object.values(jobs || {});  // BUG 5: cache for poll comparison
     renderJobList(jobs);
+    // BUG 5: if a job is open and its status changed, refresh the detail panel
+    if (selectedJobId) {
+      const cur = _jobs.find(j => j.id === selectedJobId);
+      if (cur && cur.status !== _lastRenderedStatus) {
+        selectJob(selectedJobId);
+      }
+    }
   } catch(e) {
     document.getElementById('jobList').innerHTML =
       '<div class="no-jobs">⚠ Cannot reach server</div>';
@@ -335,12 +348,12 @@ function renderJobList(jobs) {
     return;
   }
   const sorted = Object.values(jobs).sort((a,b) =>
-    (b.created||'').localeCompare(a.created||''));
+    (b.created_at||'').localeCompare(a.created_at||''));
   el.innerHTML = sorted.map(j => {
     const active = currentJob && currentJob.id === j.id ? 'active' : '';
     const badge  = `<span class="badge ${j.status||'pending'}">${j.status||'pending'}</span>`;
     const area   = j.result && j.result.area_m2 ? `${(+j.result.area_m2).toLocaleString()} m²` : '—';
-    const ts      = j.created ? j.created.substring(0,16).replace('T',' ') : '';
+    const ts      = j.created_at ? j.created_at.substring(0,16).replace('T',' ') : '';
     const ref     = j.project_ref  ? `<span style="opacity:.8;font-size:10px">#${esc(j.project_ref)} · </span>` : '';
     const pname   = j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
     return `<div class="job-item ${active}" onclick="selectJob('${j.id}')">
@@ -356,6 +369,7 @@ function renderJobList(jobs) {
 // Select / load job
 // ─────────────────────────────────────────────────
 async function selectJob(jobId) {
+  selectedJobId = jobId;  // BUG 5: track open job
   try {
     const r = await fetch(`${BASE}/job/${jobId}`);
     const job = await r.json();
@@ -379,6 +393,35 @@ async function renderJobUI(job) {
   document.getElementById('toolbar').style.display = 'flex';
   document.getElementById('infoPanel').style.display = 'flex';
   document.getElementById('emptyState').style.display = 'none';
+
+  // BUG 2: Hide approve/reject/adjust for processing/error jobs; show status message instead
+  const isActionable = job.status !== 'processing' && job.status !== 'error';
+  document.getElementById('btnApprove').style.display = isActionable ? '' : 'none';
+  document.getElementById('btnReject') .style.display = isActionable ? '' : 'none';
+  document.getElementById('btnAdjust') .style.display = isActionable ? '' : 'none';
+  // Remove any previous status message before re-rendering
+  const _prevMsg = document.getElementById('_statusMsg');
+  if (_prevMsg) _prevMsg.remove();
+  if (!isActionable) {
+    const msgDiv = document.createElement('div');
+    msgDiv.id = '_statusMsg';
+    if (job.status === 'processing') {
+      msgDiv.className = 'info-box';
+      msgDiv.textContent = '⏳ Takeoff is running — check back in a minute.';
+    } else {
+      msgDiv.className = 'error-box';
+      msgDiv.textContent = '❌ Takeoff failed. See flags below.';
+    }
+    document.getElementById('toolbar').appendChild(msgDiv);
+  }
+
+  // BUG 4: For processing jobs, show a loading state instead of fetching the snapshot
+  if (job.status === 'processing') {
+    const wrap = document.getElementById('canvasWrap');
+    wrap.innerHTML = '<div class="empty"><div class="icon">⏳</div><div style="font-size:15px;font-weight:600;color:#555">Takeoff running…</div><div>The drawing will appear once processing is complete.</div></div>';
+    _lastRenderedStatus = job.status;
+    return;
+  }
 
   // Load drawing snapshot from server
   try {
@@ -405,6 +448,7 @@ async function renderJobUI(job) {
   renderFlags(res.flags || []);
   renderDecision(job);
   loadLineItems(job);   // fetch + render line items (no-op if not yet approved)
+  _lastRenderedStatus = job.status;  // BUG 5: record status after full render
 }
 
 function renderJobDetails(job) {

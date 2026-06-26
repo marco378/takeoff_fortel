@@ -130,15 +130,17 @@ def approve(job_id):
     Approve: accept the AI's measurement as-is, proceed to costing.
     Can be triggered by clicking the email button (GET) or from the portal (POST).
     """
-    j, err, code = require_job(job_id)
-    if err: return err, code
-
     data = {}
     if request.method == "POST" and request.is_json:
         data = request.get_json(silent=True) or {}
 
     with _jobs_lock:
         jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        if job["status"] == "processing":
+            return jsonify({"error": "job is still processing"}), 409
         jobs[job_id].update({
             "status":     "approved",
             "decision":   "approved",
@@ -147,8 +149,8 @@ def approve(job_id):
         })
         save_jobs(jobs)
 
-    # Trigger costing with the AI's area
-    res = j.get("result", {})
+    # Trigger costing with the AI's area (use snapshot captured inside lock)
+    res = job.get("result", {})
     costing_result = _run_costing(res.get("area_m2"), res)
     # Auto-generate and save quotation
     quotation_paths = _save_quotation(job_id, res, costing_result)
@@ -175,15 +177,17 @@ def approve(job_id):
 @app.route("/reject/<job_id>", methods=["GET", "POST"])
 def reject(job_id):
     """Reject: mark the measurement as wrong; do not proceed to costing."""
-    j, err, code = require_job(job_id)
-    if err: return err, code
-
     data = {}
     if request.method == "POST" and request.is_json:
         data = request.get_json(silent=True) or {}
 
     with _jobs_lock:
         jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        if job["status"] == "processing":
+            return jsonify({"error": "job is still processing"}), 409
         jobs[job_id].update({
             "status":     "rejected",
             "decision":   "rejected",
@@ -192,7 +196,7 @@ def reject(job_id):
         })
         save_jobs(jobs)
 
-    res = j.get("result", {})
+    res = job.get("result", {})
     log_training({
         "event":     "reject",
         "job_id":    job_id,
@@ -212,10 +216,10 @@ def adjust(job_id):
     Adjust: assessor provides corrected polygon and/or scale.
     Re-runs geometry measurement with the assessor's inputs, then costs.
     """
-    j, err, code = require_job(job_id)
-    if err: return err, code
-
     if request.method == "GET":
+        # Quick check before redirect (no lock needed — read-only)
+        if not load_jobs().get(job_id):
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
         return redirect(f"/portal?job={job_id}")
 
     data = request.get_json(silent=True) or {}
@@ -224,7 +228,7 @@ def adjust(job_id):
     area_m2    = data.get("assessed_area_m2")
     note       = data.get("note", "")
 
-    # If assessor traced a polygon + scale, re-measure
+    # If assessor traced a polygon + scale, re-measure (heavy I/O — outside lock)
     if vertices and scale_k and len(vertices) >= 3:
         try:
             from geometry import measure_regions
@@ -234,10 +238,14 @@ def adjust(job_id):
     else:
         gflags = []
 
-    costing_result = _run_costing(area_m2, j.get("result", {})) if area_m2 else None
-
     with _jobs_lock:
         jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        if job["status"] == "processing":
+            return jsonify({"error": "job is still processing"}), 409
+        costing_result = _run_costing(area_m2, job.get("result", {})) if area_m2 else None
         jobs[job_id].update({
             "status":      "adjusted",
             "decision":    "adjusted",
@@ -253,7 +261,7 @@ def adjust(job_id):
         })
         save_jobs(jobs)
 
-    res = j.get("result", {})
+    res = job.get("result", {})
     log_training({
         "event":          "adjust",
         "job_id":         job_id,
