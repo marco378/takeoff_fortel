@@ -9,3 +9,5 @@ drawings/
 email_*.txt
 compose_url*.txt
 *_url*.txt
+.venv/
+venv/

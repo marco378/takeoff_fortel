@@ -195,20 +195,38 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
         area, n = read_marked(pdf)
         r.update({"area_m2": area, "regions": n})
 
-    elif typ == "UNMARKED vector" and vision:
-        uu = user_unit(pdf)
-        if vision.get("scale_ref"):
-            sr = vision["scale_ref"]; k = sr[2] / math.dist(sr[0], sr[1]) * uu; ksrc = "vision scale_ref"
+    elif typ == "UNMARKED vector":
+        if vision:
+            # ── LLM vision path (caller supplied region polygons + scale) ────────
+            uu = user_unit(pdf)
+            if vision.get("scale_ref"):
+                sr = vision["scale_ref"]; k = sr[2] / math.dist(sr[0], sr[1]) * uu; ksrc = "vision scale_ref"
+            else:
+                kb, info = detect_scale_bar(pdf); k = (kb * uu) if kb else None; ksrc = f"auto scale-bar: {info}"
+            if k is None:
+                r["flags"].append("no scale (no scale_ref, no detectable bar) -> assessor must supply scale")
+            else:
+                area, gflags = measure_regions(vision["regions"], k, vision.get("voids"))
+                sflags = plausible(area, site_m2=vision.get("site_m2"))
+                r.update({"area_m2": area, "scale_k": round(k, 4), "scale_src": ksrc,
+                          "flags": r["flags"] + gflags + sflags + ["assessor: confirm extent + scale"],
+                          "polygon_pts": vision["regions"][0] if vision.get("regions") else None})
         else:
-            kb, info = detect_scale_bar(pdf); k = (kb * uu) if kb else None; ksrc = f"auto scale-bar: {info}"
-        if k is None:
-            r["flags"].append("no scale (no scale_ref, no detectable bar) -> assessor must supply scale")
-        else:
-            area, gflags = measure_regions(vision["regions"], k, vision.get("voids"))
-            sflags = plausible(area, site_m2=vision.get("site_m2"))
-            r.update({"area_m2": area, "scale_k": round(k, 4), "scale_src": ksrc,
-                      "flags": r["flags"] + gflags + sflags + ["assessor: confirm extent + scale"],
-                      "polygon_pts": vision["regions"][0] if vision.get("regions") else None})
+            # ── Deterministic colour-segmentation path (takeoff_unmarked) ────────
+            import takeoff_unmarked as TU
+            tu = TU.takeoff(pdf, source=discipline)
+            r["method"] = "colour-segmentation (takeoff_unmarked)"
+            if tu.get("area_m2") is not None:
+                r.update({
+                    "area_m2":        tu["area_m2"],
+                    "scale_k":        tu.get("scale_k"),
+                    "scale_verified": tu.get("scale_verified", False),
+                })
+                r["flags"] = r["flags"] + tu.get("flags", []) + ["assessor: confirm extent + scale"]
+            else:
+                r["flags"] = r["flags"] + tu.get("flags", []) + [
+                    "takeoff_unmarked: no area emitted — assessor must trace manually"
+                ]
     else:
         r["flags"].append("needs vision {regions, voids, scale_ref}; raster/flattened -> mandatory human")
 

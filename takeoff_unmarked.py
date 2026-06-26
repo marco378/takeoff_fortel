@@ -90,27 +90,53 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
 
 
 # ---------------------------------------------------------------- segmentation
-def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0):
-    """Largest connected region of the concrete-yard hatch.
-    For a GREY target we use a luminance band + greyscale test (robust to anti-aliasing); for a
-    coloured target, per-channel tol. A small `close` bridges thin paint lines (bay markings) so the
-    slab under the paint is counted. We then fill ONLY small interior holes (paint blocks, text) and
-    LEAVE large white pockets — dock-bay door recesses, landscaped islands — as deductions (team
-    feedback: filling the dock bays over-measured D77 by ~68 m²)."""
+def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
+                  title_block_frac=0.12):
+    """Best-plausible connected region of the concrete-yard hatch.
+
+    Changes vs original:
+    - Title block excluded: bottom `title_block_frac` of the image is masked out before
+      segmentation so legend swatches / title-block backgrounds never get selected.
+    - Best-plausible selection: components are sorted largest-first; the first one whose
+      area falls in the plausible service-yard range (200–50,000 m²) is chosen.  Falls
+      back to the absolute largest if none pass (e.g. no scale yet).
+    - Small interior holes (paint blocks, text) are still filled; large voids (dock bays,
+      islands) are left as deductions — unchanged from original.
+    """
     r, g, b = im_rgb[..., 0].astype(int), im_rgb[..., 1].astype(int), im_rgb[..., 2].astype(int)
     R, G, B = rgb
     if max(rgb) - min(rgb) <= 6:                       # grey hatch
         mask = (np.abs(r - g) < 12) & (np.abs(g - b) < 12) & (r >= R - tol) & (r <= R + tol)
     else:
         mask = (np.abs(r - R) <= tol) & (np.abs(g - G) <= tol) & (np.abs(b - B) <= tol)
+
+    # ── Exclude title block / legend panel (bottom of drawing) ───────────────
+    if title_block_frac > 0:
+        cutoff = int(im_rgb.shape[0] * (1.0 - title_block_frac))
+        mask[cutoff:, :] = False
+
     if mask.sum() == 0:
         return None
     lab, n = ndi.label(ndi.binary_closing(mask, structure=np.ones((close, close))))
     sizes = ndi.sum(np.ones_like(lab), lab, range(1, n + 1))
-    comp = lab == int(np.argmax(sizes)) + 1            # largest component, NOT hole-filled
-    # size-limited fill: paint/text holes (small) get filled; dock bays / islands (large) stay out
+
+    # ── Pick the best plausible component (not just the largest) ─────────────
+    # pixels → m²: area = px * (1/S)² * k²  → px_per_m2 = S²/k²
+    order = list(np.argsort(sizes)[::-1])   # indices sorted largest-first
+    best_idx = order[0]                      # fallback: absolute largest
+    if k is not None:
+        px_per_m2 = (S * S) / (k * k)
+        _MIN_M2, _MAX_M2 = 200, 50_000      # plausible single service-yard range
+        for idx in order:
+            cand_m2 = sizes[idx] / px_per_m2
+            if _MIN_M2 <= cand_m2 <= _MAX_M2:
+                best_idx = idx
+                break
+    comp = lab == best_idx + 1              # NOT hole-filled yet
+
+    # ── Size-limited fill: paint/text holes filled; dock bays / islands kept ─
     if k:
-        px_per_m2 = 1.0 / ((1.0 / S) ** 2 * k * k)
+        px_per_m2 = (S * S) / (k * k)
         filled = ndi.binary_fill_holes(comp)
         hl, hn = ndi.label(filled & ~comp)
         if hn:
