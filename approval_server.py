@@ -24,11 +24,12 @@ Environment:
   APPROVAL_PORT   default 5001
   APPROVAL_HOST   default 0.0.0.0 (set to 127.0.0.1 for local-only)
 """
-import os, json, io, datetime, traceback
+import os, json, io, datetime, traceback, uuid, re
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
 
 JOBS_FILE    = Path(__file__).parent / "approval_jobs.json"
 TRAINING_LOG = Path(__file__).parent / "training_log.jsonl"
@@ -434,6 +435,112 @@ def n8n_webhook():
         })
     except Exception:
         return jsonify({"error": traceback.format_exc()}), 500
+
+
+# ── Health-check ─────────────────────────────────────────────────────────────
+
+@app.route("/status")
+def status():
+    """Health-check for deploy tests."""
+    jobs = load_jobs()
+    return jsonify({"status": "ok", "job_count": len(jobs)})
+
+
+# ── Upload endpoint ───────────────────────────────────────────────────────────
+
+def _sanitise_filename(name: str) -> str:
+    """Strip dangerous characters; keep alphanumeric, dash, underscore, dot."""
+    name = name.replace(" ", "_")
+    name = re.sub(r"[^\w.\-]", "", name)   # \w = [a-zA-Z0-9_]
+    return name[:80]
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    """
+    Accept a new drawing from the assessor portal without CLI intervention.
+
+    multipart/form-data fields:
+      pdf          – PDF file (required, .pdf extension only)
+      project_name – human-readable project name (required)
+      project_ref  – Fortel reference / sequential number (required)
+
+    Returns 201 {"job_id": "...", "status": "ok"} on success.
+    """
+    # ── Validate required form fields
+    project_name = (request.form.get("project_name") or "").strip()
+    project_ref  = (request.form.get("project_ref")  or "").strip()
+    pdf_file     = request.files.get("pdf")
+
+    if not project_name:
+        return jsonify({"error": "project_name is required"}), 400
+    if not project_ref:
+        return jsonify({"error": "project_ref is required"}), 400
+    if pdf_file is None:
+        return jsonify({"error": "pdf file is required"}), 400
+
+    # ── Validate extension
+    original_filename = pdf_file.filename or ""
+    if not original_filename.lower().endswith(".pdf"):
+        return jsonify({"error": "only .pdf files are accepted"}), 400
+
+    # ── Sanitise and build safe save path
+    safe_name   = _sanitise_filename(original_filename)
+    dest_name   = f"{_sanitise_filename(project_ref)}_{safe_name}"
+    drawings_dir = Path(__file__).parent / "drawings"
+    drawings_dir.mkdir(exist_ok=True)
+    dest_path   = drawings_dir / dest_name
+
+    # Path-traversal guard: resolved path must stay inside drawings/
+    try:
+        dest_resolved = dest_path.resolve()
+        dir_resolved  = drawings_dir.resolve()
+        dest_resolved.relative_to(dir_resolved)
+    except ValueError:
+        return jsonify({"error": "invalid filename (path traversal detected)"}), 400
+
+    # ── Save the PDF
+    pdf_file.save(str(dest_path))
+
+    # ── Run the takeoff pipeline
+    try:
+        from takeoff_pipeline import takeoff
+        result = takeoff(str(dest_path), project_name=project_name, project_ref=project_ref)
+    except Exception:
+        return jsonify({"error": traceback.format_exc()}), 500
+
+    # ── Build job record (mirrors existing approval_jobs.json structure)
+    job_id = str(uuid.uuid4())
+    job = {
+        "id":               job_id,
+        "pdf_path":         str(dest_path),
+        "project_name":     result.get("project_name", project_name),
+        "project_ref":      result.get("project_ref",  project_ref),
+        "type":             result.get("type"),
+        "method":           result.get("method"),
+        "confidence":       result.get("confidence"),
+        "source_discipline": result.get("source_discipline"),
+        "area_m2":          result.get("area_m2"),
+        "scale_verified":   result.get("scale_verified"),
+        "scale_src":        result.get("scale_src"),
+        "scale_sources":    result.get("scale_sources"),
+        "costing":          result.get("costing"),
+        "flags":            result.get("flags", []),
+        "polygon_pts":      result.get("polygon_pts"),
+        "status":           "pending",
+        "created_at":       datetime.datetime.utcnow().isoformat(),
+        "decision":         None,
+        "adjusted":         None,
+        # Keep the full result blob for snapshot / portal use
+        "result":           result,
+    }
+
+    # ── Persist
+    jobs = load_jobs()
+    jobs[job_id] = job
+    save_jobs(jobs)
+
+    return jsonify({"job_id": job_id, "status": "ok"}), 201
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
