@@ -135,7 +135,7 @@ def generate_quotation(result: dict, project: str = "", client: str = "",
         "discipline":    discipline,
         "area_m2":       area,
         "spec": {
-            "depth_mm": depth_mm, "mesh": mesh, "mix": mix, "layers": layers,
+            "depth_mm": depth_mm, "mesh": mesh, "conc_mix": mix, "layers": layers,
         },
         "rate":          rate,
         "breakdown":     bdwn,
@@ -299,7 +299,7 @@ if __name__ == "__main__":
             "total_gbp": 142_391.08,
             "assumed":   True,
             "spec": {
-                "depth_mm": 190, "mesh": "A252", "mix": "C32/40",
+                "depth_mm": 190, "mesh": "A252", "conc_mix": "C32/40",
                 "layers": 1, "conc_rate": 128,
             },
             "breakdown": {

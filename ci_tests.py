@@ -169,7 +169,7 @@ _demo_result = {
     "source_discipline": "architect",
     "costing": {
         "area_m2": 3172, "rate": 44.89, "total_gbp": 142391.08, "assumed": True,
-        "spec": {"depth_mm": 190, "mesh": "A252", "mix": "C32/40", "layers": 1, "conc_rate": 128},
+        "spec": {"depth_mm": 190, "mesh": "A252", "conc_mix": "C32/40", "layers": 1, "conc_rate": 128},
         "breakdown": {"concrete": 25.05, "steel": 4.30, "dpm": 0.46,
                       "curing": 0.23, "labour": 10.00, "trim": 0.40, "nett": 40.44, "margin%": 11},
     },
