@@ -88,6 +88,52 @@ try:
 except ImportError as _e:
     print(f"  [SKIP] takeoff_unmarked tests — missing dependency: {_e}")
 
+print("scale_for verification logic (scale bar vs title block)")
+try:
+    from takeoff_unmarked import scale_for as _scale_for, SCALE_BAR_AGREE_TOL as _TOL
+    import scale as _SC
+    # PT_PER_M = 0.0254/72; k for 1:500 = 500 * PT_PER_M ≈ 0.176389 m/pt
+    _PT_PER_M = 0.0254 / 72
+    _k500 = 500 * _PT_PER_M   # ≈ 0.176389 m/pt
+
+    # --- CASE 1: scale bar AGREES with title block (bar within ±3%) -> verified=True ---
+    # Bar: 88 m / 500 pt = 0.176 m/pt; diff vs k500 ≈ 0.22% < 3%
+    _c1 = canvas.Canvas("/tmp/_sf_agree.pdf", pagesize=(1400, 2200))
+    _c1.drawString(100, 2100, "Drawing Scale 1:500")   # title-block text
+    _c1.drawString(200, 120, "0          88 m")        # scale-bar label (88 m over 500 pt bar)
+    _c1.line(100, 110, 600, 110)                        # 500 pt horizontal bar
+    _c1.save()
+    _k1, _v1, _n1, _src1 = _scale_for("/tmp/_sf_agree.pdf")
+    ck("bar agrees with title -> verified=True",  _v1 is True, f"k={_k1:.5f} note={_n1[:60]}")
+    ck("agree: bar in scale_sources",             "scale_bar" in _src1)
+    ck("agree: title_block in scale_sources",     "title_block" in _src1)
+    ck("agree: returned k close to bar",          _k1 is not None and abs(_k1 - 88/500) < 1e-6)
+
+    # --- CASE 2: scale bar DISAGREES with title block (>3%) -> verified=False ---
+    # Bar: 150 m / 500 pt = 0.30 m/pt; diff vs k500 ≈ 70% >> 3%
+    _c2 = canvas.Canvas("/tmp/_sf_disagree.pdf", pagesize=(1400, 2200))
+    _c2.drawString(100, 2100, "Drawing Scale 1:500")
+    _c2.drawString(200, 120, "0         150 m")
+    _c2.line(100, 110, 600, 110)
+    _c2.save()
+    _k2, _v2, _n2, _src2 = _scale_for("/tmp/_sf_disagree.pdf")
+    ck("bar disagrees with title -> verified=False", _v2 is False, f"k={_k2:.5f} note={_n2[:60]}")
+    ck("disagree: note mentions disagrees",         "DISAGREES" in _n2 or "disagrees" in _n2.lower())
+    ck("disagree: bar k still used",               _k2 is not None and abs(_k2 - 150/500) < 1e-6)
+
+    # --- CASE 3: no scale bar, title block only -> verified=False ---
+    _c3 = canvas.Canvas("/tmp/_sf_titleonly.pdf", pagesize=(1400, 2200))
+    _c3.drawString(100, 2100, "Drawing Scale 1:500")   # title-block only, no bar line or label
+    _c3.save()
+    _k3, _v3, _n3, _src3 = _scale_for("/tmp/_sf_titleonly.pdf")
+    ck("title-only -> verified=False",            _v3 is False, f"note={_n3[:60]}")
+    ck("title-only: title_block in scale_sources", "title_block" in _src3)
+    ck("title-only: no scale_bar in scale_sources", "scale_bar" not in _src3)
+    ck("title-only: k close to k500",            _k3 is not None and abs(_k3 - _k500) < 1e-5)
+
+except ImportError as _e:
+    print(f"  [SKIP] scale_for tests — missing dependency: {_e}")
+
 print("defaults (Fortel build-up assumptions)")
 from defaults import spec_with_defaults, assumption_note, flag_assumed
 _s, _assumed = spec_with_defaults()

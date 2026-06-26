@@ -161,22 +161,51 @@ def drawing_style(im, white_thresh=233, thresh=0.03):
 
 
 # ---------------------------------------------------------------- scale
+SCALE_BAR_AGREE_TOL = 0.03   # ±3 % — bar and title-block must agree within this to verify
+
 def scale_for(pdf, page=0):
-    """(k_m_per_pt, verified_bool, note). Title-block 1:N, verified by scale bar when detectable."""
+    """(k_m_per_pt, verified_bool, note, sources).
+
+    verified_bool is True ONLY when a physical scale bar is detected AND it agrees with the
+    title-block stated scale within SCALE_BAR_AGREE_TOL (±3 %).  In all other cases it is False
+    and `note` explains why (no bar found / bar disagrees by X%).
+
+    sources: dict with keys 'title_block' and/or 'scale_bar' recording the contributing values.
+    """
     pg = fitz.open(pdf)[page]
     m = re.search(r"1\s*:\s*(\d{2,4})", pg.get_text())
     denom = int(m.group(1)) if m else None
     k_title = SC.title_block_k(denom)
     kbar, info = SC.detect_scale_bar(pdf, page)
     uu = SC.user_unit(pdf, page)
+
+    sources = {}
+    if k_title:
+        sources["title_block"] = {"denom": denom, "k": round(k_title * uu, 6)}
+
     if kbar:
         kbar *= uu
-        if k_title and abs(kbar - k_title) / k_title <= 0.05:
-            return kbar, True, f"scale bar {info} verifies title 1:{denom} (<=5%)"
-        return kbar, True, f"scale bar {info} (title 1:{denom} differs — using bar)"
+        sources["scale_bar"] = {"info": info, "k": round(kbar, 6)}
+        if k_title:
+            pct_diff = abs(kbar - k_title * uu) / (k_title * uu)
+            if pct_diff <= SCALE_BAR_AGREE_TOL:
+                note = (f"scale bar ({info}) AGREES with title 1:{denom} "
+                        f"(diff {pct_diff*100:.1f}% ≤ {SCALE_BAR_AGREE_TOL*100:.0f}%) — VERIFIED")
+                return kbar, True, note, sources
+            else:
+                note = (f"scale bar ({info}) DISAGREES with title 1:{denom}: "
+                        f"bar k={kbar:.5f} vs title k={k_title*uu:.5f} "
+                        f"({pct_diff*100:.1f}% > {SCALE_BAR_AGREE_TOL*100:.0f}%) — "
+                        "using bar scale; assessor should confirm which is correct")
+                return kbar, False, note, sources
+        else:
+            # Bar found but no title-block scale to compare against
+            note = f"scale bar {info} (no title-block 1:N found to cross-check) — unverified"
+            return kbar, False, note, sources
+
     if k_title:
-        return k_title * uu, False, f"title 1:{denom} only — VERIFY a feature before sign-off"
-    return None, False, "no scale found"
+        return k_title * uu, False, f"title 1:{denom} only — no scale bar detected; VERIFY a feature before sign-off", sources
+    return None, False, "no scale found", {}
 
 
 # ---------------------------------------------------------------- main takeoff
@@ -230,7 +259,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             flags.append(f"vision legend read skipped: {e}")
 
     # --- scale FIRST (segmentation needs k for scale-aware dock-bay/void handling) ---
-    k, verified, note = scale_for(pdf)
+    k, verified, note, scale_sources = scale_for(pdf)
     flags.append(note)
     if k is None:
         return {"pdf": pdf, "area_m2": None, "flags": flags + ["no scale — cannot measure"]}
@@ -278,6 +307,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 flags.append(f"vision confirm skipped: {e}")
 
     return {"pdf": os.path.basename(pdf), "scale_k": round(k, 5), "scale_verified": verified,
+            "scale_sources": scale_sources,
             "area_m2": area, "rate": rate, "price_gbp": price, "overlay": overlay, "flags": flags}
 
 
