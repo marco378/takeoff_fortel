@@ -204,6 +204,16 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
     </div>
 
     <h2>Pending Reviews</h2>
+    <div style="padding:6px 12px 5px;border-bottom:1px solid #25426e">
+      <div style="position:relative">
+        <input type="text" id="jobSearch" placeholder="Filter by name, ref, status…"
+               oninput="filterJobs(this.value)"
+               style="width:100%;box-sizing:border-box;padding:5px 22px 5px 8px;background:#12274a;border:1px solid #2d4e7e;border-radius:4px;color:#cdd8eb;font-size:12px;outline:none;transition:border-color .15s"
+               onfocus="this.style.borderColor='#4a7fc1'" onblur="this.style.borderColor='#2d4e7e'">
+        <span id="jobSearchClear" onclick="clearJobSearch()"
+              style="display:none;position:absolute;right:6px;top:50%;transform:translateY(-50%);cursor:pointer;color:#8ab4cc;font-size:16px;line-height:1">×</span>
+      </div>
+    </div>
     <div class="job-list" id="jobList">
       <div class="no-jobs">Loading jobs…</div>
     </div>
@@ -339,6 +349,8 @@ let currentJob = null;
 let selectedJobId = null;   // BUG 5: track which job is open
 let _jobs = [];             // BUG 5: last fetched job list
 let _lastRenderedStatus = null;  // BUG 5: status at last renderJobUI call
+let _lastJobs = null;           // cache for search re-filter
+let _jobSearchTerm = '';        // current search filter
 let canvas = null, ctx = null;
 let img = null;
 let mode = 'trace';       // 'trace' | 'cal'
@@ -383,6 +395,7 @@ async function loadJobList() {
 }
 
 function renderJobList(jobs) {
+  _lastJobs = jobs;  // cache so search re-filter works without re-fetch
   const el = document.getElementById('jobList');
   if (!jobs || !Object.keys(jobs).length) {
     el.innerHTML = '<div class="no-jobs">No pending jobs 🎉</div>';
@@ -390,7 +403,22 @@ function renderJobList(jobs) {
   }
   const sorted = Object.values(jobs).sort((a,b) =>
     (b.created_at||'').localeCompare(a.created_at||''));
-  el.innerHTML = sorted.map(j => {
+
+  const q = _jobSearchTerm;
+  const filtered = q ? sorted.filter(j => {
+    const haystack = [j.id, j.project_name, j.project_ref, j.status,
+                      j.result && j.result.file].filter(Boolean).join(' ').toLowerCase();
+    return haystack.includes(q);
+  }) : sorted;
+
+  if (!filtered.length) {
+    el.innerHTML = `<div class="no-jobs">No jobs match <em>${esc(q)}</em></div>`;
+    return;
+  }
+  const countBanner = q
+    ? `<div style="padding:4px 12px;font-size:11px;color:#8ab4cc;border-bottom:1px solid #25426e">${filtered.length} of ${sorted.length} jobs</div>`
+    : '';
+  el.innerHTML = countBanner + filtered.map(j => {
     const active = currentJob && currentJob.id === j.id ? 'active' : '';
     const badge  = `<span class="badge ${j.status||'pending'}">${j.status||'pending'}</span>`;
     const area   = j.result && j.result.area_m2 ? `${(+j.result.area_m2).toLocaleString()} m²` : '—';
@@ -404,6 +432,19 @@ function renderJobList(jobs) {
       <div class="jmeta">${area} · ${ts}</div>
     </div>`;
   }).join('');
+}
+
+function filterJobs(term) {
+  _jobSearchTerm = term.trim().toLowerCase();
+  document.getElementById('jobSearchClear').style.display = _jobSearchTerm ? '' : 'none';
+  if (_lastJobs) renderJobList(_lastJobs);
+}
+
+function clearJobSearch() {
+  _jobSearchTerm = '';
+  document.getElementById('jobSearch').value = '';
+  document.getElementById('jobSearchClear').style.display = 'none';
+  if (_lastJobs) renderJobList(_lastJobs);
 }
 
 // ─────────────────────────────────────────────────
