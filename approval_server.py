@@ -353,7 +353,13 @@ def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:
         if costing:
             result = dict(result)
             result["costing"] = costing
-        q = generate_quotation(result, project=result.get("file", ""), client="")
+        # Use the human-entered project name / ref stored at upload time rather
+        # than the raw PDF filename.  Falls back gracefully for legacy job records
+        # that predate the upload form (project_name not stored).
+        job     = load_jobs().get(job_id, {})
+        project = job.get("project_name") or result.get("file", "")
+        ref     = job.get("project_ref") or None
+        q = generate_quotation(result, project=project, client="", ref=ref)
         out_dir = Path(__file__).parent / "quotations"
         return save_quotation(q, out_dir=str(out_dir))
     except Exception as e:
