@@ -220,8 +220,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                 r.update({
                     "area_m2":        tu["area_m2"],
                     "scale_k":        tu.get("scale_k"),
+                    "scale_src":      tu.get("scale_src"),
                     "scale_verified": tu.get("scale_verified", False),
                     "scale_sources":  tu.get("scale_sources", {}),
+                    "polygon_pts":    tu.get("polygon_pts"),
                 })
                 r["flags"] = r["flags"] + tu.get("flags", []) + ["assessor: confirm extent + scale"]
             else:

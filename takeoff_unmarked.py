@@ -160,6 +160,32 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
     return comp
 
 
+# ---------------------------------------------------------------- polygon contour helper
+def _hatch_contour(comp, S, snap_s=0.5, max_pts=180):
+    """Outer contour of hatch mask → [[x,y]] in snapshot-pixel coordinates, or None.
+
+    Approach: find boundary pixels (mask minus 1-px erosion), sort them angularly
+    from the centroid, thin to max_pts.  Works well for roughly star-shaped footprints
+    (typical service yards); dock-bay concavities will be bridged, which is acceptable
+    since the assessor can nudge vertices in the portal."""
+    try:
+        boundary = comp & ~ndi.binary_erosion(comp, iterations=1)
+        ys, xs = np.where(boundary)
+        if len(ys) < 6:
+            return None
+        cy, cx = float(ys.mean()), float(xs.mean())
+        angles = np.arctan2(ys.astype(float) - cy, xs.astype(float) - cx)
+        order = np.argsort(angles)
+        xs, ys = xs[order], ys[order]
+        if len(xs) > max_pts:
+            idx = np.round(np.linspace(0, len(xs) - 1, max_pts)).astype(int)
+            xs, ys = xs[idx], ys[idx]
+        sc = snap_s / S   # mask pixel → snapshot pixel
+        return [[float(x * sc), float(y * sc)] for x, y in zip(xs, ys)]
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- drawing style guard
 def drawing_style(im, white_thresh=233, thresh=0.03):
     """Colour-coded (solid fills, e.g. SGP architect) vs line/hatch (engineer kerbing drawings: mostly
@@ -325,9 +351,16 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             except Exception as e:
                 flags.append(f"vision confirm skipped: {e}")
 
+    # --- polygon contour for portal canvas overlay ---
+    # Coordinates stored in snapshot-pixel space (PDF pt × SNAP_S) so the portal canvas,
+    # which equals the snapshot PNG in size, can draw them directly without JS rescaling.
+    SNAP_S = 0.5   # must match render_snapshot(scale=) default in approval_email.py
+    polygon_pts = _hatch_contour(comp, S, SNAP_S)
+
     return {"pdf": os.path.basename(pdf), "scale_k": round(k, 5), "scale_verified": verified,
-            "scale_sources": scale_sources,
-            "area_m2": area, "rate": rate, "price_gbp": price, "overlay": overlay, "flags": flags}
+            "scale_src": note, "scale_sources": scale_sources,
+            "area_m2": area, "rate": rate, "price_gbp": price, "overlay": overlay,
+            "polygon_pts": polygon_pts, "flags": flags}
 
 
 def main(pdf, use_api=False):
