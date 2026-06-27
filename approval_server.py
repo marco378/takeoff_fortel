@@ -284,6 +284,61 @@ def adjust(job_id):
     })
 
 
+@app.route("/spec-override/<job_id>", methods=["POST"])
+def spec_override(job_id):
+    """Assessor overrides the assumed spec (depth, mix, mesh, layers) and re-prices."""
+    data = request.get_json(silent=True) or {}
+    override = {}
+    try:
+        if "depth_mm" in data: override["depth_mm"] = int(data["depth_mm"])
+        if "conc_mix"  in data: override["conc_mix"]  = str(data["conc_mix"])
+        if "mesh"      in data: override["mesh"]       = str(data["mesh"])
+        if "layers"    in data: override["layers"]     = int(data["layers"])
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"invalid spec field: {e}"}), 400
+
+    with _jobs_lock:
+        jobs = load_jobs()
+        job  = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        if job["status"] == "processing":
+            return jsonify({"error": "job is still processing"}), 409
+
+        res     = job.get("result") or {}
+        adj     = job.get("adjusted") or {}
+        area_m2 = adj.get("area_m2") or res.get("area_m2")
+        if not area_m2:
+            return jsonify({"error": "no area_m2 on job — run takeoff first"}), 409
+
+        try:
+            from defaults import spec_with_defaults, flag_assumed
+            from costing  import rate_buildup
+            spec, _ = spec_with_defaults(override)
+            rate, parts = rate_buildup(**{k: spec[k] for k in [
+                "depth_mm","conc_rate","conc_wastage","mesh","layers",
+                "steel_rate_t","steel_wastage","lap_acc","dpm","curing",
+                "labour","trim","margin"]})
+            costing = {
+                "area_m2":   area_m2,
+                "rate":      rate,
+                "total_gbp": round(area_m2 * rate, 2),
+                "spec":      spec,
+                "assumed":   False,
+                "note":      "Spec overridden by assessor",
+                "flags":     [],
+                "breakdown": parts,
+            }
+        except Exception as e:
+            return jsonify({"error": f"costing failed: {e}"}), 500
+
+        jobs[job_id]["costing"]       = costing
+        jobs[job_id]["spec_override"] = override
+        save_jobs(jobs)
+
+    return jsonify({"status": "ok", "job_id": job_id, "costing": costing})
+
+
 # ── Costing helper ────────────────────────────────────────────────────────────
 
 def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:

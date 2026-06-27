@@ -510,10 +510,10 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
   `;
-  renderCosting(res.costing || job.costing);
+  renderCosting(res.costing || job.costing, job.status);
 }
 
-function renderCosting(c) {
+function renderCosting(c, jobStatus) {
   const el = document.getElementById('costingBlock');
   if (!c || !c.total_gbp) { el.innerHTML = '<span style="color:var(--muted)">—</span>'; return; }
   const spec    = c.spec || {};
@@ -526,6 +526,52 @@ function renderCosting(c) {
   ).join('');
   const assumedBanner = assumed
     ? `<div class="flag warn" style="margin-top:6px;font-size:11px">⚠ Build-up assumed — no engineer spec</div>` : '';
+
+  const canOverride = jobStatus === 'pending' || jobStatus === 'adjusted';
+  const overrideForm = canOverride ? `
+    <details id="specOverrideDetails" style="margin-top:8px">
+      <summary style="cursor:pointer;font-size:12px;color:#8fa8cc;user-select:none;padding:4px 0">
+        ✏ Override spec &amp; re-price
+      </summary>
+      <form id="specOverrideForm" onsubmit="submitSpecOverride(event)"
+            style="margin-top:8px;background:#0d1e38;border-radius:6px;padding:10px 12px;display:grid;gap:6px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+          <label style="font-size:11px;color:#8fa8cc">
+            Depth (mm)
+            <input type="number" name="depth_mm" min="100" max="400" step="5"
+                   value="${spec.depth_mm||190}"
+                   style="width:100%;margin-top:3px;padding:4px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
+          </label>
+          <label style="font-size:11px;color:#8fa8cc">
+            Layers
+            <select name="layers" style="width:100%;margin-top:3px;padding:4px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
+              <option value="1" ${(spec.layers||1)==1?'selected':''}>1 layer</option>
+              <option value="2" ${(spec.layers||1)==2?'selected':''}>2 layers</option>
+            </select>
+          </label>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+          <label style="font-size:11px;color:#8fa8cc">
+            Mesh type
+            <select name="mesh" style="width:100%;margin-top:3px;padding:4px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
+              ${['A142','A193','A252','A393','B785'].map(m=>`<option value="${m}" ${esc(spec.mesh||'A252')===m?'selected':''}>${m}</option>`).join('')}
+            </select>
+          </label>
+          <label style="font-size:11px;color:#8fa8cc">
+            Concrete mix
+            <select name="conc_mix" style="width:100%;margin-top:3px;padding:4px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
+              ${['C25/30','C30/37','C32/40','C35/45','C40/50'].map(m=>`<option value="${m}" ${esc(spec.conc_mix||'C32/40')===m?'selected':''}>${m}</option>`).join('')}
+            </select>
+          </label>
+        </div>
+        <button type="submit"
+                style="margin-top:4px;padding:6px 0;background:#1d6fa4;border:none;border-radius:4px;color:#fff;font-size:12px;font-weight:700;cursor:pointer">
+          Re-price with this spec
+        </button>
+        <div id="specOverrideMsg" style="font-size:11px;color:#8fa8cc;display:none"></div>
+      </form>
+    </details>` : '';
+
   el.innerHTML = `
     <div style="background:#13294b;border-radius:6px;padding:10px 12px;margin-bottom:8px;text-align:center">
       <div style="color:#aec3e0;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT)</div>
@@ -536,7 +582,47 @@ function renderCosting(c) {
     <div class="kv"><span class="k" style="font-size:11px">Rate breakdown (per m²)</span></div>
     ${rows}
     ${assumedBanner}
+    ${overrideForm}
   `;
+}
+
+async function submitSpecOverride(e) {
+  e.preventDefault();
+  const form = e.target;
+  const msg  = document.getElementById('specOverrideMsg');
+  const btn  = form.querySelector('button[type=submit]');
+  const fd   = new FormData(form);
+  const body = {
+    depth_mm: parseInt(fd.get('depth_mm'), 10),
+    layers:   parseInt(fd.get('layers'), 10),
+    mesh:     fd.get('mesh'),
+    conc_mix: fd.get('conc_mix'),
+  };
+  btn.disabled  = true;
+  btn.textContent = 'Re-pricing…';
+  msg.style.display = 'none';
+  try {
+    const r = await fetch(`${BASE}/spec-override/${selectedJobId}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    // Re-render costing inline without full panel reload
+    const job = _jobs.find(j => j.id === selectedJobId) || {};
+    renderCosting(d.costing, job.status);
+    // Reopen the details element so assessor sees the updated form
+    const det = document.getElementById('specOverrideDetails');
+    if (det) det.open = true;
+    const newMsg = document.getElementById('specOverrideMsg');
+    if (newMsg) { newMsg.textContent = '✅ Re-priced'; newMsg.style.display = 'block'; }
+  } catch(err) {
+    btn.disabled = false;
+    btn.textContent = 'Re-price with this spec';
+    msg.textContent = `❌ ${err.message}`;
+    msg.style.display = 'block';
+  }
 }
 
 function renderFlags(flags) {
