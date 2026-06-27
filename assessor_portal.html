@@ -547,6 +547,11 @@ function renderCosting(c, jobStatus) {
   const assumedBanner = assumed
     ? `<div class="flag warn" style="margin-top:6px;font-size:11px">⚠ Build-up assumed — no engineer spec</div>` : '';
 
+  const escalationBanner = (assumed && c.total_gbp > 200000)
+    ? `<div style="background:#fdecea;border:1px solid #e74c3c;border-radius:5px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:#c0392b;line-height:1.4">
+         🚨 <strong>ESCALATION — do not approve.</strong> Quotation &gt; £200k with assumed spec requires human review before this job can be actioned. See L3 QA report in #fortel.
+       </div>` : '';
+
   const canOverride = jobStatus === 'pending' || jobStatus === 'adjusted';
   const overrideForm = canOverride ? `
     <details id="specOverrideDetails" style="margin-top:8px">
@@ -593,6 +598,7 @@ function renderCosting(c, jobStatus) {
     </details>` : '';
 
   el.innerHTML = `
+    ${escalationBanner}
     <div style="background:#13294b;border-radius:6px;padding:10px 12px;margin-bottom:8px;text-align:center">
       <div style="color:#aec3e0;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT)</div>
       <div style="color:#fff;font-size:26px;font-weight:800">£${(+c.total_gbp).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
@@ -983,6 +989,14 @@ function setupButtons() {
 // ─────────────────────────────────────────────────
 async function submitDecision(action) {
   if (!currentJob) { toast('No job selected', 'warn'); return; }
+  if (action === 'approve') {
+    const res = currentJob.result || {};
+    const c   = currentJob.costing || res.costing;
+    if (c && c.assumed && c.total_gbp > 200000) {
+      toast('Cannot approve: quotation > £200k with assumed spec — human escalation required. See L3 QA report in #fortel.', 'error');
+      return;
+    }
+  }
   const a = calcArea();
   if (action === 'adjust' && (!poly.length || !a)) {
     toast('Trace the polygon first, then Submit Adjustment', 'warn'); return;
