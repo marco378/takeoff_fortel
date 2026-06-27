@@ -98,6 +98,16 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--muted);gap:10px;text-align:center;padding:40px}
 .empty .icon{font-size:48px;opacity:.3}
 
+/* ── Error detail panel ──────────────────────────── */
+.error-detail{background:#fdecea;border:1px solid #f5c6cb;border-radius:7px;padding:12px 14px;margin:0}
+.error-detail .err-headline{color:#c0392b;font-weight:700;font-size:13px;display:flex;align-items:flex-start;gap:6px;line-height:1.4}
+.error-detail .err-message{background:#fff;border:1px solid #f1b0b7;border-radius:5px;padding:8px 10px;font-size:12px;font-family:monospace;color:#7b1c1c;word-break:break-word;margin-top:8px;white-space:pre-wrap;max-height:120px;overflow-y:auto}
+.error-detail .err-trace-toggle{margin-top:8px;background:none;border:none;cursor:pointer;font-size:11px;color:#c0392b;font-weight:600;padding:0;display:flex;align-items:center;gap:4px;opacity:.8}
+.error-detail .err-trace-toggle:hover{opacity:1;text-decoration:underline}
+.error-trace-wrap{overflow:hidden;max-height:0;transition:max-height .25s ease}
+.error-trace-wrap.open{max-height:400px}
+.error-detail .err-trace{background:#fff;border:1px solid #f1b0b7;border-radius:5px;padding:8px 10px;font-size:11px;font-family:monospace;color:#555;word-break:break-word;margin-top:6px;white-space:pre-wrap;overflow-y:auto;max-height:300px}
+
 /* Toast */
 #toast{position:fixed;bottom:24px;right:24px;background:#13294b;color:#fff;padding:12px 20px;border-radius:8px;font-size:14px;font-weight:600;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
 #toast.show{opacity:1}
@@ -222,6 +232,24 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 
   <!-- ── Info panel ── -->
   <div class="info" id="infoPanel" style="display:none">
+
+    <!-- Error detail — only visible when job.status === 'error' -->
+    <div class="info-section" id="errorSection" style="display:none">
+      <h3>Takeoff Error</h3>
+      <div class="error-detail" id="errorDetail">
+        <div class="err-headline">
+          <span>❌</span>
+          <span id="errHeadlineText">Takeoff failed</span>
+        </div>
+        <div class="err-message" id="errMessage"></div>
+        <button class="err-trace-toggle" id="errTraceToggle" onclick="toggleErrTrace()" style="display:none">
+          ▶ Show full traceback
+        </button>
+        <div class="error-trace-wrap" id="errTraceWrap">
+          <div class="err-trace" id="errTrace"></div>
+        </div>
+      </div>
+    </div>
 
     <div class="info-section">
       <h3>Measured Area</h3>
@@ -415,13 +443,28 @@ async function renderJobUI(job) {
     document.getElementById('toolbar').appendChild(msgDiv);
   }
 
-  // BUG 4: For processing jobs, show a loading state instead of fetching the snapshot
+  // For processing jobs, show a loading state instead of fetching the snapshot
   if (job.status === 'processing') {
     const wrap = document.getElementById('canvasWrap');
     wrap.innerHTML = '<div class="empty"><div class="icon">⏳</div><div style="font-size:15px;font-weight:600;color:#555">Takeoff running…</div><div>The drawing will appear once processing is complete.</div></div>';
+    document.getElementById('errorSection').style.display = 'none';
     _lastRenderedStatus = job.status;
     return;
   }
+
+  // For error jobs, show a clear canvas error state and populate the error detail panel
+  if (job.status === 'error') {
+    const wrap = document.getElementById('canvasWrap');
+    wrap.innerHTML = '<div class="empty"><div class="icon" style="font-size:40px;opacity:.4">❌</div><div style="font-size:15px;font-weight:600;color:#c0392b">Takeoff failed</div><div style="color:#888;font-size:12px">See error details in the panel →</div></div>';
+    renderErrorDetail(job);
+    renderFlags(res.flags || (job.flags ? job.flags : []));
+    renderDecision(job);
+    _lastRenderedStatus = job.status;
+    return;
+  }
+
+  // Hide error section for non-error jobs
+  document.getElementById('errorSection').style.display = 'none';
 
   // Load drawing snapshot from server
   try {
@@ -528,6 +571,62 @@ function renderDecision(job) {
   } else {
     ql.style.display = 'none';
   }
+}
+
+// ─────────────────────────────────────────────────
+// Error detail panel
+// ─────────────────────────────────────────────────
+function renderErrorDetail(job) {
+  const section = document.getElementById('errorSection');
+  section.style.display = '';
+
+  // Primary error message: prefer job.flags[0], then job.result.error, then job.error, then generic
+  const flags   = job.flags || (job.result && job.result.flags) || [];
+  const errMsg  = flags[0] || (job.result && job.result.error) || job.error || 'No error detail available';
+  const trace   = (job.result && job.result.traceback) || job.traceback || '';
+
+  document.getElementById('errHeadlineText').textContent =
+    'Takeoff pipeline failed — review the error below';
+  document.getElementById('errMessage').textContent = errMsg;
+
+  // Show remaining flags as secondary context (skip the first one — already shown as headline)
+  const extraFlags = flags.slice(1);
+  if (extraFlags.length) {
+    const existing = document.getElementById('errExtraFlags');
+    if (existing) existing.remove();
+    const div = document.createElement('div');
+    div.id = 'errExtraFlags';
+    div.style.cssText = 'margin-top:6px';
+    div.innerHTML = extraFlags.map(f =>
+      `<div class="flag err" style="font-size:11px;margin-bottom:3px">⚠ ${esc(f)}</div>`
+    ).join('');
+    document.getElementById('errMessage').after(div);
+  } else {
+    const ex = document.getElementById('errExtraFlags');
+    if (ex) ex.remove();
+  }
+
+  // Show traceback toggle only when a traceback is available
+  const traceBtn  = document.getElementById('errTraceToggle');
+  const traceWrap = document.getElementById('errTraceWrap');
+  const traceEl   = document.getElementById('errTrace');
+  if (trace) {
+    traceEl.textContent = trace;
+    traceBtn.style.display = 'flex';
+    // Reset to collapsed
+    traceWrap.classList.remove('open');
+    traceBtn.textContent = '▶ Show full traceback';
+  } else {
+    traceBtn.style.display = 'none';
+    traceWrap.classList.remove('open');
+  }
+}
+
+function toggleErrTrace() {
+  const wrap = document.getElementById('errTraceWrap');
+  const btn  = document.getElementById('errTraceToggle');
+  const open = wrap.classList.toggle('open');
+  btn.textContent = open ? '▼ Hide traceback' : '▶ Show full traceback';
 }
 
 // ─────────────────────────────────────────────────
