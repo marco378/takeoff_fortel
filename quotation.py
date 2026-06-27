@@ -124,6 +124,14 @@ def generate_quotation(result: dict, project: str = "", client: str = "",
     for f in assumption_flags:
         if f not in declarations:
             declarations.append(f)
+    # Warn when caller never supplied extras — portal path where quantities
+    # can't be auto-measured (manholes, slot drains, transitions omitted).
+    if extras is None:
+        declarations.append(
+            "NOTE — Extra-over items (manholes, slot drains, transitions) not included: "
+            "quantities cannot be measured from the drawing automatically and require "
+            "manual assessment by the assessor before issue."
+        )
 
     return {
         "ref":           ref,
