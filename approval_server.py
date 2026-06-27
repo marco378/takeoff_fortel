@@ -359,7 +359,8 @@ def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:
         job     = load_jobs().get(job_id, {})
         project = job.get("project_name") or result.get("file", "")
         ref     = job.get("project_ref") or None
-        q = generate_quotation(result, project=project, client="", ref=ref)
+        client  = job.get("client_name") or ""
+        q = generate_quotation(result, project=project, client=client, ref=ref)
         out_dir = Path(__file__).parent / "quotations"
         return save_quotation(q, out_dir=str(out_dir))
     except Exception as e:
@@ -583,6 +584,7 @@ def upload():
     # ── Validate required form fields
     project_name = (request.form.get("project_name") or "").strip()
     project_ref  = (request.form.get("project_ref")  or "").strip()
+    client_name  = (request.form.get("client_name")  or "").strip()
     pdf_file     = request.files.get("pdf")
 
     if not project_name:
@@ -622,6 +624,7 @@ def upload():
         "pdf_path":         str(dest_path),
         "project_name":     project_name,
         "project_ref":      project_ref,
+        "client_name":      client_name,
         "type":             None,
         "method":           None,
         "confidence":       None,

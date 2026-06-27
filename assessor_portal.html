@@ -125,7 +125,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .upload-toggle .chevron{margin-left:auto;font-size:11px;opacity:.6;transition:transform .2s}
 .upload-toggle.open .chevron{transform:rotate(180deg)}
 .upload-form-wrap{overflow:hidden;max-height:0;transition:max-height .25s ease}
-.upload-form-wrap.open{max-height:300px}
+.upload-form-wrap.open{max-height:380px}
 .upload-form{padding:4px 16px 14px;display:flex;flex-direction:column;gap:8px}
 .upload-form label{font-size:11px;color:#8fa8cc;font-weight:600;letter-spacing:.4px;text-transform:uppercase;margin-bottom:2px}
 .upload-form-group{display:flex;flex-direction:column;gap:3px}
@@ -191,6 +191,10 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
           <div class="upload-form-group">
             <label for="upName">Project Name</label>
             <input type="text" id="upName" name="project_name" required placeholder="e.g. Twinwoods Business Park">
+          </div>
+          <div class="upload-form-group">
+            <label for="upClient">Client / Main Contractor</label>
+            <input type="text" id="upClient" name="client_name" placeholder="e.g. Winvic Construction">
           </div>
           <div class="upload-form-group">
             <label for="upFile">PDF Drawing</label>
@@ -1093,9 +1097,10 @@ function toggleUploadForm() {
 async function submitUpload(e) {
   e.preventDefault();
   const btn = document.getElementById('btnRunTakeoff');
-  const ref  = document.getElementById('upRef').value.trim();
-  const name = document.getElementById('upName').value.trim();
-  const file = document.getElementById('upFile').files[0];
+  const ref    = document.getElementById('upRef').value.trim();
+  const name   = document.getElementById('upName').value.trim();
+  const client = document.getElementById('upClient').value.trim();
+  const file   = document.getElementById('upFile').files[0];
 
   if (!ref || !name || !file) return;   // HTML5 required handles UI
 
@@ -1106,6 +1111,7 @@ async function submitUpload(e) {
   const fd = new FormData();
   fd.append('project_ref',  ref);
   fd.append('project_name', name);
+  fd.append('client_name',  client);
   fd.append('pdf',          file);
 
   try {
