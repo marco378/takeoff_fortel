@@ -91,7 +91,7 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
 
 # ---------------------------------------------------------------- segmentation
 def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
-                  title_block_frac=0.12):
+                  title_block_frac=0.12, _diag=None):
     """Best-plausible connected region of the concrete-yard hatch.
 
     Changes vs original:
@@ -145,11 +145,17 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
     # ── Size-limited fill: paint/text holes filled; dock bays / islands kept ─
     if k:
         px_per_m2 = (S * S) / (k * k)
+        if _diag is not None:
+            _diag['raw_hatch_m2'] = round(int(comp.sum()) / px_per_m2, 1)
         filled = ndi.binary_fill_holes(comp)
         hl, hn = ndi.label(filled & ~comp)
         if hn:
             hsz = ndi.sum(np.ones_like(hl), hl, range(1, hn + 1))
-            small = np.isin(hl, [i + 1 for i in range(hn) if hsz[i] < max_void_m2 * px_per_m2])
+            small_ids = [i + 1 for i in range(hn) if hsz[i] < max_void_m2 * px_per_m2]
+            small = np.isin(hl, small_ids)
+            if _diag is not None:
+                _diag['void_fill_m2'] = round(int(small.sum()) / px_per_m2, 1)
+                _diag['void_count'] = len(small_ids)
             comp = comp | small
     return comp
 
@@ -273,11 +279,15 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     if k is None:
         return {"pdf": pdf, "area_m2": None, "flags": flags + ["no scale — cannot measure"]}
 
-    comp = segment_hatch(im, rgb, k=k, S=S)
+    _seg_diag = {}
+    comp = segment_hatch(im, rgb, k=k, S=S, _diag=_seg_diag)
     if comp is None or comp.sum() == 0:
         return {"pdf": pdf, "area_m2": None, "flags": flags + ["no hatch pixels matched — assessor must trace"]}
     px = int(comp.sum())
     flags.append("dock-bay recesses & interior islands kept as DEDUCTIONS (not filled); thin paint bridged by closing")
+    if _seg_diag.get('void_fill_m2', 0) > 0:
+        flags.append(f"void-fill: +{_seg_diag['void_fill_m2']} m² from {_seg_diag['void_count']} "
+                     f"paint/text hole(s) (each < 1.0 m²) — included in measured area")
 
     area = round(px * (1.0 / S) ** 2 * k * k, 0)
 
