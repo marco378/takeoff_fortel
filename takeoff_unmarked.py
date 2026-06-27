@@ -111,13 +111,21 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
         mask = (np.abs(r - R) <= tol) & (np.abs(g - G) <= tol) & (np.abs(b - B) <= tol)
 
     # ── Exclude title block / legend panel (bottom of drawing) ───────────────
+    # Closing is applied only to the active (non-title-block) rows so the kernel
+    # cannot create boundary artefacts at the cutoff edge (fixes ~6 m² over-count
+    # that was introduced when title-block masking was added in 512b982).
     if title_block_frac > 0:
         cutoff = int(im_rgb.shape[0] * (1.0 - title_block_frac))
-        mask[cutoff:, :] = False
+        active = mask[:cutoff, :]
+        closed_active = ndi.binary_closing(active, structure=np.ones((close, close)))
+        mask = np.zeros_like(mask)
+        mask[:cutoff, :] = closed_active
+    else:
+        mask = ndi.binary_closing(mask, structure=np.ones((close, close)))
 
     if mask.sum() == 0:
         return None
-    lab, n = ndi.label(ndi.binary_closing(mask, structure=np.ones((close, close))))
+    lab, n = ndi.label(mask)
     sizes = ndi.sum(np.ones_like(lab), lab, range(1, n + 1))
 
     # ── Pick the best plausible component (not just the largest) ─────────────
