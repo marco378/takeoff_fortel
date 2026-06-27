@@ -112,7 +112,11 @@ def snapshot(job_id):
     try:
         from approval_email import render_snapshot
         res  = j.get("result", {})
-        pdf  = res.get("pdf_path") or j.get("pdf", "")
+        # "pdf_path" is used by new upload-form jobs; legacy jobs used "pdf"
+        pdf  = res.get("pdf_path") or j.get("pdf_path") or j.get("pdf", "")
+        # Resolve relative paths (legacy records) against the server directory
+        if pdf and not Path(pdf).is_absolute():
+            pdf = str(Path(__file__).parent / pdf)
         poly = res.get("polygon_pts")
         if not pdf or not Path(pdf).exists():
             return jsonify({"error": "PDF not on disk — snapshot unavailable"}), 404
