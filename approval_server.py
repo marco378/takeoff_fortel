@@ -149,9 +149,14 @@ def approve(job_id):
         })
         save_jobs(jobs)
 
-    # Trigger costing with the AI's area (use snapshot captured inside lock)
+    # Trigger costing with the AI's area (use snapshot captured inside lock).
+    # If the assessor already used spec-override, preserve their costing rather than
+    # recomputing with defaults — recomputing would silently undo the correction.
     res = job.get("result", {})
-    costing_result = _run_costing(res.get("area_m2"), res)
+    if job.get("costing") and job.get("spec_override"):
+        costing_result = job["costing"]
+    else:
+        costing_result = _run_costing(res.get("area_m2"), res)
     # Auto-generate and save quotation
     quotation_paths = _save_quotation(job_id, res, costing_result)
     with _jobs_lock:

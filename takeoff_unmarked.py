@@ -246,6 +246,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     if label and swatch:
         is_grey = (max(swatch) - min(swatch) <= 18) and (188 <= sum(swatch) / 3 <= 236)
         if is_grey:
+            rgb = swatch  # use actual confirmed swatch colour (may differ from hardcoded GREY center)
             flags.append(f"legend '{label}': swatch {swatch} is grey — concrete-yard hatch CONFIRMED")
         else:
             flags.append(f"legend '{label}' found but swatch {swatch} not grey — using SGP grey convention "
