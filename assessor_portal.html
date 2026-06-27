@@ -155,6 +155,10 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .li-subtotal td{background:#f9f9f9;font-weight:600;color:#444;border-top:1px solid var(--border)}
 .li-total td{background:#13294b;color:#fff;font-weight:800;border-top:2px solid #0a1e38}
 .li-none{font-size:12px;color:var(--muted);font-style:italic;padding:4px 0}
+
+/* ── Drawing thumbnail (info panel) ─────────────── */
+#thumbnailSection img{width:100%;border-radius:5px;border:1px solid var(--border);display:block;cursor:zoom-in}
+.thumb-fallback{font-size:12px;color:var(--muted);text-align:center;padding:12px 0;border:1px dashed var(--border);border-radius:5px}
 </style>
 </head>
 <body>
@@ -248,6 +252,15 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
         <div class="error-trace-wrap" id="errTraceWrap">
           <div class="err-trace" id="errTrace"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- Drawing thumbnail — populated by renderJobUI from /snapshot/<id> blob URL -->
+    <div class="info-section" id="thumbnailSection" style="display:none">
+      <h3>Drawing Preview</h3>
+      <img id="drawingThumb" alt="Drawing with AI overlay">
+      <div id="thumbFallback" class="thumb-fallback" style="display:none">
+        Preview unavailable<br><small>PDF not on this server</small>
       </div>
     </div>
 
@@ -448,6 +461,7 @@ async function renderJobUI(job) {
     const wrap = document.getElementById('canvasWrap');
     wrap.innerHTML = '<div class="empty"><div class="icon">⏳</div><div style="font-size:15px;font-weight:600;color:#555">Takeoff running…</div><div>The drawing will appear once processing is complete.</div></div>';
     document.getElementById('errorSection').style.display = 'none';
+    hideThumb();
     _lastRenderedStatus = job.status;
     return;
   }
@@ -456,6 +470,7 @@ async function renderJobUI(job) {
   if (job.status === 'error') {
     const wrap = document.getElementById('canvasWrap');
     wrap.innerHTML = '<div class="empty"><div class="icon" style="font-size:40px;opacity:.4">❌</div><div style="font-size:15px;font-weight:600;color:#c0392b">Takeoff failed</div><div style="color:#888;font-size:12px">See error details in the panel →</div></div>';
+    hideThumb();
     renderErrorDetail(job);
     renderFlags(res.flags || (job.flags ? job.flags : []));
     renderDecision(job);
@@ -466,17 +481,22 @@ async function renderJobUI(job) {
   // Hide error section for non-error jobs
   document.getElementById('errorSection').style.display = 'none';
 
-  // Load drawing snapshot from server
+  // Load drawing snapshot from server — reuse the blob URL for both canvas and thumbnail
   try {
     const r = await fetch(`${BASE}/snapshot/${job.id}`);
     if (r.ok) {
       const blob = await r.blob();
       const url  = URL.createObjectURL(blob);
       await loadImage(url);
+      showThumb(url);
+    } else {
+      loadImagePlaceholder();
+      showThumbFallback();
     }
   } catch(e) {
     console.warn('No snapshot for job', job.id);
     loadImagePlaceholder();
+    showThumbFallback();
   }
 
   // Store AI polygon for "Load AI polygon" button
@@ -749,6 +769,28 @@ function loadImagePlaceholder() {
   ctx.fillText('No snapshot available — drawing was not rendered', 100, 300);
   wrap.appendChild(canvas);
   setupCanvasEvents();
+}
+
+// ── Thumbnail helpers (info panel) ───────────────────
+function showThumb(blobUrl) {
+  const section  = document.getElementById('thumbnailSection');
+  const thumb    = document.getElementById('drawingThumb');
+  const fallback = document.getElementById('thumbFallback');
+  section.style.display = '';
+  thumb.style.display   = 'block';
+  thumb.src             = blobUrl;
+  fallback.style.display = 'none';
+}
+function showThumbFallback() {
+  const section  = document.getElementById('thumbnailSection');
+  const thumb    = document.getElementById('drawingThumb');
+  const fallback = document.getElementById('thumbFallback');
+  section.style.display  = '';
+  thumb.style.display    = 'none';
+  fallback.style.display = 'block';
+}
+function hideThumb() {
+  document.getElementById('thumbnailSection').style.display = 'none';
 }
 
 // ─────────────────────────────────────────────────
