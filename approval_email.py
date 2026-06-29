@@ -52,17 +52,24 @@ JOBS_FILE = Path(__file__).parent / "approval_jobs.json"
 # ---------------------------------------------------------------------------
 def snapshot_scale(pdf_path: str, page: int = 0,
                    scale: float = 0.5, max_width: int = 700) -> float:
-    """The ACTUAL render scale (snapshot px per PDF point) render_snapshot() will use.
+    """The ACTUAL render scale (snapshot px per PDF point) render_snapshot() produces.
 
     render_snapshot caps the requested `scale` so the PNG is never wider than
     `max_width`; for wide sheets (A1/A0 ≈ 1684–3370 pt) the effective scale is therefore
     BELOW 0.5.  The portal needs this exact value to convert the pipeline's scale_k
-    (metres per PDF point) into metres per CANVAS pixel:  mpp = scale_k / snapshot_scale.
-    Keeping the formula here (single source of truth) prevents the portal from assuming a
-    hardcoded 0.5 and over/under-counting area on large drawings.
+    (metres per PDF point) into metres per CANVAS pixel (mpp = scale_k / snapshot_scale)
+    AND to place the AI polygon (stored in PDF points) on the canvas (canvas_px = pt ×
+    snapshot_scale).  Both depend on this being EXACTLY the PNG's px/pt.
+
+    PyMuPDF rounds the rendered pixmap width UP to whole pixels, so the realised px/pt is
+    pixmap.width / page_width — marginally above the requested matrix scale.  We return
+    that realised value (not the requested matrix scale) so the portal's polygon overlay
+    lines up to the pixel and the area is exact, with no sub-percent drift on narrow sheets.
     """
-    w = fitz.open(pdf_path)[page].rect.width
-    return min(scale, max_width / w)
+    p = fitz.open(pdf_path)[page]
+    s = min(scale, max_width / p.rect.width)
+    pix = p.get_pixmap(matrix=fitz.Matrix(s, s))
+    return pix.width / p.rect.width
 
 
 def render_snapshot(pdf_path: str, page: int = 0,

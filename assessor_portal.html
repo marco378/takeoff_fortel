@@ -366,7 +366,8 @@ let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapsho
                           // Pipeline scale_k is m/pt, hence mpp = scale_k / snapScale. Default 0.5 matches
                           // render_snapshot(scale=0.5); the header overrides it for capped (wide) sheets.
 let dragIdx = -1;
-let aiPoly = null;        // AI's proposed polygon (pre-loaded), in snapshot-pixel (== canvas) coordinates
+let aiPoly = null;        // AI's proposed polygon (pre-loaded), already converted to CANVAS pixels
+                          // (res.polygon_pts arrive in PDF points; renderJobUI scales them × snapScale)
 
 // ─────────────────────────────────────────────────
 // Init
@@ -518,14 +519,24 @@ async function renderJobUI(job) {
     return;
   }
 
-  // For error jobs, show a clear canvas error state and populate the error detail panel
+  // For error jobs, populate the error detail panel, but STILL try to render the drawing
+  // preview. The snapshot route renders on-demand straight from the stored PDF, so a takeoff
+  // that failed (e.g. unsupported drawing, scale not found) does NOT mean the drawing can't be
+  // shown — the assessor needs to see it to trace/measure manually. (Bug 3: error jobs such as
+  // #1211 previously hid the canvas entirely even when the PDF was on disk and renderable.)
   if (job.status === 'error') {
-    const wrap = document.getElementById('canvasWrap');
-    wrap.innerHTML = '<div class="empty"><div class="icon" style="font-size:40px;opacity:.4">❌</div><div style="font-size:15px;font-weight:600;color:#c0392b">Takeoff failed</div><div style="color:#888;font-size:12px">See error details in the panel →</div></div>';
-    hideThumb();
     renderErrorDetail(job);
     renderFlags(res.flags || (job.flags ? job.flags : []));
     renderDecision(job);
+    snapScale = 0.5;
+    await loadSnapshot(job, /*errorState=*/true);
+    // AI polygon (if any) + scale, so manual trace works even on a failed job.
+    aiPoly = (res.polygon_pts || []).length
+      ? res.polygon_pts.map(p => [p[0] * snapScale, p[1] * snapScale]) : null;
+    poly = []; cal = [];
+    mpp  = res.scale_k ? (res.scale_k / snapScale) : null;
+    draw();              // redraw now that aiPoly/mpp are set (no-op if no canvas)
+    updateAreaDisplay();
     _lastRenderedStatus = job.status;
     return;
   }
@@ -538,6 +549,42 @@ async function renderJobUI(job) {
   snapScale = 0.5;
 
   // Load drawing snapshot from server — reuse the blob URL for both canvas and thumbnail
+  await loadSnapshot(job, /*errorState=*/false);
+
+  // Store AI polygon for "Load AI polygon" button.
+  // polygon_pts arrive in PDF-POINT space (the canonical space used by render_snapshot,
+  // the vision path, and measure_regions). The canvas is the snapshot PNG at snapScale px
+  // per PDF point, so convert once here: canvas_px = pt × snapScale. Drawing the raw PDF
+  // points directly (the old behaviour) placed every vertex near the top-left corner and
+  // made the overlay/trace lines radiate chaotically — Bug 2.
+  aiPoly = (res.polygon_pts || []).length
+    ? res.polygon_pts.map(p => [p[0] * snapScale, p[1] * snapScale])
+    : null;
+  poly = [];
+  cal  = [];
+  // scale_k is metres per PDF POINT (from the pipeline). The canvas is the snapshot PNG,
+  // rendered at snapScale px per PDF pt, so 1 canvas px = (1/snapScale) PDF pt. Convert to
+  // metres per CANVAS pixel: mpp = scale_k / snapScale. (Previously this used scale_k as if
+  // it were m/px, under-counting area by 1/snapScale² — e.g. 4× too small at snapScale=0.5.)
+  mpp  = res.scale_k ? (res.scale_k / snapScale) : null;
+  draw();   // redraw with the freshly-scaled aiPoly (the snapshot's onload draw() ran before
+            // aiPoly/snapScale were set, so the interactive overlay needs one more pass)
+
+  // Info panel
+  updateAreaDisplay();
+  renderJobDetails(job);
+  renderFlags(res.flags || []);
+  renderDecision(job);
+  loadLineItems(job);   // fetch + render line items (no-op if not yet approved)
+  _lastRenderedStatus = job.status;  // BUG 5: record status after full render
+}
+
+// Fetch + render the drawing snapshot onto the canvas (and the info-panel thumbnail).
+// Renders on-demand from the stored PDF via /snapshot/<id>, reads the X-Snapshot-Scale
+// header into snapScale, and falls back to a placeholder when the PDF isn't on disk.
+// errorState=true tweaks the fallback message for failed-takeoff jobs (Bug 3): the drawing
+// is still shown when renderable, otherwise a "takeoff failed" placeholder explains why.
+async function loadSnapshot(job, errorState) {
   try {
     const r = await fetch(`${BASE}/snapshot/${job.id}`);
     if (r.ok) {
@@ -549,33 +596,27 @@ async function renderJobUI(job) {
       const url  = URL.createObjectURL(blob);
       await loadImage(url);
       showThumb(url);
-    } else {
-      loadImagePlaceholder();
-      showThumbFallback();
+      return true;
     }
-  } catch(e) {
-    console.warn('No snapshot for job', job.id);
-    loadImagePlaceholder();
+    // Snapshot genuinely unavailable (PDF not on disk → 404, or server error)
+    if (errorState) { loadErrorCanvas(); } else { loadImagePlaceholder(); }
     showThumbFallback();
+    return false;
+  } catch(e) {
+    console.warn('No snapshot for job', job.id, e);
+    if (errorState) { loadErrorCanvas(); } else { loadImagePlaceholder(); }
+    showThumbFallback();
+    return false;
   }
+}
 
-  // Store AI polygon for "Load AI polygon" button
-  aiPoly = res.polygon_pts || null;
-  poly = [];
-  cal  = [];
-  // scale_k is metres per PDF POINT (from the pipeline). The canvas is the snapshot PNG,
-  // rendered at snapScale px per PDF pt, so 1 canvas px = (1/snapScale) PDF pt. Convert to
-  // metres per CANVAS pixel: mpp = scale_k / snapScale. (Previously this used scale_k as if
-  // it were m/px, under-counting area by 1/snapScale² — e.g. 4× too small at snapScale=0.5.)
-  mpp  = res.scale_k ? (res.scale_k / snapScale) : null;
-
-  // Info panel
-  updateAreaDisplay();
-  renderJobDetails(job);
-  renderFlags(res.flags || []);
-  renderDecision(job);
-  loadLineItems(job);   // fetch + render line items (no-op if not yet approved)
-  _lastRenderedStatus = job.status;  // BUG 5: record status after full render
+// Canvas placeholder for a failed-takeoff job whose drawing also can't be rendered.
+function loadErrorCanvas() {
+  const wrap = document.getElementById('canvasWrap');
+  wrap.innerHTML = '<div class="empty"><div class="icon" style="font-size:40px;opacity:.4">❌</div>' +
+    '<div style="font-size:15px;font-weight:600;color:#c0392b">Takeoff failed — drawing unavailable</div>' +
+    '<div style="color:#888;font-size:12px">PDF not on this server. See error details in the panel →</div></div>';
+  canvas = null; ctx = null;
 }
 
 function renderJobDetails(job) {

@@ -161,8 +161,16 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
 
 
 # ---------------------------------------------------------------- polygon contour helper
-def _hatch_contour(comp, S, snap_s=0.5, max_pts=180):
-    """Outer contour of hatch mask → [[x,y]] in snapshot-pixel coordinates, or None.
+def _hatch_contour(comp, S, max_pts=180):
+    """Outer contour of hatch mask → [[x,y]] in PDF-POINT coordinates, or None.
+
+    Coordinate space: PDF points — the SAME canonical space used by render_snapshot()
+    (which multiplies by the render scale), the vision path, and measure_regions(). The
+    portal converts these to canvas pixels once, by × snapScale. Storing snapshot pixels
+    here (the old behaviour, fixed snap_s=0.5) double-scaled the overlay in the email and
+    mis-placed the polygon whenever render_snapshot capped a wide sheet below 0.5 — the
+    "lines radiate from a corner" bug. The mask was rendered at S px per PDF point, so
+    mask-pixel → PDF-point is simply ÷S.
 
     Approach: find boundary pixels (mask minus 1-px erosion), sort them angularly
     from the centroid, thin to max_pts.  Works well for roughly star-shaped footprints
@@ -180,8 +188,8 @@ def _hatch_contour(comp, S, snap_s=0.5, max_pts=180):
         if len(xs) > max_pts:
             idx = np.round(np.linspace(0, len(xs) - 1, max_pts)).astype(int)
             xs, ys = xs[idx], ys[idx]
-        sc = snap_s / S   # mask pixel → snapshot pixel
-        return [[float(x * sc), float(y * sc)] for x, y in zip(xs, ys)]
+        inv = 1.0 / S   # mask pixel → PDF point (mask was rendered at S px/pt)
+        return [[float(x * inv), float(y * inv)] for x, y in zip(xs, ys)]
     except Exception:
         return None
 
@@ -352,10 +360,11 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 flags.append(f"vision confirm skipped: {e}")
 
     # --- polygon contour for portal canvas overlay ---
-    # Coordinates stored in snapshot-pixel space (PDF pt × SNAP_S) so the portal canvas,
-    # which equals the snapshot PNG in size, can draw them directly without JS rescaling.
-    SNAP_S = 0.5   # must match render_snapshot(scale=) default in approval_email.py
-    polygon_pts = _hatch_contour(comp, S, SNAP_S)
+    # Coordinates stored in PDF-point space — the canonical space shared by render_snapshot()
+    # (email + /snapshot overlay), the vision path, and measure_regions(). The portal scales
+    # them to canvas pixels once (× snapScale). Storing snapshot pixels here used to double-scale
+    # the overlay and mis-place the polygon on capped wide sheets.
+    polygon_pts = _hatch_contour(comp, S)
 
     return {"pdf": os.path.basename(pdf), "scale_k": round(k, 5), "scale_verified": verified,
             "scale_src": note, "scale_sources": scale_sources,
