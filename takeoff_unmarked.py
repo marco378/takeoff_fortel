@@ -91,17 +91,22 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
 
 # ---------------------------------------------------------------- segmentation
 def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
-                  title_block_frac=0.12, _diag=None):
+                  title_block_frac=0.0, _diag=None):
     """Best-plausible connected region of the concrete-yard hatch.
 
     Changes vs original:
-    - Title block excluded: bottom `title_block_frac` of the image is masked out before
-      segmentation so legend swatches / title-block backgrounds never get selected.
     - Best-plausible selection: components are sorted largest-first; the first one whose
       area falls in the plausible service-yard range (200–50,000 m²) is chosen.  Falls
       back to the absolute largest if none pass (e.g. no scale yet).
     - Small interior holes (paint blocks, text) are still filled; large voids (dock bays,
       islands) are left as deductions — unchanged from original.
+    - Optional title-block exclusion (`title_block_frac` > 0): mask out the bottom fraction
+      of the sheet before segmentation so a legend swatch / title-block panel can't be
+      selected.  DEFAULT 0.0 (OFF) — on real yard sheets the concrete slab routinely runs
+      into the bottom 12% of the page, and a 0.12 cut silently deleted that area (Demo-4
+      regression: D77-style yards lost ~13% / returned no plausible component).  The
+      best-plausible component selector already rejects the small title-block blob, so the
+      crop is not needed for correctness; leave it OFF unless a specific sheet needs it.
     """
     r, g, b = im_rgb[..., 0].astype(int), im_rgb[..., 1].astype(int), im_rgb[..., 2].astype(int)
     R, G, B = rgb
@@ -286,8 +291,13 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     if label and swatch:
         is_grey = (max(swatch) - min(swatch) <= 18) and (188 <= sum(swatch) / 3 <= 236)
         if is_grey:
-            rgb = swatch  # use actual confirmed swatch colour (may differ from hardcoded GREY center)
-            flags.append(f"legend '{label}': swatch {swatch} is grey — concrete-yard hatch CONFIRMED")
+            # Keep SEGMENTING on the validated GREY band center (214). Do NOT switch rgb to the
+            # raw swatch pixel: the swatch can read anywhere in [195,199]∪[229,236] and still pass
+            # is_grey, but a ±tol band centred there misses the actual 214 hatch → 0 px → area=None
+            # (Demo-4 regression that made colour-coded D77 return no area). The legend swatch is
+            # used only to CONFIRM the concrete-yard entry is grey, exactly as in the validated run.
+            flags.append(f"legend '{label}': swatch {swatch} is grey — concrete-yard hatch CONFIRMED "
+                         f"(segmenting on validated grey band {GREY})")
         else:
             flags.append(f"legend '{label}' found but swatch {swatch} not grey — using SGP grey convention "
                          f"{GREY} (lower confidence; assessor confirm)")
