@@ -16,6 +16,7 @@ import sys, os, re, io, math, contextlib
 import numpy as np, fitz
 from PIL import Image
 from scipy import ndimage as ndi
+import cv2
 
 import scale as SC
 import sanity
@@ -167,34 +168,46 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
 
 # ---------------------------------------------------------------- polygon contour helper
 def _hatch_contour(comp, S, max_pts=180):
-    """Outer contour of hatch mask → [[x,y]] in PDF-POINT coordinates, or None.
+    """Outer contour of hatch mask -> [[x,y]] in PDF-POINT coordinates, or None.
 
-    Coordinate space: PDF points — the SAME canonical space used by render_snapshot()
+    Coordinate space: PDF points -- the SAME canonical space used by render_snapshot()
     (which multiplies by the render scale), the vision path, and measure_regions(). The
-    portal converts these to canvas pixels once, by × snapScale. Storing snapshot pixels
-    here (the old behaviour, fixed snap_s=0.5) double-scaled the overlay in the email and
-    mis-placed the polygon whenever render_snapshot capped a wide sheet below 0.5 — the
-    "lines radiate from a corner" bug. The mask was rendered at S px per PDF point, so
-    mask-pixel → PDF-point is simply ÷S.
+    portal converts these to canvas pixels once, by x snapScale. The mask was rendered at
+    S px per PDF point, so mask-pixel -> PDF-point is simply / S.
 
-    Approach: find boundary pixels (mask minus 1-px erosion), sort them angularly
-    from the centroid, thin to max_pts.  Works well for roughly star-shaped footprints
-    (typical service yards); dock-bay concavities will be bridged, which is acceptable
-    since the assessor can nudge vertices in the portal."""
+    Approach: trace the actual outer boundary with cv2.findContours (RETR_EXTERNAL), which
+    walks pixel adjacency and returns vertices in path order, then simplify with
+    Douglas-Peucker (approxPolyDP) down to <= max_pts vertices.
+
+    Why not angular sort from the centroid (the previous approach): sorting boundary pixels
+    by angle and decimating only yields a clean outline for strictly star-shaped regions.
+    A real service yard is non-convex (dock-bay notches, L-shapes), so a ray from the
+    centroid crosses the boundary 2-4 times; angular order then interleaves near and far
+    pixels and the decimated polygon zig-zags across the slab -- the "lines radiate from a
+    corner / fan-star" rendering bug. Boundary tracing follows the perimeter in order, so
+    concavities are traced correctly instead of being bridged by spokes."""
     try:
-        boundary = comp & ~ndi.binary_erosion(comp, iterations=1)
-        ys, xs = np.where(boundary)
-        if len(ys) < 6:
+        mask = (np.asarray(comp) > 0).astype(np.uint8) * 255
+        if mask.sum() == 0:
             return None
-        cy, cx = float(ys.mean()), float(xs.mean())
-        angles = np.arctan2(ys.astype(float) - cy, xs.astype(float) - cx)
-        order = np.argsort(angles)
-        xs, ys = xs[order], ys[order]
-        if len(xs) > max_pts:
-            idx = np.round(np.linspace(0, len(xs) - 1, max_pts)).astype(int)
-            xs, ys = xs[idx], ys[idx]
-        inv = 1.0 / S   # mask pixel → PDF point (mask was rendered at S px/pt)
-        return [[float(x * inv), float(y * inv)] for x, y in zip(xs, ys)]
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None
+        c = max(cnts, key=cv2.contourArea)            # largest external boundary
+        if len(c) < 3 or cv2.contourArea(c) < 6:      # too small / degenerate
+            return None
+        # Douglas-Peucker: start tight, loosen until vertex count fits max_pts.
+        peri = cv2.arcLength(c, True)
+        eps = 0.001 * peri
+        approx = cv2.approxPolyDP(c, eps, True)
+        while len(approx) > max_pts and eps < 0.05 * peri:
+            eps *= 1.5
+            approx = cv2.approxPolyDP(c, eps, True)
+        pts = approx.reshape(-1, 2)
+        if len(pts) < 3:
+            return None
+        inv = 1.0 / S   # mask pixel -> PDF point (mask was rendered at S px/pt)
+        return [[float(x * inv), float(y * inv)] for x, y in pts]
     except Exception:
         return None
 

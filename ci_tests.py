@@ -85,6 +85,42 @@ try:
     _fill = segment_hatch(_v, (214, 214, 214), k=0.05, S=2.0, max_void_m2=999)   # huge thresh -> filled
     ck("large interior void kept as deduction", int(_kept.sum()) < int(_fill.sum()))
     ck("void filled only when below threshold", int(_fill.sum()) - int(_kept.sum()) > 8000)
+
+    print("polygon contour (fan/spoke regression)")
+    import math as _math
+    from takeoff_unmarked import _hatch_contour
+    # Non-convex yard: rectangle with a deep notch cut from the top edge (loading dock).
+    # The old angular-sort-from-centroid tracer produced spokes radiating across the slab
+    # (lines from a corner) because rays from the centroid cross the boundary >2 times.
+    # cv2.findContours walks the perimeter in order, so the outline must be clean.
+    _cmp = _np.zeros((700, 1000), bool)
+    _cmp[120:560, 160:840] = True
+    _cmp[120:340, 480:680] = False          # deep top-edge notch -> strongly non-star-shaped
+    _poly = _hatch_contour(_cmp, S=2.0, max_pts=80)
+    ck("hatch contour returned", _poly is not None and len(_poly) >= 4)
+    _xs = [q[0] for q in _poly]; _ys = [q[1] for q in _poly]
+    # Bounding box must match the slab extent in PDF pt (mask px / S): x 80..420, y 60..280.
+    ck("contour bbox matches slab extent",
+       abs(min(_xs)-80) < 3 and abs(max(_xs)-420) < 3 and
+       abs(min(_ys)-60) < 3 and abs(max(_ys)-280) < 3)
+    # Perimeter sanity: true outer+notch boundary ~1440 pt. The fan bug inflated this to
+    # ~2450+ pt (spokes shooting across the shape). Require it within ~25% of truth.
+    _seg = [_math.hypot(_xs[i]-_xs[i-1], _ys[i]-_ys[i-1]) for i in range(1, len(_xs))]
+    _seg.append(_math.hypot(_xs[0]-_xs[-1], _ys[0]-_ys[-1]))
+    ck("contour perimeter not inflated by spokes", 1100 < sum(_seg) < 1800)
+    # Spoke signature: count radius oscillations (near->far->near) about the centroid.
+    # A clean traced outline has very few; the fan pattern had ~23/78.
+    _cx = sum(_xs)/len(_xs); _cy = sum(_ys)/len(_ys)
+    _rad = [_math.hypot(x-_cx, y-_cy) for x, y in zip(_xs, _ys)]
+    _osc = sum(1 for i in range(1, len(_rad)-1)
+               if (_rad[i] > _rad[i-1]) != (_rad[i+1] > _rad[i]))
+    ck("no fan/spoke oscillation", _osc <= 6)
+    # Plain convex rectangle -> exactly its 4 corners; degenerate masks -> None.
+    _rect = _np.zeros((600, 800), bool); _rect[150:450, 200:650] = True
+    ck("rectangle -> 4 corners", len(_hatch_contour(_rect, S=2.0)) == 4)
+    ck("empty mask -> None", _hatch_contour(_np.zeros((40, 40), bool), S=2.0) is None)
+    _tiny = _np.zeros((40, 40), bool); _tiny[10:12, 10:12] = True
+    ck("sub-pixel blob -> None", _hatch_contour(_tiny, S=2.0) is None)
 except ImportError as _e:
     print(f"  [SKIP] takeoff_unmarked tests — missing dependency: {_e}")
 

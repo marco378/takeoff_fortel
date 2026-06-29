@@ -464,6 +464,20 @@ function clearJobSearch() {
 // ─────────────────────────────────────────────────
 async function selectJob(jobId) {
   selectedJobId = jobId;  // BUG 5: track open job
+
+  // ── Reset per-job canvas + overlay state BEFORE fetching the new job ──────
+  // The snapshot image, scale and traced/AI polygons are all module-globals.
+  // If we don't clear them here, switching jobs can leave the *previous* job's
+  // snapshot on screen: the new job's render path might take a placeholder/error
+  // branch (404, processing) that never replaces `img`, so a later draw() repaints
+  // the stale image; and even on the happy path the old image could flash before
+  // the new one loads. Clearing img/poly/cal/aiPoly + the visible canvas, and
+  // resetting snapScale/mpp, guarantees the canvas reloads fresh for each job.
+  img = null;
+  poly = []; cal = []; aiPoly = null; dragIdx = -1;
+  mpp = null; snapScale = 0.5;
+  if (ctx && canvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
+
   try {
     const r = await fetch(`${BASE}/job/${jobId}`);
     const job = await r.json();
