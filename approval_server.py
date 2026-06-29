@@ -110,7 +110,7 @@ def snapshot(job_id):
     j, err, code = require_job(job_id)
     if err: return err, code
     try:
-        from approval_email import render_snapshot
+        from approval_email import render_snapshot, snapshot_scale
         res  = j.get("result", {})
         # "pdf_path" is used by new upload-form jobs; legacy jobs used "pdf"
         pdf  = res.get("pdf_path") or j.get("pdf_path") or j.get("pdf", "")
@@ -121,7 +121,13 @@ def snapshot(job_id):
         if not pdf or not Path(pdf).exists():
             return jsonify({"error": "PDF not on disk — snapshot unavailable"}), 404
         png = render_snapshot(pdf, polygon_pts=poly)
-        return send_file(io.BytesIO(png), mimetype="image/png")
+        resp = send_file(io.BytesIO(png), mimetype="image/png")
+        # Expose the ACTUAL render scale (snapshot px per PDF point) so the portal can
+        # convert scale_k (m/pt) -> metres per canvas pixel:  mpp = scale_k / snap_scale.
+        # Without this the portal assumed 0.5 and mis-scaled area on wide (A1/A0) sheets.
+        resp.headers["X-Snapshot-Scale"] = f"{snapshot_scale(pdf):.6f}"
+        resp.headers["Access-Control-Expose-Headers"] = "X-Snapshot-Scale"
+        return resp
     except Exception:
         return jsonify({"error": traceback.format_exc()}), 500
 

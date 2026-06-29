@@ -11,24 +11,44 @@ import re, fitz
 
 
 def detect_scale_bar(pdf, page=0):
-    """Find a graphical scale bar: the horizontal line nearest a 'N m' label. -> (k_m_per_pt, info)."""
+    """Find a graphical scale bar: the horizontal line associated with a 'N m' label. -> (k_m_per_pt, info).
+
+    Hardened against the #1 real-world miss: a slab edge or sheet BORDER rule that runs near the
+    scale-bar label is longer than the bar, so the old `max(length)` grabbed it and under-scaled the
+    drawing (e.g. a 700 pt border on an 842 pt sheet -> k 2.5x too small -> area ~6x too small).
+    Two guards:
+      1. Drop near-full-width lines (> BORDER_FRAC of the page width) — those are borders/title rules,
+         not scale bars (a real bar is a small fraction of the sheet).
+      2. Among the remaining candidates, associate by PROXIMITY to the label's x-position (the 'N m'
+         text sits at/just past the bar's right end), not by raw length. Length is only the tiebreak.
+    """
     p = fitz.open(pdf)[page]
+    page_w = p.rect.width
+    BORDER_FRAC = 0.70                       # lines wider than this fraction of the sheet are borders
     words = p.get_text("words")
     ms = [w for w in words if w[4].lower() in ("m", "metres", "meters")]
     nums = [w for w in words if re.fullmatch(r"\d{1,4}", w[4])]
     if not (ms and nums):
         return None, "no scale-bar label"
-    my = ms[0][1]
-    hl = []
+    mx, my = ms[0][0], ms[0][1]              # label x and y (proximity anchor)
+
+    cands = []                               # (length, dist_to_label_x)
     for dr in p.get_drawings():
         for it in dr["items"]:
             if it[0] == "l":
                 a, b = it[1], it[2]
                 if abs(a.y - b.y) < 2 and abs(a.x - b.x) > 40 and abs(a.y - my) < 60:
-                    hl.append(abs(a.x - b.x))
-    if not hl:
+                    length = abs(a.x - b.x)
+                    if length > BORDER_FRAC * page_w:
+                        continue              # guard 1: skip border / title-block rules
+                    lo, hi = min(a.x, b.x), max(a.x, b.x)
+                    # distance from the label x to the bar's span (0 if label sits over the bar)
+                    dist = 0.0 if lo <= mx <= hi else min(abs(hi - mx), abs(lo - mx))
+                    cands.append((length, dist))
+    if not cands:
         return None, "label found but no bar line near it"
-    barlen = max(hl)
+    # guard 2: nearest to the label wins; longer bar breaks ties (more precise increment)
+    barlen = min(cands, key=lambda c: (round(c[1], 1), -c[0]))[0]
     label = max(int(w[4]) for w in nums if abs(w[1] - my) < 60)
     return label / barlen, f"{label} m / {barlen:.0f} pt"
 

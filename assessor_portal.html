@@ -360,9 +360,13 @@ let img = null;
 let mode = 'trace';       // 'trace' | 'cal'
 let poly = [];            // [{x,y}]
 let cal  = [];            // [{x,y}] calibration line endpoints
-let mpp  = null;          // metres per pixel
+let mpp  = null;          // metres per CANVAS pixel
+let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapshot-Scale header).
+                          // The canvas is the snapshot PNG at 1:1, so 1 canvas px = (1/snapScale) PDF pt.
+                          // Pipeline scale_k is m/pt, hence mpp = scale_k / snapScale. Default 0.5 matches
+                          // render_snapshot(scale=0.5); the header overrides it for capped (wide) sheets.
 let dragIdx = -1;
-let aiPoly = null;        // AI's proposed polygon (pre-loaded)
+let aiPoly = null;        // AI's proposed polygon (pre-loaded), in snapshot-pixel (== canvas) coordinates
 
 // ─────────────────────────────────────────────────
 // Init
@@ -529,10 +533,18 @@ async function renderJobUI(job) {
   // Hide error section for non-error jobs
   document.getElementById('errorSection').style.display = 'none';
 
+  // Reset snapshot scale to the render default before (re)loading; the snapshot fetch below
+  // overrides it from the X-Snapshot-Scale header. Prevents a stale value carrying across jobs.
+  snapScale = 0.5;
+
   // Load drawing snapshot from server — reuse the blob URL for both canvas and thumbnail
   try {
     const r = await fetch(`${BASE}/snapshot/${job.id}`);
     if (r.ok) {
+      // Actual snapshot render scale (snapshot px per PDF pt). render_snapshot caps the
+      // scale for wide sheets, so this can be < 0.5 — read it before converting scale_k.
+      const hdr = parseFloat(r.headers.get('X-Snapshot-Scale'));
+      snapScale = (hdr && hdr > 0) ? hdr : 0.5;
       const blob = await r.blob();
       const url  = URL.createObjectURL(blob);
       await loadImage(url);
@@ -551,7 +563,11 @@ async function renderJobUI(job) {
   aiPoly = res.polygon_pts || null;
   poly = [];
   cal  = [];
-  mpp  = res.scale_k ? res.scale_k : null;
+  // scale_k is metres per PDF POINT (from the pipeline). The canvas is the snapshot PNG,
+  // rendered at snapScale px per PDF pt, so 1 canvas px = (1/snapScale) PDF pt. Convert to
+  // metres per CANVAS pixel: mpp = scale_k / snapScale. (Previously this used scale_k as if
+  // it were m/px, under-counting area by 1/snapScale² — e.g. 4× too small at snapScale=0.5.)
+  mpp  = res.scale_k ? (res.scale_k / snapScale) : null;
 
   // Info panel
   updateAreaDisplay();
@@ -952,6 +968,13 @@ function setupCanvasEvents() {
 }
 
 function pos(e) {
+  // Map a CSS-pixel mouse coordinate into the canvas BACKING-STORE pixel space
+  // (canvas.width/height == snapshot PNG natural size). The (canvas.width / r.width) ratio
+  // already absorbs BOTH the CSS max-width:100% shrink AND window.devicePixelRatio, because
+  // getBoundingClientRect() returns CSS px while canvas.width is backing-store px. Do NOT
+  // multiply by devicePixelRatio here — the backing store is not DPR-scaled, so that would
+  // double-count. Calibration distance and polygon vertices both live in this space, so
+  // mpp (metres per canvas px) applies uniformly.
   const r = canvas.getBoundingClientRect();
   return {
     x: (e.clientX - r.left) * canvas.width  / r.width,

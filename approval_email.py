@@ -50,6 +50,21 @@ JOBS_FILE = Path(__file__).parent / "approval_jobs.json"
 # ---------------------------------------------------------------------------
 # Snapshot rendering
 # ---------------------------------------------------------------------------
+def snapshot_scale(pdf_path: str, page: int = 0,
+                   scale: float = 0.5, max_width: int = 700) -> float:
+    """The ACTUAL render scale (snapshot px per PDF point) render_snapshot() will use.
+
+    render_snapshot caps the requested `scale` so the PNG is never wider than
+    `max_width`; for wide sheets (A1/A0 ≈ 1684–3370 pt) the effective scale is therefore
+    BELOW 0.5.  The portal needs this exact value to convert the pipeline's scale_k
+    (metres per PDF point) into metres per CANVAS pixel:  mpp = scale_k / snapshot_scale.
+    Keeping the formula here (single source of truth) prevents the portal from assuming a
+    hardcoded 0.5 and over/under-counting area on large drawings.
+    """
+    w = fitz.open(pdf_path)[page].rect.width
+    return min(scale, max_width / w)
+
+
 def render_snapshot(pdf_path: str, page: int = 0,
                     polygon_pts: list = None, scale: float = 0.5,
                     max_width: int = 700) -> bytes:
@@ -60,9 +75,8 @@ def render_snapshot(pdf_path: str, page: int = 0,
     """
     doc = fitz.open(pdf_path)
     p   = doc[page]
-    # Scale to fit max_width
-    w   = p.rect.width
-    s   = min(scale, max_width / w)
+    # Scale to fit max_width (single source of truth: snapshot_scale)
+    s   = min(scale, max_width / p.rect.width)
     pix = p.get_pixmap(matrix=fitz.Matrix(s, s))
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
