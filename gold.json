@@ -1,11 +1,14 @@
 {
-  "_comment": "Gold answers. synthetic_yard.pdf is generated & provable now. The Winvic entries are the REAL known quantities from the costing sheet — they activate once the real PDFs are dropped into drawings/.",
+  "_comment": "Gold answers. synthetic_yard.pdf is generated & provable now. The Winvic entries are REAL known quantities from the costing sheet, now activated against the real PDFs in drawings/winvic/. Keys are paths relative to the repo root. drawings/_int_d77.pdf is the colour-coded UNMARKED path with gold from Smita's Bluebeam measurement.",
   "synthetic_yard.pdf": {"gross_m2": 26080, "void_m2": 160, "net_m2": 25920, "marker_count": 26, "tol_pct": 2},
 
+  "drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf":      {"net_m2": 26080, "channel_lm": 731, "manhole_count": 26, "tol_pct": 2},
+  "drawings/winvic/Dock_Slab_Area_Proposed_Site_Plan.pdf": {"net_m2": 930,   "base_count": 34, "perimeter_lm": 500, "tol_pct": 2},
+  "drawings/winvic/Area_Office_Floors_GA.pdf":             {"net_m2": 3479, "tol_pct": 2, "note": "whole marked sheet (README 'Office 3,479 exact'); 520 m2 is only the GF-ancillary sub-zone (column_count 22)"},
+  "drawings/winvic/Area_Hub_Office_Transport.pdf":         {"net_m2": 729,  "tol_pct": 2, "note": "README 'Transport 729 exact'; pipeline measures 728.6"},
+  "drawings/_int_d77.pdf":                                 {"net_m2": 3156, "tol_pct": 1, "note": "Smita's Bluebeam measurement; current pipeline gives ~3159 (~0.1%)"},
+
   "_winvic_gold_pending_real_pdfs": {
-    "Yard Area Proposed_Site_Plan.pdf":            {"net_m2": 26080, "channel_lm": 731, "manhole_count": 26, "tol_pct": 2},
-    "Dock Slab Area Proposed_Site_Plan.pdf":       {"net_m2": 930,   "base_count": 34, "perimeter_lm": 500, "tol_pct": 2},
-    "Area Office Floors GA (GF ancillary)":        {"net_m2": 520,   "column_count": 22, "tol_pct": 2},
-    "Upper floors (multi-zone)":                   {"net_m2": 3692,  "note": "plant deck logged 1120 but ~149 — engine must flag the outlier"}
+    "Upper floors (multi-zone)":         {"net_m2": 3692, "note": "plant deck logged 1120 but ~149 — engine must flag the outlier; no matching real PDF downloaded yet"}
   }
 }

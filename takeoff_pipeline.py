@@ -23,11 +23,11 @@ MANUAL APPROVAL FLOW:
 """
 import math, json, io, contextlib, os, fitz
 from pathlib import Path
-from router import classify
+from router import classify, classify_page
 from robust_takeoff import read_marked
 from geometry import measure_regions
 from scale import detect_scale_bar, user_unit
-from sanity import plausible
+from sanity import plausible, measurement_state, MEASURED_VERIFIED, MEASURED_UNVERIFIED, UNMEASURED, REJECTED
 from defaults import spec_with_defaults, assumption_note, flag_assumed
 with contextlib.redirect_stdout(io.StringIO()):       # costing self-validates on import; mute its receipt
     from costing import rate_buildup, MESH_KG
@@ -166,9 +166,46 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     project_name (optional) = human-readable project name e.g. "TSL Agratas Battery Facility"
     project_ref  (optional) = Fortel sequential reference number e.g. "2131"
     """
-    typ, route, conf, _ = classify(pdf)
-    r = {"file": pdf.split("/")[-1], "pdf_path": pdf,
-         "type": typ, "confidence": conf, "method": route, "flags": [],
+    # ── Multi-page tender pack: never assume page 0. Classify every page, rank candidates
+    # by router.drawing_priority (external-works/hard-landscaping/construction-thickness
+    # sheets first, "site plan" down-ranked), and measure the best-ranked page. Single-page
+    # PDFs skip this (page 0 is the only choice) so behaviour/perf on the common case is
+    # unchanged.
+    # ── Reject unreadable input up front: corrupt/truncated/zero-byte/non-PDF bytes must
+    # yield a REJECTED result, never an exception out of takeoff().
+    page = 0
+    page_flags = []
+    try:
+        _probe = fitz.open(pdf)
+        page_count = _probe.page_count
+        if page_count == 0:
+            raise ValueError("document has 0 pages")
+        _probe.close()
+    except Exception as e:
+        return {
+            "file": pdf.split("/")[-1], "pdf_path": pdf, "page": 0,
+            "type": "UNREADABLE", "confidence": "n/a", "method": "none",
+            "area_m2": None, "measurement_state": REJECTED, "status": REJECTED,
+            "needs_assessor": False,
+            "project_name": project_name or "", "project_ref": project_ref or "",
+            "flags": [f"REJECTED: file could not be opened as a PDF ({type(e).__name__}: {e}). "
+                      "If this is a ZIP/EML/image, upload it via the portal which extracts/converts; "
+                      "if CAD, export a PDF."],
+        }
+    if page_count > 1:
+        from router import rank_pages
+        ranked = rank_pages(pdf)
+        if ranked:
+            page = ranked[0]["page"]
+            others = ", ".join(f"p{c['page']} '{c['title']}'" for c in ranked[1:4])
+            page_flags.append(
+                f"MULTI-PAGE: measured page {page} of {page_count} ('{ranked[0]['title']}')"
+                + (f"; other candidates: {others}" if others else "")
+            )
+
+    typ, route, conf, _ = classify_page(pdf, page) if page_count > 1 else classify(pdf)
+    r = {"file": pdf.split("/")[-1], "pdf_path": pdf, "page": page,
+         "type": typ, "confidence": conf, "method": route, "flags": list(page_flags),
          "project_name": project_name or "", "project_ref": project_ref or ""}
 
     # ── Auto-extract engineer spec from the pack (if not already provided)
@@ -190,33 +227,93 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     else:
         r["source_discipline"] = discipline
 
-    # ── Measurement
-    if typ == "MARKED vector":
-        area, n = read_marked(pdf)
-        r.update({"area_m2": area, "regions": n})
+    # For a non-zero chosen page, extract it to a temp single-page PDF so the (page-0-only)
+    # measurement helpers below (read_marked, takeoff_unmarked.takeoff, detect_scale_bar)
+    # measure the RIGHT page without touching their internal math/constants.
+    meas_pdf = pdf
+    _tmp_page_pdf = None
+    if page != 0:
+        try:
+            src = fitz.open(pdf)
+            single = fitz.open()
+            single.insert_pdf(src, from_page=page, to_page=page)
+            _tmp_page_pdf = str(Path(pdf).with_suffix("")) + f".__page{page}.tmp.pdf"
+            single.save(_tmp_page_pdf)
+            meas_pdf = _tmp_page_pdf
+        except Exception as e:
+            r["flags"].append(f"could not isolate page {page} for measurement ({e}); falling back to page 0")
+            meas_pdf = pdf
 
-    elif typ == "UNMARKED vector":
-        if vision:
-            # ── LLM vision path (caller supplied region polygons + scale) ────────
-            uu = user_unit(pdf)
-            if vision.get("scale_ref"):
-                sr = vision["scale_ref"]; k = sr[2] / math.dist(sr[0], sr[1]) * uu; ksrc = "vision scale_ref"
+    try:
+        # ── Measurement
+        if typ == "MARKED vector":
+            area, n = read_marked(meas_pdf)
+            sflags = plausible(area)
+            r.update({"area_m2": area, "regions": n})
+            state, sflags2 = measurement_state(area, scale_verified=True, confidence=conf)
+            r["flags"] = r["flags"] + sflags + sflags2
+            r["measurement_state"] = state
+
+        elif typ == "UNMARKED vector":
+            if vision:
+                # ── LLM vision path (caller supplied region polygons + scale) ────────
+                uu = user_unit(meas_pdf)
+                if vision.get("scale_ref"):
+                    sr = vision["scale_ref"]; k = sr[2] / math.dist(sr[0], sr[1]) * uu; ksrc = "vision scale_ref"
+                else:
+                    kb, info = detect_scale_bar(meas_pdf); k = (kb * uu) if kb else None; ksrc = f"auto scale-bar: {info}"
+                if k is None:
+                    r["flags"].append("no scale (no scale_ref, no detectable bar) -> assessor must supply scale")
+                    r["measurement_state"] = UNMEASURED
+                else:
+                    area, gflags = measure_regions(vision["regions"], k, vision.get("voids"))
+                    sflags = plausible(area, site_m2=vision.get("site_m2"))
+                    r.update({"area_m2": area, "scale_k": round(k, 4), "scale_src": ksrc,
+                              "flags": r["flags"] + gflags + sflags + ["assessor: confirm extent + scale"],
+                              "polygon_pts": vision["regions"][0] if vision.get("regions") else None})
+                    # vision path scale is caller-supplied, never auto-verified against a 2nd source
+                    state, sflags2 = measurement_state(area, scale_verified=False, confidence=conf)
+                    r["flags"] = r["flags"] + sflags2
+                    r["measurement_state"] = state
             else:
-                kb, info = detect_scale_bar(pdf); k = (kb * uu) if kb else None; ksrc = f"auto scale-bar: {info}"
-            if k is None:
-                r["flags"].append("no scale (no scale_ref, no detectable bar) -> assessor must supply scale")
-            else:
-                area, gflags = measure_regions(vision["regions"], k, vision.get("voids"))
-                sflags = plausible(area, site_m2=vision.get("site_m2"))
-                r.update({"area_m2": area, "scale_k": round(k, 4), "scale_src": ksrc,
-                          "flags": r["flags"] + gflags + sflags + ["assessor: confirm extent + scale"],
-                          "polygon_pts": vision["regions"][0] if vision.get("regions") else None})
+                # ── Deterministic colour-segmentation path (takeoff_unmarked) ────────
+                import takeoff_unmarked as TU
+                tu = TU.takeoff(meas_pdf, source=discipline)
+                r["method"] = "colour-segmentation (takeoff_unmarked)"
+                if tu.get("area_m2") is not None:
+                    r.update({
+                        "area_m2":        tu["area_m2"],
+                        "scale_k":        tu.get("scale_k"),
+                        "scale_src":      tu.get("scale_src"),
+                        "scale_verified": tu.get("scale_verified", False),
+                        "scale_sources":  tu.get("scale_sources", {}),
+                        "polygon_pts":    tu.get("polygon_pts"),
+                    })
+                    r["flags"] = r["flags"] + tu.get("flags", []) + ["assessor: confirm extent + scale"]
+                    state, sflags2 = measurement_state(tu["area_m2"], scale_verified=tu.get("scale_verified", False),
+                                                       confidence=conf)
+                    r["flags"] = r["flags"] + sflags2
+                    r["measurement_state"] = state
+                    r["needs_assessor"] = tu.get("needs_assessor", state != MEASURED_VERIFIED)
+                else:
+                    r["flags"] = r["flags"] + tu.get("flags", []) + [
+                        "takeoff_unmarked: no area emitted — assessor must trace manually"
+                    ]
+                    r["measurement_state"] = UNMEASURED
+                    r["needs_assessor"] = True
         else:
-            # ── Deterministic colour-segmentation path (takeoff_unmarked) ────────
-            import takeoff_unmarked as TU
-            tu = TU.takeoff(pdf, source=discipline)
-            r["method"] = "colour-segmentation (takeoff_unmarked)"
-            if tu.get("area_m2") is not None:
+            # RASTER / scanned or flattened drawing. The colour-segmentation path measures
+            # rendered PIXELS, not vector paths, so a flattened-but-colour-coded sheet (e.g.
+            # D77 exports with vec<50) is still measurable — attempt it before giving up.
+            # A genuine scan without vector text yields no scale there and falls through.
+            tu = None
+            try:
+                import takeoff_unmarked as TU
+                tu = TU.takeoff(meas_pdf, source=discipline)
+            except Exception as e:
+                r["flags"].append(f"raster fallback (colour-segmentation) unavailable: {e}")
+            if tu and tu.get("area_m2") is not None:
+                r["method"] = "colour-segmentation on flattened/raster render"
                 r.update({
                     "area_m2":        tu["area_m2"],
                     "scale_k":        tu.get("scale_k"),
@@ -225,19 +322,43 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     "scale_sources":  tu.get("scale_sources", {}),
                     "polygon_pts":    tu.get("polygon_pts"),
                 })
-                r["flags"] = r["flags"] + tu.get("flags", []) + ["assessor: confirm extent + scale"]
-            else:
                 r["flags"] = r["flags"] + tu.get("flags", []) + [
-                    "takeoff_unmarked: no area emitted — assessor must trace manually"
-                ]
-    else:
-        r["flags"].append("needs vision {regions, voids, scale_ref}; raster/flattened -> mandatory human")
+                    "flattened/raster drawing measured from the RENDER (no vector geometry) — "
+                    "assessor: confirm extent + scale"]
+                state, sflags2 = measurement_state(tu["area_m2"],
+                                                   scale_verified=tu.get("scale_verified", False),
+                                                   confidence=conf)
+                r["flags"] = r["flags"] + sflags2
+                r["measurement_state"] = state
+                r["needs_assessor"] = tu.get("needs_assessor", state != MEASURED_VERIFIED)
+            else:
+                # area_m2 stays None; the PDF snapshot must still render (portal renders straight
+                # from pdf_path/page, not from anything computed here) so the assessor can trace.
+                # Approve stays blocked until the assessor supplies an area via /adjust.
+                r["flags"].append(
+                    "RASTER/scanned or flattened drawing — no reliable vector geometry to measure. "
+                    "UNMEASURED: mandatory assessor trace via the portal (snapshot renders for tracing); "
+                    "supply {regions, voids, scale_ref} vision data or trace manually via /adjust."
+                )
+                r["area_m2"] = None
+                r["measurement_state"] = UNMEASURED
+                r["needs_assessor"] = True
+    finally:
+        if _tmp_page_pdf:
+            try:
+                os.remove(_tmp_page_pdf)
+            except OSError:
+                pass
 
     # ── Costing (with defaults where no engineer spec)
     if r.get("area_m2"):
         costing = price_with_defaults(r["area_m2"], engineer_spec)
         r["costing"] = costing
         r["flags"] = r["flags"] + costing["flags"]
+
+    r.setdefault("measurement_state", UNMEASURED if not r.get("area_m2") else MEASURED_UNVERIFIED)
+    r.setdefault("needs_assessor", r["measurement_state"] != MEASURED_VERIFIED)
+    r["status"] = r["measurement_state"]   # portal/job-record field name
 
     # ── Approval trigger
     do_send = send_approval if send_approval is not None else SEND_APPROVALS

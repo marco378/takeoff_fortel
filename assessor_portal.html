@@ -46,6 +46,11 @@ header span{opacity:.7;font-size:12px}
 .badge.adjusted{background:#2980b9;color:#fff}
 .badge.processing{background:#6c757d;color:#fff}
 .badge.error{background:#dc3545;color:#fff}
+.badge.mstate{margin-left:4px}
+.badge.mstate.MEASURED_VERIFIED{background:#27ae60;color:#fff}
+.badge.mstate.MEASURED_UNVERIFIED{background:#e67e22;color:#fff}
+.badge.mstate.UNMEASURED{background:#8e44ad;color:#fff}
+.badge.mstate.REJECTED{background:#c0392b;color:#fff}
 .no-jobs{padding:24px 16px;opacity:.5;font-size:13px;text-align:center}
 
 /* ── Main panel ──────────────────────────── */
@@ -429,13 +434,15 @@ function renderJobList(jobs) {
       html = countBanner + filtered.map(j => {
         const active = currentJob && currentJob.id === j.id ? 'active' : '';
         const badge  = `<span class="badge ${j.status||'pending'}">${j.status||'pending'}</span>`;
+        const mstate = j.measurement_state || (j.result && j.result.measurement_state);
+        const mbadge = mstate ? `<span class="badge mstate ${esc(mstate)}">${esc(mstate.replace('_',' '))}</span>` : '';
         const area   = j.result && j.result.area_m2 ? `${(+j.result.area_m2).toLocaleString()} m²` : '—';
         const ts      = j.created_at ? j.created_at.substring(0,16).replace('T',' ') : '';
         const ref     = j.project_ref  ? `<span style="opacity:.8;font-size:10px">#${esc(j.project_ref)} · </span>` : '';
         const pname   = j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
         return `<div class="job-item ${active}" onclick="selectJob('${j.id}')">
           ${pname}
-          <div class="jid">${j.id} &nbsp;${badge}</div>
+          <div class="jid">${j.id} &nbsp;${badge}${mbadge}</div>
           <div class="jfile">${esc(j.result&&j.result.file||j.id)}</div>
           <div class="jmeta">${area} · ${ts}</div>
         </div>`;
@@ -640,8 +647,14 @@ function renderJobDetails(job) {
       ${job.project_ref ? `<span class="k" style="color:#13294b;font-weight:700">#${esc(job.project_ref)}</span>` : ''}
       ${job.project_name ? `<span class="v" style="color:#13294b;font-weight:700;font-size:13px">${esc(job.project_name)}</span>` : ''}
     </div>` : '';
+  const mstate = job.measurement_state || res.measurement_state;
+  const mstateRow = mstate ? `
+    <div class="kv"><span class="k">Measurement state</span>
+      <span class="v"><span class="badge mstate ${esc(mstate)}">${esc(mstate.replace('_',' '))}</span></span>
+    </div>` : '';
   document.getElementById('jobDetails').innerHTML = `
     ${projRow}
+    ${mstateRow}
     <div class="kv"><span class="k">File</span><span class="v">${esc(res.file)}</span></div>
     <div class="kv"><span class="k">Type</span><span class="v">${esc(res.type)}</span></div>
     <div class="kv"><span class="k">Source</span><span class="v">${esc(res.source_discipline)}</span></div>
@@ -1120,6 +1133,15 @@ async function submitDecision(action) {
     const c   = currentJob.costing || res.costing;
     if (c && c.assumed && c.total_gbp > 200000) {
       toast('Cannot approve: quotation > £200k with assumed spec — human escalation required. See L3 QA report in #fortel.', 'error');
+      return;
+    }
+    // Mirrors the server-side hard-block in approval_server.py (_approve_block_reason):
+    // MEASURED_UNVERIFIED / UNMEASURED / REJECTED jobs cannot be approved until the assessor
+    // has confirmed scale+extent via Adjust (server is the source of truth — this is just to
+    // avoid a round-trip for the common case).
+    const mstate = currentJob.measurement_state || res.measurement_state;
+    if (!currentJob.scale_confirmed && (mstate === 'UNMEASURED' || mstate === 'MEASURED_UNVERIFIED' || mstate === 'REJECTED')) {
+      toast(`Cannot approve: ${mstate.replace('_',' ')} — trace/confirm the area via Adjust first.`, 'error');
       return;
     }
   }

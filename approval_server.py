@@ -24,7 +24,8 @@ Environment:
   APPROVAL_PORT   default 5001
   APPROVAL_HOST   default 0.0.0.0 (set to 127.0.0.1 for local-only)
 """
-import os, json, io, datetime, traceback, uuid, re, threading
+import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil
+from email import policy
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
 
@@ -134,11 +135,36 @@ def snapshot(job_id):
 
 # ── Decision endpoints ────────────────────────────────────────────────────────
 
+def _approve_block_reason(job: dict) -> str | None:
+    """
+    Server-side hard-block mirroring the escalation-guard mechanism (fb5b92b, >£200k
+    assumed-spec jobs): MEASURED_UNVERIFIED and UNMEASURED jobs cannot be approved until an
+    assessor has confirmed scale+extent (via /adjust, which sets scale_confirmed=True).
+    Returns a reason string to block, or None to allow.
+    """
+    state = job.get("measurement_state") or (job.get("result") or {}).get("measurement_state")
+    if job.get("scale_confirmed"):
+        return None
+    if state == "REJECTED":
+        return "job is REJECTED — cannot be approved"
+    if state == "UNMEASURED":
+        return ("UNMEASURED — no reliable area was measured; assessor must supply area+scale "
+                "via Adjust before this job can be approved")
+    if state == "MEASURED_UNVERIFIED":
+        return ("MEASURED_UNVERIFIED — scale unverified, low confidence, or implausible area; "
+                "assessor must confirm scale+extent via Adjust before this job can be approved")
+    return None
+
+
 @app.route("/approve/<job_id>", methods=["GET", "POST"])
 def approve(job_id):
     """
     Approve: accept the AI's measurement as-is, proceed to costing.
     Can be triggered by clicking the email button (GET) or from the portal (POST).
+
+    Hard-blocked (409) for MEASURED_UNVERIFIED / UNMEASURED / REJECTED jobs unless the
+    assessor has already confirmed scale+extent (job['scale_confirmed'] set by /adjust) —
+    mirrors the >£200k assumed-spec escalation guard (commit fb5b92b).
     """
     data = {}
     if request.method == "POST" and request.is_json:
@@ -151,6 +177,9 @@ def approve(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job["status"] == "processing":
             return jsonify({"error": "job is still processing"}), 409
+        block_reason = _approve_block_reason(job)
+        if block_reason:
+            return jsonify({"error": f"approve blocked: {block_reason}"}), 409
         jobs[job_id].update({
             "status":     "approved",
             "decision":   "approved",
@@ -228,8 +257,12 @@ def reject(job_id):
 @app.route("/adjust/<job_id>", methods=["GET", "POST"])
 def adjust(job_id):
     """
-    Adjust: assessor provides corrected polygon and/or scale.
-    Re-runs geometry measurement with the assessor's inputs, then costs.
+    Adjust: assessor provides corrected polygon and/or scale (or a bare assessed area for
+    UNMEASURED jobs where there's no AI polygon to correct — e.g. raster/scanned drawings).
+    Re-runs geometry measurement with the assessor's inputs when a polygon+scale is given,
+    then costs. Any assessor-supplied area (polygon-derived OR a direct assessed_area_m2)
+    sets scale_confirmed=True, which is what unblocks /approve for MEASURED_UNVERIFIED and
+    UNMEASURED jobs (see _approve_block_reason).
     """
     if request.method == "GET":
         # Quick check before redirect (no lock needed — read-only)
@@ -253,6 +286,15 @@ def adjust(job_id):
     else:
         gflags = []
 
+    # A valid assessor-supplied area (however it arrived) is a human confirmation of
+    # scale+extent — this is what unblocks approve for MEASURED_UNVERIFIED/UNMEASURED jobs.
+    # Still run the plausibility guard (sanity.plausible): an assessor can fat-finger a trace
+    # too, so an implausible area does NOT silently confirm — it stays blocked for a second look.
+    from sanity import plausible as _plausible
+    plaus_flags = _plausible(area_m2) if area_m2 else []
+    gflags = gflags + plaus_flags
+    confirmed = bool(area_m2 and area_m2 > 0 and not plaus_flags)
+
     with _jobs_lock:
         jobs = load_jobs()
         job = jobs.get(job_id)
@@ -262,9 +304,13 @@ def adjust(job_id):
             return jsonify({"error": "job is still processing"}), 409
         costing_result = _run_costing(area_m2, job.get("result", {})) if area_m2 else None
         jobs[job_id].update({
-            "status":      "adjusted",
-            "decision":    "adjusted",
-            "decided_at":  now_iso(),
+            "status":            "adjusted",
+            "decision":          "adjusted",
+            "decided_at":        now_iso(),
+            "scale_confirmed":   confirmed or job.get("scale_confirmed", False),
+            "measurement_state": ("MEASURED_VERIFIED" if confirmed
+                                  else "MEASURED_UNVERIFIED" if (area_m2 and plaus_flags)
+                                  else job.get("measurement_state")),
             "adjusted": {
                 "vertices": vertices,
                 "scale_k":  scale_k,
@@ -539,14 +585,78 @@ def status():
 
 # ── Upload endpoint ───────────────────────────────────────────────────────────
 
+TAKEOFF_TIMEOUT_S = int(os.getenv("TAKEOFF_TIMEOUT_S", "120"))
+
+
+def _mark_job_unmeasured(job_id: str, flag: str, extra: dict = None):
+    """Flip a job to UNMEASURED with a flag — used by both the error handler and the
+    watchdog so a job NEVER gets stranded on 'processing' forever.
+
+    status stays "error" (the legacy field the portal already renders specially: it still
+    fetches the snapshot and lets the assessor trace manually — see assessor_portal.html's
+    job.status === 'error' branch) while measurement_state carries the new four-state value
+    so the state machine is explicit and machine-checkable.
+    """
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return
+        flags = list(job.get("flags") or [])
+        flags.append(flag)
+        job.update({
+            "status":            "error",
+            "measurement_state": "UNMEASURED",
+            "needs_assessor":    True,
+            "area_m2":           job.get("area_m2"),
+            "flags":             flags,
+        })
+        if extra:
+            job.update(extra)
+        # keep 'result' consistent with the top-level fields so the portal (which reads
+        # job.result.flags in some views) sees the same picture
+        res = dict(job.get("result") or {})
+        res["flags"] = flags
+        res.setdefault("measurement_state", "UNMEASURED")
+        res.setdefault("area_m2", job.get("area_m2"))
+        job["result"] = res
+        jobs[job_id] = job
+        save_jobs(jobs)
+
+
 def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str):
-    """Background thread: run takeoff pipeline and update job record when done."""
+    """
+    Background thread: run takeoff pipeline and update job record when done.
+
+    Hardened per the "never break, never strand" invariant:
+      - ANY exception during takeoff -> job becomes UNMEASURED with a
+        "PIPELINE ERROR: ... ; route to assessor" flag, never a bare crash/"error" dead-end.
+      - A watchdog timer flips the job to UNMEASURED with a timeout flag if the pipeline
+        hasn't finished within TAKEOFF_TIMEOUT_S; the worker thread may keep running (daemon
+        thread, no forced kill) but the job record is never left stuck on "processing".
+    """
+    watchdog = threading.Timer(
+        TAKEOFF_TIMEOUT_S, _mark_job_unmeasured, args=(
+            job_id,
+            f"PIPELINE TIMEOUT: takeoff did not finish within {TAKEOFF_TIMEOUT_S}s; "
+            "route to assessor — the worker thread may still be running in the background.",
+        )
+    )
+    watchdog.daemon = True
+    watchdog.start()
     try:
         import takeoff_pipeline
         result = takeoff_pipeline.takeoff(pdf_path, project_name=project_name, project_ref=project_ref)
+        watchdog.cancel()
         with _jobs_lock:
             jobs = load_jobs()
-            jobs[job_id].update({
+            job = jobs.get(job_id)
+            if job is None:
+                return  # job vanished (shouldn't happen) — nothing to update
+            # Preserve any pre-takeoff flags already on the job (e.g. zip/eml disambiguation
+            # notes recorded at upload time) rather than letting the pipeline result overwrite them.
+            pre_flags = list(job.get("flags") or [])
+            job.update({
                 "project_name":     result.get("project_name", project_name),
                 "project_ref":      result.get("project_ref",  project_ref),
                 "type":             result.get("type"),
@@ -554,22 +664,27 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "confidence":       result.get("confidence"),
                 "source_discipline": result.get("source_discipline"),
                 "area_m2":          result.get("area_m2"),
+                "measurement_state": result.get("measurement_state"),
+                "needs_assessor":   result.get("needs_assessor", True),
                 "scale_verified":   result.get("scale_verified"),
+                "scale_confirmed":  False,
                 "scale_src":        result.get("scale_src"),
                 "scale_sources":    result.get("scale_sources"),
                 "costing":          result.get("costing"),
-                "flags":            result.get("flags", []),
+                "flags":            pre_flags + result.get("flags", []),
                 "polygon_pts":      result.get("polygon_pts"),
                 "result":           result,
                 "status":           "pending",
             })
+            jobs[job_id] = job
             save_jobs(jobs)
     except Exception as e:
-        with _jobs_lock:
-            jobs = load_jobs()
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["flags"]  = [str(e)]
-            save_jobs(jobs)
+        watchdog.cancel()
+        _mark_job_unmeasured(
+            job_id,
+            f"PIPELINE ERROR: {e}; route to assessor",
+            extra={"error": traceback.format_exc()},
+        )
 
 
 def _sanitise_filename(name: str) -> str:
@@ -579,59 +694,18 @@ def _sanitise_filename(name: str) -> str:
     return name[:80]
 
 
-@app.route("/upload", methods=["POST"])
-def upload():
-    """
-    Accept a new drawing from the assessor portal without CLI intervention.
+MAX_EXTRACT_BYTES  = 200 * 1024 * 1024   # safety cap on total bytes extracted from a zip
+MAX_EXTRACT_FILES  = 200                 # safety cap on member count
+CAD_EXTENSIONS     = (".dwg", ".dxf")
 
-    multipart/form-data fields:
-      pdf          – PDF file (required, .pdf extension only)
-      project_name – human-readable project name (required)
-      project_ref  – Fortel reference / sequential number (required)
 
-    Returns 201 {"job_id": "...", "status": "ok"} on success.
-    """
-    # ── Validate required form fields
-    project_name = (request.form.get("project_name") or "").strip()
-    project_ref  = (request.form.get("project_ref")  or "").strip()
-    client_name  = (request.form.get("client_name")  or "").strip()
-    pdf_file     = request.files.get("pdf")
-
-    if not project_name:
-        return jsonify({"error": "project_name is required"}), 400
-    if not project_ref:
-        return jsonify({"error": "project_ref is required"}), 400
-    if pdf_file is None:
-        return jsonify({"error": "pdf file is required"}), 400
-
-    # ── Validate extension
-    original_filename = pdf_file.filename or ""
-    if not original_filename.lower().endswith(".pdf"):
-        return jsonify({"error": "only .pdf files are accepted"}), 400
-
-    # ── Sanitise and build safe save path
-    safe_name   = _sanitise_filename(original_filename)
-    dest_name   = f"{_sanitise_filename(project_ref)}_{safe_name}"
-    drawings_dir = Path(__file__).parent / "drawings"
-    drawings_dir.mkdir(exist_ok=True)
-    dest_path   = drawings_dir / dest_name
-
-    # Path-traversal guard: resolved path must stay inside drawings/
-    try:
-        dest_resolved = dest_path.resolve()
-        dir_resolved  = drawings_dir.resolve()
-        dest_resolved.relative_to(dir_resolved)
-    except ValueError:
-        return jsonify({"error": "invalid filename (path traversal detected)"}), 400
-
-    # ── Save the PDF
-    pdf_file.save(str(dest_path))
-
-    # ── Create a stub job record immediately (status=processing)
+def _create_rejected_job(project_name, project_ref, client_name, filename, reason) -> str:
+    """Create a REJECTED job record — visible in the portal job list with a human-readable
+    reason (never a bare HTTP 400 that vanishes)."""
     job_id = str(uuid.uuid4())
     job = {
         "id":               job_id,
-        "pdf_path":         str(dest_path),
+        "pdf_path":         None,
         "project_name":     project_name,
         "project_ref":      project_ref,
         "client_name":      client_name,
@@ -640,11 +714,262 @@ def upload():
         "confidence":       None,
         "source_discipline": None,
         "area_m2":          None,
+        "measurement_state": "REJECTED",
+        "needs_assessor":   False,
         "scale_verified":   None,
         "scale_src":        None,
         "scale_sources":    None,
         "costing":          None,
-        "flags":            [],
+        "flags":            [f"REJECTED: {reason}"],
+        "polygon_pts":      None,
+        "status":           "rejected",
+        "decision":         "rejected",
+        "created_at":       datetime.datetime.utcnow().isoformat(),
+        "decided_at":       now_iso(),
+        "note":             reason,
+        "adjusted":         None,
+        "result":           {"file": filename, "measurement_state": "REJECTED",
+                             "flags": [f"REJECTED: {reason}"]},
+    }
+    with _jobs_lock:
+        jobs = load_jobs()
+        jobs[job_id] = job
+        save_jobs(jobs)
+    return job_id
+
+
+def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> tuple[list, list]:
+    """Extract PDFs from a zip archive, guarding against zip-slip and oversize archives.
+    Returns (list of extracted PDF Paths, flags)."""
+    flags = []
+    pdfs = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_EXTRACT_FILES:
+                flags.append(f"zip has {len(infos)} entries — only first {MAX_EXTRACT_FILES} considered")
+                infos = infos[:MAX_EXTRACT_FILES]
+            total = 0
+            for info in infos:
+                if info.is_dir():
+                    continue
+                if not info.filename.lower().endswith(".pdf"):
+                    continue
+                total += info.file_size
+                if total > MAX_EXTRACT_BYTES:
+                    flags.append("zip extraction stopped — size cap exceeded")
+                    break
+                # zip-slip guard: resolved member path must stay inside dest_dir
+                member_name = _sanitise_filename(Path(info.filename).name)
+                if not member_name:
+                    continue
+                target = (dest_dir / member_name).resolve()
+                if not str(target).startswith(str(dest_dir.resolve())):
+                    flags.append(f"skipped unsafe zip entry: {info.filename!r}")
+                    continue
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                pdfs.append(target)
+    except zipfile.BadZipFile as e:
+        flags.append(f"corrupt zip archive: {e}")
+    return pdfs, flags
+
+
+def _extract_eml_pdfs(eml_path: Path, dest_dir: Path) -> tuple[list, list]:
+    """Parse a .eml with the stdlib email lib, save any PDF attachments. Returns (paths, flags)."""
+    flags = []
+    pdfs = []
+    try:
+        with open(eml_path, "rb") as f:
+            msg = email.message_from_binary_file(f, policy=policy.default)
+        for part in msg.iter_attachments():
+            fname = part.get_filename() or ""
+            if fname.lower().endswith(".pdf"):
+                safe = _sanitise_filename(fname) or f"attachment_{uuid.uuid4().hex[:8]}.pdf"
+                target = dest_dir / safe
+                payload = part.get_payload(decode=True)
+                if payload:
+                    target.write_bytes(payload)
+                    pdfs.append(target)
+        if not pdfs:
+            flags.append("no PDF attachments found in .eml")
+    except Exception as e:
+        flags.append(f"failed to parse .eml: {e}")
+    return pdfs, flags
+
+
+def _rank_pdfs_by_priority(pdf_paths: list) -> list:
+    """Rank candidate PDFs by router.drawing_priority on filename (best first)."""
+    from router import drawing_priority
+    return sorted(pdf_paths, key=lambda p: drawing_priority(Path(p).name), reverse=True)
+
+
+def _open_pdf_safely(path: Path):
+    """Try to open a PDF and confirm it's readable. Returns (fitz.Document|None, reason|None)."""
+    try:
+        import fitz
+        if path.stat().st_size == 0:
+            return None, "zero-byte file"
+        doc = fitz.open(str(path))
+        if doc.needs_pass:
+            return None, "encrypted/password-protected PDF"
+        if doc.page_count < 1:
+            return None, "PDF has no pages"
+        _ = doc[0].get_text()   # force a real read — catches some corrupt-stream cases
+        return doc, None
+    except Exception as e:
+        return None, f"corrupt or unreadable PDF ({e})"
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    """
+    Accept a new drawing/enquiry from the assessor portal without CLI intervention.
+
+    multipart/form-data fields:
+      pdf          – the uploaded file (required). Accepts:
+                       .pdf            -> takeoff runs directly
+                       .zip            -> PDFs extracted, best one (by router.drawing_priority
+                                          on filename) becomes the job; others listed in flags
+                       .eml            -> PDF attachments extracted, same ranking
+                       .png/.jpg/.jpeg -> wrapped into a single-page PDF, routed as raster/UNMEASURED
+                       .dwg/.dxf/other -> REJECTED job, "CAD/unsupported format — please export PDF"
+                     Encrypted/corrupt/zero-byte PDFs (at any stage above) -> REJECTED job with
+                     the specific reason instead of a bare HTTP 400.
+      project_name – human-readable project name (required)
+      project_ref  – Fortel reference / sequential number (required)
+
+    Returns 201 {"job_id": "...", "status": "processing"} for a takeoff-bound job, or
+    201 {"job_id": "...", "status": "rejected"} for a REJECTED job — always 2xx with a job
+    record the portal can show, never a bare 400 that vanishes.
+    """
+    # ── Validate required form fields
+    project_name = (request.form.get("project_name") or "").strip()
+    project_ref  = (request.form.get("project_ref")  or "").strip()
+    client_name  = (request.form.get("client_name")  or "").strip()
+    up_file      = request.files.get("pdf")
+
+    if not project_name:
+        return jsonify({"error": "project_name is required"}), 400
+    if not project_ref:
+        return jsonify({"error": "project_ref is required"}), 400
+    if up_file is None:
+        return jsonify({"error": "file is required"}), 400
+
+    original_filename = up_file.filename or "upload"
+    ext = Path(original_filename).suffix.lower()
+
+    drawings_dir = Path(__file__).parent / "drawings"
+    drawings_dir.mkdir(exist_ok=True)
+
+    # ── Save the raw upload to a staging path first (needed for zip/eml parsing + safety checks)
+    safe_name  = _sanitise_filename(original_filename) or f"upload_{uuid.uuid4().hex[:8]}{ext}"
+    stage_name = f"{_sanitise_filename(project_ref)}_{safe_name}"
+    stage_path = drawings_dir / stage_name
+    try:
+        stage_resolved = stage_path.resolve()
+        stage_resolved.relative_to(drawings_dir.resolve())
+    except ValueError:
+        return jsonify({"error": "invalid filename (path traversal detected)"}), 400
+    up_file.save(str(stage_path))
+
+    extra_flags = []
+    pdf_path = None
+
+    if ext == ".pdf":
+        pdf_path = stage_path
+
+    elif ext == ".zip":
+        pdfs, flags = _safe_extract_zip(stage_path, drawings_dir)
+        extra_flags += flags
+        stage_path.unlink(missing_ok=True)
+        if not pdfs:
+            job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
+                                          "zip archive contained no extractable PDFs")
+            return jsonify({"job_id": job_id, "status": "rejected"}), 201
+        ranked = _rank_pdfs_by_priority(pdfs)
+        pdf_path = ranked[0]
+        if len(ranked) > 1:
+            others = ", ".join(p.name for p in ranked[1:6])
+            extra_flags.append(f"zip contained {len(ranked)} PDFs; measured '{pdf_path.name}' "
+                               f"(highest drawing_priority); others: {others}")
+
+    elif ext == ".eml":
+        pdfs, flags = _extract_eml_pdfs(stage_path, drawings_dir)
+        extra_flags += flags
+        stage_path.unlink(missing_ok=True)
+        if not pdfs:
+            job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
+                                          "no PDF attachments found in .eml")
+            return jsonify({"job_id": job_id, "status": "rejected"}), 201
+        ranked = _rank_pdfs_by_priority(pdfs)
+        pdf_path = ranked[0]
+        if len(ranked) > 1:
+            others = ", ".join(p.name for p in ranked[1:6])
+            extra_flags.append(f".eml contained {len(ranked)} PDF attachments; measured '{pdf_path.name}' "
+                               f"(highest drawing_priority); others: {others}")
+
+    elif ext in (".png", ".jpg", ".jpeg"):
+        try:
+            import fitz
+            img_doc = fitz.open(str(stage_path))
+            pdf_doc = fitz.open()
+            rect = img_doc[0].rect
+            page = pdf_doc.new_page(width=rect.width, height=rect.height)
+            page.insert_image(rect, filename=str(stage_path))
+            pdf_path = stage_path.with_suffix(".pdf")
+            pdf_doc.save(str(pdf_path))
+            stage_path.unlink(missing_ok=True)
+            extra_flags.append(f"image ({ext}) wrapped into a single-page PDF for takeoff — "
+                               "raster source, routes to UNMEASURED/mandatory assessor trace")
+        except Exception as e:
+            job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
+                                          f"could not wrap image into PDF: {e}")
+            return jsonify({"job_id": job_id, "status": "rejected"}), 201
+
+    elif ext in CAD_EXTENSIONS:
+        stage_path.unlink(missing_ok=True)
+        job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
+                                      "CAD/unsupported format — please export PDF")
+        return jsonify({"job_id": job_id, "status": "rejected"}), 201
+
+    else:
+        stage_path.unlink(missing_ok=True)
+        job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
+                                      f"unsupported file type '{ext or '(none)'}' — please upload PDF, "
+                                      "ZIP, EML, PNG or JPG")
+        return jsonify({"job_id": job_id, "status": "rejected"}), 201
+
+    # ── Final gate: the chosen PDF must actually open (catches encrypted/corrupt/zero-byte
+    # at whatever stage it arrived — direct .pdf upload, zip member, or eml attachment).
+    doc, bad_reason = _open_pdf_safely(pdf_path)
+    if bad_reason:
+        job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
+                                      bad_reason)
+        return jsonify({"job_id": job_id, "status": "rejected"}), 201
+    doc.close()
+
+    # ── Create a stub job record immediately (status=processing)
+    job_id = str(uuid.uuid4())
+    job = {
+        "id":               job_id,
+        "pdf_path":         str(pdf_path),
+        "project_name":     project_name,
+        "project_ref":      project_ref,
+        "client_name":      client_name,
+        "type":             None,
+        "method":           None,
+        "confidence":       None,
+        "source_discipline": None,
+        "area_m2":          None,
+        "measurement_state": None,
+        "needs_assessor":   None,
+        "scale_verified":   None,
+        "scale_confirmed":  False,
+        "scale_src":        None,
+        "scale_sources":    None,
+        "costing":          None,
+        "flags":            extra_flags,
         "polygon_pts":      None,
         "status":           "processing",
         "created_at":       datetime.datetime.utcnow().isoformat(),
@@ -661,7 +986,7 @@ def upload():
     # ── Launch takeoff in background; portal polls /jobs every 15 s
     threading.Thread(
         target=_run_takeoff,
-        args=(job_id, str(dest_path), project_name, project_ref),
+        args=(job_id, str(pdf_path), project_name, project_ref),
         daemon=True,
     ).start()
 

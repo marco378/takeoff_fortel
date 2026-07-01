@@ -253,14 +253,22 @@ def scale_for(pdf, page=0):
         kbar *= uu
         sources["scale_bar"] = {"info": info, "k": round(kbar, 6)}
         if k_title:
-            pct_diff = abs(kbar - k_title * uu) / (k_title * uu)
-            if pct_diff <= SCALE_BAR_AGREE_TOL:
+            # Two independent sources — run them through scale.scale_consensus (same tolerance
+            # mechanism as the multi-reference guard that fixed the 95,463 m² incident) rather
+            # than a bespoke pct-diff check. consensus expects (real_metres, span_units) pairs;
+            # both sources already reduce to a single k (m/pt), so use span=1 for each and let
+            # consensus do the agree/disagree math at SCALE_BAR_AGREE_TOL.
+            k_title_full = k_title * uu
+            k_consensus, cflags = SC.scale_consensus([(kbar, 1), (k_title_full, 1)], tol=SCALE_BAR_AGREE_TOL)
+            pct_diff = abs(kbar - k_title_full) / k_title_full
+            if k_consensus is not None:
                 note = (f"scale bar ({info}) AGREES with title 1:{denom} "
-                        f"(diff {pct_diff*100:.1f}% ≤ {SCALE_BAR_AGREE_TOL*100:.0f}%) — VERIFIED")
+                        f"(diff {pct_diff*100:.1f}% ≤ {SCALE_BAR_AGREE_TOL*100:.0f}%) — VERIFIED "
+                        f"[{cflags[0]}]")
                 return kbar, True, note, sources
             else:
                 note = (f"scale bar ({info}) DISAGREES with title 1:{denom}: "
-                        f"bar k={kbar:.5f} vs title k={k_title*uu:.5f} "
+                        f"bar k={kbar:.5f} vs title k={k_title_full:.5f} "
                         f"({pct_diff*100:.1f}% > {SCALE_BAR_AGREE_TOL*100:.0f}%) — "
                         "using bar scale; assessor should confirm which is correct")
                 return kbar, False, note, sources
@@ -287,6 +295,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     flags.append(f"drawing style: {style} (solid-fill {solid*100:.0f}%)")
     if style == "line/hatch":
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
+                "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "flags": flags + [
                     "NON-COLOUR-CODED (line/hatch) drawing — solid-fill colour segmentation does NOT apply "
                     "(it scrapes stray grey -> wrong area). Route to hatch-mode / Claude vision / assessor "
@@ -334,12 +343,16 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     k, verified, note, scale_sources = scale_for(pdf)
     flags.append(note)
     if k is None:
-        return {"pdf": pdf, "area_m2": None, "flags": flags + ["no scale — cannot measure"]}
+        return {"pdf": pdf, "area_m2": None,
+                "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
+                "flags": flags + ["no scale — cannot measure"]}
 
     _seg_diag = {}
     comp = segment_hatch(im, rgb, k=k, S=S, _diag=_seg_diag)
     if comp is None or comp.sum() == 0:
-        return {"pdf": pdf, "area_m2": None, "flags": flags + ["no hatch pixels matched — assessor must trace"]}
+        return {"pdf": pdf, "area_m2": None,
+                "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
+                "flags": flags + ["no hatch pixels matched — assessor must trace"]}
     px = int(comp.sum())
     flags.append("dock-bay recesses & interior islands kept as DEDUCTIONS (not filled); thin paint bridged by closing")
     if _seg_diag.get('void_fill_m2', 0) > 0:
@@ -389,10 +402,17 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # the overlay and mis-place the polygon on capped wide sheets.
     polygon_pts = _hatch_contour(comp, S)
 
+    # --- measurement_state: the four-state contract (sanity.py) so downstream (pipeline,
+    # portal, approve endpoint) never has to re-derive verified/plausible logic itself. ---
+    state, state_flags = sanity.measurement_state(area, scale_verified=verified)
+    flags += state_flags
+    needs_assessor = state != sanity.MEASURED_VERIFIED
+
     return {"pdf": os.path.basename(pdf), "scale_k": round(k, 5), "scale_verified": verified,
             "scale_src": note, "scale_sources": scale_sources,
             "area_m2": area, "rate": rate, "price_gbp": price, "overlay": overlay,
-            "polygon_pts": polygon_pts, "flags": flags}
+            "polygon_pts": polygon_pts, "flags": flags,
+            "measurement_state": state, "needs_assessor": needs_assessor}
 
 
 def main(pdf, use_api=False):

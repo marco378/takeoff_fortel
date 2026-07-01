@@ -88,6 +88,56 @@ def buildup_source(name, text="", source=None):
                       "the assumption in the quote; ~5% area tolerance vs an engineer drawing")
 
 
+def classify_page(path, page):
+    """classify() for an arbitrary page index (classify() always opens page 0)."""
+    doc = fitz.open(path)
+    p = doc[page]
+    annots = list(p.annots() or [])
+    area_markups = sum(1 for a in annots
+                       if a.type[1] == "Polygon" and "sq m" in (a.info.get("content", "") or ""))
+    vec = len(p.get_drawings())
+    has_red = any(dr.get("color") and dr["color"][0] > 0.5 and dr["color"][1] < 0.45 and dr["color"][2] < 0.45
+                  for dr in p.get_drawings())
+    scales = sorted(set(re.findall(r"1\s*:\s*\d{2,4}", p.get_text())))
+
+    if vec < 50:
+        typ, route, conf = "RASTER / scanned", "CV + OCR + scale-bar detect; MANDATORY human check", "low"
+    elif area_markups > 0:
+        typ, route, conf = "MARKED vector", "read Bluebeam area annotations (EXACT)", "high"
+    else:
+        typ, route, conf = "UNMARKED vector", "per-viewport scale + vision-proposed boundary + assessor confirm", "medium"
+    return typ, route, conf, dict(vector_paths=vec, area_markups=area_markups,
+                                  site_boundary=has_red, scales=scales)
+
+
+def rank_pages(path):
+    """
+    Classify EVERY page of a multi-page tender pack and rank candidates for the takeoff by
+    router.drawing_priority (external-works/hard-landscaping/construction-thickness sheets
+    first, "site plan" down-ranked). Never assumes page 0.
+
+    Returns a list of dicts, best candidate first:
+      {page, type, confidence, method, meta, title, score}
+    'title' is the first line of page text (best-effort sheet title for display/flags).
+    """
+    doc = fitz.open(path)
+    out = []
+    for i in range(doc.page_count):
+        try:
+            typ, route, conf, meta = classify_page(path, i)
+        except Exception as e:
+            out.append({"page": i, "type": "ERROR", "confidence": "low", "method": str(e),
+                        "meta": {}, "title": "", "score": -999})
+            continue
+        text = doc[i].get_text()
+        title = next((ln.strip() for ln in text.splitlines() if ln.strip()), f"page {i}")
+        score = drawing_priority(title, text)
+        out.append({"page": i, "type": typ, "confidence": conf, "method": route,
+                    "meta": meta, "title": title[:80], "score": score})
+    out.sort(key=lambda d: d["score"], reverse=True)
+    return out
+
+
 if __name__ == "__main__":
     for f in sorted(glob.glob("drawings/*.pdf")):
         t, route, conf, meta = classify(f)

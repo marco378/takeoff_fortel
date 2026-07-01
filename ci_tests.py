@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Self-contained CI tests (NO client drawings — those are gitignored). Exit non-zero on failure."""
-import sys
+import sys, shutil
+from pathlib import Path
 from reportlab.pdfgen import canvas
 from geometry import measure_regions
 from scale import detect_scale_bar
@@ -268,6 +269,186 @@ ck("inquiry html starts DOCTYPE","<!DOCTYPE" in _inq["html"])
 ck("inquiry cubes > 0",          _inq["cubes_m3"] > 0)
 _inq_no_proj = generate_inquiry({"area_m2": 1000, "costing": {}})
 ck("inquiry works with no project info", bool(_inq_no_proj["subject"]))
+
+print("measurement state machine (sanity.measurement_state)")
+from sanity import measurement_state, MEASURED_VERIFIED, MEASURED_UNVERIFIED, UNMEASURED, REJECTED
+ck("verified + high conf -> MEASURED_VERIFIED",
+   measurement_state(26080, scale_verified=True, confidence="high")[0] == MEASURED_VERIFIED)
+ck("unverified scale -> MEASURED_UNVERIFIED",
+   measurement_state(26080, scale_verified=False)[0] == MEASURED_UNVERIFIED)
+ck("low confidence -> MEASURED_UNVERIFIED",
+   measurement_state(100, scale_verified=True, confidence="low")[0] == MEASURED_UNVERIFIED)
+ck("implausible area -> MEASURED_UNVERIFIED (blocks pricing AND approval)",
+   measurement_state(95463, site_m2=34329)[0] == MEASURED_UNVERIFIED)
+ck("over single-zone bound -> MEASURED_UNVERIFIED",
+   measurement_state(70000, scale_verified=True, confidence="high")[0] == MEASURED_UNVERIFIED)
+ck("no area -> UNMEASURED", measurement_state(None)[0] == UNMEASURED)
+ck("rejected_reason short-circuits -> REJECTED",
+   measurement_state(26080, scale_verified=True, rejected_reason="encrypted PDF")[0] == REJECTED)
+ck("plausible + verified -> no flags", measurement_state(26080, scale_verified=True, confidence="high")[1] == [])
+
+print("multi-page routing (router.rank_pages / classify_page)")
+try:
+    from reportlab.pdfgen import canvas as _canvas
+    import fitz as _fitz
+    from router import rank_pages, classify_page, drawing_priority
+    _d = _fitz.open()
+    _p0 = _d.new_page(width=1000, height=1000)
+    _p0.insert_text((50, 50), "Proposed Site Plan")
+    for _i in range(5):
+        _p0.draw_line((100 + _i, 100), (100 + _i, 200))     # < 50 vector paths -> low priority / raster-ish
+    _p1 = _d.new_page(width=1000, height=1000)
+    _p1.insert_text((50, 50), "External Construction Thickness Layout")
+    for _i in range(60):
+        _p1.draw_line((100 + _i, 300), (100 + _i, 400))     # >= 50 vector paths -> UNMARKED vector
+    _d.save("/tmp/_ci_rank_test.pdf")
+
+    _ranked = rank_pages("/tmp/_ci_rank_test.pdf")
+    ck("rank_pages classifies every page", len(_ranked) == 2)
+    ck("rank_pages best candidate is page 1 (construction-thickness beats site plan)",
+       _ranked[0]["page"] == 1)
+    ck("rank_pages best candidate score > runner-up", _ranked[0]["score"] > _ranked[1]["score"])
+    ck("classify_page(1) matches rank_pages page-1 type",
+       classify_page("/tmp/_ci_rank_test.pdf", 1)[0] == _ranked[0]["type"])
+    ck("classify_page(0) is page-0-only (never assumes the whole doc)",
+       classify_page("/tmp/_ci_rank_test.pdf", 0)[0] == "RASTER / scanned")
+except ImportError as _e:
+    print(f"  [SKIP] router multi-page tests — missing dependency: {_e}")
+
+print("pipeline multi-page + raster UNMEASURED (takeoff_pipeline.takeoff)")
+try:
+    import os as _os
+    _os.environ["SKIP_APPROVAL_LOG"] = "1"
+    with contextlib.redirect_stdout(_io.StringIO()):
+        from takeoff_pipeline import takeoff as _pipeline_takeoff
+    import fitz as _fitz2
+
+    # Multi-page MARKED pack: page 0 is a decoy site plan, page 1 has the priced markup.
+    # takeoff() must measure page 1, not silently default to page 0.
+    _mp = _fitz2.open()
+    _mp0 = _mp.new_page(width=1400, height=2200)
+    _mp0.insert_text((100, 100), "Proposed Site Plan")
+    for _i in range(5):
+        _mp0.draw_line((100 + _i, 300), (100 + _i, 400))
+    _mp1 = _mp.new_page(width=1400, height=2200)
+    _mp1.insert_text((100, 100), "External Construction Thickness Layout")
+    for _i in range(60):
+        _mp1.draw_line((100 + _i, 300), (100 + _i, 400))
+    _annot = _mp1.add_polygon_annot([(100, 100), (600, 100), (600, 500), (100, 500)])
+    _annot.set_info(content="Area = 3000.0 sq m")
+    _annot.update()
+    _mp.save("/tmp/_ci_pipeline_multipage.pdf")
+
+    with contextlib.redirect_stdout(_io.StringIO()):
+        _rmp = _pipeline_takeoff("/tmp/_ci_pipeline_multipage.pdf")
+    ck("multi-page pipeline measures the ranked page, not page 0", _rmp.get("page") == 1)
+    ck("multi-page pipeline area comes from page 1's markup", _rmp.get("area_m2") == 3000.0)
+    ck("multi-page pipeline flags which page was chosen",
+       any("MULTI-PAGE" in f and "page 1 of 2" in f for f in _rmp.get("flags", [])))
+    ck("multi-page pipeline lists the other candidate page",
+       any("other candidates" in f for f in _rmp.get("flags", [])))
+
+    # Single-page MARKED vector -> MEASURED_VERIFIED, matches the four-state contract.
+    _sp = _fitz2.open()
+    _spp = _sp.new_page(width=1400, height=2200)
+    for _i in range(60):
+        _spp.draw_line((100 + _i, 100), (100 + _i, 200))
+    _sannot = _spp.add_polygon_annot([(100, 100), (600, 100), (600, 500), (100, 500)])
+    _sannot.set_info(content="Area = 2000.0 sq m")
+    _sannot.update()
+    _sp.save("/tmp/_ci_pipeline_marked.pdf")
+    with contextlib.redirect_stdout(_io.StringIO()):
+        _rsp = _pipeline_takeoff("/tmp/_ci_pipeline_marked.pdf")
+    ck("MARKED vector -> MEASURED_VERIFIED", _rsp.get("measurement_state") == MEASURED_VERIFIED)
+    ck("MARKED vector -> status mirrors measurement_state", _rsp.get("status") == MEASURED_VERIFIED)
+    ck("MARKED vector -> needs_assessor False", _rsp.get("needs_assessor") is False)
+
+    # RASTER/scanned (few vector paths, e.g. a scanned/flattened sheet) -> proper UNMEASURED
+    # job, never a bare flag-only stub. area_m2 stays None; needs_assessor True.
+    _rast = _fitz2.open()
+    _rp = _rast.new_page(width=1400, height=2200)
+    _rp.insert_text((100, 100), "Scanned Site Photo")   # < 50 vector paths -> RASTER / scanned
+    _rast.save("/tmp/_ci_pipeline_raster.pdf")
+    with contextlib.redirect_stdout(_io.StringIO()):
+        _rr = _pipeline_takeoff("/tmp/_ci_pipeline_raster.pdf")
+    ck("raster drawing -> area_m2 stays None", _rr.get("area_m2") is None)
+    ck("raster drawing -> UNMEASURED (not a crash, not a bare flag)",
+       _rr.get("measurement_state") == UNMEASURED)
+    ck("raster drawing -> needs_assessor True", _rr.get("needs_assessor") is True)
+    ck("raster drawing -> flag explains mandatory assessor trace",
+       any("mandatory assessor trace" in f.lower() or "UNMEASURED" in f for f in _rr.get("flags", [])))
+except ImportError as _e:
+    print(f"  [SKIP] pipeline multi-page/raster tests — missing dependency: {_e}")
+
+print("D77 accuracy invariant (measurement math unchanged)")
+try:
+    from takeoff_unmarked import takeoff as _tu_takeoff
+    _d77 = _tu_takeoff("drawings/_int_d77.pdf")
+    ck("D77 area unchanged at 3,159 m² (Smita gold 3,156)", _d77.get("area_m2") == 3159.0)
+    ck("D77 scale verified True (bar agrees with title via scale_consensus)",
+       _d77.get("scale_verified") is True)
+    ck("D77 measurement_state MEASURED_VERIFIED", _d77.get("measurement_state") == MEASURED_VERIFIED)
+    ck("D77 needs_assessor False", _d77.get("needs_assessor") is False)
+except (ImportError, FileNotFoundError) as _e:
+    print(f"  [SKIP] D77 accuracy test — missing dependency or file: {_e}")
+
+print("approval_server: upload format handling + approve hard-block")
+try:
+    import approval_server as _AS
+    import fitz as _fitz3, zipfile as _zipfile, tempfile as _tempfile
+
+    _tmpdir = Path(_tempfile.mkdtemp(prefix="ci_upload_"))
+
+    # .zip with two PDFs -> both extracted, ranked by drawing_priority, no zip-slip
+    _pdf_a = _tmpdir / "Proposed Site Plan.pdf"
+    _pdf_b = _tmpdir / "External Construction Thickness Layout.pdf"
+    for _pp in (_pdf_a, _pdf_b):
+        _dd = _fitz3.open(); _dd.new_page(); _dd.save(str(_pp))
+    _zip_path = _tmpdir / "pack.zip"
+    with _zipfile.ZipFile(_zip_path, "w") as _zf:
+        _zf.write(_pdf_a, _pdf_a.name)
+        _zf.write(_pdf_b, _pdf_b.name)
+    _extracted, _zflags = _AS._safe_extract_zip(_zip_path, _tmpdir)
+    ck("zip extraction pulls both PDFs", len(_extracted) == 2)
+    _ranked_zip = _AS._rank_pdfs_by_priority(_extracted)
+    ck("zip PDFs ranked — construction-thickness beats site plan",
+       "Construction_Thickness" in _ranked_zip[0].name or "Thickness" in _ranked_zip[0].name)
+
+    # zip-slip guard: a malicious entry name must never escape dest_dir
+    _evil_zip = _tmpdir / "evil.zip"
+    with _zipfile.ZipFile(_evil_zip, "w") as _zf:
+        _zf.writestr("../../etc/evil.pdf", b"%PDF-1.4 fake")
+    _esc_before = set(_tmpdir.parent.glob("evil.pdf"))
+    _extracted_evil, _eflags = _AS._safe_extract_zip(_evil_zip, _tmpdir)
+    ck("zip-slip entry sanitised to a safe basename (stays inside dest_dir)",
+       all(str(p).startswith(str(_tmpdir.resolve())) for p in _extracted_evil))
+
+    # encrypted / zero-byte PDF -> rejected reason, not a crash
+    _zero = _tmpdir / "zero.pdf"; _zero.write_bytes(b"")
+    _doc, _reason = _AS._open_pdf_safely(_zero)
+    ck("zero-byte PDF -> rejected with reason (not a crash)", _doc is None and "zero-byte" in _reason)
+
+    _enc = _tmpdir / "enc.pdf"
+    _ed = _fitz3.open(); _ed.new_page()
+    _ed.save(str(_enc), encryption=_fitz3.PDF_ENCRYPT_AES_256, owner_pw="x", user_pw="y")
+    _doc2, _reason2 = _AS._open_pdf_safely(_enc)
+    ck("encrypted PDF -> rejected with reason (not a crash)",
+       _doc2 is None and "encrypted" in _reason2.lower())
+
+    # approve hard-block mirrors the >£200k escalation guard mechanism (fb5b92b)
+    ck("UNMEASURED job blocks approve",
+       _AS._approve_block_reason({"measurement_state": "UNMEASURED", "scale_confirmed": False}) is not None)
+    ck("MEASURED_UNVERIFIED job blocks approve",
+       _AS._approve_block_reason({"measurement_state": "MEASURED_UNVERIFIED", "scale_confirmed": False}) is not None)
+    ck("MEASURED_VERIFIED job does not block approve",
+       _AS._approve_block_reason({"measurement_state": "MEASURED_VERIFIED", "scale_confirmed": False}) is None)
+    ck("assessor-confirmed UNMEASURED job no longer blocks approve",
+       _AS._approve_block_reason({"measurement_state": "UNMEASURED", "scale_confirmed": True}) is None)
+    ck("REJECTED job blocks approve", _AS._approve_block_reason({"measurement_state": "REJECTED"}) is not None)
+
+    shutil.rmtree(_tmpdir, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server upload/approve tests — missing dependency: {_e}")
 
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)
