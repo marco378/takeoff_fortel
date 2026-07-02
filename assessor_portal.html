@@ -244,13 +244,25 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <span id="readout">area: —</span>
     </div>
 
-    <div class="canvas-wrap" id="canvasWrap">
-      <div class="empty" id="emptyState">
-        <div class="icon">📋</div>
-        <div style="font-size:16px;font-weight:600;color:#333">Select a job to review</div>
-        <div>or wait for the AI to flag one for approval</div>
-      </div>
+    <!--
+      emptyState lives OUTSIDE canvasWrap on purpose. loadImage()/loadImagePlaceholder()/
+      loadErrorCanvas()/the "processing" branch of renderJobUI() all do
+      canvasWrap.innerHTML = '' to rebuild the canvas — if emptyState were a child of
+      canvasWrap (as it originally was), the FIRST snapshot load of any kind (success,
+      placeholder, or error) would permanently delete it from the DOM. Every renderJobUI()
+      call after that referenced document.getElementById('emptyState').style.display and hit
+      "Cannot read properties of null" — an uncaught exception that aborted the function
+      before it ever reached loadSnapshot()/aiPoly, so no canvas, snapshot, AI polygon, or
+      job details refreshed for ANY subsequently-selected job for the rest of the page's
+      life. That was the actual root cause of the field report "switching projects goes
+      blank" — not a network race, a one-time DOM self-destruct on the first job view.
+    -->
+    <div class="empty" id="emptyState">
+      <div class="icon">📋</div>
+      <div style="font-size:16px;font-weight:600;color:#333">Select a job to review</div>
+      <div>or wait for the AI to flag one for approval</div>
     </div>
+    <div class="canvas-wrap" id="canvasWrap" style="display:none"></div>
   </div>
 
   <!-- ── Info panel ── -->
@@ -360,6 +372,16 @@ let _jobs = [];             // BUG 5: last fetched job list
 let _lastRenderedStatus = null;  // BUG 5: status at last renderJobUI call
 let _lastJobs = null;           // cache for search re-filter
 let _jobSearchTerm = '';        // current search filter
+// Monotonic generation counter guarding selectJob() against out-of-order completion.
+// selectJob is async (fetch /job/<id> then render); with no guard, rapidly switching
+// jobs (or a poll-triggered re-select racing a user click) can let an OLDER in-flight
+// selectJob's fetch resolve AFTER a newer one and paint stale canvas/snapshot data over
+// the job the user actually has open now — this is what field testing saw as "switching
+// projects goes blank" (an old job's empty/placeholder branch winning the race and never
+// getting overwritten by the real job that had already loaded). Each selectJob() call
+// takes a ticket; only the call still holding the latest ticket is allowed to touch the
+// DOM/canvas after an await.
+let _selectGen = 0;
 let canvas = null, ctx = null;
 let img = null;
 let mode = 'trace';       // 'trace' | 'cal'
@@ -472,6 +494,13 @@ function clearJobSearch() {
 async function selectJob(jobId) {
   selectedJobId = jobId;  // BUG 5: track open job
 
+  // Claim a generation ticket. If another selectJob() call starts before this one's
+  // fetch/render finishes (rapid clicks, or the 15s poll's auto-reselect on status change
+  // racing a manual click), that later call bumps _selectGen and this call becomes stale —
+  // every await-resumption point below checks it and bails out rather than painting an
+  // older job's data over whatever the user is now looking at. See _selectGen comment above.
+  const gen = ++_selectGen;
+
   // ── Reset per-job canvas + overlay state BEFORE fetching the new job ──────
   // The snapshot image, scale and traced/AI polygons are all module-globals.
   // If we don't clear them here, switching jobs can leave the *previous* job's
@@ -487,27 +516,36 @@ async function selectJob(jobId) {
 
   try {
     const r = await fetch(`${BASE}/job/${jobId}`);
+    if (gen !== _selectGen) return;  // superseded by a newer selectJob() while we awaited
     const job = await r.json();
+    if (gen !== _selectGen) return;  // superseded while parsing JSON
     currentJob = job;
     const hdrParts = [];
     if (job.project_ref)  hdrParts.push(`#${job.project_ref}`);
     if (job.project_name) hdrParts.push(job.project_name);
     hdrParts.push(job.result&&job.result.file || job.id);
     document.getElementById('hdr-job').textContent = hdrParts.join(' · ');
-    renderJobUI(job);
+    await renderJobUI(job, gen);
     loadJobList();
   } catch(e) {
-    toast('Failed to load job', 'error');
+    if (gen === _selectGen) toast('Failed to load job', 'error');
   }
 }
 
-async function renderJobUI(job) {
+async function renderJobUI(job, gen) {
+  // gen is the generation ticket this render belongs to (undefined when called directly,
+  // e.g. after approve/reject/adjust re-renders the SAME job — always allowed in that case).
+  const isCurrent = () => gen === undefined || gen === _selectGen;
   const res = job.result || {};
 
   // Show toolbar + info panel
   document.getElementById('toolbar').style.display = 'flex';
   document.getElementById('infoPanel').style.display = 'flex';
+  // emptyState/canvasWrap are now siblings (see the HTML comment above canvasWrap) — swap
+  // visibility explicitly instead of relying on canvasWrap innerHTML swaps to implicitly
+  // hide emptyState (that was the bug: those swaps DELETED it instead).
   document.getElementById('emptyState').style.display = 'none';
+  document.getElementById('canvasWrap').style.display = 'flex';
 
   // BUG 2: Hide approve/reject/adjust for processing/error jobs; show status message instead
   const isActionable = job.status !== 'processing' && job.status !== 'error';
@@ -551,6 +589,11 @@ async function renderJobUI(job) {
     renderDecision(job);
     snapScale = 0.5;
     await loadSnapshot(job, /*errorState=*/true);
+    // A newer selectJob() may have started (and already cleared img/aiPoly/canvas) while
+    // this fetch was in flight — if so, this response is stale: stop before it repaints
+    // the canvas/aiPoly with the WRONG job's data over whatever loaded after it. This is
+    // the fix for "switching projects goes blank/wrong" under rapid switching.
+    if (!isCurrent()) return;
     // AI polygon (if any) + scale, so manual trace works even on a failed job.
     aiPoly = (res.polygon_pts || []).length
       ? res.polygon_pts.map(p => [p[0] * snapScale, p[1] * snapScale]) : null;
@@ -571,6 +614,8 @@ async function renderJobUI(job) {
 
   // Load drawing snapshot from server — reuse the blob URL for both canvas and thumbnail
   await loadSnapshot(job, /*errorState=*/false);
+  // Stale response guard (see above) — a newer selectJob() superseded this one.
+  if (!isCurrent()) return;
 
   // Store AI polygon for "Load AI polygon" button.
   // polygon_pts arrive in PDF-POINT space (the canonical space used by render_snapshot,
@@ -606,16 +651,29 @@ async function renderJobUI(job) {
 // errorState=true tweaks the fallback message for failed-takeoff jobs (Bug 3): the drawing
 // is still shown when renderable, otherwise a "takeoff failed" placeholder explains why.
 async function loadSnapshot(job, errorState) {
+  // Stale-response guard: selectedJobId is set synchronously at the top of selectJob(), so
+  // comparing against it at every resumption point below detects "the user (or the poll
+  // loop) has since moved on to a different job" even for calls made directly with a job
+  // object (not just through selectJob's gen ticket). Without this, an in-flight snapshot
+  // fetch for job A that resolves AFTER the user has already switched to job B will still
+  // run loadImage()/loadErrorCanvas()/loadImagePlaceholder() — which unconditionally replace
+  // canvasWrap's innerHTML and build a brand-new <canvas> — tearing out job B's already-
+  // rendered snapshot and leaving A's (or a placeholder) on screen instead. That is the
+  // "switching projects goes blank" field report.
+  const stillCurrent = () => job.id === selectedJobId;
   try {
     const r = await fetch(`${BASE}/snapshot/${job.id}`);
+    if (!stillCurrent()) return false;
     if (r.ok) {
       // Actual snapshot render scale (snapshot px per PDF pt). render_snapshot caps the
       // scale for wide sheets, so this can be < 0.5 — read it before converting scale_k.
       const hdr = parseFloat(r.headers.get('X-Snapshot-Scale'));
       snapScale = (hdr && hdr > 0) ? hdr : 0.5;
       const blob = await r.blob();
+      if (!stillCurrent()) return false;
       const url  = URL.createObjectURL(blob);
-      await loadImage(url);
+      await loadImage(url, job.id);
+      if (!stillCurrent()) return false;
       showThumb(url);
       return true;
     }
@@ -625,6 +683,7 @@ async function loadSnapshot(job, errorState) {
     return false;
   } catch(e) {
     console.warn('No snapshot for job', job.id, e);
+    if (!stillCurrent()) return false;
     if (errorState) { loadErrorCanvas(); } else { loadImagePlaceholder(); }
     showThumbFallback();
     return false;
@@ -876,8 +935,14 @@ function toggleErrTrace() {
 // ─────────────────────────────────────────────────
 // Image loading
 // ─────────────────────────────────────────────────
-function loadImage(url) {
+function loadImage(url, forJobId) {
   return new Promise(res => {
+    // Bail BEFORE touching the DOM if a newer selectJob() has already taken over — decoding
+    // happens off-thread, so without this a slow/late-resolving stale call would still tear
+    // down the current job's already-populated canvas (wrap.innerHTML = '') and rebuild an
+    // empty one, even though its own onload below will refuse to draw into it. That
+    // teardown-without-redraw is exactly the "switching projects goes blank" symptom.
+    if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
     const wrap = document.getElementById('canvasWrap');
     wrap.innerHTML = '';
     canvas = document.createElement('canvas');
@@ -885,6 +950,11 @@ function loadImage(url) {
     wrap.appendChild(canvas);
     img = new Image();
     img.onload = () => {
+      // forJobId is set by loadSnapshot(); if a newer selectJob() has since taken over
+      // (image decode is async — a stale call's onload can fire after a newer call has
+      // already rebuilt the canvas), skip sizing/drawing so we don't stomp the current
+      // job's canvas with old pixels sized for a different job's image.
+      if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
       canvas.width  = img.width;
       canvas.height = img.height;
       setupCanvasEvents();

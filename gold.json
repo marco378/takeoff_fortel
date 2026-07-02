@@ -1,14 +1,16 @@
 {
-  "_comment": "Gold answers. synthetic_yard.pdf is generated & provable now. The Winvic entries are REAL known quantities from the costing sheet, now activated against the real PDFs in drawings/winvic/. Keys are paths relative to the repo root. drawings/_int_d77.pdf is the colour-coded UNMARKED path with gold from Smita's Bluebeam measurement.",
-  "synthetic_yard.pdf": {"gross_m2": 26080, "void_m2": 160, "net_m2": 25920, "marker_count": 26, "tol_pct": 2},
+  "_comment": "Gold answers. synthetic_yard.pdf is generated & provable now (see ci_tests.py _gen_synthetic_yard) and also carries manhole_count 26 for the MARKED-path Circle-annot counter (robust_takeoff.count_manholes_marked), matching marker_count. The Winvic entries are REAL known quantities from the costing sheet, now activated against the real PDFs in drawings/winvic/. Keys are paths relative to the repo root. drawings/_int_d77.pdf is the colour-coded UNMARKED path with gold from Smita's Bluebeam measurement. drawings/_int_d77_borders.pdf proves the border/legend exclusion fix (segment_hatch exclude_border=True).",
+  "synthetic_yard.pdf": {"gross_m2": 26080, "void_m2": 160, "net_m2": 25920, "marker_count": 26, "manhole_count": 26, "tol_pct": 2},
 
-  "drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf":      {"net_m2": 26080, "channel_lm": 731, "manhole_count": 26, "tol_pct": 2},
+  "drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf":      {"net_m2": 26080, "channel_lm": 731, "tol_pct": 2},
   "drawings/winvic/Dock_Slab_Area_Proposed_Site_Plan.pdf": {"net_m2": 930,   "base_count": 34, "perimeter_lm": 500, "tol_pct": 2},
   "drawings/winvic/Area_Office_Floors_GA.pdf":             {"net_m2": 3479, "tol_pct": 2, "note": "whole marked sheet (README 'Office 3,479 exact'); 520 m2 is only the GF-ancillary sub-zone (column_count 22)"},
   "drawings/winvic/Area_Hub_Office_Transport.pdf":         {"net_m2": 729,  "tol_pct": 2, "note": "README 'Transport 729 exact'; pipeline measures 728.6"},
   "drawings/_int_d77.pdf":                                 {"net_m2": 3156, "tol_pct": 1, "note": "Smita's Bluebeam measurement; current pipeline gives ~3159 (~0.1%)"},
+  "drawings/_int_d77_borders.pdf":                         {"net_m2": 3159, "tol_pct": 1, "note": "Same yard as _int_d77 plus a grey sheet-frame border strip + legend swatch (Aryan field report: real SGP sheets over-measure by border/legend grey). With border/legend exclusion (segment_hatch exclude_border=True) this must match _int_d77's 3,159 m², not over-count."},
 
   "_winvic_gold_pending_real_pdfs": {
-    "Upper floors (multi-zone)":         {"net_m2": 3692, "note": "plant deck logged 1120 but ~149 — engine must flag the outlier; no matching real PDF downloaded yet"}
+    "Upper floors (multi-zone)":         {"net_m2": 3692, "note": "plant deck logged 1120 but ~149 — engine must flag the outlier; no matching real PDF downloaded yet"},
+    "Yard manhole_count":                {"manhole_count": 26, "note": "Winvic costing sheet 'E/O for MH details, 26 Nr, £75.00, £1,950.00' — the real Yard_Area_Proposed_Site_Plan.pdf in drawings/winvic/ as shipped in this repo carries NO Circle annots (confirmed by direct inspection; its 18 Square annots are AutoCAD SHX Text boxes for street names/numbers, not manhole markers), so count_manholes_marked() honestly returns 0 on it today. The mechanism is proven against drawings/synthetic_yard.pdf (manhole_count 26) instead; move this into the active gold block once Fortel places real Circle manhole markers on the Winvic PDF."}
   }
 }

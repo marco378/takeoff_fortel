@@ -31,6 +31,25 @@ def read_marked(pdf):
     return round(sum(areas), 1), len(areas)
 
 
+def count_manholes_marked(pdf, page=0):
+    """MARKED path: count manhole markers Fortel placed on the drawing.
+
+    Convention: a manhole is annotated as a Bluebeam Circle annot (small circle/count
+    marker dropped at each manhole location) — the same convention already assumed for
+    gold.json's manhole_count/marker_count entries. We deliberately do NOT require any
+    particular label text on the annot (real Fortel markup sometimes just drops a bare
+    circle stamp per manhole, sometimes labels it "MH"/a number), so this counts every
+    Circle-type annot on the page. If a future convention needs filtering (e.g. Circle
+    annots used for something else too), narrow this by content/colour then.
+
+    Returns int count (0 if none / no annots / page has no Circle annots)."""
+    try:
+        p = fitz.open(pdf)[page]
+    except Exception:
+        return 0
+    return sum(1 for a in (p.annots() or []) if a.type[1] == "Circle")
+
+
 def calibrate_scale(pdf):
     """Return (k_m_per_pt, source, verified?). Title-block scale is UNVERIFIED — flag it."""
     p = fitz.open(pdf)[0]

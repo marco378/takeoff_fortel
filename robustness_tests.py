@@ -236,6 +236,19 @@ def run_one(filepath):
         result["gold_verdict"] = "GOLD_FAIL"
         result["notes"] += " (gold expects an area but none was produced)"
 
+    # manhole_count gold check (MARKED path — confirmed Circle-marker count). Independent
+    # of the area gold_verdict above: a file can carry both, either, or neither entry.
+    if entry and "manhole_count" in entry:
+        gold_mh = entry["manhole_count"]
+        got_mh = payload.get("manhole_count")
+        result["gold_manhole_count"] = gold_mh
+        result["manhole_count"] = got_mh
+        if got_mh is not None and got_mh == gold_mh:
+            result["gold_manhole_verdict"] = "GOLD_PASS"
+        else:
+            result["gold_manhole_verdict"] = "GOLD_FAIL"
+            result["notes"] += f" (gold expects manhole_count={gold_mh}, got {got_mh})"
+
     return result
 
 
@@ -270,11 +283,15 @@ def main():
         tally[r["class"]] = tally.get(r["class"], 0) + 1
     gold_pass = sum(1 for r in results if r.get("gold_verdict") == "GOLD_PASS")
     gold_fail = sum(1 for r in results if r.get("gold_verdict") == "GOLD_FAIL")
+    mh_gold_pass = sum(1 for r in results if r.get("gold_manhole_verdict") == "GOLD_PASS")
+    mh_gold_fail = sum(1 for r in results if r.get("gold_manhole_verdict") == "GOLD_FAIL")
 
     summary_parts = [f"{v} {k}" for k, v in sorted(tally.items())]
     summary_line = f"{len(results)} files: " + ", ".join(summary_parts)
     if gold_pass or gold_fail:
         summary_line += f" | gold: {gold_pass} PASS, {gold_fail} FAIL"
+    if mh_gold_pass or mh_gold_fail:
+        summary_line += f" | manhole gold: {mh_gold_pass} PASS, {mh_gold_fail} FAIL"
 
     # ── Write report ──────────────────────────────────────────────────
     lines = []

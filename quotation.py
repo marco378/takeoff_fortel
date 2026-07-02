@@ -101,11 +101,24 @@ def generate_quotation(result: dict, project: str = "", client: str = "",
                                 "qty": qty, "unit": unit, "rate": r,
                                 "value": round(qty * r, 2)})
 
-    # Extra-over items (manholes, slot drains, transitions, etc.)
-    for desc, qty, unit, r in (extras or []):
+    # Extra-over items (manholes, slot drains, transitions, etc.). If the caller didn't
+    # pass extras explicitly, fall back to whatever the pipeline's costing step already
+    # measured automatically (currently: the manhole E/O line — costing["extras"], added
+    # by takeoff_pipeline.price_with_defaults when manhole_count/manhole_count_estimate
+    # is present). This does NOT change the "extras not included" declaration below —
+    # that still fires whenever the caller supplied nothing AND nothing was auto-measured,
+    # so slot drains/transitions (still fully manual) keep getting flagged.
+    auto_extras = costing.get("extras", [])
+    caller_extras = list(extras) if extras is not None else []
+    for desc, qty, unit, r in caller_extras:
         line_items.append({"section": "Extra-over", "description": desc,
                             "qty": qty, "unit": unit, "rate": r,
                             "value": round(qty * r, 2)})
+    if extras is None:
+        for ex in auto_extras:
+            line_items.append({"section": "Extra-over", "description": ex["description"],
+                                "qty": ex["qty"], "unit": ex["unit"], "rate": ex["rate"],
+                                "value": ex["value"], "provisional": ex.get("estimate", False)})
 
     subtotal = round(sum(li["value"] for li in line_items), 2)
 
@@ -124,14 +137,23 @@ def generate_quotation(result: dict, project: str = "", client: str = "",
     for f in assumption_flags:
         if f not in declarations:
             declarations.append(f)
-    # Warn when caller never supplied extras — portal path where quantities
-    # can't be auto-measured (manholes, slot drains, transitions omitted).
+    # Warn when caller never supplied extras — portal path where quantities can't be
+    # auto-measured (slot drains, transitions — still always manual). Manholes are
+    # exempted from this generic warning once auto_extras picked one up; that line gets
+    # its own provisional/confirmed declaration below instead.
     if extras is None:
         declarations.append(
-            "NOTE — Extra-over items (manholes, slot drains, transitions) not included: "
-            "quantities cannot be measured from the drawing automatically and require "
-            "manual assessment by the assessor before issue."
+            "NOTE — Extra-over items (slot drains, transitions, etc. other than manholes) "
+            "not included: quantities cannot be measured from the drawing automatically "
+            "and require manual assessment by the assessor before issue."
         )
+        for ex in auto_extras:
+            if ex.get("estimate"):
+                declarations.append(
+                    f"PROVISIONAL — {ex['description']}: manhole count is an ESTIMATE from "
+                    "automatic circle detection on the unmarked drawing, not a confirmed "
+                    "marker count. Assessor must confirm the quantity before this line is firm."
+                )
 
     return {
         "ref":           ref,

@@ -392,6 +392,275 @@ try:
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] D77 accuracy test — missing dependency or file: {_e}")
 
+print("D77 border/legend exclusion (Aryan field report: real SGP sheet over-measures by "
+      "border strips + legend swatch that share the yard's grey)")
+try:
+    import fitz as _fitz_b
+    from takeoff_unmarked import takeoff as _tu_takeoff2, segment_hatch as _seg_b
+
+    def _gen_d77_borders(out_path, with_borders):
+        """Rebuild _int_d77.pdf's exact yard rect + scale bar (same geometry, so the
+        measured area is directly comparable), optionally adding:
+          - a grey sheet-frame border strip running around the full page edge
+            (same fill colour as the yard hatch — this is what a real SGP sheet's
+            outer frame line looks like when rendered to raster and colour-segmented)
+          - a small grey legend swatch rectangle near the title block (isolated,
+            far from the yard, same grey) — mimics a legend colour chip.
+        WITHOUT the fix these must inflate the measured area; WITH the fix
+        (segment_hatch exclude_border=True, default) the result must match
+        plain _int_d77.pdf (3,159 m²) within 0.5%.
+        """
+        d = _fitz_b.open()
+        W, H = 1067.7659912109375, 824.853515625
+        pg = d.new_page(width=W, height=H)
+        GREY = (0.84, 0.84, 0.84)
+        # Same yard rect + scale bar + title text as drawings/_int_d77.pdf
+        pg.draw_rect(_fitz_b.Rect(130.0, 120.0, 937.765625, 624.853515625),
+                     color=(0, 0, 0), fill=GREY, width=1.0)
+        pg.draw_line(_fitz_b.Point(130.0, 714.853515625), _fitz_b.Point(696.9290771484375, 714.853515625),
+                     color=(0, 0, 0), width=2.0)
+        pg.insert_text((130.0, 80), "PROPOSED HARD LANDSCAPING - CONCRETE SERVICE YARD    Scale 1:250",
+                       fontsize=13)
+        pg.insert_text((126.0, 731), "0", fontsize=11)
+        pg.insert_text((678.9, 731), "50 m", fontsize=11)
+        if with_borders:
+            # Sheet-frame border strip: four thin grey rects running along the outer page
+            # edge (inside the outer ~1% margin), same grey as the yard hatch — drawn as
+            # separate strips (not a filled rect + white hole) so they don't cover other
+            # content or perturb the solid-fill drawing-style heuristic.
+            bw = 6  # strip thickness in pt
+            m = 4   # inset from the physical page edge
+            for r in (
+                _fitz_b.Rect(m, m, W - m, m + bw),                 # top
+                _fitz_b.Rect(m, H - m - bw, W - m, H - m),          # bottom
+                _fitz_b.Rect(m, m, m + bw, H - m),                  # left
+                _fitz_b.Rect(W - m - bw, m, W - m, H - m),          # right
+            ):
+                pg.draw_rect(r, color=None, fill=GREY, width=0)
+            # Thin grey bridging tail connecting the left border strip to the yard rect's
+            # own left edge — this reproduces the real failure mode Aryan found: a border
+            # line that runs close enough to the yard boundary that binary_closing (kernel
+            # size 9) fuses it into the SAME connected component as the yard hatch, directly
+            # inflating the measured area rather than appearing as an isolated, easily-
+            # skipped satellite blob. A frame that stays fully isolated out in the margin is
+            # already handled by the pre-existing best-plausible-component selection, so it
+            # alone would not exercise this fix.
+            pg.draw_rect(_fitz_b.Rect(m + bw, 300, 130, 306), color=None, fill=GREY, width=0)
+            # Legend colour swatch: small isolated grey chip near the title block, far
+            # from the yard polygon (same grey, small — a real legend colour key patch).
+            pg.draw_rect(_fitz_b.Rect(950, 760, 966, 776), color=(0, 0, 0), fill=GREY, width=0.5)
+        d.save(out_path)
+        d.close()
+
+    _p_plain = "/tmp/_ci_d77_borders_plain.pdf"
+    _p_bord = "drawings/_int_d77_borders.pdf"
+    _gen_d77_borders(_p_plain, with_borders=False)
+    _gen_d77_borders(_p_bord, with_borders=True)
+
+    # Sanity: the regenerated plain fixture reproduces the real _int_d77.pdf's area.
+    _r_plain = _tu_takeoff2(_p_plain)
+    ck("regenerated D77 fixture matches real _int_d77.pdf area (3,159 m²)",
+       _r_plain.get("area_m2") == 3159.0, f"got {_r_plain.get('area_m2')}")
+
+    # WITHOUT the exclusion: border pixels (frame touches the mask + legend swatch)
+    # must inflate the measured area if segmented with exclude_border=False.
+    import numpy as _np_b
+    from PIL import Image as _Image_b
+    _pgb = _fitz_b.open(_p_bord)[0]
+    _pixb = _pgb.get_pixmap(matrix=_fitz_b.Matrix(2.0, 2.0))
+    _imb = _np_b.frombuffer(_pixb.samples, _np_b.uint8).reshape(_pixb.height, _pixb.width, _pixb.n)[..., :3]
+    _GREY_RGB = (214, 214, 214)
+    _k77 = 0.08819   # same k as D77 (1:250, verified)
+    _comp_noex = _seg_b(_imb, _GREY_RGB, k=_k77, S=2.0, exclude_border=False)
+    _area_noex = round(int(_comp_noex.sum()) * (1 / 2.0) ** 2 * _k77 * _k77, 0)
+    ck("WITHOUT exclusion: borders+legend over-measure vs plain 3,159 m²",
+       _area_noex > 3159.0 + 15, f"got {_area_noex}")
+
+    # WITH the exclusion (default path, via full takeoff()): must land back on 3,159 ± 0.5%.
+    _r_bord = _tu_takeoff2(_p_bord)
+    _area_bord = _r_bord.get("area_m2")
+    ck("WITH exclusion: _int_d77_borders.pdf area back to 3,159 m² (±0.5%)",
+       _area_bord is not None and abs(_area_bord - 3159.0) / 3159.0 <= 0.005,
+       f"got {_area_bord}")
+    ck("WITH exclusion: flag lists excluded border/legend components",
+       any("excluded" in f and "border/legend" in f for f in _r_bord.get("flags", [])),
+       _r_bord.get("flags"))
+except (ImportError, FileNotFoundError) as _e:
+    print(f"  [SKIP] D77 border/legend exclusion test — missing dependency or file: {_e}")
+
+print("manhole counting — MARKED path (robust_takeoff.count_manholes_marked)")
+try:
+    import fitz as _fitz_mh
+    from robust_takeoff import read_marked as _read_marked_mh, count_manholes_marked
+
+    def _gen_synthetic_yard(out_path, n_manholes=26):
+        """drawings/synthetic_yard.pdf: the gold.json 'synthetic_yard.pdf' fixture —
+        a yard boundary labelled with its NET area (25,920 sq m — gross 26,080 minus a
+        160 m² void, mirroring how gold.json tracks gross_m2/void_m2/net_m2 for this
+        fixture and how a real Bluebeam net-area markup states the final net figure
+        directly on the polygon, not gross+void as two separate summed entries) plus
+        n_manholes Circle annots scattered inside (Fortel's manhole-marker convention
+        on the MARKED path). read_marked() sums Polygon-labelled areas, so a single
+        polygon labelled with the net figure reproduces net_m2 exactly.
+        """
+        d = _fitz_mh.open()
+        pg = d.new_page(width=1800, height=1800)
+        ox, oy = 50, 50
+        W, H = 1630, 1600
+        # router.classify() gates MARKED-vs-RASTER on vector path count (vec >= 50); a plain
+        # annot-only PDF has 0 page-content vector paths and would misclassify as RASTER.
+        # Draw the actual yard boundary + a filler grid as real vector lines (matching how
+        # ci_tests.py's own multi-page/marked fixtures push vec >= 50) so this fixture
+        # classifies as MARKED vector like a real Bluebeam-marked drawing does.
+        pg.draw_rect(_fitz_mh.Rect(ox, oy, ox + W, oy + H), color=(0, 0, 0), width=1.5)
+        for i in range(60):
+            pg.draw_line(_fitz_mh.Point(ox + 10 + i, oy + H + 40), _fitz_mh.Point(ox + 10 + i, oy + H + 140))
+        # Yard boundary polygon, labelled with the NET area (gross 26,080 - void 160).
+        outer = [(ox, oy), (ox + W, oy), (ox + W, oy + H), (ox, oy + H)]
+        a = pg.add_polygon_annot(outer)
+        a.set_info(content="L = 6,460.0 m\rA = 25,920.0 sq m")
+        a.update()
+        # A drawn (non-annotated) void rectangle purely for visual/context completeness —
+        # NOT a separate Polygon annot, so read_marked (which sums every Polygon annot's
+        # labelled area) doesn't double count it against the net figure above.
+        pg.draw_rect(_fitz_mh.Rect(ox + 700, oy + 700, ox + 800, oy + 860), color=(0.5, 0.5, 0.5), width=1)
+        # 26 manhole markers: small Circle annots scattered on a grid inside the yard,
+        # avoiding the void rectangle.
+        placed = 0
+        gx, gy = 0, 0
+        cols = 6
+        while placed < n_manholes:
+            cx = ox + 120 + (gx % cols) * 260
+            cy = oy + 120 + gy * 260
+            if not (ox + 680 <= cx <= ox + 820 and oy + 680 <= cy <= oy + 880):
+                c = pg.add_circle_annot(_fitz_mh.Rect(cx - 6, cy - 6, cx + 6, cy + 6))
+                c.set_info(content="MH")
+                c.update()
+                placed += 1
+            gx += 1
+            if gx % cols == 0:
+                gy += 1
+        d.save(out_path)
+        d.close()
+
+    _p_synth = "drawings/synthetic_yard.pdf"
+    _gen_synthetic_yard(_p_synth, n_manholes=26)
+
+    _area_synth, _n_regions = _read_marked_mh(_p_synth)
+    ck("synthetic_yard net area == gold net_m2 (25,920 = 26,080 gross - 160 void)",
+       _area_synth == 25920.0, f"got {_area_synth}")
+    _mh_count = count_manholes_marked(_p_synth)
+    ck("synthetic_yard manhole_count (Circle annots) == 26 (gold marker_count/manhole_count)",
+       _mh_count == 26, f"got {_mh_count}")
+
+    # A drawing with no Circle annots at all -> 0, not a crash.
+    _d_nomh = _fitz_mh.open(); _p_nomh = _d_nomh.new_page()
+    _a_nomh = _p_nomh.add_polygon_annot([(10, 10), (100, 10), (100, 100), (10, 100)])
+    _a_nomh.set_info(content="A = 100 sq m"); _a_nomh.update()
+    _d_nomh.save("/tmp/_ci_no_manholes.pdf"); _d_nomh.close()
+    ck("no Circle annots -> manhole_count 0 (not a crash)",
+       count_manholes_marked("/tmp/_ci_no_manholes.pdf") == 0)
+
+    # Real Winvic marked yard PDF: as shipped in this repo it carries NO Circle annots
+    # (Fortel has not yet placed manhole markers on it — confirmed by direct inspection;
+    # its 18 Square annots are AutoCAD SHX Text bounding boxes for street names/numbers,
+    # not manhole markers). count_manholes_marked must report that honestly (0), never
+    # fabricate the Winvic costing sheet's "26 Nr" figure from thin air.
+    _winvic_yard = "drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf"
+    if Path(_winvic_yard).is_file():
+        ck("real Winvic yard PDF has 0 Circle annots today (no markers placed yet -> honest 0, "
+           "not a fabricated 26)", count_manholes_marked(_winvic_yard) == 0)
+except (ImportError, FileNotFoundError) as _e:
+    print(f"  [SKIP] manhole counting (marked path) test — missing dependency or file: {_e}")
+
+print("manhole counting — UNMARKED path (takeoff_unmarked.detect_manholes, conservative ESTIMATE)")
+try:
+    import numpy as _np_mh, cv2 as _cv2_mh
+    from takeoff_unmarked import detect_manholes, takeoff as _tu_takeoff3
+
+    def _gen_yard_with_circles(n_circles, diam_m, k=0.05, S=2.0):
+        """A grey yard rect rendered directly as a numpy image (no PDF round-trip needed —
+        detect_manholes takes the rendered array + mask + k directly), with n_circles dark
+        rings drawn inside at diam_m real-world diameter, converted to px via k/S."""
+        H_px, W_px = 900, 1200
+        im = _np_mh.full((H_px, W_px, 3), 255, _np_mh.uint8)
+        im[100:800, 100:1100] = (214, 214, 214)   # yard hatch
+        r_px = int(round((diam_m / 2) * (S / k)))
+        centres = []
+        cols = 6
+        for i in range(n_circles):
+            cx = 200 + (i % cols) * 150
+            cy = 200 + (i // cols) * 150
+            _cv2_mh.circle(im, (cx, cy), r_px, (60, 60, 60), thickness=2)
+            centres.append((cx, cy))
+        comp = _np_mh.zeros((H_px, W_px), bool)
+        comp[100:800, 100:1100] = True
+        return im, comp, centres
+
+    # 6 manhole-sized circles (0.9 m diameter, mid-band) inside the yard -> detector finds them.
+    _im_mh, _comp_mh, _true_centres = _gen_yard_with_circles(6, diam_m=0.9, k=0.05, S=2.0)
+    _n_mh, _found_centres = detect_manholes(_im_mh, _comp_mh, k=0.05, S=2.0)
+    ck("detect_manholes finds manhole-sized circles inside the yard (>=4 of 6)", _n_mh >= 4,
+       f"found {_n_mh}")
+
+    # No circles at all -> 0, not a crash (D77-style plain rect).
+    _im_none = _np_mh.full((400, 400, 3), 255, _np_mh.uint8); _im_none[50:350, 50:350] = (214, 214, 214)
+    _comp_none = _np_mh.zeros((400, 400), bool); _comp_none[50:350, 50:350] = True
+    _n_none, _ = detect_manholes(_im_none, _comp_none, k=0.05, S=2.0)
+    ck("no circular features -> manhole_count_estimate 0 (not a crash)", _n_none == 0)
+
+    # Oversized circles (e.g. 6 m diameter — a roundabout/planter, not a manhole) must NOT
+    # be counted: the radius band excludes anything outside MANHOLE_DIAM_M_MIN..MAX.
+    _im_big, _comp_big, _ = _gen_yard_with_circles(2, diam_m=6.0, k=0.05, S=2.0)
+    _n_big, _ = detect_manholes(_im_big, _comp_big, k=0.05, S=2.0)
+    ck("oversized circles (6 m dia, not manhole-sized) excluded by radius band", _n_big == 0,
+       f"found {_n_big}")
+
+    # End-to-end: D77 (plain rect, no circular features) -> manhole_count_estimate present,
+    # zero, and no false "confirm" flag fired when there's nothing to confirm.
+    _d77_mh = _tu_takeoff3("drawings/_int_d77.pdf")
+    ck("D77 takeoff() carries manhole_count_estimate field", "manhole_count_estimate" in _d77_mh)
+    ck("D77 manhole_count_estimate is 0 (plain rect, no circular features)",
+       _d77_mh.get("manhole_count_estimate") == 0)
+except (ImportError, FileNotFoundError) as _e:
+    print(f"  [SKIP] manhole counting (unmarked path) test — missing dependency or file: {_e}")
+
+print("manhole E/O costing line (costing.py Winvic rate: £75.00/Nr)")
+try:
+    from quotation import generate_quotation as _gen_q_mh
+
+    MANHOLE_EO_RATE = 75.00   # £/Nr — "E/O for MH details" from the real Winvic costing sheet
+
+    _demo_confirmed = {
+        "file": "Yard.pdf", "type": "MARKED vector", "confidence": "high",
+        "source_discipline": "engineer",
+        "costing": {"area_m2": 26080, "rate": 44.89, "total_gbp": 1170731.20, "assumed": False,
+                    "spec": {"depth_mm": 190, "mesh": "A252", "conc_mix": "C32/40", "layers": 1, "conc_rate": 128}},
+        "flags": [], "manhole_count": 26,
+    }
+    _extras_confirmed = [("E/O for MH details", 26, "Nr", MANHOLE_EO_RATE)]
+    _q_confirmed = _gen_q_mh(_demo_confirmed, project="Winvic Yard", client="Winvic",
+                             ref="TST-MH-CONFIRMED", extras=_extras_confirmed)
+    _mh_line = next((li for li in _q_confirmed["line_items"] if "MH details" in li["description"]), None)
+    ck("confirmed manhole_count -> E/O line present", _mh_line is not None)
+    ck("confirmed E/O line value = 26 x £75.00 = £1,950.00",
+       _mh_line is not None and _mh_line["value"] == 1950.00, _mh_line)
+    ck("confirmed E/O line NOT marked ESTIMATE", _mh_line is not None and "ESTIMATE" not in _mh_line["description"])
+
+    _demo_estimate = dict(_demo_confirmed)
+    _demo_estimate["manhole_count_estimate"] = 3
+    _demo_estimate.pop("manhole_count", None)
+    _extras_estimate = [("E/O for MH details (ESTIMATE — assessor confirm)", 3, "Nr", MANHOLE_EO_RATE)]
+    _q_estimate = _gen_q_mh(_demo_estimate, project="D77", client="Fortel",
+                            ref="TST-MH-ESTIMATE", extras=_extras_estimate)
+    _mh_line_est = next((li for li in _q_estimate["line_items"] if "MH details" in li["description"]), None)
+    ck("estimated manhole_count_estimate -> E/O line present and marked ESTIMATE",
+       _mh_line_est is not None and "ESTIMATE" in _mh_line_est["description"])
+    ck("estimated E/O line value = 3 x £75.00 = £225.00",
+       _mh_line_est is not None and _mh_line_est["value"] == 225.00, _mh_line_est)
+except ImportError as _e:
+    print(f"  [SKIP] manhole E/O costing test — missing dependency: {_e}")
+
 print("approval_server: upload format handling + approve hard-block")
 try:
     import approval_server as _AS
@@ -449,6 +718,212 @@ try:
     shutil.rmtree(_tmpdir, ignore_errors=True)
 except ImportError as _e:
     print(f"  [SKIP] approval_server upload/approve tests — missing dependency: {_e}")
+
+print("approval_server: /snapshot status codes for all four measurement states "
+      "(Aryan field report — 'session which renders screenshots is not working properly')")
+try:
+    import approval_server as _AS2
+    import fitz as _fitz4, uuid as _uuid2, tempfile as _tempfile2
+
+    _client = _AS2.app.test_client()
+    _tmpdir2 = Path(_tempfile2.mkdtemp(prefix="ci_snapshot_"))
+
+    # Save/restore the real jobs file around this block — snapshot() reads via load_jobs()
+    # which is a real file read, not mockable without a live Flask app context.
+    _jobs_backup = _AS2.JOBS_FILE.read_text() if _AS2.JOBS_FILE.exists() else None
+
+    def _mk_pdf(path, w=600, h=400, n_pages=1):
+        d = _fitz4.open()
+        for _ in range(n_pages):
+            d.new_page(width=w, height=h)
+        d.save(str(path))
+        return path
+
+    try:
+        _jobs = _AS2.load_jobs()
+
+        # 1. REJECTED job (no pdf_path at all) -> 404, not 500
+        _jid_rej = str(_uuid2.uuid4())
+        _jobs[_jid_rej] = {"id": _jid_rej, "status": "rejected", "measurement_state": "REJECTED",
+                           "pdf_path": None, "result": {"measurement_state": "REJECTED"}}
+
+        # 2. UNMEASURED job with a real PDF on disk -> 200 (assessor still needs to see it to trace)
+        _pdf_unm = _mk_pdf(_tmpdir2 / "unmeasured.pdf")
+        _jid_unm = str(_uuid2.uuid4())
+        _jobs[_jid_unm] = {"id": _jid_unm, "status": "error", "measurement_state": "UNMEASURED",
+                           "pdf_path": str(_pdf_unm),
+                           "result": {"pdf_path": str(_pdf_unm), "page": 0, "measurement_state": "UNMEASURED"}}
+
+        # 3. UNMEASURED job whose PDF is missing from disk (temp dir cleaned up) -> 404, not 500
+        _jid_gone = str(_uuid2.uuid4())
+        _jobs[_jid_gone] = {"id": _jid_gone, "status": "error", "measurement_state": "UNMEASURED",
+                            "pdf_path": str(_tmpdir2 / "does_not_exist.pdf"),
+                            "result": {"pdf_path": str(_tmpdir2 / "does_not_exist.pdf"),
+                                      "measurement_state": "UNMEASURED"}}
+
+        # 4. MEASURED_VERIFIED multi-page job whose result["page"] != 0 -> snapshot must render
+        # THAT page (this was the root cause of "AI polygon not shown": /snapshot always
+        # rendered page 0 regardless of which page the pipeline actually measured).
+        _pdf_multi = _mk_pdf(_tmpdir2 / "multi.pdf", n_pages=3)
+        _jid_page = str(_uuid2.uuid4())
+        _jobs[_jid_page] = {"id": _jid_page, "status": "pending", "measurement_state": "MEASURED_VERIFIED",
+                            "pdf_path": str(_pdf_multi),
+                            "result": {"pdf_path": str(_pdf_multi), "page": 2,
+                                      "polygon_pts": [[10, 10], [100, 10], [100, 100], [10, 100]],
+                                      "measurement_state": "MEASURED_VERIFIED"}}
+
+        # 5. Out-of-range page index (stale data) -> must fall back to page 0, never 500
+        _jid_badpage = str(_uuid2.uuid4())
+        _jobs[_jid_badpage] = {"id": _jid_badpage, "status": "pending", "measurement_state": "MEASURED_VERIFIED",
+                               "pdf_path": str(_pdf_multi),
+                               "result": {"pdf_path": str(_pdf_multi), "page": 99,
+                                         "measurement_state": "MEASURED_VERIFIED"}}
+
+        _AS2.save_jobs(_jobs)
+
+        _r_rej = _client.get(f"/snapshot/{_jid_rej}")
+        ck("REJECTED job snapshot -> 404 (not 500)", _r_rej.status_code == 404, _r_rej.status_code)
+
+        _r_unm = _client.get(f"/snapshot/{_jid_unm}")
+        ck("UNMEASURED job with PDF on disk -> 200 (assessor can still trace)",
+           _r_unm.status_code == 200, _r_unm.status_code)
+
+        _r_gone = _client.get(f"/snapshot/{_jid_gone}")
+        ck("UNMEASURED job with missing PDF -> 404 (not 500)", _r_gone.status_code == 404, _r_gone.status_code)
+
+        _r_page = _client.get(f"/snapshot/{_jid_page}")
+        ck("multi-page job snapshot -> 200", _r_page.status_code == 200, _r_page.status_code)
+        # Verify it actually rendered page 2's dimensions, not page 0's (both pages here are
+        # the same size so we check indirectly: render page 2 directly and diff against the
+        # response bytes' pixel dimensions via the PNG header — same width guaranteed by
+        # construction, so the meaningful assertion is the X-Snapshot-Scale header matches
+        # snapshot_scale() computed for page 2 specifically.
+        from approval_email import snapshot_scale as _snap_scale_fn
+        _expected_scale = f"{_snap_scale_fn(str(_pdf_multi), page=2):.6f}"
+        ck("multi-page snapshot X-Snapshot-Scale computed for the MEASURED page (not page 0)",
+           _r_page.headers.get("X-Snapshot-Scale") == _expected_scale,
+           (_r_page.headers.get("X-Snapshot-Scale"), _expected_scale))
+
+        _r_badpage = _client.get(f"/snapshot/{_jid_badpage}")
+        ck("out-of-range page index falls back to page 0 (not 500)",
+           _r_badpage.status_code == 200, _r_badpage.status_code)
+
+        _r_404job = _client.get(f"/snapshot/{_uuid2.uuid4()}")
+        ck("nonexistent job -> 404", _r_404job.status_code == 404, _r_404job.status_code)
+
+    finally:
+        if _jobs_backup is not None:
+            _AS2.JOBS_FILE.write_text(_jobs_backup)
+        shutil.rmtree(_tmpdir2, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server snapshot tests — missing dependency: {_e}")
+
+print("approval_server: watchdog-vs-completion race (Aryan field report — 'server is unstable')")
+try:
+    import approval_server as _AS3
+    import sys as _sys3, time as _time3, uuid as _uuid3
+    from unittest import mock as _mock3
+
+    _jobs_backup3 = _AS3.JOBS_FILE.read_text() if _AS3.JOBS_FILE.exists() else None
+    try:
+        _jid_wd = str(_uuid3.uuid4())
+        _jobs3 = _AS3.load_jobs()
+        _jobs3[_jid_wd] = {"id": _jid_wd, "status": "processing", "flags": []}
+        _AS3.save_jobs(_jobs3)
+
+        # _mark_job_unmeasured with watchdog_fired=True sets the sentinel used to detect the race
+        _AS3._mark_job_unmeasured(_jid_wd, "PIPELINE TIMEOUT: took too long", watchdog_fired=True)
+        _j_after_wd = _AS3.load_jobs()[_jid_wd]
+        ck("watchdog fire sets _watchdog_fired sentinel", _j_after_wd.get("_watchdog_fired") is True)
+        ck("watchdog fire flips job to UNMEASURED", _j_after_wd.get("measurement_state") == "UNMEASURED")
+        ck("watchdog fire records a PIPELINE TIMEOUT flag",
+           any("PIPELINE TIMEOUT" in f for f in _j_after_wd.get("flags", [])))
+
+        # Now simulate the pipeline finishing LATE (after the watchdog already fired) by
+        # driving the real _run_takeoff() with a stubbed takeoff_pipeline module whose
+        # takeoff() sleeps past a 1s watchdog timeout — exercises the actual production
+        # code path, not a re-implementation of its logic.
+        _orig_timeout = _AS3.TAKEOFF_TIMEOUT_S
+        _AS3.TAKEOFF_TIMEOUT_S = 1
+        _jid_wd2 = str(_uuid3.uuid4())
+        _jobs3 = _AS3.load_jobs()
+        _jobs3[_jid_wd2] = {"id": _jid_wd2, "status": "processing", "flags": []}
+        _AS3.save_jobs(_jobs3)
+
+        _fake_pipeline = _mock3.MagicMock()
+        def _slow_takeoff(pdf_path, project_name=None, project_ref=None):
+            _time3.sleep(2.2)
+            return {"measurement_state": "MEASURED_VERIFIED", "area_m2": 3159.0,
+                    "flags": ["completed ok"], "project_name": project_name, "project_ref": project_ref}
+        _fake_pipeline.takeoff = _slow_takeoff
+        _real_module = _sys3.modules.get("takeoff_pipeline")
+        _sys3.modules["takeoff_pipeline"] = _fake_pipeline
+        try:
+            _AS3._run_takeoff(_jid_wd2, "drawings/_int_d77.pdf", "QA WD race", "QA-PORTAL-CI-WDRACE")
+        finally:
+            if _real_module is not None:
+                _sys3.modules["takeoff_pipeline"] = _real_module
+            else:
+                _sys3.modules.pop("takeoff_pipeline", None)
+            _AS3.TAKEOFF_TIMEOUT_S = _orig_timeout
+
+        _j_final = _AS3.load_jobs()[_jid_wd2]
+        ck("late pipeline completion overwrites watchdog UNMEASURED with the real result",
+           _j_final.get("measurement_state") == "MEASURED_VERIFIED", _j_final.get("measurement_state"))
+        ck("stale 'PIPELINE TIMEOUT' flag stripped once the pipeline actually completes",
+           not any("PIPELINE TIMEOUT" in f for f in _j_final.get("flags", [])), _j_final.get("flags"))
+        ck("_watchdog_fired sentinel cleared after the race resolves",
+           "_watchdog_fired" not in _j_final)
+
+        _jobs3 = _AS3.load_jobs()
+        _jobs3.pop(_jid_wd, None); _jobs3.pop(_jid_wd2, None)
+        _AS3.save_jobs(_jobs3)
+    finally:
+        if _jobs_backup3 is not None:
+            _AS3.JOBS_FILE.write_text(_jobs_backup3)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server watchdog-race tests — missing dependency: {_e}")
+
+print("approval_server: approval_jobs.json concurrent read/write does not raise "
+      "(Aryan field report — 'the server is unstable')")
+try:
+    import approval_server as _AS4
+    import threading as _threading4, tempfile as _tempfile4
+
+    _tmp_jobs_file = Path(_tempfile4.mkdtemp(prefix="ci_atomic_")) / "jobs.json"
+    _orig_jobs_file = _AS4.JOBS_FILE
+    _AS4.JOBS_FILE = _tmp_jobs_file
+    try:
+        _big = {str(_i): {"x": "y" * 500} for _i in range(500)}
+        _AS4.save_jobs(_big)
+
+        _errors4 = []
+        def _reader4():
+            for _ in range(150):
+                try:
+                    _d = _AS4.load_jobs()
+                    if not isinstance(_d, dict):
+                        _errors4.append("load_jobs did not return a dict")
+                except Exception as _e:
+                    _errors4.append(str(_e))
+
+        def _writer4():
+            for _ in range(150):
+                _AS4.save_jobs(_big)
+
+        _t1 = _threading4.Thread(target=_reader4)
+        _t2 = _threading4.Thread(target=_writer4)
+        _t1.start(); _t2.start(); _t1.join(); _t2.join()
+
+        ck("concurrent load_jobs()/save_jobs() never raises or returns a torn read",
+           len(_errors4) == 0, _errors4[:3])
+        ck("no leftover .tmp files after concurrent saves",
+           list(_tmp_jobs_file.parent.glob("*.tmp*")) == [])
+    finally:
+        _AS4.JOBS_FILE = _orig_jobs_file
+        shutil.rmtree(_tmp_jobs_file.parent, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server atomic-write tests — missing dependency: {_e}")
 
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)

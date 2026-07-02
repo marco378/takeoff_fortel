@@ -42,12 +42,35 @@ _jobs_lock = threading.Lock()
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def load_jobs() -> dict:
+    """Read approval_jobs.json.
+
+    save_jobs() below writes atomically (tmp file + os.replace), so a well-formed writer
+    can never leave a torn/partial file on disk. But this file predates that fix, and any
+    external writer (a script, a stray editor) could still leave a transiently-partial file
+    mid-write; guard the parse so a concurrent /jobs poll never 500s on a race, it just sees
+    a momentarily-empty job list.
+    """
     if JOBS_FILE.exists():
-        return json.loads(JOBS_FILE.read_text())
+        try:
+            return json.loads(JOBS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
     return {}
 
 def save_jobs(jobs: dict):
-    JOBS_FILE.write_text(json.dumps(jobs, indent=2))
+    """Write approval_jobs.json atomically.
+
+    Plain write_text() is NOT atomic — it truncates the file then streams bytes in, so any
+    concurrent reader (the portal polls GET /jobs every 15s; multiple upload/approve/reject/
+    adjust/watchdog writers can all fire close together) can observe a half-written file and
+    hit a JSONDecodeError. That surfaced in the field as "the server is unstable". Write to a
+    temp file in the same directory and os.replace() it into place — POSIX guarantees rename
+    is atomic, so readers always see either the old or the new complete file, never a partial
+    one.
+    """
+    tmp = JOBS_FILE.with_suffix(f".json.tmp{os.getpid()}")
+    tmp.write_text(json.dumps(jobs, indent=2))
+    os.replace(tmp, JOBS_FILE)
 
 def log_training(entry: dict):
     """Append a decision to the training log for model improvement."""
@@ -119,14 +142,32 @@ def snapshot(job_id):
         if pdf and not Path(pdf).is_absolute():
             pdf = str(Path(__file__).parent / pdf)
         poly = res.get("polygon_pts")
+        # Multi-page tender packs: takeoff_pipeline.takeoff() ranks every page and measures
+        # the best one (result["page"]), NOT necessarily page 0 — see router.rank_pages. The
+        # AI's polygon_pts are in that measured page's PDF-point coordinate space. Rendering
+        # page 0 unconditionally (the old behaviour) showed the WRONG page for any multi-page
+        # pack whose best page wasn't 0, so the "AI polygon" either looked misplaced/garbled
+        # or simply didn't correspond to anything visible on screen — this was the field
+        # report "need to show the actual highlighted area in AI polygon". Always render the
+        # SAME page the measurement came from.
+        page = res.get("page") or 0
         if not pdf or not Path(pdf).exists():
             return jsonify({"error": "PDF not on disk — snapshot unavailable"}), 404
-        png = render_snapshot(pdf, polygon_pts=poly)
+        # Guard against a stale/out-of-range page index (e.g. a page count mismatch after
+        # the source file was replaced) — fall back to page 0 rather than 500ing.
+        try:
+            import fitz as _fitz
+            with _fitz.open(pdf) as _doc:
+                if not (0 <= page < _doc.page_count):
+                    page = 0
+        except Exception:
+            page = 0
+        png = render_snapshot(pdf, page=page, polygon_pts=poly)
         resp = send_file(io.BytesIO(png), mimetype="image/png")
         # Expose the ACTUAL render scale (snapshot px per PDF point) so the portal can
         # convert scale_k (m/pt) -> metres per canvas pixel:  mpp = scale_k / snap_scale.
         # Without this the portal assumed 0.5 and mis-scaled area on wide (A1/A0) sheets.
-        resp.headers["X-Snapshot-Scale"] = f"{snapshot_scale(pdf):.6f}"
+        resp.headers["X-Snapshot-Scale"] = f"{snapshot_scale(pdf, page=page):.6f}"
         resp.headers["Access-Control-Expose-Headers"] = "X-Snapshot-Scale"
         return resp
     except Exception:
@@ -588,7 +629,7 @@ def status():
 TAKEOFF_TIMEOUT_S = int(os.getenv("TAKEOFF_TIMEOUT_S", "120"))
 
 
-def _mark_job_unmeasured(job_id: str, flag: str, extra: dict = None):
+def _mark_job_unmeasured(job_id: str, flag: str, extra: dict = None, watchdog_fired: bool = False):
     """Flip a job to UNMEASURED with a flag — used by both the error handler and the
     watchdog so a job NEVER gets stranded on 'processing' forever.
 
@@ -596,6 +637,11 @@ def _mark_job_unmeasured(job_id: str, flag: str, extra: dict = None):
     fetches the snapshot and lets the assessor trace manually — see assessor_portal.html's
     job.status === 'error' branch) while measurement_state carries the new four-state value
     so the state machine is explicit and machine-checkable.
+
+    watchdog_fired=True marks the job with a "_watchdog_fired" sentinel so that IF the real
+    takeoff thread later completes successfully, _run_takeoff can detect the conflict, strip
+    the now-stale "PIPELINE TIMEOUT" flag instead of baking it permanently into a job that
+    actually succeeded, and log the race instead of silently overwriting.
     """
     with _jobs_lock:
         jobs = load_jobs()
@@ -611,6 +657,8 @@ def _mark_job_unmeasured(job_id: str, flag: str, extra: dict = None):
             "area_m2":           job.get("area_m2"),
             "flags":             flags,
         })
+        if watchdog_fired:
+            job["_watchdog_fired"] = True
         if extra:
             job.update(extra)
         # keep 'result' consistent with the top-level fields so the portal (which reads
@@ -634,13 +682,22 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
       - A watchdog timer flips the job to UNMEASURED with a timeout flag if the pipeline
         hasn't finished within TAKEOFF_TIMEOUT_S; the worker thread may keep running (daemon
         thread, no forced kill) but the job record is never left stuck on "processing".
+      - watchdog-vs-completion race: threading.Timer.cancel() is a no-op once the timer has
+        already fired, so if takeoff() finishes just after the 120s mark the watchdog may have
+        already flipped the job to UNMEASURED before this thread gets the lock back. That's
+        fine — the completed result below always overwrites it (a late success should win over
+        a timeout placeholder) — but the watchdog's "PIPELINE TIMEOUT" flag must not survive
+        into the completed job's flags (it would be a permanently-confusing lie on a job that
+        in fact succeeded). Detect the "_watchdog_fired" sentinel, strip that one flag, and log
+        the race so it's visible in the server log rather than silently swallowed.
     """
     watchdog = threading.Timer(
         TAKEOFF_TIMEOUT_S, _mark_job_unmeasured, args=(
             job_id,
             f"PIPELINE TIMEOUT: takeoff did not finish within {TAKEOFF_TIMEOUT_S}s; "
             "route to assessor — the worker thread may still be running in the background.",
-        )
+        ),
+        kwargs={"watchdog_fired": True},
     )
     watchdog.daemon = True
     watchdog.start()
@@ -656,6 +713,17 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
             # Preserve any pre-takeoff flags already on the job (e.g. zip/eml disambiguation
             # notes recorded at upload time) rather than letting the pipeline result overwrite them.
             pre_flags = list(job.get("flags") or [])
+            if job.get("_watchdog_fired"):
+                # The watchdog already fired and flipped this job to UNMEASURED before we got
+                # here. We're overwriting that with a real completed result (the right call —
+                # late success beats a timeout placeholder) but strip the now-stale
+                # "PIPELINE TIMEOUT" flag it appended so it doesn't linger on a job that in
+                # fact succeeded, and log the race so it shows up in the server log.
+                pre_flags = [f for f in pre_flags if not f.startswith("PIPELINE TIMEOUT")]
+                print(f"[watchdog-race] job {job_id}: pipeline finished AFTER the "
+                      f"{TAKEOFF_TIMEOUT_S}s watchdog already marked it UNMEASURED; "
+                      f"overwriting with the completed result (state={result.get('measurement_state')}).")
+            job.pop("_watchdog_fired", None)
             job.update({
                 "project_name":     result.get("project_name", project_name),
                 "project_ref":      result.get("project_ref",  project_ref),

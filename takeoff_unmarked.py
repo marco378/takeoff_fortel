@@ -91,8 +91,19 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
 
 
 # ---------------------------------------------------------------- segmentation
+# Fraction of the rendered page treated as "outer margin" — a sheet-frame border strip
+# or ruled border line living out here is never part of the priced yard hatch. Kept small
+# deliberately: real yards routinely run close to the page edge on tightly-cropped sheets,
+# so this must stay narrow enough to never clip genuine yard geometry (see MARGIN_FRAC note
+# below and the _int_d77 regression guard in ci_tests.py / robustness_tests.py).
+MARGIN_FRAC = 0.025
+# A component smaller than this fraction of the largest plausible component's area is
+# treated as a legend swatch / title-block chip / stray glyph, not a second yard region.
+SATELLITE_FRAC = 0.015
+
+
 def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
-                  title_block_frac=0.0, _diag=None):
+                  title_block_frac=0.0, exclude_border=True, _diag=None):
     """Best-plausible connected region of the concrete-yard hatch.
 
     Changes vs original:
@@ -108,6 +119,24 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
       regression: D77-style yards lost ~13% / returned no plausible component).  The
       best-plausible component selector already rejects the small title-block blob, so the
       crop is not needed for correctness; leave it OFF unless a specific sheet needs it.
+    - Border/legend exclusion (`exclude_border=True`, DEFAULT ON): fixes the real-sheet
+      over-measurement Aryan found on the SGP architect PDFs (D77 measured 3,172 vs gold
+      3,156; D219 similarly over-inclusive). A sheet-frame border strip is drawn as a ruled
+      line/rect running along the page edge and is frequently the SAME grey as the yard
+      hatch, and a legend colour swatch is a small isolated chip near the title block —
+      both get picked up by the grey mask. Two passes:
+        1. MARGIN STRIP: any mask pixel inside the outer MARGIN_FRAC of the page (border
+           frame lives here almost by definition) is dropped from the mask BEFORE labeling.
+           This has to happen pre-closing/pre-labeling, not as a post-hoc component filter,
+           because a border frame that touches/overlaps the yard's own bounding edge would
+           otherwise fuse into the same connected component via binary_closing and inflate
+           its area directly rather than appearing as a separate small blob.
+        2. SATELLITE COMPONENTS: after labeling, any component whose area is <SATELLITE_FRAC
+           of the chosen (best-plausible) component's area is dropped — legend swatches and
+           stray title-block chips are a tiny fraction of the yard; a genuine multi-part yard
+           is not (kept deliberately generous so multi-region yards survive).
+      Excluded pixels are reported via `_diag['excluded_components']` / `_diag['excluded_m2']`
+      so the caller can flag what was dropped for the assessor.
     """
     r, g, b = im_rgb[..., 0].astype(int), im_rgb[..., 1].astype(int), im_rgb[..., 2].astype(int)
     R, G, B = rgb
@@ -115,6 +144,23 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
         mask = (np.abs(r - g) < 12) & (np.abs(g - b) < 12) & (r >= R - tol) & (r <= R + tol)
     else:
         mask = (np.abs(r - R) <= tol) & (np.abs(g - G) <= tol) & (np.abs(b - B) <= tol)
+
+    # ── Exclude sheet-frame border strip (outer margin band) ──────────────────
+    # Must run BEFORE closing/labeling — see docstring. Pixels here are zeroed outright,
+    # not just excluded from being "the chosen component", so a border strip that runs
+    # up to (or over) the yard's own edge can't bridge into the yard's connected component.
+    margin_excluded_px = 0
+    if exclude_border:
+        H, W = mask.shape
+        my = max(1, int(round(H * MARGIN_FRAC)))
+        mx = max(1, int(round(W * MARGIN_FRAC)))
+        border_band = np.zeros_like(mask)
+        border_band[:my, :] = True
+        border_band[-my:, :] = True
+        border_band[:, :mx] = True
+        border_band[:, -mx:] = True
+        margin_excluded_px = int((mask & border_band).sum())
+        mask = mask & ~border_band
 
     # ── Exclude title block / legend panel (bottom of drawing) ───────────────
     # Closing is applied only to the active (non-title-block) rows so the kernel
@@ -147,6 +193,28 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
                 best_idx = idx
                 break
     comp = lab == best_idx + 1              # NOT hole-filled yet
+
+    # ── Drop satellite components (legend swatches, stray chips) ─────────────
+    # Keep the chosen component plus any OTHER component that is a meaningful fraction
+    # of its area (a real multi-part yard); drop the rest. Report what was excluded.
+    if exclude_border and n > 1:
+        best_size = sizes[best_idx]
+        satellite_ids = [i + 1 for i in range(n)
+                         if i != best_idx and sizes[i] < SATELLITE_FRAC * best_size]
+        excluded_satellite_px = int(sum(sizes[i - 1] for i in satellite_ids))
+    else:
+        excluded_satellite_px = 0
+
+    if _diag is not None:
+        total_excluded_px = margin_excluded_px + excluded_satellite_px
+        n_excluded = (1 if margin_excluded_px > 0 else 0) + \
+                     (len(satellite_ids) if exclude_border and n > 1 else 0)
+        if k is not None and total_excluded_px > 0:
+            px_per_m2 = (S * S) / (k * k)
+            _diag['excluded_components'] = n_excluded
+            _diag['excluded_m2'] = round(total_excluded_px / px_per_m2, 1)
+            _diag['excluded_margin_m2'] = round(margin_excluded_px / px_per_m2, 1)
+            _diag['excluded_satellite_m2'] = round(excluded_satellite_px / px_per_m2, 1)
 
     # ── Size-limited fill: paint/text holes filled; dock bays / islands kept ─
     if k:
@@ -210,6 +278,57 @@ def _hatch_contour(comp, S, max_pts=180):
         return [[float(x * inv), float(y * inv)] for x, y in pts]
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------- manhole detector (UNMARKED, conservative)
+# Real manhole covers/chambers on a site plan are typically drawn ~0.6-1.5 m diameter.
+MANHOLE_DIAM_M_MIN = 0.5
+MANHOLE_DIAM_M_MAX = 1.8
+
+
+def detect_manholes(im_rgb, comp, k, S=2.0):
+    """Conservative small near-circular contour detector INSIDE the measured yard polygon.
+
+    This is an ESTIMATE, never authoritative — the unmarked path has no reliable way to
+    distinguish a manhole cover symbol from a gully, a stray annotation circle, or a dimension
+    bubble on a rendered raster, so the result is always surfaced as manhole_count_estimate
+    with a flag telling the assessor to confirm it, never as a bare manhole_count (that field
+    is reserved for the MARKED path where Fortel has placed an explicit marker).
+
+    Method: cv2.HoughCircles on the greyscale render, restricted to a radius band scaled by k
+    (m/pt) so only real-manhole-sized circles (MANHOLE_DIAM_M_MIN..MAX diameter) are candidates,
+    and restricted to centres that fall INSIDE the measured yard mask `comp` (so kerb radii,
+    dimension arrows, and title-block symbols outside the yard are never counted).
+
+    Returns (count, centres_px) — centres_px is a list of (x, y) in mask-pixel space (S px/pt),
+    for overlay/debugging; count is the conservative estimate.
+    """
+    if k is None or comp is None or comp.sum() == 0:
+        return 0, []
+    px_per_m = S / k
+    r_min_px = max(1, int(round((MANHOLE_DIAM_M_MIN / 2) * px_per_m)))
+    r_max_px = max(r_min_px + 1, int(round((MANHOLE_DIAM_M_MAX / 2) * px_per_m)))
+
+    gray = cv2.cvtColor(np.ascontiguousarray(im_rgb), cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    try:
+        circles = cv2.HoughCircles(
+            gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=max(4, r_min_px * 2),
+            param1=80, param2=28, minRadius=r_min_px, maxRadius=r_max_px)
+    except cv2.error:
+        return 0, []
+
+    if circles is None:
+        return 0, []
+
+    H, W = comp.shape
+    centres = []
+    for cxf, cyf, rf in circles[0]:
+        cx, cy = int(round(cxf)), int(round(cyf))
+        if 0 <= cy < H and 0 <= cx < W and comp[cy, cx]:
+            centres.append((cx, cy))
+    return len(centres), centres
 
 
 # ---------------------------------------------------------------- drawing style guard
@@ -358,6 +477,11 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     if _seg_diag.get('void_fill_m2', 0) > 0:
         flags.append(f"void-fill: +{_seg_diag['void_fill_m2']} m² from {_seg_diag['void_count']} "
                      f"paint/text hole(s) (each < 1.0 m²) — included in measured area")
+    if _seg_diag.get('excluded_m2', 0) > 0:
+        flags.append(f"excluded {_seg_diag['excluded_components']} border/legend component(s) "
+                     f"({_seg_diag['excluded_m2']} m² equivalent: {_seg_diag.get('excluded_margin_m2', 0)} m² "
+                     f"sheet-frame/border strip + {_seg_diag.get('excluded_satellite_m2', 0)} m² legend/satellite "
+                     f"chip(s)) — not part of the measured yard region")
 
     area = round(px * (1.0 / S) ** 2 * k * k, 0)
 
@@ -402,6 +526,13 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # the overlay and mis-place the polygon on capped wide sheets.
     polygon_pts = _hatch_contour(comp, S)
 
+    # --- manhole count ESTIMATE (unmarked path — conservative, never authoritative) ---
+    manhole_count_estimate, _mh_centres = detect_manholes(im, comp, k, S=S)
+    if manhole_count_estimate > 0:
+        flags.append(f"manhole_count_estimate={manhole_count_estimate} (small near-circular "
+                     f"features inside the measured yard, {MANHOLE_DIAM_M_MIN}-{MANHOLE_DIAM_M_MAX} m "
+                     "diameter band) — this is an ESTIMATE, assessor confirm before pricing E/O manhole details")
+
     # --- measurement_state: the four-state contract (sanity.py) so downstream (pipeline,
     # portal, approve endpoint) never has to re-derive verified/plausible logic itself. ---
     state, state_flags = sanity.measurement_state(area, scale_verified=verified)
@@ -412,6 +543,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "scale_src": note, "scale_sources": scale_sources,
             "area_m2": area, "rate": rate, "price_gbp": price, "overlay": overlay,
             "polygon_pts": polygon_pts, "flags": flags,
+            "manhole_count_estimate": manhole_count_estimate,
             "measurement_state": state, "needs_assessor": needs_assessor}
 
 

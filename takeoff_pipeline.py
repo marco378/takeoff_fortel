@@ -24,7 +24,7 @@ MANUAL APPROVAL FLOW:
 import math, json, io, contextlib, os, fitz
 from pathlib import Path
 from router import classify, classify_page
-from robust_takeoff import read_marked
+from robust_takeoff import read_marked, count_manholes_marked
 from geometry import measure_regions
 from scale import detect_scale_bar, user_unit
 from sanity import plausible, measurement_state, MEASURED_VERIFIED, MEASURED_UNVERIFIED, UNMEASURED, REJECTED
@@ -130,10 +130,44 @@ def price_zone(area_m2, depth_mm, conc_rate, mesh, layers, steel_rate_t, margin,
     return round(area_m2 * rate, 2), rate, []
 
 
-def price_with_defaults(area_m2: float, engineer_spec: dict = None) -> dict:
+# E/O for manhole details — £75.00/Nr, from the real Winvic costing sheet ("E/O for MH
+# details, 26 Nr, £75.00, £1,950.00" — see costing.py BOQ). Applies equally whether the
+# manhole count is a confirmed marked-drawing figure or an unmarked-path estimate; the
+# ESTIMATE case is only ever distinguished by the line description + provisional flag,
+# never by a different rate.
+MANHOLE_EO_RATE = 75.00
+
+
+def manhole_eo_line(manhole_count: int = None, manhole_count_estimate: int = None):
+    """Build the (desc, qty, unit, rate) E/O BOQ line for manhole details, or (None, False)
+    if neither a confirmed count nor an estimate is available. Confirmed counts (from the
+    MARKED path's Circle markers) take priority and are NOT marked provisional; an
+    estimate-only count (unmarked path) is always labelled ESTIMATE so the quotation
+    and costing breakdown never present it as authoritative.
+
+    Returns (line, is_estimate) where line is an (desc, qty, unit, rate) BOQ tuple or None."""
+    if manhole_count:
+        return ("E/O for MH details", manhole_count, "Nr", MANHOLE_EO_RATE), False
+    if manhole_count_estimate:
+        return ("E/O for MH details (ESTIMATE — assessor confirm)",
+                manhole_count_estimate, "Nr", MANHOLE_EO_RATE), True
+    return None, False
+
+
+def price_with_defaults(area_m2: float, engineer_spec: dict = None,
+                        manhole_count: int = None, manhole_count_estimate: int = None) -> dict:
     """
     Price a zone using engineer spec if available, otherwise Fortel defaults.
     Returns a costing dict with area, rate, total, flags, and assumption note.
+
+    manhole_count / manhole_count_estimate (optional): when either is supplied, an
+    "E/O for MH details" extra-over BOQ line (£75.00/Nr, from the real Winvic costing
+    sheet) is added under costing["extras"] and folded into costing["grand_total_gbp"].
+    total_gbp itself stays the SLAB-ONLY total (unchanged) so existing callers that only
+    care about the concrete slab price are unaffected; grand_total_gbp is the one to use
+    once manholes are in scope. manhole_count (confirmed, from marked-drawing Circle
+    markers) takes priority over manhole_count_estimate (unmarked-path ESTIMATE, which is
+    always flagged provisional and never silently folded in as if confirmed).
     """
     spec, assumed = spec_with_defaults(engineer_spec)
     aspec_flags   = flag_assumed(spec, assumed)
@@ -142,14 +176,34 @@ def price_with_defaults(area_m2: float, engineer_spec: dict = None) -> dict:
         spec["layers"], spec["steel_rate_t"], spec["margin"],
         spec["conc_wastage"], spec["steel_wastage"], spec["lap_acc"],
         spec["dpm"], spec["curing"], spec["labour"], spec["trim"])
+
+    extras, extra_flags, grand_total = [], [], val
+    line, is_estimate = manhole_eo_line(manhole_count, manhole_count_estimate)
+    if line:
+        desc, qty, unit, mrate = line
+        mvalue = round(qty * mrate, 2)
+        extras.append({"description": desc, "qty": qty, "unit": unit, "rate": mrate,
+                       "value": mvalue, "estimate": is_estimate})
+        if val is not None:
+            grand_total = round(val + mvalue, 2)
+        if is_estimate:
+            extra_flags.append(f"E/O for MH details is an ESTIMATE ({qty} Nr from unmarked-path "
+                               "circle detection) — assessor must confirm the count before this "
+                               "line is treated as firm; quotation carries it as PROVISIONAL")
+        else:
+            extra_flags.append(f"E/O for MH details: {qty} Nr confirmed manhole markers x "
+                               f"£{mrate:.2f} = £{mvalue:,.2f}")
+
     return {
-        "area_m2":    area_m2,
-        "rate":       rate,
-        "total_gbp":  val,
-        "spec":       spec,
-        "assumed":    assumed,
-        "note":       assumption_note(spec) if assumed else "",
-        "flags":      aspec_flags + perr,
+        "area_m2":         area_m2,
+        "rate":            rate,
+        "total_gbp":       val,
+        "spec":            spec,
+        "assumed":         assumed,
+        "note":            assumption_note(spec) if assumed else "",
+        "flags":           aspec_flags + perr + extra_flags,
+        "extras":          extras,
+        "grand_total_gbp": grand_total,
     }
 
 
@@ -180,6 +234,12 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
         page_count = _probe.page_count
         if page_count == 0:
             raise ValueError("document has 0 pages")
+        if not _probe.is_pdf:
+            # fitz opens bare images/XPS as image documents; downstream native code
+            # (render/classify) can segfault on them. The portal converts images to
+            # PDF before calling takeoff(); direct callers must convert first.
+            raise ValueError("not a native PDF (image/other container) — convert to PDF first "
+                             "(the portal does this automatically on upload)")
         _probe.close()
     except Exception as e:
         return {
@@ -253,6 +313,11 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             state, sflags2 = measurement_state(area, scale_verified=True, confidence=conf)
             r["flags"] = r["flags"] + sflags + sflags2
             r["measurement_state"] = state
+            # Manhole markers (Circle annots Fortel placed) — CONFIRMED count, not an estimate.
+            mh_n = count_manholes_marked(meas_pdf)
+            if mh_n > 0:
+                r["manhole_count"] = mh_n
+                r["flags"].append(f"manhole_count={mh_n} (Circle markers on the marked drawing)")
 
         elif typ == "UNMARKED vector":
             if vision:
@@ -295,6 +360,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     r["flags"] = r["flags"] + sflags2
                     r["measurement_state"] = state
                     r["needs_assessor"] = tu.get("needs_assessor", state != MEASURED_VERIFIED)
+                    # Manhole count is an ESTIMATE on this path (never authoritative) — the
+                    # flag explaining that is already appended by takeoff_unmarked.takeoff().
+                    if tu.get("manhole_count_estimate"):
+                        r["manhole_count_estimate"] = tu["manhole_count_estimate"]
                 else:
                     r["flags"] = r["flags"] + tu.get("flags", []) + [
                         "takeoff_unmarked: no area emitted — assessor must trace manually"
@@ -352,7 +421,9 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
 
     # ── Costing (with defaults where no engineer spec)
     if r.get("area_m2"):
-        costing = price_with_defaults(r["area_m2"], engineer_spec)
+        costing = price_with_defaults(r["area_m2"], engineer_spec,
+                                      manhole_count=r.get("manhole_count"),
+                                      manhole_count_estimate=r.get("manhole_count_estimate"))
         r["costing"] = costing
         r["flags"] = r["flags"] + costing["flags"]
 
