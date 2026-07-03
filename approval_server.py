@@ -806,11 +806,17 @@ def _create_rejected_job(project_name, project_ref, client_name, filename, reaso
     return job_id
 
 
-def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> tuple[list, list]:
+def _safe_extract_zip(zip_path: Path, dest_dir: Path, prefix: str = "") -> tuple[list, list]:
     """Extract PDFs from a zip archive, guarding against zip-slip and oversize archives.
-    Returns (list of extracted PDF Paths, flags)."""
+    Returns (list of extracted PDF Paths, flags).
+
+    `prefix` (typically the sanitised project_ref) is prepended to every extracted filename so
+    two uploads whose archives happen to contain a same-named member (e.g. both ship a
+    "Yard_Area_Proposed_Site_Plan.pdf") never collide/overwrite each other on disk — mirrors the
+    `{project_ref}_{filename}` convention already used for direct .pdf uploads below."""
     flags = []
     pdfs = []
+    pfx = f"{prefix}_" if prefix else ""
     try:
         with zipfile.ZipFile(zip_path) as zf:
             infos = zf.infolist()
@@ -831,7 +837,7 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> tuple[list, list]:
                 member_name = _sanitise_filename(Path(info.filename).name)
                 if not member_name:
                     continue
-                target = (dest_dir / member_name).resolve()
+                target = (dest_dir / f"{pfx}{member_name}").resolve()
                 if not str(target).startswith(str(dest_dir.resolve())):
                     flags.append(f"skipped unsafe zip entry: {info.filename!r}")
                     continue
@@ -843,10 +849,15 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> tuple[list, list]:
     return pdfs, flags
 
 
-def _extract_eml_pdfs(eml_path: Path, dest_dir: Path) -> tuple[list, list]:
-    """Parse a .eml with the stdlib email lib, save any PDF attachments. Returns (paths, flags)."""
+def _extract_eml_pdfs(eml_path: Path, dest_dir: Path, prefix: str = "") -> tuple[list, list]:
+    """Parse a .eml with the stdlib email lib, save any PDF attachments. Returns (paths, flags).
+
+    `prefix` is prepended to every extracted attachment filename for the same collision-avoidance
+    reason as _safe_extract_zip above (two enquiry emails can easily carry an attachment named
+    "Proposed_Site_Plan.pdf")."""
     flags = []
     pdfs = []
+    pfx = f"{prefix}_" if prefix else ""
     try:
         with open(eml_path, "rb") as f:
             msg = email.message_from_binary_file(f, policy=policy.default)
@@ -854,7 +865,7 @@ def _extract_eml_pdfs(eml_path: Path, dest_dir: Path) -> tuple[list, list]:
             fname = part.get_filename() or ""
             if fname.lower().endswith(".pdf"):
                 safe = _sanitise_filename(fname) or f"attachment_{uuid.uuid4().hex[:8]}.pdf"
-                target = dest_dir / safe
+                target = dest_dir / f"{pfx}{safe}"
                 payload = part.get_payload(decode=True)
                 if payload:
                     target.write_bytes(payload)
@@ -948,7 +959,7 @@ def upload():
         pdf_path = stage_path
 
     elif ext == ".zip":
-        pdfs, flags = _safe_extract_zip(stage_path, drawings_dir)
+        pdfs, flags = _safe_extract_zip(stage_path, drawings_dir, prefix=_sanitise_filename(project_ref))
         extra_flags += flags
         stage_path.unlink(missing_ok=True)
         if not pdfs:
@@ -963,7 +974,7 @@ def upload():
                                f"(highest drawing_priority); others: {others}")
 
     elif ext == ".eml":
-        pdfs, flags = _extract_eml_pdfs(stage_path, drawings_dir)
+        pdfs, flags = _extract_eml_pdfs(stage_path, drawings_dir, prefix=_sanitise_filename(project_ref))
         extra_flags += flags
         stage_path.unlink(missing_ok=True)
         if not pdfs:
