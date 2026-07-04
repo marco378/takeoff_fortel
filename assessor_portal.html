@@ -66,6 +66,8 @@ header span{opacity:.7;font-size:12px}
 .toolbar button.reject:hover{background:#a93226}
 .toolbar button.adjust{background:#2980b9;color:#fff;border-color:#2980b9}
 .toolbar button.adjust:hover{background:#2471a3}
+.toolbar button.delete{background:#fff;color:#8e44ad;border-color:#8e44ad}
+.toolbar button.delete:hover{background:#8e44ad;color:#fff}
 .toolbar button.on{background:var(--blue);color:#fff;border-color:var(--blue)}
 #readout{margin-left:auto;font-size:13px;font-weight:700;color:var(--blue)}
 .divider{width:1px;background:var(--border);height:24px;margin:0 4px}
@@ -222,6 +224,12 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
         <span id="jobSearchClear" onclick="clearJobSearch()"
               style="display:none;position:absolute;right:6px;top:50%;transform:translateY(-50%);cursor:pointer;color:#8ab4cc;font-size:16px;line-height:1">×</span>
       </div>
+      <div style="margin-top:6px">
+        <label style="font-size:11px;color:#8ab4cc;cursor:pointer;user-select:none">
+          <input type="checkbox" id="showArchivedToggle" onchange="toggleShowArchived(this.checked)" style="vertical-align:middle;margin-right:5px">
+          Show archived (<span id="archivedCount">0</span>)
+        </label>
+      </div>
     </div>
     <div class="job-list" id="jobList">
       <div class="no-jobs">Loading jobs…</div>
@@ -241,6 +249,8 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <button id="btnApprove" class="approve">✅ Approve</button>
       <button id="btnReject"  class="reject">✗ Reject</button>
       <button id="btnAdjust"  class="adjust">✏️ Submit Adjustment</button>
+      <div class="divider"></div>
+      <button id="btnDelete"  class="delete" title="Soft delete — archives the job, recoverable, does not erase data">🗑️ Delete</button>
       <span id="readout">area: —</span>
     </div>
 
@@ -372,6 +382,8 @@ let _jobs = [];             // BUG 5: last fetched job list
 let _lastRenderedStatus = null;  // BUG 5: status at last renderJobUI call
 let _lastJobs = null;           // cache for search re-filter
 let _jobSearchTerm = '';        // current search filter
+let _archivedJobs = {};         // cache of archived jobs (fetched only when the toggle is on)
+let _showArchived = false;      // "Show archived" sidebar toggle state
 // Monotonic generation counter guarding selectJob() against out-of-order completion.
 // selectJob is async (fetch /job/<id> then render); with no guard, rapidly switching
 // jobs (or a poll-triggered re-select racing a user click) can let an OLDER in-flight
@@ -416,6 +428,17 @@ async function loadJobList() {
     const r = await fetch(`${BASE}/jobs`);
     const jobs = await r.json();
     _jobs = Object.values(jobs || {});  // BUG 5: cache for poll comparison
+
+    // Archived jobs live in a separate store (approval_jobs_archive.json) so the hot list
+    // stays small; fetch the count always (cheap), and the full records only when the
+    // "Show archived" toggle is on so the default view stays unaffected by archive size.
+    try {
+      const ar = await fetch(`${BASE}/jobs/archived`);
+      _archivedJobs = await ar.json() || {};
+    } catch (e) { /* archived listing is best-effort — never block the live list on it */ }
+    const cntEl = document.getElementById('archivedCount');
+    if (cntEl) cntEl.textContent = Object.keys(_archivedJobs || {}).length;
+
     renderJobList(jobs);
     // BUG 5: if a job is open and its status changed, refresh the detail panel
     if (selectedJobId) {
@@ -430,14 +453,25 @@ async function loadJobList() {
   }
 }
 
+function toggleShowArchived(checked) {
+  _showArchived = checked;
+  if (_lastJobs) renderJobList(_lastJobs);
+}
+
 function renderJobList(jobs) {
   _lastJobs = jobs;  // cache so search re-filter works without re-fetch
   const el = document.getElementById('jobList');
   let html;
-  if (!jobs || !Object.keys(jobs).length) {
+
+  // Merge in archived jobs (greyed out) only when the toggle is on. Archived records carry
+  // archived:true so the row template below can render them distinctly and swap the normal
+  // click-to-select behaviour for an Unarchive action instead.
+  const merged = _showArchived ? Object.assign({}, jobs, _archivedJobs) : jobs;
+
+  if (!merged || !Object.keys(merged).length) {
     html = '<div class="no-jobs">No pending jobs 🎉</div>';
   } else {
-    const sorted = Object.values(jobs).sort((a,b) =>
+    const sorted = Object.values(merged).sort((a,b) =>
       (b.created_at||'').localeCompare(a.created_at||''));
 
     const q = _jobSearchTerm;
@@ -462,6 +496,16 @@ function renderJobList(jobs) {
         const ts      = j.created_at ? j.created_at.substring(0,16).replace('T',' ') : '';
         const ref     = j.project_ref  ? `<span style="opacity:.8;font-size:10px">#${esc(j.project_ref)} · </span>` : '';
         const pname   = j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
+        if (j.archived) {
+          return `<div class="job-item archived" style="opacity:.55">
+            ${pname}
+            <div class="jid">${j.id} &nbsp;${badge}${mbadge} <span class="badge" style="background:#555">archived</span></div>
+            <div class="jfile">${esc(j.result&&j.result.file||j.id)}</div>
+            <div class="jmeta">${area} · ${ts}
+              <a href="#" onclick="unarchiveJob('${j.id}');return false;" style="color:#8ab4cc;margin-left:8px">↩ Unarchive</a>
+            </div>
+          </div>`;
+        }
         return `<div class="job-item ${active}" onclick="selectJob('${j.id}')">
           ${pname}
           <div class="jid">${j.id} &nbsp;${badge}${mbadge}</div>
@@ -473,6 +517,21 @@ function renderJobList(jobs) {
   }
   // Only repaint if content changed — prevents cosmetic flicker on every 15s poll
   if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+async function unarchiveJob(jobId) {
+  try {
+    const r = await fetch(`${BASE}/unarchive/${jobId}`, { method: 'POST' });
+    const rj = await r.json().catch(() => ({}));
+    if (r.ok) {
+      toast('↩ Job restored from archive');
+      loadJobList();
+    } else {
+      toast(`Error: ${rj.error || 'unknown'}`, 'error');
+    }
+  } catch (e) {
+    toast('Server error — is approval_server.py running?', 'error');
+  }
 }
 
 function filterJobs(term) {
@@ -552,6 +611,12 @@ async function renderJobUI(job, gen) {
   document.getElementById('btnApprove').style.display = isActionable ? '' : 'none';
   document.getElementById('btnReject') .style.display = isActionable ? '' : 'none';
   document.getElementById('btnAdjust') .style.display = isActionable ? '' : 'none';
+  // Delete: hidden while a takeoff is still running (server 409s on 'processing' anyway —
+  // this just avoids a pointless round-trip), and hidden for already-approved jobs — those
+  // represent a committed client quotation and the server hard-blocks archiving them too
+  // (mirrors _approve_block_reason's server-is-source-of-truth pattern elsewhere in this file).
+  const canDelete = job.status !== 'processing' && job.decision !== 'approved';
+  document.getElementById('btnDelete').style.display = canDelete ? '' : 'none';
   // Remove any previous status message before re-rendering
   const _prevMsg = document.getElementById('_statusMsg');
   if (_prevMsg) _prevMsg.remove();
@@ -1191,6 +1256,46 @@ function setupButtons() {
   document.getElementById('btnApprove').addEventListener('click', () => submitDecision('approve'));
   document.getElementById('btnReject') .addEventListener('click', () => submitDecision('reject'));
   document.getElementById('btnAdjust') .addEventListener('click', () => submitDecision('adjust'));
+  document.getElementById('btnDelete') .addEventListener('click', deleteCurrentJob);
+}
+
+// ─────────────────────────────────────────────────
+// Delete (soft — archive) current job
+// ─────────────────────────────────────────────────
+async function deleteCurrentJob() {
+  if (!currentJob) { toast('No job selected', 'warn'); return; }
+  if (currentJob.decision === 'approved') {
+    toast('Cannot delete: job is already approved — this is a committed client quotation. '
+        + 'Ask Jas to archive/unwind it manually.', 'error');
+    return;
+  }
+  const label = currentJob.project_name
+    ? `#${currentJob.project_ref || ''} ${currentJob.project_name}`.trim()
+    : (currentJob.result && currentJob.result.file) || currentJob.id;
+  const ok = window.confirm(
+    `Delete estimation "${label}"?\n\n` +
+    'This archives the job — it is recoverable via "Show archived" and does NOT erase any ' +
+    'data. It will be hidden from the pending list.\n\nContinue?');
+  if (!ok) return;
+
+  try {
+    const r = await fetch(`${BASE}/archive/${currentJob.id}`, { method: 'POST' });
+    const rj = await r.json().catch(() => ({}));
+    if (r.ok) {
+      toast('🗑️ Job archived (recoverable via "Show archived")');
+      currentJob = null;
+      selectedJobId = null;
+      document.getElementById('toolbar').style.display = 'none';
+      document.getElementById('infoPanel').style.display = 'none';
+      document.getElementById('canvasWrap').style.display = 'none';
+      document.getElementById('emptyState').style.display = '';
+      loadJobList();
+    } else {
+      toast(`Cannot delete: ${rj.error || 'unknown error'}`, 'error');
+    }
+  } catch (e) {
+    toast('Server error — is approval_server.py running?', 'error');
+  }
 }
 
 // ─────────────────────────────────────────────────

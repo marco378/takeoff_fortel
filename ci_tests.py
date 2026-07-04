@@ -146,8 +146,11 @@ try:
     ck("agree: title_block in scale_sources",     "title_block" in _src1)
     ck("agree: returned k close to bar",          _k1 is not None and abs(_k1 - 88/500) < 1e-6)
 
-    # --- CASE 2: scale bar DISAGREES with title block (>3%) -> verified=False ---
-    # Bar: 150 m / 500 pt = 0.30 m/pt; diff vs k500 ≈ 70% >> 3%
+    # --- CASE 2: scale bar DISAGREES with title block (>3%) -> verified=False. Bar: 150 m / 500 pt
+    # = 0.30 m/pt (implies ~1:850, an individually PLAUSIBLE drawing ratio) vs title k500 ≈ 70% off.
+    # Both sources are plausible on their own -> this is the MIXED/DISAGREE branch (CLAUDE.md
+    # invariant 3: disagreement -> refuse, don't auto-pick). Neither is silently adopted; the
+    # title-block k is used for display and the assessor must set the scale explicitly.
     _c2 = canvas.Canvas("/tmp/_sf_disagree.pdf", pagesize=(1400, 2200))
     _c2.drawString(100, 2100, "Drawing Scale 1:500")
     _c2.drawString(200, 120, "0         150 m")
@@ -155,8 +158,9 @@ try:
     _c2.save()
     _k2, _v2, _n2, _src2 = _scale_for("/tmp/_sf_disagree.pdf")
     ck("bar disagrees with title -> verified=False", _v2 is False, f"k={_k2:.5f} note={_n2[:60]}")
-    ck("disagree: note mentions disagrees",         "DISAGREES" in _n2 or "disagrees" in _n2.lower())
-    ck("disagree: bar k still used",               _k2 is not None and abs(_k2 - 150/500) < 1e-6)
+    ck("disagree: note flags MIXED/DISAGREE",        "MIXED/DISAGREE" in _n2)
+    ck("disagree: NOT auto-picked to bar k (title k used instead)",
+       _k2 is not None and abs(_k2 - _k500) < 1e-6)
 
     # --- CASE 3: no scale bar, title block only -> verified=False ---
     _c3 = canvas.Canvas("/tmp/_sf_titleonly.pdf", pagesize=(1400, 2200))
@@ -167,6 +171,42 @@ try:
     ck("title-only: title_block in scale_sources", "title_block" in _src3)
     ck("title-only: no scale_bar in scale_sources", "scale_bar" not in _src3)
     ck("title-only: k close to k500",            _k3 is not None and abs(_k3 - _k500) < 1e-5)
+
+    # --- CASE 4: bar DISAGREES with title AND the bar-implied ratio is IMPLAUSIBLE (false
+    # scale-bar anchor, e.g. an unrelated dimension callout mis-paired to a nearby short line
+    # fragment) -> reject the bar entirely, fall back to title-block k, still UNVERIFIED.
+    # Reproduces the real corpus incident: Proposed_Gatehouse's "7016 m / 34 pt" bar candidate
+    # implies k=205.868 m/pt (~1:583,563) which is nowhere near a real drawing scale.
+    # Bar: 7016 m / 34 pt = 206.35 m/pt -> implied ~1:584,000, way outside 1:20-1:5000.
+    _c4 = canvas.Canvas("/tmp/_sf_implausible.pdf", pagesize=(1400, 2200))
+    _c4.drawString(100, 2100, "Drawing Scale 1:1250")
+    _c4.drawString(200, 120, "0          7016 m")
+    _c4.line(100, 110, 134, 110)                        # 34 pt bar
+    _c4.save()
+    _k4, _v4, _n4, _src4 = _scale_for("/tmp/_sf_implausible.pdf")
+    _k1250 = 1250 * _PT_PER_M
+    ck("implausible bar -> verified=False",        _v4 is False, f"k={_k4:.5f} note={_n4[:70]}")
+    ck("implausible bar -> note says rejected",     "rejected as implausible" in _n4)
+    ck("implausible bar -> falls back to title k",  _k4 is not None and abs(_k4 - _k1250) < 1e-5)
+    ck("implausible bar -> sources still recorded", "scale_bar" in _src4 and "title_block" in _src4)
+
+    # --- CASE 5: bar DISAGREES with title but BOTH are individually plausible drawing ratios
+    # (e.g. a genuine 1:2500 site-location viewport vs a stale 1:1500 title block) -> MIXED/
+    # DISAGREE. Must NOT auto-pick either side; verified stays False; title k shown for display.
+    # Reproduces the real corpus incident: Site_Location_Plan's "100 m / 113 pt" bar (k=0.882,
+    # ~1:2500 — a perfectly plausible ratio) disagreeing with the sheet's stated title 1:1500.
+    _c5 = canvas.Canvas("/tmp/_sf_mixed.pdf", pagesize=(1400, 2200))
+    _c5.drawString(100, 2100, "Drawing Scale 1:1500")
+    _c5.drawString(200, 120, "0          100 m")
+    _c5.line(100, 110, 213, 110)                        # 113 pt bar -> k=0.885 (~1:2504, plausible)
+    _c5.save()
+    _k5, _v5, _n5, _src5 = _scale_for("/tmp/_sf_mixed.pdf")
+    _k1500 = 1500 * _PT_PER_M
+    ck("mixed/disagree -> verified=False",          _v5 is False, f"k={_k5:.5f} note={_n5[:70]}")
+    ck("mixed/disagree -> note says MIXED/DISAGREE", "MIXED/DISAGREE" in _n5)
+    ck("mixed/disagree -> returns title k (no auto-pick of bar)",
+       _k5 is not None and abs(_k5 - _k1500) < 1e-5)
+    ck("mixed/disagree -> sources still recorded",  "scale_bar" in _src5 and "title_block" in _src5)
 
 except ImportError as _e:
     print(f"  [SKIP] scale_for tests — missing dependency: {_e}")
@@ -924,6 +964,717 @@ try:
         shutil.rmtree(_tmp_jobs_file.parent, ignore_errors=True)
 except ImportError as _e:
     print(f"  [SKIP] approval_server atomic-write tests — missing dependency: {_e}")
+
+print("D77 swatch-locked grey band vs 'Footpaths (ancillary): Concrete' annexation "
+      "(Aryan field report: real SGP sheet measured 3,172 vs Smita gold 3,156 — root cause was "
+      "the generic 214±14 grey band admitting a darker, adjacent ancillary-concrete legend "
+      "colour and binary_closing fusing it into the yard's own connected component)")
+try:
+    import fitz as _fitz_fp
+    from takeoff_unmarked import (takeoff as _tu_takeoff_fp, segment_hatch as _seg_fp,
+                                   PLAUSIBLE_MIN_M2 as _PMIN_FP, PLAUSIBLE_MAX_M2 as _PMAX_FP)
+
+    def _gen_d77_footpath(out_path, chip_grey=0.878, yard_grey=0.878):
+        """Same D77 yard geometry (page 1067.766x824.854pt, scale bar, 1:250 title) plus:
+          - a darker 'Footpaths (ancillary): Concrete' strip (204 grey) sitting 0.65pt below
+            the yard's bottom edge — close enough for the close=9 binary_closing to bridge,
+            reproducing the real-sheet CONNECTED over-measure (not a satellite blob).
+          - a legend swatch chip + label 'Concrete Service Yard construction' (readable by
+            find_concrete_swatch_rgb) so the swatch-lock path engages.
+          - a second, non-matching legend line 'Footpaths (ancillary): Concrete' with its own
+            (darker) swatch chip — must NOT be picked up as the concrete-yard label anchor.
+        Title text deliberately avoids CONCRETE_LABELS substrings (unlike drawings/_int_d77.pdf,
+        whose title text IS the label match and has no nearby swatch chip -> unreadable swatch,
+        which is why that fixture stays on the generic-band fallback path untouched by this fix).
+        """
+        d = _fitz_fp.open()
+        W, H = 1067.7659912109375, 824.853515625
+        pg = d.new_page(width=W, height=H)
+        pg.insert_text((130.0, 80), "PROPOSED HARD LANDSCAPING - UNIT 1 SITE PLAN    Scale 1:250",
+                       fontsize=13)
+        pg.draw_line(_fitz_fp.Point(130.0, 714.853515625), _fitz_fp.Point(696.9290771484375, 714.853515625),
+                     color=(0, 0, 0), width=2.0)
+        pg.insert_text((126.0, 731), "0", fontsize=11)
+        pg.insert_text((678.9, 731), "50 m", fontsize=11)
+
+        yg = (yard_grey, yard_grey, yard_grey)
+        pg.draw_rect(_fitz_fp.Rect(130.0, 120.0, 937.765625, 624.853515625),
+                     color=(0, 0, 0), fill=yg, width=1.0)
+
+        # Ancillary footpath strip: 230x9pt = 16.1 m² at k=0.08819, darker grey (204), 0.65pt
+        # gap below the yard's own bottom edge (bridged by close=9, same mechanism as the real
+        # sheet's kerb-line gap).
+        strip_grey = (0.80, 0.80, 0.80)
+        pg.draw_rect(_fitz_fp.Rect(350.0, 625.503515625, 580.0, 634.503515625),
+                     color=None, fill=strip_grey, width=0)
+
+        # Legend: matching swatch chip + label (concrete-yard anchor).
+        cg = (chip_grey, chip_grey, chip_grey)
+        pg.draw_rect(_fitz_fp.Rect(330.0, 762.0, 360.0, 776.0), color=(0, 0, 0), fill=cg, width=0.5)
+        pg.insert_text((400.0, 772.0), "Concrete Service Yard construction", fontsize=9)
+
+        # Second legend line: non-matching label + its own (darker) swatch chip — must not be
+        # mistaken for the concrete-yard anchor, and is small/isolated -> satellite-dropped.
+        pg.draw_rect(_fitz_fp.Rect(330.0, 784.0, 360.0, 796.0), color=(0, 0, 0), fill=strip_grey, width=0.5)
+        pg.insert_text((400.0, 792.0), "Footpaths (ancillary): Concrete", fontsize=9)
+
+        d.save(out_path)
+        d.close()
+
+    _p_fp = "drawings/_int_d77_footpath.pdf"
+    _gen_d77_footpath(_p_fp)
+
+    # BEFORE: old generic-band segmentation (direct segment_hatch call, mirroring the borders
+    # test's "WITHOUT exclusion" pattern) — proves the annexation is real and CONNECTED (not
+    # something the satellite-fraction filter would already have dropped).
+    _pgfp = _fitz_fp.open(_p_fp)[0]
+    _pixfp = _pgfp.get_pixmap(matrix=_fitz_fp.Matrix(2.0, 2.0))
+    import numpy as _np_fp
+    _imfp = _np_fp.frombuffer(_pixfp.samples, _np_fp.uint8).reshape(_pixfp.height, _pixfp.width, _pixfp.n)[..., :3]
+    _k_fp = 0.08819
+    _comp_old_fp = _seg_fp(_imfp, (214, 214, 214), k=_k_fp, S=2.0, exclude_border=True)
+    _area_old_fp = round(int(_comp_old_fp.sum()) * (1 / 2.0) ** 2 * _k_fp * _k_fp, 0)
+    ck("BEFORE fix (generic 214 band): footpath strip annexed, area > 3,159 + 10 m² "
+       "(connected over-measure, not a dropped satellite)",
+       _area_old_fp > 3159.0 + 10, f"got {_area_old_fp}")
+
+    # AFTER: full takeoff() with the swatch-lock fix — flags show the lock, area back to gold.
+    _r_fp = _tu_takeoff_fp(_p_fp)
+    _area_fp = _r_fp.get("area_m2")
+    ck("AFTER fix: swatch (224ish) LOCKED — footpath strip excluded, area within 0.5% of 3,159 m²",
+       _area_fp is not None and abs(_area_fp - 3159.0) / 3159.0 <= 0.005, f"got {_area_fp}")
+    ck("AFTER fix: flags show the swatch-locked band",
+       any("LOCKED" in f for f in _r_fp.get("flags", [])), _r_fp.get("flags"))
+    ck("AFTER fix: measurement_state MEASURED_VERIFIED",
+       _r_fp.get("measurement_state") == MEASURED_VERIFIED, _r_fp.get("measurement_state"))
+
+    # DEMO-4 REGRESSION GUARD: swatch reads far enough from the yard's own fill (232 vs 214)
+    # that the locked band [218,246] misses the 214 yard entirely -> must FALL BACK, never
+    # silently return area=None on a perfectly measurable sheet.
+    _p_fp_d4 = "/tmp/_ci_d77_footpath_demo4.pdf"
+    _gen_d77_footpath(_p_fp_d4, chip_grey=0.910, yard_grey=0.84)
+    _r_fp_d4 = _tu_takeoff_fp(_p_fp_d4)
+    ck("DEMO-4 GUARD: swatch-locked band misses the yard fill -> FELL BACK (flag present)",
+       any("FELL BACK" in f for f in _r_fp_d4.get("flags", [])), _r_fp_d4.get("flags"))
+    ck("DEMO-4 GUARD: fallback still produces a measurable area (never area=None)",
+       _r_fp_d4.get("area_m2") is not None, _r_fp_d4.get("area_m2"))
+    ck("DEMO-4 GUARD: fallback state is MEASURED_VERIFIED (not silently UNMEASURED)",
+       _r_fp_d4.get("measurement_state") == MEASURED_VERIFIED, _r_fp_d4.get("measurement_state"))
+
+    # GOLD GUARDS unchanged: both pre-existing synthetic fixtures have unreadable swatches
+    # (title text IS the label match, no nearby swatch chip) -> always take the fallback path,
+    # golds untouched by this change.
+    _d77_regress = _tu_takeoff_fp("drawings/_int_d77.pdf")
+    ck("GOLD GUARD: _int_d77.pdf still exactly 3,159 m² (swatch-lock did not touch it)",
+       _d77_regress.get("area_m2") == 3159.0, _d77_regress.get("area_m2"))
+except (ImportError, FileNotFoundError) as _e:
+    print(f"  [SKIP] D77 swatch-locked grey band test — missing dependency or file: {_e}")
+
+print("approval_server: soft-delete (archive/unarchive) — Aryan's portal delete-estimation request")
+try:
+    import approval_server as _AS5
+    import tempfile as _tempfile5
+
+    _tmpdir5 = Path(_tempfile5.mkdtemp(prefix="ci_archive_"))
+    _orig_jobs_file5 = _AS5.JOBS_FILE
+    _orig_archive_file5 = _AS5.JOBS_ARCHIVE_FILE
+    _AS5.JOBS_FILE = _tmpdir5 / "jobs.json"
+    _AS5.JOBS_ARCHIVE_FILE = _tmpdir5 / "jobs_archive.json"
+    try:
+        _app5 = _AS5.app
+        _app5.testing = True
+        _client5 = _app5.test_client()
+
+        # Ordinary pending job -> archivable
+        _jid5 = "job-pending-1"
+        _AS5.save_jobs({_jid5: {"id": _jid5, "status": "pending", "decision": None,
+                                 "project_name": "Test Yard", "flags": []}})
+        _r5 = _client5.post(f"/archive/{_jid5}", json={"note": "duplicate upload"})
+        ck("archive: pending job archives with 200", _r5.status_code == 200, _r5.status_code)
+        _jobs_after5 = _AS5.load_jobs()
+        ck("archive: job removed from hot jobs file", _jid5 not in _jobs_after5)
+        _archive5 = _AS5._load_archive()
+        ck("archive: job present in archive file", _jid5 in _archive5)
+        ck("archive: archived record carries archived=True + archived_at",
+           _archive5.get(_jid5, {}).get("archived") is True and _archive5.get(_jid5, {}).get("archived_at"),
+           _archive5.get(_jid5))
+        ck("archive: status set to 'deleted' in the archive record",
+           _archive5.get(_jid5, {}).get("status") == "deleted", _archive5.get(_jid5, {}).get("status"))
+        ck("archive: no data lost — project_name preserved",
+           _archive5.get(_jid5, {}).get("project_name") == "Test Yard")
+
+        # /jobs/archived surfaces it, default /jobs does not
+        _r_list5 = _client5.get("/jobs/archived")
+        ck("GET /jobs/archived includes the archived job", _jid5 in _r_list5.get_json())
+        _r_hot5 = _client5.get("/jobs")
+        ck("GET /jobs (default) excludes the archived job", _jid5 not in _r_hot5.get_json())
+
+        # Unarchive restores it
+        _r_un5 = _client5.post(f"/unarchive/{_jid5}")
+        ck("unarchive: restores with 200", _r_un5.status_code == 200, _r_un5.status_code)
+        _jobs_restored5 = _AS5.load_jobs()
+        ck("unarchive: job back in hot jobs file", _jid5 in _jobs_restored5)
+        ck("unarchive: archived flag cleared", _jobs_restored5.get(_jid5, {}).get("archived") is False)
+        _archive_after_un5 = _AS5._load_archive()
+        ck("unarchive: removed from archive file", _jid5 not in _archive_after_un5)
+
+        # Approved job -> BLOCKED (needs Jas, not a portal button)
+        _jid5b = "job-approved-1"
+        _AS5.save_jobs({_jid5b: {"id": _jid5b, "status": "approved", "decision": "approved",
+                                  "project_name": "Approved Yard", "flags": []}})
+        _r5b = _client5.post(f"/archive/{_jid5b}")
+        ck("archive: approved job is BLOCKED (409)", _r5b.status_code == 409, _r5b.status_code)
+        ck("archive: blocked-job error mentions Jas / manual",
+           "jas" in _r5b.get_json().get("error", "").lower(), _r5b.get_json())
+        ck("archive: approved job NOT removed from hot jobs file after a blocked attempt",
+           _jid5b in _AS5.load_jobs())
+
+        # Processing job -> BLOCKED (409), same pattern as approve/reject/adjust
+        _jid5c = "job-processing-1"
+        _AS5.save_jobs({_jid5c: {"id": _jid5c, "status": "processing", "decision": None, "flags": []}})
+        _r5c = _client5.post(f"/archive/{_jid5c}")
+        ck("archive: processing job is BLOCKED (409)", _r5c.status_code == 409, _r5c.status_code)
+
+        # Unknown job -> 404, never a crash
+        _r5d = _client5.post("/archive/does-not-exist")
+        ck("archive: unknown job -> 404 (not a crash)", _r5d.status_code == 404, _r5d.status_code)
+        _r5e = _client5.post("/unarchive/does-not-exist")
+        ck("unarchive: unknown archived job -> 404 (not a crash)", _r5e.status_code == 404, _r5e.status_code)
+    finally:
+        _AS5.JOBS_FILE = _orig_jobs_file5
+        _AS5.JOBS_ARCHIVE_FILE = _orig_archive_file5
+        shutil.rmtree(_tmpdir5, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server soft-delete tests — missing dependency: {_e}")
+
+print("approval_server: PORTAL_TOKEN auth gate (prod-audit MUST — unauthenticated approve/reject/adjust)")
+try:
+    import approval_server as _AS6
+    import tempfile as _tempfile6
+
+    _tmpdir6 = Path(_tempfile6.mkdtemp(prefix="ci_auth_"))
+    _orig_jobs_file6 = _AS6.JOBS_FILE
+    _AS6.JOBS_FILE = _tmpdir6 / "jobs.json"
+    _orig_token6 = _AS6.APPROVAL_TOKEN
+    _AS6.APPROVAL_TOKEN = "test-secret-token-123"
+    try:
+        _app6 = _AS6.app
+        _app6.testing = True
+        _client6 = _app6.test_client()
+
+        _jid6 = "job-auth-1"
+        _AS6.save_jobs({_jid6: {"id": _jid6, "status": "pending", "decision": None, "flags": []}})
+
+        # No token at all -> 401, never a silent pass-through
+        _r6 = _client6.get("/jobs")
+        ck("no token -> /jobs is 401 when APPROVAL_TOKEN is set", _r6.status_code == 401, _r6.status_code)
+
+        # Wrong token -> 401
+        _r6b = _client6.get("/jobs", headers={"Authorization": "Bearer wrong-token"})
+        ck("wrong Bearer token -> 401", _r6b.status_code == 401, _r6b.status_code)
+
+        # Correct Bearer token -> 200
+        _r6c = _client6.get("/jobs", headers={"Authorization": "Bearer test-secret-token-123"})
+        ck("correct Bearer token -> 200", _r6c.status_code == 200, _r6c.status_code)
+
+        # /status always exempt (health-check must work for deploy monitoring pre-auth)
+        _r6d = _client6.get("/status")
+        ck("/status is exempt from the token gate", _r6d.status_code == 200, _r6d.status_code)
+
+        # /portal?token=<correct> sets a cookie and redirects
+        _r6e = _client6.get(f"/portal?token=test-secret-token-123")
+        ck("/portal?token=<correct> redirects (sets cookie)", _r6e.status_code in (301, 302), _r6e.status_code)
+        _set_cookie6 = _r6e.headers.get("Set-Cookie", "")
+        ck("/portal?token=<correct> Set-Cookie contains the token cookie name",
+           "approval_token" in _set_cookie6, _set_cookie6)
+
+        # /portal?token=<wrong> does not authorise — use a FRESH client (no cookie carried
+        # over from the earlier correct-token request on _client6, which would mask this).
+        _client6fresh = _app6.test_client()
+        _r6f = _client6fresh.get("/portal?token=nope")
+        ck("/portal?token=<wrong> -> 401, not silently served", _r6f.status_code == 401, _r6f.status_code)
+
+        # Cookie-based auth works for a mutating route (mirrors what the portal's own fetch()
+        # calls will do once the browser holds the cookie from the bootstrap redirect above)
+        _client6.set_cookie("approval_token", "test-secret-token-123")
+        _r6g = _client6.get(f"/job/{_jid6}")
+        ck("cookie auth authorises a normal route", _r6g.status_code == 200, _r6g.status_code)
+
+        # With APPROVAL_TOKEN unset, auth is fully disabled (back-compat / local dev)
+        _AS6.APPROVAL_TOKEN = ""
+        _client6b = _app6.test_client()
+        _r6h = _client6b.get("/jobs")
+        ck("no APPROVAL_TOKEN configured -> auth disabled, /jobs open", _r6h.status_code == 200, _r6h.status_code)
+    finally:
+        _AS6.JOBS_FILE = _orig_jobs_file6
+        _AS6.APPROVAL_TOKEN = _orig_token6
+        shutil.rmtree(_tmpdir6, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server auth-gate tests — missing dependency: {_e}")
+
+print("approval_server: jobs-file backup rotation + corrupt-file preservation (prod-audit MUST)")
+try:
+    import approval_server as _AS7
+    import tempfile as _tempfile7
+
+    _tmpdir7 = Path(_tempfile7.mkdtemp(prefix="ci_backup_"))
+    _orig_jobs_file7 = _AS7.JOBS_FILE
+    _orig_backup_dir7 = _AS7.BACKUP_DIR
+    _AS7.JOBS_FILE = _tmpdir7 / "jobs.json"
+    _AS7.BACKUP_DIR = _tmpdir7 / "backups"
+    try:
+        # First-ever save: JOBS_FILE doesn't exist yet, so there's nothing to snapshot —
+        # _rotate_backup is a correct no-op here (never backs up a file that isn't there yet).
+        _AS7.save_jobs({"a": {"id": "a"}})
+        # Backup filenames are keyed off JOBS_FILE.stem ("jobs" here, not "approval_jobs") —
+        # see approval_server._rotate_backup's stem-based naming (item 5, QA-instance isolation).
+        _backups7 = list(_AS7.BACKUP_DIR.glob("jobs.*.json"))
+        ck("no backup created on the very first save (nothing existed yet to snapshot)",
+           len(_backups7) == 0, [str(p) for p in _backups7])
+
+        # Second save the same day: JOBS_FILE now exists from the first save, so THIS save's
+        # rotation check snapshots it before overwriting -> exactly one dated backup appears.
+        _AS7.save_jobs({"a": {"id": "a"}, "b": {"id": "b"}})
+        _backups7b = list(_AS7.BACKUP_DIR.glob("jobs.*.json"))
+        ck("save_jobs creates a same-day backup once a prior file exists to snapshot",
+           len(_backups7b) == 1, [str(p) for p in _backups7b])
+
+        # A third save the same day must NOT create a second backup file for today
+        _AS7.save_jobs({"a": {"id": "a"}, "b": {"id": "b"}, "c": {"id": "c"}})
+        _backups7b2 = list(_AS7.BACKUP_DIR.glob("jobs.*.json"))
+        ck("no duplicate backup for a third save on the same day",
+           len(_backups7b2) == 1, [str(p) for p in _backups7b2])
+
+        # Pruning: force more than BACKUP_KEEP dated backup files to exist, then trigger a
+        # rotation check that should prune down to the newest BACKUP_KEEP.
+        import datetime as _dt7
+        for _i in range(20):
+            _fake_date = (_dt7.date(2020, 1, 1) + _dt7.timedelta(days=_i)).isoformat()
+            (_AS7.BACKUP_DIR / f"jobs.{_fake_date}.json").write_text("{}")
+        _AS7._rotate_backup()  # today's backup already exists, so this call only prunes
+        _backups7c = sorted(_AS7.BACKUP_DIR.glob("jobs.*.json"))
+        ck(f"backup pruning keeps at most BACKUP_KEEP={_AS7.BACKUP_KEEP} files",
+           len(_backups7c) <= _AS7.BACKUP_KEEP, len(_backups7c))
+
+        # Corrupt (non-empty, unparseable) jobs file -> preserved as .corrupt-*, load returns {}
+        _AS7.JOBS_FILE.write_text("{not valid json!!")
+        _loaded7 = _AS7.load_jobs()
+        ck("corrupt jobs file -> load_jobs returns {} (never raises)", _loaded7 == {}, _loaded7)
+        _corrupt_copies7 = list(_tmpdir7.glob("jobs.json.corrupt-*"))
+        ck("corrupt jobs file -> a .corrupt-* copy is preserved for recovery",
+           len(_corrupt_copies7) == 1, [str(p) for p in _corrupt_copies7])
+    finally:
+        _AS7.JOBS_FILE = _orig_jobs_file7
+        _AS7.BACKUP_DIR = _orig_backup_dir7
+        shutil.rmtree(_tmpdir7, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server backup-rotation tests — missing dependency: {_e}")
+
+print("approval_server: startup sweep clears stranded 'processing' jobs on restart (prod-audit MUST)")
+try:
+    import approval_server as _AS8
+    import tempfile as _tempfile8
+
+    _tmpdir8 = Path(_tempfile8.mkdtemp(prefix="ci_sweep_"))
+    _orig_jobs_file8 = _AS8.JOBS_FILE
+    _AS8.JOBS_FILE = _tmpdir8 / "jobs.json"
+    try:
+        _jid8 = "job-stranded-1"
+        _AS8.save_jobs({_jid8: {"id": _jid8, "status": "processing", "decision": None, "flags": []}})
+        _AS8._sweep_stranded_processing_jobs()
+        _swept8 = _AS8.load_jobs()[_jid8]
+        ck("stranded 'processing' job flipped to UNMEASURED by the startup sweep",
+           _swept8.get("measurement_state") == "UNMEASURED", _swept8.get("measurement_state"))
+        ck("startup sweep flag mentions PIPELINE INTERRUPTED",
+           any("PIPELINE INTERRUPTED" in f for f in _swept8.get("flags", [])), _swept8.get("flags"))
+        ck("startup sweep sets needs_assessor=True", _swept8.get("needs_assessor") is True)
+
+        # A job that is NOT processing must be left untouched
+        _jid8b = "job-approved-untouched"
+        _AS8.save_jobs({_jid8b: {"id": _jid8b, "status": "approved", "decision": "approved", "flags": ["ok"]}})
+        _AS8._sweep_stranded_processing_jobs()
+        _unswept8 = _AS8.load_jobs()[_jid8b]
+        ck("non-processing job untouched by the startup sweep",
+           _unswept8.get("status") == "approved" and _unswept8.get("flags") == ["ok"], _unswept8)
+    finally:
+        _AS8.JOBS_FILE = _orig_jobs_file8
+        shutil.rmtree(_tmpdir8, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server startup-sweep tests — missing dependency: {_e}")
+
+print("approval_server: /webhook/n8n pdf_path containment guard (prod-audit MUST — arbitrary file read)")
+try:
+    import approval_server as _AS9
+    import approval_email as _AE9
+    import tempfile as _tempfile9
+    import json as _json9
+
+    # /webhook/n8n -> approval_email.create_job() writes straight to approval_email.JOBS_FILE.
+    # Left pointed at the real approval_jobs.json, every POST in this test (three per run)
+    # permanently wrote a junk "x.pdf" / area=100 pending job into the LIVE jobs file — this is
+    # exactly how the ~17 junk jobs that were polluting approval_jobs.json got there. Point
+    # approval_email.JOBS_FILE at a tempfile.mkdtemp() scratch path for the duration of this
+    # test (never a hardcoded /tmp path) and restore it in finally, so CI is byte-stable
+    # against the live jobs file no matter how many times it runs.
+    _tmpdir9 = Path(_tempfile9.mkdtemp(prefix="ci_webhook_n8n_"))
+    _orig_ae_jobs_file9 = _AE9.JOBS_FILE
+    _AE9.JOBS_FILE = _tmpdir9 / "jobs.json"
+    try:
+        _app9 = _AS9.app
+        _app9.testing = True
+        _client9 = _app9.test_client()
+
+        _r9 = _client9.post("/webhook/n8n", json={
+            "pdf_path": "/etc/passwd",
+            "result": {"area_m2": 100, "file": "x.pdf"},
+        })
+        ck("pdf_path outside drawings/ is rejected with 400, not read",
+           _r9.status_code == 400, _r9.status_code)
+
+        _r9b = _client9.post("/webhook/n8n", json={
+            "pdf_path": "../../etc/passwd",
+            "result": {"area_m2": 100, "file": "x.pdf"},
+        })
+        ck("path-traversal pdf_path is rejected with 400",
+           _r9b.status_code == 400, _r9b.status_code)
+
+        # Empty pdf_path (legit use case — result created without a snapshot) still works
+        _r9c = _client9.post("/webhook/n8n", json={
+            "pdf_path": "",
+            "result": {"area_m2": 100, "file": "x.pdf"},
+        })
+        ck("empty pdf_path (no snapshot) is not blocked by the containment guard",
+           _r9c.status_code == 200, _r9c.status_code)
+
+        # The job this test creates must land in the scratch JOBS_FILE, never the live one.
+        ck("webhook test job landed in the scratch jobs file, not the live approval_jobs.json",
+           _AE9.JOBS_FILE.exists() and len(_json9.loads(_AE9.JOBS_FILE.read_text())) >= 1,
+           str(_AE9.JOBS_FILE))
+    finally:
+        _AE9.JOBS_FILE = _orig_ae_jobs_file9
+        shutil.rmtree(_tmpdir9, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server webhook containment tests — missing dependency: {_e}")
+
+print("approval_server: GET on /approve /reject does NOT mutate; POST does "
+      "(top-level-navigation CSRF fix — SameSite=Lax cookies + a mutating GET meant an "
+      "email client's link-preview prefetch, or any page merely linking here, could "
+      "silently approve/reject a job)")
+try:
+    import approval_server as _AS10
+    import tempfile as _tempfile10
+
+    _tmpdir10 = Path(_tempfile10.mkdtemp(prefix="ci_csrf_"))
+    _orig_jobs_file10 = _AS10.JOBS_FILE
+    _AS10.JOBS_FILE = _tmpdir10 / "jobs.json"
+    try:
+        _app10 = _AS10.app
+        _app10.testing = True
+        _client10 = _app10.test_client()
+
+        # --- /approve: GET must not mutate ---
+        _jid10a = "job-csrf-approve"
+        _AS10.save_jobs({_jid10a: {
+            "id": _jid10a, "status": "pending", "decision": None,
+            "measurement_state": "MEASURED_VERIFIED", "scale_confirmed": True,
+            "result": {"area_m2": 1000, "file": "csrf_test.pdf"}, "flags": [],
+        }})
+        _rg10a = _client10.get(f"/approve/{_jid10a}")
+        ck("GET /approve/<id> returns 200 (confirm page, not a mutation)",
+           _rg10a.status_code == 200, _rg10a.status_code)
+        ck("GET /approve/<id> renders an HTML confirm page (not JSON)",
+           "text/html" in _rg10a.content_type, _rg10a.content_type)
+        _job_after_get10a = _AS10.load_jobs()[_jid10a]
+        ck("GET /approve/<id> did NOT change job status (still 'pending')",
+           _job_after_get10a["status"] == "pending", _job_after_get10a["status"])
+        ck("GET /approve/<id> did NOT set a decision",
+           _job_after_get10a.get("decision") is None, _job_after_get10a.get("decision"))
+        # The confirm page must contain a POST form targeting the real action, not a link
+        # that itself mutates (otherwise it's just moved the vulnerability one click later).
+        _body10a = _rg10a.get_data(as_text=True)
+        ck("confirm page's form method is POST", 'method="POST"' in _body10a, _body10a[:200])
+        ck(f"confirm page's form posts to /approve/{_jid10a}",
+           f"/approve/{_jid10a}" in _body10a)
+
+        # Now POST actually mutates
+        _rp10a = _client10.post(f"/approve/{_jid10a}", json={})
+        ck("POST /approve/<id> returns 200", _rp10a.status_code == 200, _rp10a.status_code)
+        _job_after_post10a = _AS10.load_jobs()[_jid10a]
+        ck("POST /approve/<id> DID change job status to 'approved'",
+           _job_after_post10a["status"] == "approved", _job_after_post10a["status"])
+
+        # --- /reject: GET must not mutate ---
+        _jid10b = "job-csrf-reject"
+        _AS10.save_jobs({_jid10b: {
+            "id": _jid10b, "status": "pending", "decision": None,
+            "result": {"file": "csrf_test2.pdf"}, "flags": [],
+        }})
+        _rg10b = _client10.get(f"/reject/{_jid10b}")
+        ck("GET /reject/<id> returns 200 (confirm page, not a mutation)",
+           _rg10b.status_code == 200, _rg10b.status_code)
+        _job_after_get10b = _AS10.load_jobs()[_jid10b]
+        ck("GET /reject/<id> did NOT change job status (still 'pending')",
+           _job_after_get10b["status"] == "pending", _job_after_get10b["status"])
+
+        _rp10b = _client10.post(f"/reject/{_jid10b}", json={})
+        ck("POST /reject/<id> returns 200", _rp10b.status_code == 200, _rp10b.status_code)
+        _job_after_post10b = _AS10.load_jobs()[_jid10b]
+        ck("POST /reject/<id> DID change job status to 'rejected'",
+           _job_after_post10b["status"] == "rejected", _job_after_post10b["status"])
+
+        # --- /adjust: GET already only redirects (never mutated) — confirm that holds ---
+        _jid10c = "job-csrf-adjust"
+        _AS10.save_jobs({_jid10c: {
+            "id": _jid10c, "status": "pending", "decision": None,
+            "result": {"file": "csrf_test3.pdf"}, "flags": [],
+        }})
+        _rg10c = _client10.get(f"/adjust/{_jid10c}", follow_redirects=False)
+        ck("GET /adjust/<id> redirects into the portal (302/301), never mutates",
+           _rg10c.status_code in (301, 302), _rg10c.status_code)
+        _job_after_get10c = _AS10.load_jobs()[_jid10c]
+        ck("GET /adjust/<id> did NOT change job status", _job_after_get10c["status"] == "pending")
+
+        # --- Unknown job on GET -> 404, not a 200 confirm page for a job that doesn't exist ---
+        _r404_10 = _client10.get("/approve/does-not-exist-10")
+        ck("GET /approve/<unknown> -> 404, not a confirm page for a nonexistent job",
+           _r404_10.status_code == 404, _r404_10.status_code)
+    finally:
+        _AS10.JOBS_FILE = _orig_jobs_file10
+        shutil.rmtree(_tmpdir10, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approval_server GET-no-mutation tests — missing dependency: {_e}")
+
+print("approval_email: emailed approve/reject/adjust links carry ?token= when the token "
+      "gate is enabled (token mode previously 401'd every emailed action link)")
+try:
+    import approval_email as _AE11
+    import importlib as _importlib11
+
+    _orig_token11 = _AE11.APPROVAL_TOKEN
+    try:
+        # --- Token configured: every action link + the portal link carries ?token= ---
+        _AE11.APPROVAL_TOKEN = "test-email-token-456"
+        _html11 = _AE11.build_html_email(
+            "job-email-1",
+            {"area_m2": 500, "file": "email_test.pdf", "flags": []},
+            png_b64="",
+        )
+        ck("approve link carries ?token= when APPROVAL_TOKEN is set",
+           "/approve/job-email-1?token=test-email-token-456" in _html11)
+        ck("reject link carries ?token= when APPROVAL_TOKEN is set",
+           "/reject/job-email-1?token=test-email-token-456" in _html11)
+        ck("adjust link carries ?token= when APPROVAL_TOKEN is set",
+           "/adjust/job-email-1?token=test-email-token-456" in _html11)
+        ck("portal review link carries ?token= when APPROVAL_TOKEN is set",
+           "/review/job-email-1?token=test-email-token-456" in _html11)
+
+        # --- No token configured: links are unchanged (no bare '?token=' with an empty value) ---
+        _AE11.APPROVAL_TOKEN = ""
+        _html11b = _AE11.build_html_email(
+            "job-email-2",
+            {"area_m2": 500, "file": "email_test.pdf", "flags": []},
+            png_b64="",
+        )
+        ck("no token configured -> approve link has no ?token= param at all",
+           "token=" not in _html11b.split('href="')[1].split('"')[0]
+           if 'href="' in _html11b else True)
+        ck("no token configured -> approve link is the plain job URL",
+           "/approve/job-email-2" in _html11b)
+    finally:
+        _AE11.APPROVAL_TOKEN = _orig_token11
+except ImportError as _e:
+    print(f"  [SKIP] approval_email token-link tests — missing dependency: {_e}")
+
+print("scale: detect_scale_bar rotation-agnostic + segmented-bar + crash-guard "
+      "(Aryan field report — real SGP sheet 'title 1:250 only — no scale bar detected'; root "
+      "cause: every real Fortel A0/A1 sheet is landscape content in a portrait MediaBox with "
+      "page /Rotate 90/270, and PyMuPDF returns RAW pre-rotation coordinates, so a visually- "
+      "horizontal bar is a stack of near-VERTICAL strokes the old horizontal-only test could "
+      "never match; also the real bar is SEGMENTED [alternating-fill tick blocks] with a fused "
+      "'25m' terminal label, and ms[0]-anchoring on text-extraction order crashed with "
+      "'max() arg is an empty sequence' on two real Winvic sheets)")
+try:
+    import fitz as _fitz_sb
+
+    def _gen_rotated_segmented_bar_sb(out_path, rotation=270):
+        """Portrait-mediabox page (mimics the real 2384x3370 Winvic sheets) with a scale bar drawn
+        as 4 stacked alternating-fill blocks (reportlab 're' rects) + a fused '25m' terminal tick,
+        then rotated via PyMuPDF post-process — reproducing 'visually horizontal bar, raw-space
+        near-vertical strokes' exactly as found on drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf."""
+        _c = canvas.Canvas(out_path, pagesize=(850, 1200))
+        _c.setFont("Helvetica", 10)
+        _c.drawString(50, 150, "Scale 1:250")
+        x0, y0, block_h = 120, 400, 30
+        for i in range(4):
+            y = y0 + i * block_h
+            _c.setFillColorRGB(0, 0, 0) if i % 2 == 0 else _c.setFillColorRGB(1, 1, 1)
+            _c.rect(x0, y, 6, block_h, fill=1, stroke=1)
+        for i, lab in enumerate(["0", "5", "10", "15", "20", "25m"]):
+            _c.drawString(x0 + 10, y0 + i * block_h - 3, lab)
+        _c.save()
+        _d = _fitz_sb.open(out_path)
+        _d[0].set_rotation(rotation)
+        _d.saveIncr()
+        _d.close()
+
+    _sb_expected_k = 25 / 120   # 25 m over the 4x30pt stacked-block span
+
+    _path_sb270 = "/tmp/_sb_rotated270.pdf"
+    _gen_rotated_segmented_bar_sb(_path_sb270, rotation=270)
+    _k_sb270, _info_sb270 = detect_scale_bar(_path_sb270)
+    ck("rotation=270 segmented tick-block bar (real Winvic sheet style) now detects",
+       _k_sb270 is not None and abs(_k_sb270 - _sb_expected_k) < 1e-9, (_k_sb270, _info_sb270))
+
+    _path_sb90 = "/tmp/_sb_rotated90.pdf"
+    _gen_rotated_segmented_bar_sb(_path_sb90, rotation=90)
+    _k_sb90, _info_sb90 = detect_scale_bar(_path_sb90)
+    ck("rotation=90 segmented tick-block bar also detects",
+       _k_sb90 is not None and abs(_k_sb90 - _sb_expected_k) < 1e-9, (_k_sb90, _info_sb90))
+
+    _path_sb0 = "/tmp/_sb_unrotated_control.pdf"
+    _gen_rotated_segmented_bar_sb(_path_sb0, rotation=0)
+    _k_sb0, _info_sb0 = detect_scale_bar(_path_sb0)
+    ck("rotation=0 control (same fixture, no rotation) also detects — proves the fix is "
+       "additive, not rotation-only", _k_sb0 is not None and abs(_k_sb0 - _sb_expected_k) < 1e-9,
+       (_k_sb0, _info_sb0))
+
+    # Unrotated segmented bar with a WIDE fused terminal tick ('50m'), several alternating blocks —
+    # exercises the horizontal branch of the same clustering/merge logic.
+    def _gen_segmented_bar_h_sb(out_path):
+        _c = canvas.Canvas(out_path, pagesize=(1400, 900))
+        _c.setFont("Helvetica", 10)
+        _c.drawString(100, 800, "Scale 1:200")
+        x0, y0, block_w = 200, 300, 40
+        for i in range(5):
+            x = x0 + i * block_w
+            _c.setFillColorRGB(0, 0, 0) if i % 2 == 0 else _c.setFillColorRGB(1, 1, 1)
+            _c.rect(x, y0, block_w, 8, fill=1, stroke=1)
+        for i, lab in enumerate(["0", "10", "20", "30", "40", "50m"]):
+            _c.drawString(x0 + i * block_w - 5, y0 - 15, lab)
+        _c.save()
+
+    _path_sb_h = "/tmp/_sb_segmented_h.pdf"
+    _gen_segmented_bar_h_sb(_path_sb_h)
+    _k_sbh, _info_sbh = detect_scale_bar(_path_sb_h)
+    _expected_sbh = 50 / (5 * 40)
+    ck("horizontal segmented alternating-fill bar with fused '50m' terminal tick",
+       _k_sbh is not None and abs(_k_sbh - _expected_sbh) < 1e-9, (_k_sbh, _info_sbh))
+
+    # Crash-guard regression: an early, text-order-first 'm' token with NO nearby bar/digits at
+    # all must not raise (old code: max() on an empty generator -> ValueError, reproduced directly
+    # on drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf and Dock_Slab_Area_Proposed_Site_Plan.pdf).
+    # The real scale bar (a plain line + bare 'm' label, further down the page) must still be found.
+    def _gen_bad_anchor_sb(out_path):
+        _c = canvas.Canvas(out_path, pagesize=(1400, 900))
+        _c.setFont("Helvetica", 10)
+        _c.drawString(700, 850, "m")                      # unrelated early 'm', no nearby digits
+        _c.line(100, 150, 500, 150)
+        _c.drawString(250, 160, "0          40 m")
+        _c.save()
+
+    _path_bad = "/tmp/_sb_bad_anchor.pdf"
+    _gen_bad_anchor_sb(_path_bad)
+    try:
+        _k_bad, _info_bad = detect_scale_bar(_path_bad)
+        ck("no crash when the first text-order 'm' token has zero nearby bar/digits "
+           "(old ms[0] anchor -> max() on empty sequence -> ValueError)", True, (_k_bad, _info_bad))
+        ck("bad-anchor fixture still finds the REAL bar via a later, valid label",
+           _k_bad is not None and abs(_k_bad - 0.1) < 1e-9, (_k_bad, _info_bad))
+    except Exception as _e:
+        ck("no crash when the first text-order 'm' token has zero nearby bar/digits "
+           "(old ms[0] anchor -> max() on empty sequence -> ValueError)", False,
+           f"{type(_e).__name__}: {_e}")
+
+    # A page with literally no scale-bar shape at all must still return cleanly, never raise.
+    _path_none = "/tmp/_sb_no_bar_at_all.pdf"
+    _c_none = canvas.Canvas(_path_none, pagesize=(800, 600))
+    _c_none.drawString(100, 100, "no bar here, just some m words and 5 10 15 numbers")
+    _c_none.save()
+    try:
+        _k_none, _info_none = detect_scale_bar(_path_none)
+        ck("page with no real scale-bar shape returns (None, ...) cleanly, never raises",
+           _k_none is None, (_k_none, _info_none))
+    except Exception as _e:
+        ck("page with no real scale-bar shape returns (None, ...) cleanly, never raises",
+           False, f"{type(_e).__name__}: {_e}")
+
+    # Detection improvements must never bypass verification: scale_consensus still gates a
+    # disagreeing bar-vs-title pair (a rotated segmented bar detected via the fix, paired with a
+    # deliberately wrong title-block scale) exactly as it does for the unrotated path.
+    _k_gate, _flags_gate = scale_consensus([(_k_sb270, 1), (25 / 40, 1)], tol=0.03)
+    ck("scale_consensus still REFUSES when the (correctly-detected, rotation-fixed) bar "
+       "disagrees with a second reference beyond tol — detection fix does not bypass the gate",
+       _k_gate is None and any("DISAGREE" in f for f in _flags_gate), _flags_gate)
+
+    _k_agree, _flags_agree = scale_consensus([(_k_sb270, 1), (_k_sb270 * 1.01, 1)], tol=0.03)
+    ck("scale_consensus VERIFIES the rotation-fixed bar reading when a second reference agrees "
+       "within tol", _k_agree is not None, _flags_agree)
+
+except ImportError as _e:
+    print(f"  [SKIP] scale.py rotation/segmented-bar tests — missing dependency: {_e}")
+
+print("scale: real-sheet proof — Winvic sheets that already detected still detect after the fix, "
+      "and the SGP-family real sheet that previously missed entirely now detects + VERIFIES "
+      "against its title-block scale (never bypassing scale_consensus)")
+try:
+    import os as _os_sb
+
+    _real_sheets_unchanged = [
+        ("drawings/_int_d77.pdf", 0.08819445326652144),
+        ("drawings/_int_d77_borders.pdf", 0.08819445326652144),
+    ]
+    for _pdf_path, _expected_k in _real_sheets_unchanged:
+        if _os_sb.path.exists(_pdf_path):
+            _k_chk, _info_chk = detect_scale_bar(_pdf_path)
+            ck(f"unrotated gold fixture {_pdf_path} still detects the same k as before the fix",
+               _k_chk is not None and abs(_k_chk - _expected_k) < 1e-6, (_k_chk, _info_chk))
+        else:
+            print(f"  [SKIP] {_pdf_path} not present locally")
+
+    # The real Winvic sheets (270/90-rotated) must no longer crash, and the two with a genuine
+    # readable segmented bar (Yard, Dock — same title-block template) must now agree with each
+    # other (same physical bar) instead of one crashing and the other silently mis-anchoring.
+    _winvic_rotated = [
+        "drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf",
+        "drawings/winvic/Dock_Slab_Area_Proposed_Site_Plan.pdf",
+    ]
+    _winvic_ks = {}
+    for _wp in _winvic_rotated:
+        if _os_sb.path.exists(_wp):
+            try:
+                _k_w, _info_w = detect_scale_bar(_wp)
+                _winvic_ks[_wp] = _k_w
+                ck(f"{_wp} (rotation 270) no longer crashes calling detect_scale_bar",
+                   True, (_k_w, _info_w))
+            except Exception as _e:
+                ck(f"{_wp} (rotation 270) no longer crashes calling detect_scale_bar",
+                   False, f"{type(_e).__name__}: {_e}")
+        else:
+            print(f"  [SKIP] {_wp} not present locally")
+
+    if len(_winvic_ks) == 2 and all(_v is not None for _v in _winvic_ks.values()):
+        _vals = list(_winvic_ks.values())
+        ck("Yard and Dock (same rotated title-block template, same '0 5 10 15 20 25m' bar) "
+           "agree on k within 0.1% — both correctly read the same physical scale bar",
+           abs(_vals[0] - _vals[1]) / _vals[1] < 0.001, _winvic_ks)
+
+    # Full scale_for() (takeoff_unmarked's consensus-gated wrapper) on the real UNMARKED-vector,
+    # rotated, segmented-bar sheet that most closely matches Aryan's real SGP sheet's shape
+    # (same title-block family: rotated A0/A1, printed 1:N scale + graphical bar) — must now
+    # VERIFY rather than fall back to 'title only — no scale bar detected'.
+    _tp_site_plan = ("drawings/tender_pack/2-Enquiry/01-Tender/Drawings/Proposed_Site_Plan.pdf")
+    if _os_sb.path.exists(_tp_site_plan):
+        import takeoff_unmarked as _TU_sb
+        _k_tp, _verified_tp, _note_tp, _sources_tp = _TU_sb.scale_for(_tp_site_plan)
+        ck("real rotated tender-pack Proposed_Site_Plan.pdf: scale bar now VERIFIED against "
+           "title-block (was previously undetectable/unverified pre-fix)",
+           _verified_tp is True, _note_tp)
+        ck("...and it went through scale_consensus (both sources present), not a bypass",
+           "scale_bar" in _sources_tp and "title_block" in _sources_tp, _sources_tp)
+    else:
+        print(f"  [SKIP] {_tp_site_plan} not present locally")
+except ImportError as _e:
+    print(f"  [SKIP] scale.py real-sheet regression tests — missing dependency: {_e}")
 
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)

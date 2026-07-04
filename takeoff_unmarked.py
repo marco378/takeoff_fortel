@@ -101,6 +101,11 @@ MARGIN_FRAC = 0.025
 # treated as a legend swatch / title-block chip / stray glyph, not a second yard region.
 SATELLITE_FRAC = 0.015
 
+# Plausible single service-yard area range (m²) — shared by segment_hatch's best-component
+# selection AND the swatch-lock fallback gate below (same magic numbers, one place).
+PLAUSIBLE_MIN_M2 = 200
+PLAUSIBLE_MAX_M2 = 50_000
+
 
 def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
                   title_block_frac=0.0, exclude_border=True, _diag=None):
@@ -186,7 +191,7 @@ def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
     best_idx = order[0]                      # fallback: absolute largest
     if k is not None:
         px_per_m2 = (S * S) / (k * k)
-        _MIN_M2, _MAX_M2 = 200, 50_000      # plausible single service-yard range
+        _MIN_M2, _MAX_M2 = PLAUSIBLE_MIN_M2, PLAUSIBLE_MAX_M2   # plausible single service-yard range
         for idx in order:
             cand_m2 = sizes[idx] / px_per_m2
             if _MIN_M2 <= cand_m2 <= _MAX_M2:
@@ -348,12 +353,43 @@ def drawing_style(im, white_thresh=233, thresh=0.03):
 # ---------------------------------------------------------------- scale
 SCALE_BAR_AGREE_TOL = 0.03   # ±3 % — bar and title-block must agree within this to verify
 
+# Plausible drawing-scale ratio band (1:N). Derived from the realistic range of architectural /
+# civil engineering drawing scales actually used on Fortel tender packs (title-block 1:N values
+# seen across the corpus run from 1:20 detail blow-ups to ~1:2500 site-location plans; 1:5000 gives
+# headroom above that without being so wide it admits a false detection). A detected scale bar
+# implying a ratio outside this band is not "a different but real scale" — it is a mis-paired
+# label/line (e.g. an unrelated "7016 m" dimension callout fused to a nearby 34pt line fragment)
+# and must be rejected as a false anchor rather than trusted over the title block.
+PLAUSIBLE_SCALE_RATIO_MIN = 20
+PLAUSIBLE_SCALE_RATIO_MAX = 5000
+
+
+def _implausible_scale_ratio(k_m_per_pt):
+    """True if k (m/pt) implies a 1:N drawing ratio outside the plausible band, i.e. the value
+    that PRODUCED k (a detected scale-bar length/label pairing) is almost certainly a false
+    anchor rather than a genuine — if unusual — drawing scale."""
+    if not k_m_per_pt or k_m_per_pt <= 0:
+        return True
+    implied_n = k_m_per_pt / SC.PT_PER_M
+    return not (PLAUSIBLE_SCALE_RATIO_MIN <= implied_n <= PLAUSIBLE_SCALE_RATIO_MAX)
+
+
 def scale_for(pdf, page=0):
     """(k_m_per_pt, verified_bool, note, sources).
 
     verified_bool is True ONLY when a physical scale bar is detected AND it agrees with the
     title-block stated scale within SCALE_BAR_AGREE_TOL (±3 %).  In all other cases it is False
-    and `note` explains why (no bar found / bar disagrees by X%).
+    and `note` explains why (no bar found / bar disagrees by X% / bar rejected as implausible).
+
+    On bar/title disagreement beyond tolerance this NEVER auto-picks a side (CLAUDE.md invariant
+    3 — "disagreement -> refuse, don't auto-pick"):
+      (a) if the bar-implied ratio is implausible for a drawing (see _implausible_scale_ratio),
+          the bar is almost certainly a false detection (an unrelated line/label pairing) — the
+          title-block k is used instead, flagged as a rejected-bar case, still UNVERIFIED.
+      (b) if both sources are individually plausible but disagree, neither is picked — the
+          title-block k is used for DISPLAY only, flagged MIXED/DISAGREE, still UNVERIFIED, and
+          the assessor must set the scale explicitly.
+    Both branches return verified=False; there is no path out of a disagreement that returns True.
 
     sources: dict with keys 'title_block' and/or 'scale_bar' recording the contributing values.
     """
@@ -385,14 +421,32 @@ def scale_for(pdf, page=0):
                         f"(diff {pct_diff*100:.1f}% ≤ {SCALE_BAR_AGREE_TOL*100:.0f}%) — VERIFIED "
                         f"[{cflags[0]}]")
                 return kbar, True, note, sources
+            elif _implausible_scale_ratio(kbar):
+                # (a) bar disagrees AND is individually implausible -> false anchor. Reject the
+                # bar, fall back to title-block k. Still UNVERIFIED (single uncorroborated source).
+                implied_n = kbar / SC.PT_PER_M
+                note = (f"scale bar candidate rejected as implausible (bar {info} implies "
+                        f"~1:{implied_n:.0f}, outside plausible 1:{PLAUSIBLE_SCALE_RATIO_MIN}-"
+                        f"1:{PLAUSIBLE_SCALE_RATIO_MAX}) — title-block 1:{denom} scale used, "
+                        "UNVERIFIED")
+                return k_title_full, False, note, sources
             else:
-                note = (f"scale bar ({info}) DISAGREES with title 1:{denom}: "
-                        f"bar k={kbar:.5f} vs title k={k_title_full:.5f} "
-                        f"({pct_diff*100:.1f}% > {SCALE_BAR_AGREE_TOL*100:.0f}%) — "
-                        "using bar scale; assessor should confirm which is correct")
-                return kbar, False, note, sources
+                # (b) both individually plausible but disagree -> MIXED/DISAGREE. Do not pick
+                # either silently: keep title k for display, flag for assessor, stay UNVERIFIED.
+                note = (f"MIXED/DISAGREE — scale bar ({info}, k={kbar:.5f}) and title 1:{denom} "
+                        f"(k={k_title_full:.5f}) disagree by {pct_diff*100:.1f}% "
+                        f"(> {SCALE_BAR_AGREE_TOL*100:.0f}%) and both are individually plausible — "
+                        "assessor must set scale; title-block value shown, NOT auto-picked")
+                return k_title_full, False, note, sources
         else:
             # Bar found but no title-block scale to compare against
+            if _implausible_scale_ratio(kbar):
+                implied_n = kbar / SC.PT_PER_M
+                note = (f"scale bar candidate rejected as implausible (bar {info} implies "
+                        f"~1:{implied_n:.0f}, outside plausible 1:{PLAUSIBLE_SCALE_RATIO_MIN}-"
+                        f"1:{PLAUSIBLE_SCALE_RATIO_MAX}, no title-block to fall back on) — no scale")
+                sources.pop("scale_bar", None)
+                return None, False, note, sources
             note = f"scale bar {info} (no title-block 1:N found to cross-check) — unverified"
             return kbar, False, note, sources
 
@@ -422,30 +476,49 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
 
     # --- region colour ---
     # The priced "Concrete Service Yard construction" hatch on SGP architect sheets is a light grey
-    # (validated across all 4 Hemington units). We SEGMENT on that grey, and use the legend only to
-    # CONFIRM the concrete-yard entry exists and that its swatch is grey (the anchor). Reading an
-    # arbitrary swatch pixel as the segmentation colour proved fragile (grabbed green/white on other
-    # units → absurd areas), so the grey convention is primary; --api can override for non-SGP packs.
-    GREY = (214, 214, 214)   # band center; with tol=14 -> grey [200,228], matching the validated session
-    rgb = GREY
+    # (validated across all 4 Hemington units). Historically we always SEGMENTED on a hard-coded
+    # generic grey band centred at 214 regardless of what the legend swatch actually read, using the
+    # swatch only to CONFIRM a concrete-yard entry exists. Aryan's real SGP sheet (105301-SGP-01
+    # D77) showed why that is unsafe: its legend swatch read (224,224,224), and the sheet ALSO has a
+    # second, separate grey legend entry "Footpaths (ancillary): Concrete" whose darker fill lands
+    # inside the generic [200,228] band and is close enough to the yard's own bottom edge that
+    # binary_closing fuses it into the same connected component — a straight +16 m² over-measure
+    # (3,172 vs Smita's Bluebeam 3,156) that is invisible to the border/satellite exclusion above
+    # because it is CONNECTED, not a separate blob.
+    #
+    # Fix: LOCK the segmentation band centre to the legend-confirmed swatch colour when the swatch
+    # is readable and grey (e.g. 224 here) — the darker ancillary-concrete grey then falls outside
+    # the locked ±tol band and is never admitted into the mask, regardless of closing. A plausibility
+    # gate (same PLAUSIBLE_MIN_M2/MAX_M2 range segment_hatch already uses for best-component choice)
+    # falls back to the validated generic 214 band if the locked band yields nothing plausible —
+    # this is what prevents a repeat of the Demo-4 regression (swatch reads in [195,199]∪[229,236]
+    # while the real hatch is 214 → a naive lock would produce area=None on a perfectly measurable
+    # sheet). Synthetic gold fixtures (_int_d77*.pdf) have unreadable swatches, so they always take
+    # the fallback path unchanged — their golds (3,159 / 3,159) are untouched by this change.
+    GREY_FALLBACK = (214, 214, 214)   # validated SGP convention; band [200,228] with tol=14
+    GREY_TOL = 14
+    rgb = GREY_FALLBACK
+    swatch_locked = False
     swatch, label = find_concrete_swatch_rgb(pdf, im=im, S=S)
     if label and swatch:
         is_grey = (max(swatch) - min(swatch) <= 18) and (188 <= sum(swatch) / 3 <= 236)
         if is_grey:
-            # Keep SEGMENTING on the validated GREY band center (214). Do NOT switch rgb to the
-            # raw swatch pixel: the swatch can read anywhere in [195,199]∪[229,236] and still pass
-            # is_grey, but a ±tol band centred there misses the actual 214 hatch → 0 px → area=None
-            # (Demo-4 regression that made colour-coded D77 return no area). The legend swatch is
-            # used only to CONFIRM the concrete-yard entry is grey, exactly as in the validated run.
-            flags.append(f"legend '{label}': swatch {swatch} is grey — concrete-yard hatch CONFIRMED "
-                         f"(segmenting on validated grey band {GREY})")
+            # LOCK the band centre to the legend-confirmed swatch colour. Other grey surfaces on
+            # the sheet (e.g. "Footpaths (ancillary): Concrete") that render at a different grey
+            # fall outside this locked band and are excluded, even if they would have fallen inside
+            # the old generic [200,228] band.
+            rgb = swatch
+            swatch_locked = True
+            flags.append(f"legend '{label}': swatch {swatch} grey — band LOCKED to swatch centre "
+                         f"±{GREY_TOL} (other grey surfaces, e.g. 'Footpaths (ancillary): Concrete', "
+                         f"fall outside the locked band and are excluded)")
         else:
             flags.append(f"legend '{label}' found but swatch {swatch} not grey — using SGP grey convention "
-                         f"{GREY} (lower confidence; assessor confirm)")
+                         f"{GREY_FALLBACK} (lower confidence; assessor confirm)")
     elif label:
-        flags.append(f"legend '{label}' found (swatch unreadable) — using SGP grey convention {GREY}")
+        flags.append(f"legend '{label}' found (swatch unreadable) — using SGP grey convention {GREY_FALLBACK}")
     else:
-        flags.append(f"no concrete-yard legend label — grey-hatch heuristic {GREY} (LOW confidence; assessor confirm)")
+        flags.append(f"no concrete-yard legend label — grey-hatch heuristic {GREY_FALLBACK} (LOW confidence; assessor confirm)")
     if use_api:
         try:
             import llm_client
@@ -467,12 +540,41 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 "flags": flags + ["no scale — cannot measure"]}
 
     _seg_diag = {}
-    comp = segment_hatch(im, rgb, k=k, S=S, _diag=_seg_diag)
+    comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S, _diag=_seg_diag)
+
+    # --- swatch-lock plausibility gate: fall back to the validated generic grey band if the
+    # locked swatch band produced nothing plausible (closes the Demo-4 regression class — a
+    # swatch reading in [195,199]∪[229,236] while the real hatch is 214 would otherwise lock an
+    # empty band and silently turn a measurable sheet into area=None). ---
+    if swatch_locked:
+        px_per_m2 = (S * S) / (k * k)
+        cand_m2 = (int(comp.sum()) / px_per_m2) if comp is not None else 0.0
+        if comp is None or comp.sum() == 0 or not (PLAUSIBLE_MIN_M2 <= cand_m2 <= PLAUSIBLE_MAX_M2):
+            flags.append(f"swatch-locked band {swatch}±{GREY_TOL} produced no plausible yard region "
+                         f"(candidate {cand_m2:.0f} m²) — FELL BACK to validated SGP grey band "
+                         f"{GREY_FALLBACK}±{GREY_TOL}; assessor confirm region colour")
+            rgb = GREY_FALLBACK
+            _seg_diag = {}
+            comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S, _diag=_seg_diag)
+
     if comp is None or comp.sum() == 0:
         return {"pdf": pdf, "area_m2": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "flags": flags + ["no hatch pixels matched — assessor must trace"]}
     px = int(comp.sum())
+
+    # --- confidence cross-check: dominant grey value of the chosen component vs the band centre
+    # actually used to select it (cheap sanity signal for the assessor, no behaviour change). ---
+    try:
+        comp_pixels = im[comp]
+        if comp_pixels.size:
+            dom_mode = int(np.bincount(comp_pixels[:, 0]).argmax())
+            matches = abs(dom_mode - rgb[0]) <= GREY_TOL
+            flags.append(f"component dominant grey {dom_mode} — "
+                         f"{'matches' if matches else 'DIFFERS from'} segmentation centre {rgb}")
+    except Exception:
+        pass
+
     flags.append("dock-bay recesses & interior islands kept as DEDUCTIONS (not filled); thin paint bridged by closing")
     if _seg_diag.get('void_fill_m2', 0) > 0:
         flags.append(f"void-fill: +{_seg_diag['void_fill_m2']} m² from {_seg_diag['void_count']} "

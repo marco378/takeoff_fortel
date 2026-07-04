@@ -42,9 +42,20 @@ SMTP_HOST         = os.getenv("SMTP_HOST",     "smtp.gmail.com")
 SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER         = os.getenv("SMTP_USER",     "estimatingai@fortel.co.uk")
 SMTP_PASS         = os.getenv("SMTP_PASS",     "")
+# Same token env as approval_server.py (PORTAL_TOKEN, with APPROVAL_TOKEN as an older alias,
+# PORTAL_TOKEN wins if both set). When set, approval_server's @app.before_request token gate
+# 401s every route including /approve, /reject, /adjust — so emailed action links MUST carry
+# ?token=<token> or clicking them from the email just hits a 401 page. See build_html_email.
+APPROVAL_TOKEN    = os.getenv("PORTAL_TOKEN") or os.getenv("APPROVAL_TOKEN", "")
 
-# Stored pending-review jobs (simple JSON file; replace with DB in production)
-JOBS_FILE = Path(__file__).parent / "approval_jobs.json"
+# Stored pending-review jobs (simple JSON file; replace with DB in production).
+# Same JOBS_FILE env override as approval_server.py so a caller (a test, a QA instance,
+# n8n pointed at a scratch file) can redirect writes away from the live jobs file instead
+# of hard-writing it. _load_jobs()/_save_jobs() below read this module attribute at call
+# time (not a cached copy), so tests that monkeypatch approval_email.JOBS_FILE after
+# import (the established pattern already used for approval_server.JOBS_FILE in
+# ci_tests.py) take effect immediately.
+JOBS_FILE = Path(os.getenv("JOBS_FILE") or (Path(__file__).parent / "approval_jobs.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -125,12 +136,28 @@ def png_to_b64(png_bytes: bytes) -> str:
 # ---------------------------------------------------------------------------
 def _load_jobs() -> dict:
     if JOBS_FILE.exists():
-        return json.loads(JOBS_FILE.read_text())
+        try:
+            return json.loads(JOBS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            # Mirror approval_server.load_jobs()'s fail-safe: a torn/corrupt read must never
+            # crash a caller (e.g. create_job below) — treat it as an empty job store rather
+            # than raising mid-request.
+            return {}
     return {}
 
 
 def _save_jobs(jobs: dict):
-    JOBS_FILE.write_text(json.dumps(jobs, indent=2))
+    """Write atomically: temp file + os.replace, same pattern as approval_server.save_jobs.
+
+    Plain write_text() truncates then streams bytes in, so a concurrent reader (the portal
+    polling GET /jobs, or another writer) can observe a half-written file. Write to a temp
+    file in the same directory and os.replace() it into place — POSIX guarantees the rename
+    is atomic, so readers always see either the old or the new complete file.
+    """
+    JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = JOBS_FILE.with_suffix(f".json.tmp{os.getpid()}")
+    tmp.write_text(json.dumps(jobs, indent=2))
+    os.replace(tmp, JOBS_FILE)
 
 
 def create_job(pdf_path: str, result: dict,
@@ -306,13 +333,26 @@ def _costing_block(result: dict) -> str:
       </td></tr>"""
 
 
+def _with_token(url: str) -> str:
+    """Append ?token=<APPROVAL_TOKEN> when the token gate is enabled, so a link clicked
+    straight out of the email doesn't just hit approval_server's 401 page. No-op when no
+    token is configured (local/dev, auth disabled)."""
+    if not APPROVAL_TOKEN:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}token={APPROVAL_TOKEN}"
+
+
 def build_html_email(job_id: str, result: dict, png_b64: str,
                      project_name: str = None, project_ref: str = None) -> str:
     base = APPROVAL_BASE_URL.rstrip("/")
-    approve_url = f"{base}/approve/{job_id}"
-    reject_url  = f"{base}/reject/{job_id}"
-    adjust_url  = f"{base}/adjust/{job_id}"
-    portal_url  = f"{base}/review/{job_id}"
+    # GET on these routes now only renders a no-mutation confirm page with a POST button
+    # (CSRF hardening — see approval_server.py's approve/reject/adjust handlers); the token
+    # is still appended so the confirm page itself is reachable when the token gate is on.
+    approve_url = _with_token(f"{base}/approve/{job_id}")
+    reject_url  = _with_token(f"{base}/reject/{job_id}")
+    adjust_url  = _with_token(f"{base}/adjust/{job_id}")
+    portal_url  = _with_token(f"{base}/review/{job_id}")
 
     area    = result.get("area_m2")
     area_s  = f"{area:,.0f} m²" if area else "— (not measured)"

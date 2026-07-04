@@ -52,3 +52,19 @@ overlapping double-count; unknown mesh; zero/negative area. All fixed or flagged
 2. Assessor UI: polygon + scale over the drawing, one-click confirm/nudge, log corrections as training data.
 3. Scale-bar / grid CV detector as a second, cross-checked source.
 4. Wire measured area -> `costing.py` -> quote draft in the n8n flow.
+
+## Running it in production (assessor portal)
+
+Full operations guide (start/stop/restart, log + backup locations, updating, health
+check): see `DEPLOY.md`. Environment variables: see `.env.example`.
+
+Quick reference:
+```
+cp .env.example .env      # fill in real values
+./run.sh start             # start the portal, logs to logs/portal.log
+./run.sh status            # PID + one-line health check
+./run.sh stop               # stop it
+```
+For an OS-supervised deployment (auto-restart on crash/boot) on a shared Mac, use the
+launchd unit template `com.fortel.approval.plist.example` — see `DEPLOY.md` for the
+install steps.

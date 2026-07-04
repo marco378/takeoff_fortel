@@ -21,10 +21,19 @@ Run:
   python3 approval_server.py          # default port 5001
 
 Environment:
-  APPROVAL_PORT   default 5001
-  APPROVAL_HOST   default 0.0.0.0 (set to 127.0.0.1 for local-only)
+  APPROVAL_PORT    default 5001
+  APPROVAL_HOST    default 127.0.0.1 (single-team deployment; set 0.0.0.0 only with
+                    APPROVAL_TOKEN also set, e.g. on the shared office Mac)
+  PORTAL_TOKEN     shared secret gating every mutating/data-bearing route (APPROVAL_TOKEN is
+                    accepted as an older alias). If unset, the server runs with NO auth (fine
+                    for 127.0.0.1-only local use) but refuses to bind 0.0.0.0 without one (see
+                    main guard below).
+  JOBS_FILE        override path to the jobs datastore (default approval_jobs.json next to
+                    this file) — lets QA/test instances point at a scratch file instead of
+                    colliding with the live jobs file (CLAUDE.md: "QA jobs out of
+                    approval_jobs.json").
 """
-import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil
+import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib
 from email import policy
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
@@ -32,11 +41,77 @@ from flask import Flask, request, jsonify, send_file, redirect, Response
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
 
-JOBS_FILE    = Path(__file__).parent / "approval_jobs.json"
+JOBS_FILE    = Path(os.getenv("JOBS_FILE") or (Path(__file__).parent / "approval_jobs.json"))
+# JOBS_ARCHIVE_FILE / BACKUP_DIR used to derive from JOBS_FILE.parent only — so a QA instance
+# started with JOBS_FILE=approval_jobs.qa.json still shared approval_jobs_archive.json and
+# backups/ with the live instance (both live in the same directory). Archive/backups now
+# derive from the JOBS_FILE STEM instead, so approval_jobs.qa.json gets its own
+# approval_jobs.qa_archive.json and backups_approval_jobs.qa/ — never colliding with the live
+# instance's approval_jobs_archive.json / backups/. Dedicated env overrides win if set
+# (e.g. a QA setup that wants archive/backups somewhere else entirely).
+JOBS_ARCHIVE_FILE = Path(os.getenv("JOBS_ARCHIVE_FILE") or
+                         (JOBS_FILE.parent / f"{JOBS_FILE.stem}_archive.json"))
 TRAINING_LOG = Path(__file__).parent / "training_log.jsonl"
 PORTAL_HTML  = Path(__file__).parent / "assessor_portal.html"
+BACKUP_DIR   = Path(os.getenv("BACKUP_DIR") or
+                    (JOBS_FILE.parent / ("backups" if JOBS_FILE.stem == "approval_jobs"
+                                         else f"backups_{JOBS_FILE.stem}")))
+BACKUP_KEEP  = 14   # keep the newest N daily backups
 
 _jobs_lock = threading.Lock()
+
+# ── Auth (pragmatic shared-secret — right-sized for a single small team) ─────
+# PORTAL_TOKEN (or its older alias APPROVAL_TOKEN — both accepted, PORTAL_TOKEN wins if both
+# are set), if set, gates every route except /status (health-check) and the static portal
+# shell itself (the portal's own fetch() calls still need the token/cookie to get any data
+# back, so an unauthenticated visitor sees an empty, non-functional page — not a 404, since a
+# 404 here would be more confusing than useful).
+APPROVAL_TOKEN = os.getenv("PORTAL_TOKEN") or os.getenv("APPROVAL_TOKEN", "")
+_TOKEN_COOKIE  = "approval_token"
+
+
+def _token_ok(supplied: str) -> bool:
+    if not APPROVAL_TOKEN or not supplied:
+        return False
+    # constant-time compare — this is a shared secret, not a public value
+    return secrets.compare_digest(supplied, APPROVAL_TOKEN)
+
+
+@app.before_request
+def _require_token():
+    if not APPROVAL_TOKEN:
+        return None  # no token configured -> auth disabled (local/dev use)
+    if request.method == "OPTIONS":
+        return None
+    if request.path == "/status":
+        return None
+    # One-time bootstrap: /portal?token=XXX sets the cookie, then redirects to the clean URL
+    # so the token never lingers in browser history/bookmarks past the first visit.
+    if request.path == "/portal":
+        qtoken = request.args.get("token", "")
+        if _token_ok(qtoken):
+            resp = redirect("/portal")
+            resp.set_cookie(_TOKEN_COOKIE, APPROVAL_TOKEN, httponly=True, samesite="Lax",
+                             max_age=60 * 60 * 24 * 30)
+            return resp
+        if _token_ok(request.cookies.get(_TOKEN_COOKIE, "")):
+            return None
+        return Response(
+            "Fortel Approval Portal — authorisation required.\n"
+            "Ask Jas for the portal link (it includes a one-time ?token=... parameter).",
+            401, {"Content-Type": "text/plain"})
+    # Every other route: accept Bearer header, cookie, or (for emailed action links) ?token=
+    supplied = ""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        supplied = auth_header[len("Bearer "):]
+    if not supplied:
+        supplied = request.cookies.get(_TOKEN_COOKIE, "")
+    if not supplied:
+        supplied = request.args.get("token", "")
+    if not _token_ok(supplied):
+        return jsonify({"error": "unauthorized — missing or invalid token"}), 401
+    return None
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -52,10 +127,53 @@ def load_jobs() -> dict:
     """
     if JOBS_FILE.exists():
         try:
-            return json.loads(JOBS_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
+            text = JOBS_FILE.read_text()
+            return json.loads(text)
+        except (json.JSONDecodeError, OSError) as e:
+            # A non-empty file that fails to parse is a real corruption event, not the benign
+            # torn-read race the try/except above was originally written for (this file
+            # predates atomic writes for some external writers). Preserve the evidence instead
+            # of silently returning {} and then having the next save_jobs() overwrite it —
+            # rename the bad file aside so it can be inspected/recovered, and log loudly so a
+            # blank job list in the portal is never a silent mystery.
+            try:
+                if JOBS_FILE.exists() and JOBS_FILE.stat().st_size > 0:
+                    corrupt_path = JOBS_FILE.with_suffix(
+                        f".json.corrupt-{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}")
+                    shutil.copy2(JOBS_FILE, corrupt_path)
+                    print(f"[load_jobs] CRITICAL: {JOBS_FILE} failed to parse ({e}); "
+                          f"preserved a copy at {corrupt_path}. Returning empty job list.")
+            except OSError:
+                pass
             return {}
     return {}
+
+def _rotate_backup():
+    """Once per calendar day, copy the current jobs file into backups/ before the first save
+    of the day, then prune to the newest BACKUP_KEEP. Cheap insurance against a corrupting
+    write/edit destroying all decision history — no database needed at this scale.
+
+    Backup filenames are keyed off JOBS_FILE.stem (not hardcoded "approval_jobs") so that if
+    BACKUP_DIR is ever shared between two differently-named jobs files (e.g. an explicit
+    BACKUP_DIR override), their dated backups don't collide or get pruned against each other.
+    """
+    try:
+        stem = JOBS_FILE.stem
+        if JOBS_FILE.exists():
+            BACKUP_DIR.mkdir(exist_ok=True)
+            today = datetime.date.today().isoformat()
+            dated = BACKUP_DIR / f"{stem}.{today}.json"
+            if not dated.exists():
+                shutil.copy2(JOBS_FILE, dated)
+        # Prune unconditionally (not just when a new backup was just made) — otherwise a
+        # backlog of old backups (e.g. BACKUP_KEEP lowered, or files added by another process)
+        # never gets cleaned up once today's backup already exists.
+        if BACKUP_DIR.exists():
+            backups = sorted(BACKUP_DIR.glob(f"{stem}.*.json"))
+            for stale in backups[:-BACKUP_KEEP]:
+                stale.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"[_rotate_backup] WARNING: could not rotate jobs backup: {e}")
 
 def save_jobs(jobs: dict):
     """Write approval_jobs.json atomically.
@@ -68,6 +186,7 @@ def save_jobs(jobs: dict):
     is atomic, so readers always see either the old or the new complete file, never a partial
     one.
     """
+    _rotate_backup()
     tmp = JOBS_FILE.with_suffix(f".json.tmp{os.getpid()}")
     tmp.write_text(json.dumps(jobs, indent=2))
     os.replace(tmp, JOBS_FILE)
@@ -82,7 +201,20 @@ def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
 
 def get_job(job_id: str) -> dict | None:
-    return load_jobs().get(job_id)
+    """Look up a job in the hot store, falling back to the archive.
+
+    /archive moves a job's record into approval_jobs_archive.json and deletes it from the hot
+    JOBS_FILE (see archive_job) — but /snapshot/<id>, /job/<id> and /quotation/<id>.<fmt> all
+    route through get_job()/require_job(), so an archived job used to 404 on every one of
+    them. That's a real regression for an assessor who archives a job then later wants to look
+    at (or re-download the quotation for) what they archived — soft-delete is supposed to mean
+    "hidden from the default list", not "unreachable". Fall back to the archive so archived
+    jobs keep working everywhere except the default /jobs listing.
+    """
+    job = load_jobs().get(job_id)
+    if job is not None:
+        return job
+    return _load_archive().get(job_id)
 
 def require_job(job_id: str):
     j = get_job(job_id)
@@ -91,12 +223,22 @@ def require_job(job_id: str):
     return j, None, None
 
 
-# ── CORS for the portal ───────────────────────────────────────────────────────
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# The portal is served same-origin from /portal and needs no CORS at all. A wildcard
+# Access-Control-Allow-Origin combined with (formerly) no auth meant ANY webpage open in
+# ANY browser on the LAN could drive /approve, /reject etc. cross-origin — closed per the
+# prod audit. If a legitimate cross-origin caller is ever needed (e.g. an n8n instance on a
+# different host calling /webhook/n8n from browser JS — most n8n setups call server-side and
+# don't need this at all), set APPROVAL_CORS_ORIGIN to that single origin. Never '*'.
+_CORS_ORIGIN = os.getenv("APPROVAL_CORS_ORIGIN", "")
+
+
 @app.after_request
 def add_cors(resp):
-    resp.headers["Access-Control-Allow-Origin"]  = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    if _CORS_ORIGIN:
+        resp.headers["Access-Control-Allow-Origin"]  = _CORS_ORIGIN
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
 
 @app.route("/", methods=["OPTIONS"])
@@ -201,15 +343,22 @@ def _approve_block_reason(job: dict) -> str | None:
 def approve(job_id):
     """
     Approve: accept the AI's measurement as-is, proceed to costing.
-    Can be triggered by clicking the email button (GET) or from the portal (POST).
 
-    Hard-blocked (409) for MEASURED_UNVERIFIED / UNMEASURED / REJECTED jobs unless the
-    assessor has already confirmed scale+extent (job['scale_confirmed'] set by /adjust) —
-    mirrors the >£200k assumed-spec escalation guard (commit fb5b92b).
+    GET performs NO mutation — it only renders a confirm page with a POST button. Mutating
+    routes accepting GET with SameSite=Lax cookies is a top-level-navigation CSRF hole: any
+    page (or a pre-fetching email client / link scanner) that merely links to or navigates to
+    this URL would have approved/rejected a job just by being opened, no user click required.
+    The emailed action buttons and the portal's own JS both POST already (see
+    approval_email.build_html_email and assessor_portal.html's submitDecision) — GET now only
+    exists so an emailed link lands on a safe, human-readable "confirm this?" page.
     """
-    data = {}
-    if request.method == "POST" and request.is_json:
-        data = request.get_json(silent=True) or {}
+    if request.method == "GET":
+        j = get_job(job_id)
+        if not j:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        return _html_confirm_page("approve", job_id)
+
+    data = request.get_json(silent=True) or {} if request.is_json else {}
 
     with _jobs_lock:
         jobs = load_jobs()
@@ -254,17 +403,27 @@ def approve(job_id):
         "timestamp":  now_iso(),
     })
 
-    if request.method == "GET":
+    # The confirm page's <form> does a plain (non-JSON) POST and wants the human-readable
+    # result page back; the portal's own JS POSTs JSON and wants JSON back (unchanged).
+    if not request.is_json:
         return _html_confirmation("approved", job_id, costing_result)
     return jsonify({"status": "approved", "job_id": job_id, "costing": costing_result})
 
 
 @app.route("/reject/<job_id>", methods=["GET", "POST"])
 def reject(job_id):
-    """Reject: mark the measurement as wrong; do not proceed to costing."""
-    data = {}
-    if request.method == "POST" and request.is_json:
-        data = request.get_json(silent=True) or {}
+    """Reject: mark the measurement as wrong; do not proceed to costing.
+
+    GET performs NO mutation (see approve() docstring for the CSRF rationale) — it renders a
+    confirm page whose button issues the actual POST.
+    """
+    if request.method == "GET":
+        j = get_job(job_id)
+        if not j:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        return _html_confirm_page("reject", job_id)
+
+    data = request.get_json(silent=True) or {} if request.is_json else {}
 
     with _jobs_lock:
         jobs = load_jobs()
@@ -290,7 +449,7 @@ def reject(job_id):
         "timestamp": now_iso(),
     })
 
-    if request.method == "GET":
+    if not request.is_json:
         return _html_confirmation("rejected", job_id, None)
     return jsonify({"status": "rejected", "job_id": job_id})
 
@@ -304,9 +463,14 @@ def adjust(job_id):
     then costs. Any assessor-supplied area (polygon-derived OR a direct assessed_area_m2)
     sets scale_confirmed=True, which is what unblocks /approve for MEASURED_UNVERIFIED and
     UNMEASURED jobs (see _approve_block_reason).
+
+    GET already performed NO mutation before this CSRF pass (it only redirects into the
+    portal for manual polygon adjustment there, which itself POSTs) — adjust doesn't need
+    the confirm-page treatment approve/reject got since there's nothing to confirm without
+    the assessor's actual polygon/scale input.
     """
     if request.method == "GET":
-        # Quick check before redirect (no lock needed — read-only)
+        # Quick check before redirect (no lock needed — read-only, no mutation)
         if not load_jobs().get(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         return redirect(f"/portal?job={job_id}")
@@ -441,6 +605,103 @@ def spec_override(job_id):
     return jsonify({"status": "ok", "job_id": job_id, "costing": costing})
 
 
+# ── Soft delete (archive) ─────────────────────────────────────────────────────
+#
+# Aryan asked for a portal "delete estimation" button. A hard delete would destroy client
+# decision history and training-log context, and an unauthenticated/mis-clicked hard delete
+# of an approved six-figure job is unrecoverable — approval_jobs.json is the only system of
+# record. So: SOFT delete only. /archive sets status='deleted' + an archived_at timestamp and
+# moves a COPY of the record into approval_jobs_archive.json (never destroys it); the job is
+# then removed from the hot jobs file (kept small) and hidden from the default /jobs list.
+# /unarchive restores it. There is deliberately no hard-delete endpoint — see CLAUDE.md
+# ("never commit client data") and the prod-audit finding this implements.
+
+def _load_archive() -> dict:
+    if JOBS_ARCHIVE_FILE.exists():
+        try:
+            return json.loads(JOBS_ARCHIVE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+def _save_archive(archive: dict):
+    tmp = JOBS_ARCHIVE_FILE.with_suffix(f".json.tmp{os.getpid()}")
+    tmp.write_text(json.dumps(archive, indent=2))
+    os.replace(tmp, JOBS_ARCHIVE_FILE)
+
+
+@app.route("/archive/<job_id>", methods=["POST"])
+def archive_job(job_id):
+    """Soft-delete: move the job to approval_jobs_archive.json, mark status='deleted' there,
+    and drop it from the hot jobs file. Blocked for already-approved jobs — those represent a
+    committed client quotation and need Jas (a human, out-of-band) to unwind, not a button."""
+    data = request.get_json(silent=True) or {}
+    note = data.get("note", "")
+
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        if job.get("status") == "processing":
+            return jsonify({"error": "job is still processing — wait for it to finish"}), 409
+        if job.get("decision") == "approved":
+            return jsonify({"error": "job is already approved — this represents a committed "
+                                      "client quotation; ask Jas to archive/unwind it manually, "
+                                      "it cannot be deleted from the portal"}), 409
+
+        job = dict(job)
+        job["archived"]    = True
+        job["archived_at"] = now_iso()
+        job["archive_note"] = note
+        job["status"]      = "deleted"
+
+        archive = _load_archive()
+        archive[job_id] = job
+        _save_archive(archive)
+
+        del jobs[job_id]
+        save_jobs(jobs)
+
+    log_training({"event": "archive", "job_id": job_id, "note": note, "timestamp": now_iso()})
+    return jsonify({"status": "archived", "job_id": job_id})
+
+
+@app.route("/unarchive/<job_id>", methods=["POST"])
+def unarchive_job(job_id):
+    """Reverse an /archive — mistakes must be recoverable. Restores the job into the hot
+    jobs file and removes it from the archive."""
+    with _jobs_lock:
+        archive = _load_archive()
+        job = archive.get(job_id)
+        if not job:
+            return jsonify({"error": f"archived job {job_id!r} not found"}), 404
+
+        job = dict(job)
+        job["archived"] = False
+        job.pop("archived_at", None)
+        job.pop("archive_note", None)
+        # Restore a sane status — 'pending' unless the job carries its own decision already.
+        job["status"] = job.get("decision") or "pending"
+
+        jobs = load_jobs()
+        jobs[job_id] = job
+        save_jobs(jobs)
+
+        del archive[job_id]
+        _save_archive(archive)
+
+    log_training({"event": "unarchive", "job_id": job_id, "timestamp": now_iso()})
+    return jsonify({"status": "unarchived", "job_id": job_id})
+
+
+@app.route("/jobs/archived")
+def list_archived_jobs():
+    """Archived jobs, kept out of the default /jobs listing (which the portal polls every
+    15s) so the hot list stays focused on live work."""
+    return jsonify(_load_archive())
+
+
 # ── Costing helper ────────────────────────────────────────────────────────────
 
 def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:
@@ -493,7 +754,44 @@ def _run_costing(area_m2, result: dict) -> dict | None:
         return {"error": str(e)}
 
 
-# ── HTML email-click confirmation page ───────────────────────────────────────
+# ── HTML email-click confirm page (GET, no mutation) ─────────────────────────
+
+def _html_confirm_page(action: str, job_id: str) -> str:
+    """Rendered for GET /approve|reject/<job_id> — the link an assessor clicks straight out
+    of the email. Performs NO mutation itself: it's a plain HTML page whose <form> issues the
+    real POST when (and only when) the human clicks the button. This is what keeps a mutating
+    action from firing on mere top-level navigation (an email client link-preview/scanner
+    prefetching the URL, or an attacker page that just links here, would otherwise have
+    silently approved/rejected a job under the SameSite=Lax cookie — see approve()'s docstring).
+    """
+    labels  = {"approve": ("✅ Approve", "#27ae60"), "reject": ("✗ Reject", "#c0392b")}
+    label, col = labels.get(action, (action.title(), "#13294b"))
+    # Preserve ?token=... (or a cookie already covers it) so the POST from this page's form
+    # is itself authorised when the token gate is on.
+    token = request.args.get("token", "")
+    action_url = f"/{action}/{job_id}" + (f"?token={token}" if token else "")
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+    <title>Fortel AI Takeoff — Confirm {action.title()}</title></head>
+    <body style="font-family:Arial,sans-serif;background:#f0f2f5;display:flex;
+                 align-items:center;justify-content:center;min-height:100vh;margin:0">
+    <div style="background:#fff;border-radius:12px;padding:40px;max-width:460px;
+                box-shadow:0 2px 20px rgba(0,0,0,.1);text-align:center">
+      <h2 style="color:#13294b;margin:0 0 8px 0">Confirm action</h2>
+      <p style="color:#666;font-size:14px">
+        Job <b>{job_id}</b> — clicking below will <b>{action}</b> this job.
+      </p>
+      <form method="POST" action="{action_url}">
+        <button type="submit" style="
+           display:inline-block;padding:12px 28px;margin:14px 4px 4px 4px;
+           background:{col};color:#fff;border:none;border-radius:8px;
+           font-size:15px;font-weight:700;cursor:pointer;">{label}</button>
+      </form>
+      <a href="/portal?job={job_id}"
+         style="display:inline-block;margin-top:10px;color:#888;font-size:12px;
+                text-decoration:none;">Open in portal instead →</a>
+    </div></body></html>"""
+
 
 def _html_confirmation(action: str, job_id: str, costing) -> str:
     colours = {"approved": "#27ae60", "rejected": "#c0392b", "adjusted": "#2980b9"}
@@ -591,6 +889,19 @@ def n8n_webhook():
 
     if not result:
         return jsonify({"error": "result required"}), 400
+
+    # Containment guard: pdf_path comes straight from the request body. Without this, any
+    # caller could point it at an arbitrary file readable by the server user and have it
+    # rendered/exfiltrated back as a base64 PNG. Only allow paths that resolve inside this
+    # server's own drawings/ directory (same pattern already used at /upload).
+    if pdf_path:
+        drawings_dir = (Path(__file__).parent / "drawings").resolve()
+        try:
+            resolved = Path(pdf_path).resolve()
+            resolved.relative_to(drawings_dir)
+        except ValueError:
+            return jsonify({"error": "pdf_path must resolve inside the server's drawings/ "
+                                      "directory"}), 400
 
     try:
         from approval_email import create_job, render_snapshot, png_to_b64, build_html_email
@@ -1072,10 +1383,76 @@ def upload():
     return jsonify({"job_id": job_id, "status": "processing"}), 202
 
 
+# ── Startup sweep ─────────────────────────────────────────────────────────────
+
+def _sweep_stranded_processing_jobs():
+    """Any job left on status='processing' at process start was orphaned by a restart/crash —
+    the watchdog Timer and worker thread that would have resolved it die with the old process,
+    and nothing else ever revisits it. No takeoff can legitimately still be "running" at boot
+    (threads are daemon, they don't survive), so unconditionally flip every such job to
+    UNMEASURED with a clear flag rather than leaving it spinning in the portal forever."""
+    with _jobs_lock:
+        jobs = load_jobs()
+        changed = False
+        for job_id, job in jobs.items():
+            if job.get("status") == "processing":
+                flags = list(job.get("flags") or [])
+                flags.append("PIPELINE INTERRUPTED: server restarted while takeoff was "
+                              "running; route to assessor")
+                job.update({
+                    "status":            "error",
+                    "measurement_state": "UNMEASURED",
+                    "needs_assessor":    True,
+                    "flags":             flags,
+                })
+                res = dict(job.get("result") or {})
+                res["flags"] = flags
+                res.setdefault("measurement_state", "UNMEASURED")
+                job["result"] = res
+                changed = True
+                print(f"[startup-sweep] job {job_id} was stranded on 'processing' at a prior "
+                      "restart — marked UNMEASURED, routed to assessor.")
+        if changed:
+            save_jobs(jobs)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.getenv("APPROVAL_PORT", 5001))
-    host = os.getenv("APPROVAL_HOST", "0.0.0.0")
-    print(f"Fortel Approval Server → http://{host}:{port}/portal")
+    # Single-team, LAN-only deployment: default to loopback so exposure to the network is an
+    # explicit opt-in, not the out-of-the-box behaviour. If someone does want 0.0.0.0 (the
+    # shared office Mac), require APPROVAL_TOKEN to be set first — binding wide open with no
+    # auth is exactly the "anyone on the LAN can approve six-figure quotes" hole this closes.
+    host = os.getenv("APPROVAL_HOST", "127.0.0.1")
+    if host not in ("127.0.0.1", "localhost") and not APPROVAL_TOKEN:
+        print(f"REFUSING to bind {host} without APPROVAL_TOKEN set — anyone on the network "
+              "could approve/reject/adjust jobs. Set APPROVAL_TOKEN, or leave APPROVAL_HOST "
+              "at the 127.0.0.1 default for local-only use. Falling back to 127.0.0.1.")
+        host = "127.0.0.1"
+
+    _sweep_stranded_processing_jobs()
+
+    # Startup banner goes to stdout, which run.sh redirects straight into logs/portal.log
+    # (and launchd's own copy). Printing the raw token there means it sits in a plaintext
+    # log file indefinitely — mask everything but the first 4 chars so the log is still
+    # useful for confirming *which* token is loaded (e.g. after a rotation) without being a
+    # second place the live secret is stored. Get the real value from `.env`/env, not the log.
+    def _mask_token(t: str) -> str:
+        if not t:
+            return ""
+        return f"{t[:4]}…" if len(t) > 4 else "…"
+
+    print("Fortel Approval Server — config:")
+    print(f"  host:port     = {host}:{os.getenv('APPROVAL_PORT', 5001)}")
+    print(f"  jobs file     = {JOBS_FILE}")
+    print(f"  jobs archive  = {JOBS_ARCHIVE_FILE}")
+    print(f"  backups dir   = {BACKUP_DIR}")
+    print(f"  base url      = {os.getenv('APPROVAL_BASE_URL', 'http://localhost:5001')}")
+    print(f"  token set     = {'yes (' + _mask_token(APPROVAL_TOKEN) + ')' if APPROVAL_TOKEN else 'no'}")
+    print(f"  cors origin   = {_CORS_ORIGIN or '(none — same-origin only)'}")
+    print(f"  portal        = http://{host}:{port}/portal"
+          + (f"?token={_mask_token(APPROVAL_TOKEN)} (masked — see .env for the real value)"
+             if APPROVAL_TOKEN else ""))
+
     app.run(host=host, port=port, debug=False)

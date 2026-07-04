@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Fortel AI Takeoff — launchd unit for keeping the portal running on a
+  shared Mac (auto-restart on crash, auto-start on login/boot).
+
+  Install (see DEPLOY.md for the full walkthrough):
+    1. Fill in the two REPLACE_ME paths below (repo path, and your macOS
+       username for the log paths under ~/Library/Logs is fine as-is).
+    2. cp com.fortel.approval.plist.example ~/Library/LaunchAgents/com.fortel.approval.plist
+    3. launchctl load ~/Library/LaunchAgents/com.fortel.approval.plist
+    4. launchctl start com.fortel.approval
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.fortel.approval.plist
+    rm ~/Library/LaunchAgents/com.fortel.approval.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fortel.approval</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE_ME/fortel-takeoff-repo/.venv/bin/python</string>
+        <string>/REPLACE_ME/fortel-takeoff-repo/approval_server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/REPLACE_ME/fortel-takeoff-repo</string>
+
+    <!-- Restart automatically if the process dies, and start it at login/boot. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Prefer .env for real config; these are just safe fallback defaults.
+         launchd does NOT source .env for you — run.sh does that, but launchd
+         calls approval_server.py directly, so mirror any non-default values
+         from your .env here too if you rely on them. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>APPROVAL_HOST</key>
+        <string>127.0.0.1</string>
+        <key>APPROVAL_PORT</key>
+        <string>5001</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/fortel-approval.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/fortel-approval.log</string>
+
+    <!-- Don't hot-loop-restart if it's crashing fast (e.g. bad config). -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

@@ -11,3 +11,22 @@ compose_url*.txt
 *_url*.txt
 .venv/
 venv/
+
+# Ops / runtime (run.sh, DEPLOY.md) — logs, PID files, backups, local config
+logs/
+run/
+backups/
+backups_*/
+.env
+
+# Client/operational data — never commit (see CLAUDE.md)
+approval_jobs.json
+approval_jobs.json.bak*
+approval_jobs.json.tmp*
+approval_jobs.json.corrupt-*
+approval_jobs_archive.json
+approval_jobs_archive.json.tmp*
+approval_jobs.*.json
+approval_jobs.*_archive.json
+training_log.jsonl
+quotations/
