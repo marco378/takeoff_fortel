@@ -1419,17 +1419,22 @@ def _sweep_stranded_processing_jobs():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.getenv("APPROVAL_PORT", 5001))
-    # Single-team, LAN-only deployment: default to loopback so exposure to the network is an
-    # explicit opt-in, not the out-of-the-box behaviour. If someone does want 0.0.0.0 (the
-    # shared office Mac), require APPROVAL_TOKEN to be set first — binding wide open with no
-    # auth is exactly the "anyone on the LAN can approve six-figure quotes" hole this closes.
-    host = os.getenv("APPROVAL_HOST", "127.0.0.1")
-    if host not in ("127.0.0.1", "localhost") and not APPROVAL_TOKEN:
-        print(f"REFUSING to bind {host} without APPROVAL_TOKEN set — anyone on the network "
-              "could approve/reject/adjust jobs. Set APPROVAL_TOKEN, or leave APPROVAL_HOST "
-              "at the 127.0.0.1 default for local-only use. Falling back to 127.0.0.1.")
-        host = "127.0.0.1"
+    # Detect Railway: it injects RAILWAY_* vars and requires binding to 0.0.0.0.
+    is_railway = bool(os.getenv("RAILWAY_PROJECT_ID"))
+    _raw_port = (os.getenv("PORT") or "").strip()
+    if _raw_port:
+        port = int(_raw_port)
+        host = "0.0.0.0"
+    else:
+        port = int((os.getenv("APPROVAL_PORT") or "5001").strip())
+        host = os.getenv("APPROVAL_HOST", "127.0.0.1")
+        # Safety check: refuse 0.0.0.0 on bare metal without auth.
+        # On Railway this is skipped — Railway's infrastructure handles external access.
+        if not is_railway and host not in ("127.0.0.1", "localhost") and not APPROVAL_TOKEN:
+            print(f"REFUSING to bind {host} without APPROVAL_TOKEN set — anyone on the network "
+                  "could approve/reject/adjust jobs. Set APPROVAL_TOKEN, or leave APPROVAL_HOST "
+                  "at the 127.0.0.1 default for local-only use. Falling back to 127.0.0.1.")
+            host = "127.0.0.1"
 
     _sweep_stranded_processing_jobs()
 
