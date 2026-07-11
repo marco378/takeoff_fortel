@@ -500,6 +500,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     rgb = GREY_FALLBACK
     swatch_locked = False
     swatch, label = find_concrete_swatch_rgb(pdf, im=im, S=S)
+    legend_found = bool(label)   # True in both label branches below; False only in the no-legend else
     if label and swatch:
         is_grey = (max(swatch) - min(swatch) <= 18) and (188 <= sum(swatch) / 3 <= 236)
         if is_grey:
@@ -587,6 +588,25 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
 
     area = round(px * (1.0 / S) ** 2 * k * k, 0)
 
+    # --- refuse instead of guess (invariant 5) ------------------------------------------------
+    # No concrete-yard legend label AND no verified scale means BOTH the region identity and the
+    # scale are guesses — the resulting number is meaningless. Elevation, gatehouse and
+    # location-plan sheets land here and used to emit confident 5,000-6,000 m² garbage (gated
+    # behind the assessor, but still misleading). Emit NO area; route to the assessor with the
+    # candidate figure in the flag so they can judge quickly. Inderjit's real D77 gold is
+    # UNAFFECTED: it carries a legend label (legend_found=True) even though its scale bar is
+    # unverified, so this guard never fires on it.
+    if not legend_found and not verified:
+        return {"pdf": os.path.basename(pdf), "area_m2": None,
+                "scale_k": round(k, 5), "scale_verified": verified,
+                "scale_src": note, "scale_sources": scale_sources,
+                "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
+                "flags": flags + [
+                    f"REFUSED — no concrete-yard legend label AND scale unverified: the candidate "
+                    f"{area:,.0f} m² is a shape on an unidentified sheet (elevation / section / "
+                    f"location plan measure here), not a verified slab. Assessor must confirm the "
+                    f"drawing type, region and scale before any area is issued."]}
+
     # --- plausibility (BLOCKS, not just flags) ---
     san = sanity.plausible(area)
     flags += san
@@ -635,9 +655,30 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                      f"features inside the measured yard, {MANHOLE_DIAM_M_MIN}-{MANHOLE_DIAM_M_MAX} m "
                      "diameter band) — this is an ESTIMATE, assessor confirm before pricing E/O manhole details")
 
+    # --- manhole count ASSUMPTION (Inderjit, last Fortel call) ------------------------------
+    # When there is no drainage layout and no manhole symbol was detected, Fortel's rule is to
+    # ASSUME 1 manhole per 1,000 m² (placed corner-to-corner) so the assessor starts from a
+    # figure rather than a bare zero. Kept in its OWN field (never manhole_count_estimate, which
+    # auto-prices via price_with_defaults) so it stays a COUNT ASSUMPTION + flag and never feeds
+    # the £75/Nr E/O line automatically — the assessor confirms the count first. Gated on a found
+    # legend label so a mis-segmented non-yard sheet can't sprout phantom manholes. round() with a
+    # floor of 1 matches the real Winvic sheet (26,080 m² → 26 Nr; ceil would over-count at 27).
+    manhole_count_assumed = None
+    if manhole_count_estimate == 0 and area and not blocked and legend_found:
+        manhole_count_assumed = max(1, round(area / 1000.0))
+        flags.append(f"manhole_count_assumed={manhole_count_assumed} — ASSUMPTION per Inderjit's rule "
+                     f"(1 per 1,000 m², placed corner-to-corner), applied because no drainage layout / "
+                     f"no manhole symbols were detected: round({area:,.0f} / 1,000), min 1. Assessor "
+                     "confirms the count before any E/O manhole line is priced.")
+
     # --- measurement_state: the four-state contract (sanity.py) so downstream (pipeline,
     # portal, approve endpoint) never has to re-derive verified/plausible logic itself. ---
-    state, state_flags = sanity.measurement_state(area, scale_verified=verified)
+    # A sheet measured WITHOUT a legend label (generic grey-hatch guess) can never be
+    # approvable even if its scale happens to verify — the region identity is still unconfirmed.
+    # Feed confidence="low" in that case so the state machine caps it at MEASURED_UNVERIFIED
+    # (approve-blocked) rather than MEASURED_VERIFIED. A labelled sheet (e.g. D77) is unaffected.
+    state, state_flags = sanity.measurement_state(
+        area, scale_verified=verified, confidence=(None if legend_found else "low"))
     flags += state_flags
     needs_assessor = state != sanity.MEASURED_VERIFIED
 
@@ -646,6 +687,8 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "area_m2": area, "rate": rate, "price_gbp": price, "overlay": overlay,
             "polygon_pts": polygon_pts, "flags": flags,
             "manhole_count_estimate": manhole_count_estimate,
+            "manhole_count_assumed": manhole_count_assumed,
+            "legend_found": legend_found,
             "measurement_state": state, "needs_assessor": needs_assessor}
 
 

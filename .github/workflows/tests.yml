@@ -8,5 +8,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pymupdf shapely reportlab numpy scipy pillow
+      # Install the pinned set the repo is actually developed against. The previous hand-rolled
+      # list (pymupdf shapely reportlab numpy scipy pillow) silently omitted opencv-python-headless
+      # AND Flask, so 139 of 252 checks — the ENTIRE colour-segmentation measurement engine and the
+      # ENTIRE approval_server portal backend — skipped on missing imports while CI still went green.
+      # requirements.txt matches the working .venv (python3.11) and includes both, restoring coverage.
+      - run: pip install -r requirements.txt
       - run: python ci_tests.py
