@@ -662,8 +662,56 @@ try:
     ck("D77 takeoff() carries manhole_count_estimate field", "manhole_count_estimate" in _d77_mh)
     ck("D77 manhole_count_estimate is 0 (plain rect, no circular features)",
        _d77_mh.get("manhole_count_estimate") == 0)
+    # Inderjit's rule (last Fortel call): no drainage layout / no drawn symbols -> ASSUME 1 per
+    # 1,000 m². D77 measures ~3,159 m² with a legend label, so the assumed count = round(3159/1000)
+    # = 3. It's a SEPARATE field (never manhole_count_estimate, which auto-prices) so it never
+    # feeds the £75/Nr E/O line automatically — the assessor confirms first.
+    ck("D77 takeoff() carries manhole_count_assumed field", "manhole_count_assumed" in _d77_mh)
+    ck("D77 manhole_count_assumed == round(area/1000), floor 1 (Inderjit's 1-per-1,000 rule)",
+       _d77_mh.get("manhole_count_assumed") == max(1, round((_d77_mh.get("area_m2") or 0) / 1000.0)),
+       f"assumed={_d77_mh.get('manhole_count_assumed')} area={_d77_mh.get('area_m2')}")
+    ck("D77 manhole_count_assumed is 3 for the ~3,159 m² fixture",
+       _d77_mh.get("manhole_count_assumed") == 3, f"got {_d77_mh.get('manhole_count_assumed')}")
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] manhole counting (unmarked path) test — missing dependency or file: {_e}")
+
+print("refuse-instead-of-guess guard — non-slab sheets must REFUSE, not emit a garbage area")
+try:
+    import os as _os_rg
+    import takeoff_pipeline as _tp_rg
+    # Four real tender-pack sheets that are NOT concrete slabs. Before the guard they emitted
+    # confident 5,000-6,000 m² areas (no legend label + unverified scale). They must now REFUSE
+    # cleanly. Files are gitignored client drawings, so this block skips in CI (drawings/ absent);
+    # it runs locally as the regression that pins the fix.
+    _fp_files = [
+        "drawings/tender_pack/2-Enquiry/01-Tender/Drawings/Proposed_GA_Elevations.pdf",
+        "drawings/tender_pack/2-Enquiry/01-Tender/Drawings/Proposed_GA_Office_Elevations.pdf",
+        "drawings/tender_pack/2-Enquiry/01-Tender/Drawings/Proposed_Gatehouse.pdf",
+        "drawings/tender_pack/2-Enquiry/01-Tender/Planning-Documentation/Site_Location_Plan.pdf",
+    ]
+    _fp_present = [f for f in _fp_files if _os_rg.path.exists(f)]
+    if not _fp_present:
+        print("  [SKIP] refuse-guard regression — tender-pack drawings not present (gitignored)")
+    for _f in _fp_present:
+        _r = _tp_rg.takeoff(_f, send_approval=False)
+        _b = _os_rg.path.basename(_f)
+        ck(f"non-slab '{_b}' refuses -> area_m2 is None", _r.get("area_m2") is None,
+           f"got area={_r.get('area_m2')}")
+        ck(f"non-slab '{_b}' -> UNMEASURED", _r.get("measurement_state") == "UNMEASURED",
+           f"got {_r.get('measurement_state')}")
+        ck(f"non-slab '{_b}' carries a REFUSED flag",
+           any("REFUSED" in _fl for _fl in _r.get("flags", [])))
+    # Positive control: real D77 gold has a legend label, so the guard must NOT fire even though
+    # its scale bar is unverified — it must still measure the slab (~3,156 m²).
+    for _d77f in ("drawings/real_sgp/D77_Hard_Landscaping.pdf", "drawings/_int_d77.pdf"):
+        if _os_rg.path.exists(_d77f):
+            _rd = _tp_rg.takeoff(_d77f, send_approval=False)
+            ck(f"legend'd D77 '{_os_rg.path.basename(_d77f)}' NOT refused by guard (area still emitted)",
+               _rd.get("area_m2") is not None and _rd.get("area_m2") > 2500,
+               f"got area={_rd.get('area_m2')}")
+            break
+except (ImportError, FileNotFoundError) as _e:
+    print(f"  [SKIP] refuse-guard regression — missing dependency or file: {_e}")
 
 print("manhole E/O costing line (costing.py Winvic rate: £75.00/Nr)")
 try:
