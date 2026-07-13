@@ -808,7 +808,7 @@ def _html_confirmation(action: str, job_id: str, costing) -> str:
             £{costing['total_gbp']:,.2f}
           </div>
           <div style="font-size:13px;color:#888">
-            {costing.get('area_m2',0):,.0f} m² @ £{costing.get('rate',0)}/m²
+            {costing.get('area_m2',0):,.0f} m² @ £{costing.get('rate',0):.2f}/m²
           </div>
           {f'<div style="font-size:12px;color:#e67e22;margin-top:6px">{costing.get("note","")}</div>'
            if costing.get("note") else ""}
@@ -844,7 +844,9 @@ def quotation_download(job_id, fmt):
 
     try:
         from quotation import generate_quotation, quotation_text, quotation_html, quotation_json
-        result  = j.get("result", {})
+        result  = dict(j.get("result") or {})
+        if j.get("costing"):
+            result["costing"] = dict(j["costing"])
         # Use adjusted area if assessor corrected it
         adj = j.get("adjusted", {})
         if adj and adj.get("area_m2"):
@@ -905,6 +907,9 @@ def n8n_webhook():
 
     try:
         from approval_email import create_job, render_snapshot, png_to_b64, build_html_email
+        if polygon_pts is not None and not result.get("polygon_pts"):
+            result = dict(result)
+            result["polygon_pts"] = polygon_pts
         job_id = create_job(pdf_path, result)
         # Snapshot (best-effort — PDF may not be on this server's disk)
         b64 = ""

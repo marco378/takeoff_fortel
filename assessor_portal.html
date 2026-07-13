@@ -152,11 +152,12 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .line-items-toggle{width:100%;background:none;border:none;padding:6px 0 4px;color:var(--blue);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;cursor:pointer;display:flex;align-items:center;gap:5px;text-align:left}
 .line-items-toggle .chevron{margin-left:auto;font-size:10px;opacity:.5;transition:transform .2s}
 .line-items-toggle.open .chevron{transform:rotate(180deg)}
-.li-wrap{overflow:hidden;max-height:0;transition:max-height .3s ease}
+.li-wrap{overflow-x:auto;overflow-y:hidden;max-height:0;transition:max-height .3s ease}
 .li-wrap.open{max-height:1200px}
-.li-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:6px}
-.li-table th{text-align:left;padding:4px 5px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap}
-.li-table td{padding:3px 5px;border-bottom:1px solid #f0f2f5;vertical-align:top}
+.li-table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:11px;margin-top:6px}
+.li-table th{text-align:left;padding:4px 3px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap}
+.li-table td{padding:3px;border-bottom:1px solid #f0f2f5;vertical-align:top}
+.li-table td:first-child{overflow-wrap:anywhere}
 .li-table td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .li-section-hdr td{background:#f4f6fb;font-weight:700;color:var(--blue);font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:5px 5px 3px}
 .li-subtotal td{background:#f9f9f9;font-weight:600;color:#444;border-top:1px solid var(--border)}
@@ -791,7 +792,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
   `;
-  renderCosting(res.costing || job.costing, job.status);
+  renderCosting(job.costing || res.costing, job.status);
 }
 
 function renderCosting(c, jobStatus) {
@@ -800,6 +801,10 @@ function renderCosting(c, jobStatus) {
   const spec    = c.spec || {};
   const bdwn    = c.breakdown || {};
   const assumed = c.assumed;
+  const numericRate = Number(c.rate);
+  const rateDisplay = Number.isFinite(numericRate)
+    ? numericRate.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})
+    : '—';
   const rows = ['concrete','steel','dpm','curing','labour','trim'].map(k =>
     bdwn[k] != null
       ? `<div class="kv"><span class="k" style="padding-left:8px">${k.charAt(0).toUpperCase()+k.slice(1)}</span><span class="v">£${(+bdwn[k]).toFixed(2)}/m²</span></div>`
@@ -863,7 +868,7 @@ function renderCosting(c, jobStatus) {
     <div style="background:#13294b;border-radius:6px;padding:10px 12px;margin-bottom:8px;text-align:center">
       <div style="color:#aec3e0;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT)</div>
       <div style="color:#fff;font-size:26px;font-weight:800">£${(+c.total_gbp).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
-      <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${c.rate}/m²</div>
+      <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${rateDisplay}/m²</div>
       <div style="color:#8fa8cc;font-size:11px">${spec.depth_mm||190}mm ${esc(spec.conc_mix||'C32/40')} / ${spec.layers||1}× ${esc(spec.mesh||'A252')}</div>
     </div>
     <div class="kv"><span class="k" style="font-size:11px">Rate breakdown (per m²)</span></div>
@@ -897,8 +902,11 @@ async function submitSpecOverride(e) {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || r.statusText);
     // Re-render costing inline without full panel reload
-    const job = _jobs.find(j => j.id === selectedJobId) || {};
+    const job = currentJob && currentJob.id === selectedJobId
+      ? currentJob : (_jobs.find(j => j.id === selectedJobId) || {});
+    if (currentJob && currentJob.id === selectedJobId) currentJob.costing = d.costing;
     renderCosting(d.costing, job.status);
+    await loadLineItems(job);
     // Reopen the details element so assessor sees the updated form
     const det = document.getElementById('specOverrideDetails');
     if (det) det.open = true;
@@ -1149,18 +1157,29 @@ function calcArea() {
 }
 
 function updateAreaDisplay() {
-  const a = calcArea();
-  const ai = currentJob && currentJob.result && currentJob.result.area_m2;
-  const aStr = a ? `${a.toLocaleString(undefined,{maximumFractionDigits:0})} m²` : '—';
+  const tracedArea = calcArea();
+  const adjustedArea = Number(currentJob && currentJob.adjusted && currentJob.adjusted.area_m2) || null;
+  const aiArea = Number(currentJob && (
+    (currentJob.result && currentJob.result.area_m2) || currentJob.area_m2
+  )) || null;
+  const displayedArea = tracedArea || adjustedArea || aiArea;
+  const aStr = displayedArea
+    ? `${displayedArea.toLocaleString(undefined,{maximumFractionDigits:0})} m²` : '—';
   document.getElementById('areaDisplay').textContent = aStr;
   document.getElementById('scaleDisplay').textContent = mpp ? mpp.toFixed(5) : '—';
-  if (a && ai) {
-    const diff = ((a - ai)/ai*100).toFixed(1);
+  if (tracedArea && aiArea) {
+    const diff = ((tracedArea - aiArea)/aiArea*100).toFixed(1);
     const sign = diff > 0 ? '+' : '';
     document.getElementById('areaSource').textContent =
-      `Assessor trace · AI was ${ai.toLocaleString()} m² (${sign}${diff}% difference)`;
+      `Assessor trace · AI was ${aiArea.toLocaleString()} m² (${sign}${diff}% difference)`;
+  } else if (tracedArea) {
+    document.getElementById('areaSource').textContent = 'Assessor trace';
+  } else if (adjustedArea) {
+    document.getElementById('areaSource').textContent = 'Assessor adjustment';
+  } else if (aiArea) {
+    document.getElementById('areaSource').textContent = 'AI measurement';
   } else {
-    document.getElementById('areaSource').textContent = a ? 'Assessor trace' : 'No polygon traced yet';
+    document.getElementById('areaSource').textContent = 'No polygon traced yet';
   }
   document.getElementById('readout').textContent =
     `area: ${aStr}  ·  ${poly.length} pts  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
@@ -1483,8 +1502,12 @@ function renderLineItemsTable(items) {
     : (v ?? '—');
 
   let html = `<table class="li-table">
+    <colgroup>
+      <col style="width:29%"><col style="width:17%"><col style="width:10%">
+      <col style="width:17%"><col style="width:27%">
+    </colgroup>
     <thead><tr>
-      <th style="width:38%">Description</th>
+      <th>Description</th>
       <th class="num">Qty</th>
       <th>Unit</th>
       <th class="num">Rate&nbsp;(£)</th>
