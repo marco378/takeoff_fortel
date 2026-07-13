@@ -791,7 +791,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
   `;
-  renderCosting(res.costing || job.costing, job.status);
+  renderCosting(job.costing || res.costing, job.status);
 }
 
 function renderCosting(c, jobStatus) {
@@ -863,7 +863,7 @@ function renderCosting(c, jobStatus) {
     <div style="background:#13294b;border-radius:6px;padding:10px 12px;margin-bottom:8px;text-align:center">
       <div style="color:#aec3e0;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT)</div>
       <div style="color:#fff;font-size:26px;font-weight:800">£${(+c.total_gbp).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
-      <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${c.rate}/m²</div>
+      <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${(+c.rate).toFixed(2)}/m²</div>
       <div style="color:#8fa8cc;font-size:11px">${spec.depth_mm||190}mm ${esc(spec.conc_mix||'C32/40')} / ${spec.layers||1}× ${esc(spec.mesh||'A252')}</div>
     </div>
     <div class="kv"><span class="k" style="font-size:11px">Rate breakdown (per m²)</span></div>
@@ -1151,7 +1151,10 @@ function calcArea() {
 function updateAreaDisplay() {
   const a = calcArea();
   const ai = currentJob && currentJob.result && currentJob.result.area_m2;
-  const aStr = a ? `${a.toLocaleString(undefined,{maximumFractionDigits:0})} m²` : '—';
+  const adj = currentJob && currentJob.adjusted && currentJob.adjusted.area_m2;
+  // Prefer assessor trace > adjusted > AI area
+  const displayed = a || adj || ai;
+  const aStr = displayed ? `${displayed.toLocaleString(undefined,{maximumFractionDigits:0})} m²` : '—';
   document.getElementById('areaDisplay').textContent = aStr;
   document.getElementById('scaleDisplay').textContent = mpp ? mpp.toFixed(5) : '—';
   if (a && ai) {
@@ -1159,8 +1162,14 @@ function updateAreaDisplay() {
     const sign = diff > 0 ? '+' : '';
     document.getElementById('areaSource').textContent =
       `Assessor trace · AI was ${ai.toLocaleString()} m² (${sign}${diff}% difference)`;
+  } else if (a) {
+    document.getElementById('areaSource').textContent = 'Assessor trace';
+  } else if (adj && ai) {
+    document.getElementById('areaSource').textContent = `Adjusted · AI was ${ai.toLocaleString()} m²`;
+  } else if (ai) {
+    document.getElementById('areaSource').textContent = 'AI measured';
   } else {
-    document.getElementById('areaSource').textContent = a ? 'Assessor trace' : 'No polygon traced yet';
+    document.getElementById('areaSource').textContent = 'No polygon traced yet';
   }
   document.getElementById('readout').textContent =
     `area: ${aStr}  ·  ${poly.length} pts  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
