@@ -39,6 +39,15 @@ header span{opacity:.7;font-size:12px}
 .job-item .jid{font-size:11px;opacity:.6;font-family:monospace}
 .job-item .jfile{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .job-item .jmeta{font-size:11px;opacity:.7;margin-top:2px}
+.project-group{border-bottom:1px solid #1e3c6a}
+.project-group-header{width:100%;border:0;background:#142d56;color:#d0dff5;padding:8px 12px;display:flex;align-items:center;gap:7px;cursor:pointer;text-align:left}
+.project-group-header:hover{background:#1e3c6a}
+.project-group-header .project-title{min-width:0;flex:1;font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.project-group-header .project-count{font-size:10px;color:#8fa8cc;white-space:nowrap}
+.project-group-header .chevron{font-size:10px;transition:transform .2s}
+.project-group-header.collapsed .chevron{transform:rotate(-90deg)}
+.project-group-children.collapsed{display:none}
+.project-group-children .job-item{padding-left:25px}
 .badge{display:inline-block;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;text-transform:uppercase}
 .badge.pending{background:#e67e22;color:#fff}
 .badge.approved{background:#27ae60;color:#fff}
@@ -205,8 +214,8 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
             <input type="text" id="upClient" name="client_name" placeholder="e.g. Winvic Construction">
           </div>
           <div class="upload-form-group">
-            <label for="upFile">PDF Drawing</label>
-            <input type="file" id="upFile" name="pdf" accept=".pdf" required>
+            <label for="upFile">PDF Drawing(s) or ZIP</label>
+            <input type="file" id="upFile" name="pdf" accept=".pdf,.zip" multiple required>
           </div>
           <button type="submit" class="btn-run-takeoff" id="btnRunTakeoff">
             🚀 Run Takeoff
@@ -385,6 +394,7 @@ let _lastJobs = null;           // cache for search re-filter
 let _jobSearchTerm = '';        // current search filter
 let _archivedJobs = {};         // cache of archived jobs (fetched only when the toggle is on)
 let _showArchived = false;      // "Show archived" sidebar toggle state
+let _collapsedProjects = new Set();
 // Monotonic generation counter guarding selectJob() against out-of-order completion.
 // selectJob is async (fetch /job/<id> then render); with no guard, rapidly switching
 // jobs (or a poll-triggered re-select racing a user click) can let an OLDER in-flight
@@ -489,7 +499,13 @@ function renderJobList(jobs) {
       const countBanner = q
         ? `<div style="padding:4px 12px;font-size:11px;color:#8ab4cc;border-bottom:1px solid #25426e">${filtered.length} of ${sorted.length} jobs</div>`
         : '';
-      html = countBanner + filtered.map(j => {
+      const projectCounts = new Map();
+      for (const j of sorted) {
+        const ref = String(j.project_ref || '').trim();
+        if (ref) projectCounts.set(ref, (projectCounts.get(ref) || 0) + 1);
+      }
+
+      const renderJobRow = (j, grouped=false) => {
         const active = currentJob && currentJob.id === j.id ? 'active' : '';
         const badge  = `<span class="badge ${j.status||'pending'}">${j.status||'pending'}</span>`;
         const mstate = j.measurement_state || (j.result && j.result.measurement_state);
@@ -497,7 +513,7 @@ function renderJobList(jobs) {
         const area   = j.result && j.result.area_m2 ? `${(+j.result.area_m2).toLocaleString()} m²` : '—';
         const ts      = j.created_at ? j.created_at.substring(0,16).replace('T',' ') : '';
         const ref     = j.project_ref  ? `<span style="opacity:.8;font-size:10px">#${esc(j.project_ref)} · </span>` : '';
-        const pname   = j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
+        const pname   = !grouped && j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
         if (j.archived) {
           return `<div class="job-item archived" style="opacity:.55">
             ${pname}
@@ -514,11 +530,54 @@ function renderJobList(jobs) {
           <div class="jfile">${esc(j.result&&j.result.file||j.id)}</div>
           <div class="jmeta">${area} · ${ts}</div>
         </div>`;
+      };
+
+      const projectGroups = new Map();
+      const renderOrder = [];
+      for (const j of filtered) {
+        const ref = String(j.project_ref || '').trim();
+        if (ref && (projectCounts.get(ref) || 0) > 1) {
+          if (!projectGroups.has(ref)) {
+            projectGroups.set(ref, []);
+            renderOrder.push({type:'project', ref});
+          }
+          projectGroups.get(ref).push(j);
+        } else {
+          renderOrder.push({type:'job', job:j});
+        }
+      }
+
+      html = countBanner + renderOrder.map(entry => {
+        if (entry.type === 'job') return renderJobRow(entry.job);
+        const children = projectGroups.get(entry.ref);
+        const first = children[0];
+        const total = projectCounts.get(entry.ref) || children.length;
+        const count = _jobSearchTerm && children.length !== total
+          ? `${children.length} of ${total} drawings` : `${total} drawings`;
+        const collapsed = !_jobSearchTerm && _collapsedProjects.has(entry.ref);
+        return `<div class="project-group">
+          <button class="project-group-header ${collapsed?'collapsed':''}" data-project-ref="${esc(entry.ref)}" onclick="toggleProjectGroup(this)">
+            <span class="chevron">▼</span>
+            <span class="project-title">#${esc(entry.ref)} · ${esc(first.project_name||'Unnamed project')}</span>
+            <span class="project-count">${count}</span>
+          </button>
+          <div class="project-group-children ${collapsed?'collapsed':''}">
+            ${children.map(j => renderJobRow(j, true)).join('')}
+          </div>
+        </div>`;
       }).join('');
     }
   }
   // Only repaint if content changed — prevents cosmetic flicker on every 15s poll
   if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+function toggleProjectGroup(button) {
+  if (_jobSearchTerm) return;
+  const ref = button.dataset.projectRef;
+  if (_collapsedProjects.has(ref)) _collapsedProjects.delete(ref);
+  else _collapsedProjects.add(ref);
+  if (_lastJobs) renderJobList(_lastJobs);
 }
 
 async function unarchiveJob(jobId) {
@@ -1402,19 +1461,19 @@ async function submitUpload(e) {
   const ref    = document.getElementById('upRef').value.trim();
   const name   = document.getElementById('upName').value.trim();
   const client = document.getElementById('upClient').value.trim();
-  const file   = document.getElementById('upFile').files[0];
+  const files  = Array.from(document.getElementById('upFile').files || []);
 
-  if (!ref || !name || !file) return;   // HTML5 required handles UI
+  if (!ref || !name || !files.length) return;   // HTML5 required handles UI
 
   // Spinner state
   btn.disabled = true;
-  btn.innerHTML = '<span class="upload-spinner"></span> Processing…';
+  btn.innerHTML = `<span class="upload-spinner"></span> Processing ${files.length} file${files.length===1?'':'s'}…`;
 
   const fd = new FormData();
   fd.append('project_ref',  ref);
   fd.append('project_name', name);
   fd.append('client_name',  client);
-  fd.append('pdf',          file);
+  files.forEach(file => fd.append('pdf', file));
 
   try {
     const r = await fetch(`${BASE}/upload`, { method: 'POST', body: fd });
@@ -1428,10 +1487,13 @@ async function submitUpload(e) {
       toggle.classList.remove('open');
       document.getElementById('uploadForm').reset();
 
-      toast('Job submitted — processing…');
+      const newIds = rj.job_ids || [rj.job_id || rj.id].filter(Boolean);
+      toast(newIds.length > 1
+        ? `${newIds.length} drawings submitted under project #${ref}`
+        : 'Job submitted — processing…');
 
-      // Auto-select the new job if the server returned a job_id
-      const newId = rj.job_id || rj.id;
+      // Auto-select the primary job while all project drawings process independently
+      const newId = rj.job_id || rj.id || newIds[0];
       if (newId) {
         await loadJobList();
         await selectJob(newId);

@@ -778,7 +778,7 @@ except ImportError as _e:
 print("approval_server: upload format handling + approve hard-block")
 try:
     import approval_server as _AS
-    import fitz as _fitz3, zipfile as _zipfile, tempfile as _tempfile
+    import fitz as _fitz3, zipfile as _zipfile, tempfile as _tempfile, io as _io3
 
     _tmpdir = Path(_tempfile.mkdtemp(prefix="ci_upload_"))
 
@@ -817,6 +817,92 @@ try:
     _doc2, _reason2 = _AS._open_pdf_safely(_enc)
     ck("encrypted PDF -> rejected with reason (not a crash)",
        _doc2 is None and "encrypted" in _reason2.lower())
+
+    _orig_jobs_file_up = _AS.JOBS_FILE
+    _orig_backup_dir_up = _AS.BACKUP_DIR
+    _orig_server_file_up = _AS.__file__
+    _orig_thread_up = _AS.threading.Thread
+    _started_up = []
+
+    class _NoStartThread:
+        def __init__(self, target, args, daemon):
+            self.target, self.args, self.daemon = target, args, daemon
+        def start(self):
+            _started_up.append(self.args)
+
+    try:
+        _AS.JOBS_FILE = _tmpdir / "multi_upload_jobs.json"
+        _AS.BACKUP_DIR = _tmpdir / "multi_upload_backups"
+        _AS.__file__ = str(_tmpdir / "approval_server.py")
+        _AS.threading.Thread = _NoStartThread
+        _client_up = _AS.app.test_client()
+        _pdf_a_bytes = _pdf_a.read_bytes()
+        _pdf_b_bytes = _pdf_b.read_bytes()
+
+        _AS.save_jobs({})
+        _started_up.clear()
+        _multi_resp = _client_up.post("/upload", data={
+            "project_ref": "MULTI-001",
+            "project_name": "Four Slab Project",
+            "client_name": "Fortel QA",
+            "pdf": [(_io3.BytesIO(_pdf_a_bytes), "Yard.pdf"),
+                    (_io3.BytesIO(_pdf_b_bytes), "Dock.pdf")],
+        }, content_type="multipart/form-data")
+        _multi_json = _multi_resp.get_json()
+        _multi_jobs = _AS.load_jobs()
+        ck("multi-file upload returns two job_ids", _multi_resp.status_code == 202 and
+           len(_multi_json.get("job_ids", [])) == 2, _multi_json)
+        ck("multi-file upload creates one job per drawing under one project",
+           len(_multi_jobs) == 2 and
+           {j.get("project_ref") for j in _multi_jobs.values()} == {"MULTI-001"} and
+           {j.get("project_name") for j in _multi_jobs.values()} == {"Four Slab Project"})
+        ck("multi-file upload preserves prefixed, non-overwriting source paths",
+           len({j.get("pdf_path") for j in _multi_jobs.values()}) == 2 and
+           all(Path(j["pdf_path"]).name.startswith("MULTI-001_") for j in _multi_jobs.values()))
+        ck("multi-file upload launches one independent takeoff worker per drawing",
+           len(_started_up) == 2)
+
+        _AS.save_jobs({})
+        _started_up.clear()
+        _single_resp = _client_up.post("/upload", data={
+            "project_ref": "SINGLE-001", "project_name": "Single Drawing Project",
+            "pdf": (_io3.BytesIO(_pdf_a_bytes), "Yard.pdf"),
+        }, content_type="multipart/form-data")
+        _single_json = _single_resp.get_json()
+        ck("single-file upload keeps legacy one-job response shape",
+           _single_resp.status_code == 202 and "job_id" in _single_json and
+           "job_ids" not in _single_json and len(_AS.load_jobs()) == 1, _single_json)
+
+        _AS.save_jobs({})
+        _started_up.clear()
+        _zip_resp = _client_up.post("/upload", data={
+            "project_ref": "ZIP-001", "project_name": "ZIP Slab Project",
+            "pdf": (_io3.BytesIO(_zip_path.read_bytes()), "slabs.zip"),
+        }, content_type="multipart/form-data")
+        _zip_json = _zip_resp.get_json()
+        _zip_jobs = _AS.load_jobs()
+        ck("ZIP upload creates a job for every contained PDF",
+           _zip_resp.status_code == 202 and len(_zip_json.get("job_ids", [])) == 2 and
+           len(_zip_jobs) == 2 and len(_started_up) == 2, _zip_json)
+        ck("ZIP jobs share the project ref and record all-drawings provenance",
+           {j.get("project_ref") for j in _zip_jobs.values()} == {"ZIP-001"} and
+           all(any("every PDF queued" in f for f in j.get("flags", []))
+               for j in _zip_jobs.values()))
+
+        _portal_html_up = (Path(_orig_server_file_up).parent / "assessor_portal.html").read_text()
+        ck("portal file input allows multiple PDFs and ZIPs",
+           'accept=".pdf,.zip" multiple' in _portal_html_up)
+        ck("portal submits every selected file under the backward-compatible pdf field",
+           "files.forEach(file => fd.append('pdf', file))" in _portal_html_up)
+        ck("portal groups repeated project refs under collapsible project headers",
+           "projectCounts.get(ref)" in _portal_html_up and
+           'class="project-group-header' in _portal_html_up and
+           "toggleProjectGroup(this)" in _portal_html_up)
+    finally:
+        _AS.threading.Thread = _orig_thread_up
+        _AS.__file__ = _orig_server_file_up
+        _AS.JOBS_FILE = _orig_jobs_file_up
+        _AS.BACKUP_DIR = _orig_backup_dir_up
 
     # approve hard-block mirrors the >£200k escalation guard mechanism (fb5b92b)
     ck("UNMEASURED job blocks approve",
