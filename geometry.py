@@ -14,6 +14,32 @@ from shapely.ops import unary_union
 from shapely.validation import make_valid
 
 
+def polygon_perimeter_lm(vertices, metres_per_unit):
+    """Closed polygon perimeter in metres for coordinates measured in one linear unit.
+
+    Pipeline ``polygon_pts`` are PDF points and use ``scale_k`` metres/PDF-point;
+    assessor-adjusted vertices are canvas pixels and use metres/canvas-pixel.  The same
+    first-power conversion is therefore correct for both coordinate spaces.
+    """
+    try:
+        scale = float(metres_per_unit)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(scale) or scale <= 0:
+        return None
+    if not vertices or len(vertices) < 3:
+        return None
+    try:
+        points = [(float(x), float(y)) for x, y in vertices]
+    except (TypeError, ValueError):
+        return None
+    if any(not (math.isfinite(x) and math.isfinite(y)) for x, y in points):
+        return None
+    length = sum(math.dist(points[i], points[(i + 1) % len(points)])
+                 for i in range(len(points)))
+    return round(length * scale, 1)
+
+
 def _build_region(outer_verts, hole_verts_list, idx, flags):
     """Build a single region polygon with holes correctly subtracted.
 

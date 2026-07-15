@@ -172,6 +172,8 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .li-subtotal td{background:#f9f9f9;font-weight:600;color:#444;border-top:1px solid var(--border)}
 .li-total td{background:#13294b;color:#fff;font-weight:800;border-top:2px solid #0a1e38}
 .li-none{font-size:12px;color:var(--muted);font-style:italic;padding:4px 0}
+.li-provisional{display:inline-block;margin-top:2px;padding:1px 4px;border-radius:3px;background:#fff2cc;color:#7a5200;font-size:9px;font-weight:700}
+.li-measurements{margin:5px 0 8px;padding:7px 8px;background:#eef3fa;border-radius:5px;font-size:11px;color:#13294b}
 
 /* ── Drawing thumbnail (info panel) ─────────────── */
 #thumbnailSection img{width:100%;border-radius:5px;border:1px solid var(--border);display:block;cursor:zoom-in}
@@ -319,6 +321,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <h3>Measured Area</h3>
       <div class="area-big" id="areaDisplay">—</div>
       <div class="area-sub" id="areaSource"></div>
+      <div class="kv" style="margin-top:7px"><span class="k">Slab perimeter</span><span class="v" id="perimeterDisplay">—</span></div>
     </div>
 
     <div class="info-section">
@@ -366,7 +369,8 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <div id="decisionBlock">No decision yet</div>
       <div id="quotationLinks" style="margin-top:8px;display:none">
         <a id="linkTxt"  href="#" target="_blank" style="display:block;font-size:12px;color:#13294b;margin-bottom:2px">📄 Download quotation (.txt)</a>
-        <a id="linkHtml" href="#" target="_blank" style="display:block;font-size:12px;color:#13294b">🌐 View quotation (HTML)</a>
+        <a id="linkHtml" href="#" target="_blank" style="display:block;font-size:12px;color:#13294b;margin-bottom:2px">🌐 View quotation (HTML)</a>
+        <a id="linkXlsx" href="#" target="_blank" style="display:block;font-size:12px;color:#13294b">📊 Download editable quotation (.xlsx)</a>
       </div>
     </div>
 
@@ -829,8 +833,17 @@ function loadErrorCanvas() {
   canvas = null; ctx = null;
 }
 
+function effectiveStoredPerimeter(job) {
+  const adjusted = job && job.adjusted;
+  if (adjusted && Object.prototype.hasOwnProperty.call(adjusted, 'perimeter_lm')) {
+    return Number(adjusted.perimeter_lm) || null;
+  }
+  return Number(job && ((job.result && job.result.perimeter_lm) || job.perimeter_lm)) || null;
+}
+
 function renderJobDetails(job) {
   const res = job.result || {};
+  const perimeter = effectiveStoredPerimeter(job);
   const projRow = (job.project_ref || job.project_name) ? `
     <div class="kv" style="background:#eef3fa;border-radius:5px;padding:5px 8px;margin-bottom:4px">
       ${job.project_ref ? `<span class="k" style="color:#13294b;font-weight:700">#${esc(job.project_ref)}</span>` : ''}
@@ -849,6 +862,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">Source</span><span class="v">${esc(res.source_discipline)}</span></div>
     <div class="kv"><span class="k">Confidence</span><span class="v">${esc(res.confidence)}</span></div>
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
+    <div class="kv"><span class="k">Slab perimeter</span><span class="v">${perimeter!=null?perimeter.toLocaleString()+' m':'—'}</span></div>
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
   `;
   renderCosting(job.costing || res.costing, job.status);
@@ -1008,6 +1022,7 @@ function renderDecision(job) {
     ql.style.display = 'block';
     document.getElementById('linkTxt').href  = `${BASE}/quotation/${job.id}.txt`;
     document.getElementById('linkHtml').href = `${BASE}/quotation/${job.id}.html`;
+    document.getElementById('linkXlsx').href = `${BASE}/quotation/${job.id}.xlsx`;
   } else {
     ql.style.display = 'none';
   }
@@ -1215,16 +1230,30 @@ function calcArea() {
   return shoelace(poly) * mpp * mpp;
 }
 
+function calcPerimeter() {
+  if (!mpp || poly.length < 3) return null;
+  let length = 0;
+  for (let i=0; i<poly.length; i++) {
+    const a=poly[i], b=poly[(i+1)%poly.length];
+    length += Math.hypot(b.x-a.x, b.y-a.y);
+  }
+  return length * mpp;
+}
+
 function updateAreaDisplay() {
   const tracedArea = calcArea();
+  const tracedPerimeter = calcPerimeter();
   const adjustedArea = Number(currentJob && currentJob.adjusted && currentJob.adjusted.area_m2) || null;
   const aiArea = Number(currentJob && (
     (currentJob.result && currentJob.result.area_m2) || currentJob.area_m2
   )) || null;
   const displayedArea = tracedArea || adjustedArea || aiArea;
+  const displayedPerimeter = tracedPerimeter || effectiveStoredPerimeter(currentJob);
   const aStr = displayedArea
     ? `${displayedArea.toLocaleString(undefined,{maximumFractionDigits:0})} m²` : '—';
   document.getElementById('areaDisplay').textContent = aStr;
+  document.getElementById('perimeterDisplay').textContent = displayedPerimeter
+    ? `${displayedPerimeter.toLocaleString(undefined,{maximumFractionDigits:1})} m` : '—';
   document.getElementById('scaleDisplay').textContent = mpp ? mpp.toFixed(5) : '—';
   if (tracedArea && aiArea) {
     const diff = ((tracedArea - aiArea)/aiArea*100).toFixed(1);
@@ -1541,10 +1570,19 @@ async function loadLineItems(job) {
       el.innerHTML = '<span class="li-none">No line items in quotation.</span>';
       return;
     }
-    el.innerHTML = renderLineItemsTable(items);
+    el.innerHTML = renderQuotationMeasurements(data.measurements || []) + renderLineItemsTable(items);
   } catch(err) {
     el.innerHTML = '<span class="li-none">Line items not yet available.</span>';
   }
+}
+
+function renderQuotationMeasurements(measurements) {
+  if (!Array.isArray(measurements) || !measurements.length) return '';
+  return `<div class="li-measurements"><strong>Informational · not priced</strong>${measurements.map(m => `
+    <div style="margin-top:3px">${esc(m.section)} — ${esc(m.description)}:
+      <strong>${(+m.qty).toLocaleString(undefined,{maximumFractionDigits:1})} ${esc(m.unit)}</strong>
+      ${m.provisional?'<span class="li-provisional">PROVISIONAL — NO DETAILS PROVIDED</span>':''}
+    </div>`).join('')}</div>`;
 }
 
 function renderLineItemsTable(items) {
@@ -1585,7 +1623,7 @@ function renderLineItemsTable(items) {
       const val = typeof it.value === 'number' ? it.value : 0;
       subtotal += val;
       html += `<tr>
-        <td>${esc(it.description)}</td>
+        <td>${esc(it.description)}${it.provisional?'<br><span class="li-provisional">PROVISIONAL — NO DETAILS PROVIDED</span>':''}</td>
         <td class="num">${fmtQty(it.qty)}</td>
         <td>${esc(it.unit)}</td>
         <td class="num">${fmt(it.rate)}</td>

@@ -435,6 +435,14 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             except OSError:
                 pass
 
+    # Informational formwork quantity only: polygon_pts are PDF points and scale_k is m/pt,
+    # so closed polygon length × scale_k gives linear metres.  This never enters pricing.
+    if r.get("polygon_pts") and r.get("scale_k"):
+        from geometry import polygon_perimeter_lm
+        perimeter_lm = polygon_perimeter_lm(r["polygon_pts"], r["scale_k"])
+        if perimeter_lm is not None:
+            r["perimeter_lm"] = perimeter_lm
+
     # ── Costing (with defaults where no engineer spec)
     if r.get("area_m2"):
         costing = price_with_defaults(r["area_m2"], engineer_spec,

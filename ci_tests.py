@@ -247,7 +247,12 @@ _e4 = extract_spec_from_text("A393 x2 250 mm C40/50")
 ck("x2 notation -> 2 layers", _e4.get("layers") == 2)
 
 print("quotation generator")
-from quotation import generate_quotation, quotation_text, quotation_html
+from quotation import (generate_quotation, quotation_text, quotation_html, quotation_json,
+                       quotation_xlsx, SECTION_ORDER, PROVISIONAL_LABEL)
+from geometry import polygon_perimeter_lm
+from openpyxl import load_workbook as _load_workbook
+from io import BytesIO as _BytesIO
+import copy as _copy
 _demo_result = {
     "file": "D77.pdf", "type": "UNMARKED vector", "confidence": "medium",
     "source_discipline": "architect",
@@ -267,6 +272,88 @@ ck("slab line item present",  any("slab" in li["description"].lower() for li in 
 ck("text contains total",     "TOTAL NETT" in quotation_text(_q))
 ck("html contains total",     "TOTAL NETT" in quotation_html(_q) or "Total" in quotation_html(_q))
 ck("html is valid-ish",       quotation_html(_q).startswith("<!DOCTYPE html>"))
+
+# Client-call quotation requirements: one editable tab, canonical section order, aggregate
+# identical unit specs, retain different specs, mark assumptions provisional, and expose an
+# informational perimeter without pricing it. Synthetic geometry only — no drawings fixture.
+def _quotation_unit(filename, section, area, *, mesh="A252", assumed=False):
+    unit = _copy.deepcopy(_demo_result)
+    unit.update({"file": filename, "quotation_section": section, "area_m2": area,
+                 "source_discipline": "engineer", "flags": []})
+    unit["costing"].update({"area_m2": area, "assumed": assumed})
+    unit["costing"]["spec"] = dict(unit["costing"]["spec"], mesh=mesh)
+    return unit
+
+_quote_units = [
+    _quotation_unit("Upper.pdf", "Upper floor slabs", 40),
+    _quotation_unit("Yard-A.pdf", "External yard slabs", 100, assumed=True),
+    _quotation_unit("Dock.pdf", "Dock slabs", 30),
+    _quotation_unit("Ground.pdf", "Ground floor slabs", 20),
+    _quotation_unit("Yard-B.pdf", "External yard slabs", 150, assumed=True),
+]
+_q_multi = generate_quotation(
+    _quote_units, project="Multi-unit", client="Fortel", ref="TST-MULTI",
+    extras=[{"section": "Prelims", "description": "Existing prelim item",
+             "qty": 1, "unit": "Item", "rate": _demo_result["costing"]["rate"]}],
+)
+_actual_sections = list(dict.fromkeys(li["section"] for li in _q_multi["line_items"]))
+ck("quotation sections follow client order", _actual_sections == list(SECTION_ORDER), _actual_sections)
+_yard_slabs = [li for li in _q_multi["line_items"]
+               if li["section"] == "External yard slabs" and "supply & lay" in li["description"]]
+ck("matching-spec units aggregate into one slab row", len(_yard_slabs) == 1 and
+   _yard_slabs[0]["qty"] == 250, _yard_slabs)
+_q_diff_spec = generate_quotation([
+    _quotation_unit("Yard-A.pdf", "External yard slabs", 100),
+    _quotation_unit("Yard-C.pdf", "External yard slabs", 50, mesh="A393"),
+], ref="TST-DIFF-SPEC")
+ck("different unit specs remain separate on one quotation",
+   len([li for li in _q_diff_spec["line_items"] if "supply & lay" in li["description"]]) == 2)
+
+_rect = [[0, 0], [40, 0], [40, 20], [0, 20]]
+ck("perimeter_lm rectangle: 20m × 10m -> 60.0m",
+   polygon_perimeter_lm(_rect, 0.5) == 60.0)
+_perimeter_result = _quotation_unit("Dock-Perimeter.pdf", "Dock slabs", 200)
+_perimeter_result.update({"polygon_pts": _rect, "scale_k": 0.5})
+_q_perimeter = generate_quotation(_perimeter_result, ref="TST-PERIMETER")
+ck("quotation surfaces perimeter as informational, unpriced quantity",
+   _q_perimeter["perimeter_lm"] == 60.0 and
+   any(m["description"] == "Slab perimeter" and m["qty"] == 60.0
+       for m in _q_perimeter["measurements"]) and
+   all("perimeter" not in li["description"].lower() for li in _q_perimeter["line_items"]))
+
+_q_text = quotation_text(_q)
+_q_html = quotation_html(_q)
+_q_json = quotation_json(_q)
+ck("assumed build-up is provisional in text/html/json",
+   all(PROVISIONAL_LABEL in output for output in (_q_text, _q_html, _q_json)))
+
+_xlsx_bytes = quotation_xlsx(_q_multi)
+_xlsx_wb = _load_workbook(_BytesIO(_xlsx_bytes), data_only=False)
+_xlsx_ws = _xlsx_wb["Quotation"]
+ck("xlsx export reopens as exactly one editable quotation tab", _xlsx_wb.sheetnames == ["Quotation"])
+_xlsx_section_rows = {
+    _xlsx_ws.cell(row, 1).value: row for row in range(1, _xlsx_ws.max_row + 1)
+    if _xlsx_ws.cell(row, 1).value in SECTION_ORDER
+}
+ck("xlsx section headers follow client order",
+   list(_xlsx_section_rows) == list(SECTION_ORDER), _xlsx_section_rows)
+_xlsx_item_row = next(row for row in range(1, _xlsx_ws.max_row + 1)
+                      if "supply & lay" in str(_xlsx_ws.cell(row, 1).value or ""))
+ck("xlsx qty/rate are numeric and row value is a live formula",
+   isinstance(_xlsx_ws.cell(_xlsx_item_row, 3).value, (int, float)) and
+   isinstance(_xlsx_ws.cell(_xlsx_item_row, 5).value, (int, float)) and
+   _xlsx_ws.cell(_xlsx_item_row, 6).data_type == "f" and
+   _xlsx_ws.cell(_xlsx_item_row, 6).value == f"=ROUND(C{_xlsx_item_row}*E{_xlsx_item_row},2)")
+ck("xlsx section subtotals and nett total are formulas",
+   any(_xlsx_ws.cell(row, 6).data_type == "f" and
+       str(_xlsx_ws.cell(row, 1).value or "").startswith("Subtotal —")
+       for row in range(1, _xlsx_ws.max_row + 1)) and
+   any(_xlsx_ws.cell(row, 6).data_type == "f" and
+       _xlsx_ws.cell(row, 1).value == "TOTAL NETT (excl. VAT)"
+       for row in range(1, _xlsx_ws.max_row + 1)))
+ck("xlsx visibly marks assumed quantity provisional",
+   any(_xlsx_ws.cell(row, 7).value == PROVISIONAL_LABEL
+       for row in range(1, _xlsx_ws.max_row + 1)))
 
 print("pipeline price_with_defaults")
 import contextlib, io as _io
@@ -819,6 +906,7 @@ try:
        _doc2 is None and "encrypted" in _reason2.lower())
 
     _orig_jobs_file_up = _AS.JOBS_FILE
+    _orig_jobs_archive_file_up = _AS.JOBS_ARCHIVE_FILE
     _orig_backup_dir_up = _AS.BACKUP_DIR
     _orig_server_file_up = _AS.__file__
     _orig_thread_up = _AS.threading.Thread
@@ -832,6 +920,7 @@ try:
 
     try:
         _AS.JOBS_FILE = _tmpdir / "multi_upload_jobs.json"
+        _AS.JOBS_ARCHIVE_FILE = _tmpdir / "multi_upload_jobs_archive.json"
         _AS.BACKUP_DIR = _tmpdir / "multi_upload_backups"
         _AS.__file__ = str(_tmpdir / "approval_server.py")
         _AS.threading.Thread = _NoStartThread
@@ -889,6 +978,46 @@ try:
            all(any("every PDF queued" in f for f in j.get("flags", []))
                for j in _zip_jobs.values()))
 
+        _route_costing_a = _copy.deepcopy(_demo_result["costing"])
+        _route_costing_a.update({"area_m2": 100, "assumed": True})
+        _route_costing_b = _copy.deepcopy(_demo_result["costing"])
+        _route_costing_b.update({"area_m2": 150, "assumed": True})
+        _route_jobs = {
+            "11111111-1111-4111-8111-111111111111": {
+                "id": "11111111-1111-4111-8111-111111111111", "decision": "approved",
+                "status": "approved", "project_ref": "QUOTE-MULTI-001",
+                "project_name": "Two Yard Units", "client_name": "Fortel QA",
+                "created_at": "2026-07-15T10:00:00",
+                "costing": _route_costing_a,
+                "result": {"file": "Yard-A.pdf", "quotation_section": "External yard slabs",
+                           "area_m2": 100, "costing": _route_costing_a, "flags": []},
+            },
+            "22222222-2222-4222-8222-222222222222": {
+                "id": "22222222-2222-4222-8222-222222222222", "decision": "adjusted",
+                "status": "adjusted", "project_ref": "QUOTE-MULTI-001",
+                "project_name": "Two Yard Units", "client_name": "Fortel QA",
+                "created_at": "2026-07-15T10:01:00",
+                "costing": _route_costing_b,
+                "result": {"file": "Yard-B.pdf", "quotation_section": "External yard slabs",
+                           "area_m2": 150, "costing": _route_costing_b, "flags": []},
+            },
+        }
+        _AS.save_jobs(_route_jobs)
+        _xlsx_route_resp = _client_up.get(
+            "/quotation/11111111-1111-4111-8111-111111111111.xlsx")
+        _xlsx_route_wb = _load_workbook(_BytesIO(_xlsx_route_resp.data), data_only=False)
+        _xlsx_route_ws = _xlsx_route_wb["Quotation"]
+        _xlsx_route_slab_row = next(
+            row for row in range(1, _xlsx_route_ws.max_row + 1)
+            if "supply & lay" in str(_xlsx_route_ws.cell(row, 1).value or ""))
+        ck("xlsx download route returns a valid attachment",
+           _xlsx_route_resp.status_code == 200 and
+           _xlsx_route_resp.mimetype ==
+           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" and
+           "QUOTE-MULTI-001.xlsx" in _xlsx_route_resp.headers.get("Content-Disposition", ""))
+        ck("xlsx route aggregates approved sibling units sharing project_ref",
+           _xlsx_route_ws.cell(_xlsx_route_slab_row, 3).value == 250)
+
         _portal_html_up = (Path(_orig_server_file_up).parent / "assessor_portal.html").read_text()
         ck("portal file input allows multiple PDFs and ZIPs",
            'accept=".pdf,.zip" multiple' in _portal_html_up)
@@ -898,10 +1027,14 @@ try:
            "projectCounts.get(ref)" in _portal_html_up and
            'class="project-group-header' in _portal_html_up and
            "toggleProjectGroup(this)" in _portal_html_up)
+        ck("portal exposes editable xlsx quotation download",
+           'id="linkXlsx"' in _portal_html_up and
+           "quotation/${job.id}.xlsx" in _portal_html_up)
     finally:
         _AS.threading.Thread = _orig_thread_up
         _AS.__file__ = _orig_server_file_up
         _AS.JOBS_FILE = _orig_jobs_file_up
+        _AS.JOBS_ARCHIVE_FILE = _orig_jobs_archive_file_up
         _AS.BACKUP_DIR = _orig_backup_dir_up
 
     # approve hard-block mirrors the >£200k escalation guard mechanism (fb5b92b)

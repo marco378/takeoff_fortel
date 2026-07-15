@@ -484,11 +484,13 @@ def adjust(job_id):
     # If assessor traced a polygon + scale, re-measure (heavy I/O — outside lock)
     if vertices and scale_k and len(vertices) >= 3:
         try:
-            from geometry import measure_regions
+            from geometry import measure_regions, polygon_perimeter_lm
             area_m2, gflags = measure_regions([vertices], scale_k)
+            perimeter_lm = polygon_perimeter_lm(vertices, scale_k)
         except Exception as e:
-            area_m2, gflags = None, [f"geometry error: {e}"]
+            area_m2, perimeter_lm, gflags = None, None, [f"geometry error: {e}"]
     else:
+        perimeter_lm = None
         gflags = []
 
     # A valid assessor-supplied area (however it arrived) is a human confirmation of
@@ -520,6 +522,7 @@ def adjust(job_id):
                 "vertices": vertices,
                 "scale_k":  scale_k,
                 "area_m2":  area_m2,
+                "perimeter_lm": perimeter_lm,
                 "flags":    gflags,
                 "note":     note,
             },
@@ -545,6 +548,7 @@ def adjust(job_id):
         "status":   "adjusted",
         "job_id":   job_id,
         "area_m2":  area_m2,
+        "perimeter_lm": perimeter_lm,
         "costing":  costing_result,
         "flags":    gflags,
     })
@@ -702,23 +706,69 @@ def list_archived_jobs():
     return jsonify(_load_archive())
 
 
-# ── Costing helper ────────────────────────────────────────────────────────────
+# ── Costing / quotation helpers ───────────────────────────────────────────────
+
+def _quotation_result_for_job(job: dict, result_override=None, costing_override=None) -> dict:
+    """Effective approved result, preferring assessor-adjusted measurements when present."""
+    result = dict(result_override if result_override is not None else (job.get("result") or {}))
+    costing = costing_override if costing_override is not None else job.get("costing")
+    if costing:
+        result["costing"] = dict(costing)
+    adjusted = job.get("adjusted") or {}
+    if adjusted.get("area_m2"):
+        result["area_m2"] = adjusted["area_m2"]
+        if result.get("costing"):
+            result["costing"] = dict(result["costing"])
+            result["costing"]["area_m2"] = adjusted["area_m2"]
+            # Preserve the route's existing adjusted-area total behaviour unchanged.
+            result["costing"]["total_gbp"] = round(
+                adjusted["area_m2"] * (result["costing"].get("rate") or 0), 2)
+    if adjusted and "perimeter_lm" in adjusted:
+        if adjusted.get("perimeter_lm") is not None:
+            result["perimeter_lm"] = adjusted["perimeter_lm"]
+        elif adjusted.get("area_m2"):
+            # A direct area-only adjustment has no matching final geometry. Do not present
+            # the superseded AI outline's perimeter as if it described the adjusted area.
+            result.pop("perimeter_lm", None)
+            result.pop("polygon_pts", None)
+    return result
+
+
+def _quotation_for_job(job_id: str, result_override=None, costing_override=None):
+    """Build one project quotation from every approved/adjusted sibling job."""
+    from quotation import generate_quotation
+
+    hot_jobs = load_jobs()
+    all_jobs = dict(_load_archive())
+    all_jobs.update(hot_jobs)
+    anchor = all_jobs.get(job_id, {})
+    project_ref = anchor.get("project_ref")
+    if project_ref:
+        siblings = [
+            (sibling_id, sibling) for sibling_id, sibling in all_jobs.items()
+            if sibling.get("project_ref") == project_ref
+            and sibling.get("decision") in ("approved", "adjusted")
+        ]
+        siblings.sort(key=lambda pair: (pair[1].get("created_at") or "", pair[0]))
+    else:
+        siblings = [(job_id, anchor)]
+
+    results = []
+    for sibling_id, sibling in siblings:
+        results.append(_quotation_result_for_job(
+            sibling,
+            result_override if sibling_id == job_id else None,
+            costing_override if sibling_id == job_id else None,
+        ))
+    project = anchor.get("project_name") or (results[0].get("file", "") if results else "")
+    client = anchor.get("client_name") or ""
+    return generate_quotation(results, project=project, client=client, ref=project_ref or None)
 
 def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:
     """Generate and save quotation files for this job. Returns paths dict."""
     try:
-        from quotation import generate_quotation, save_quotation
-        if costing:
-            result = dict(result)
-            result["costing"] = costing
-        # Use the human-entered project name / ref stored at upload time rather
-        # than the raw PDF filename.  Falls back gracefully for legacy job records
-        # that predate the upload form (project_name not stored).
-        job     = load_jobs().get(job_id, {})
-        project = job.get("project_name") or result.get("file", "")
-        ref     = job.get("project_ref") or None
-        client  = job.get("client_name") or ""
-        q = generate_quotation(result, project=project, client=client, ref=ref)
+        from quotation import save_quotation
+        q = _quotation_for_job(job_id, result_override=result, costing_override=costing)
         out_dir = Path(__file__).parent / "quotations"
         return save_quotation(q, out_dir=str(out_dir))
     except Exception as e:
@@ -836,33 +886,29 @@ def _html_confirmation(action: str, job_id: str, costing) -> str:
 
 @app.route("/quotation/<job_id>.<fmt>")
 def quotation_download(job_id, fmt):
-    """Serve the quotation for an approved/adjusted job in txt, html, or json."""
+    """Serve the project quotation for an approved/adjusted job."""
     j, err, code = require_job(job_id)
     if err: return err, code
     if j.get("decision") not in ("approved", "adjusted"):
         return jsonify({"error": "quotation only available after approval or adjustment"}), 400
 
     try:
-        from quotation import generate_quotation, quotation_text, quotation_html, quotation_json
-        result  = dict(j.get("result") or {})
-        if j.get("costing"):
-            result["costing"] = dict(j["costing"])
-        # Use adjusted area if assessor corrected it
-        adj = j.get("adjusted", {})
-        if adj and adj.get("area_m2"):
-            result = dict(result)
-            if result.get("costing"):
-                result["costing"] = dict(result["costing"])
-                result["costing"]["area_m2"]   = adj["area_m2"]
-                result["costing"]["total_gbp"] = round(
-                    adj["area_m2"] * (result["costing"].get("rate") or 0), 2)
-        q = generate_quotation(result, project=result.get("file", ""), client="")
+        from quotation import quotation_text, quotation_html, quotation_json, quotation_xlsx
+        q = _quotation_for_job(job_id)
         if fmt == "txt":
             return Response(quotation_text(q),  mimetype="text/plain; charset=utf-8")
         elif fmt == "html":
             return Response(quotation_html(q),  mimetype="text/html; charset=utf-8")
         elif fmt == "json":
             return Response(quotation_json(q),  mimetype="application/json")
+        elif fmt == "xlsx":
+            filename = f"{_sanitise_filename(str(j.get('project_ref') or job_id))}.xlsx"
+            return send_file(
+                io.BytesIO(quotation_xlsx(q)),
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                as_attachment=True,
+                download_name=filename,
+            )
         else:
             return jsonify({"error": f"unknown format {fmt!r}"}), 400
     except Exception:
@@ -1057,6 +1103,7 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "costing":          result.get("costing"),
                 "flags":            pre_flags + result.get("flags", []),
                 "polygon_pts":      result.get("polygon_pts"),
+                "perimeter_lm":     result.get("perimeter_lm"),
                 "result":           result,
                 "status":           "pending",
             })
