@@ -26,13 +26,14 @@ Usage:
 Run standalone:
   python3 quotation.py          # self-test with synthetic data
 """
-import datetime, json, uuid, io, contextlib
+import datetime, html, json, uuid, io, contextlib
 from collections import OrderedDict
 from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from slab_spec import (brief_spec_signature, build_brief_spec,
+                       display_lines as brief_spec_display_lines, normalise_slab_type)
 
 with contextlib.redirect_stdout(io.StringIO()):
     from costing import rate_buildup, MESH_KG
@@ -102,9 +103,11 @@ def _normalise_section(section, fallback="External yard slabs"):
     return aliases.get(probe, fallback)
 
 
-def _spec_key(costing):
-    # Compare the complete existing spec record so units are never merged when any supplied
-    # specification provenance differs. This only groups data; it does not infer new fields.
+def _spec_key(costing, brief_spec=None):
+    # The client checklist's field-level provisional state is part of specification identity:
+    # equal effective values cannot be collapsed when one is assumed and one is confirmed.
+    if brief_spec:
+        return brief_spec_signature(brief_spec)
     return json.dumps(costing.get("spec") or {}, sort_keys=True, default=str, separators=(",", ":"))
 
 
@@ -119,7 +122,7 @@ def _unique_notes(notes):
 # ── Core generator ────────────────────────────────────────────────────────────
 
 def generate_quotation(result: dict | list, project: str = "", client: str = "",
-                       ref: str = None, extras: list = None) -> dict:
+                       ref: str = None, extras: list = None, commercial: dict = None) -> dict:
     """Build one structured quotation from one result or a project's result list.
 
     Units with the same canonical section, specification, existing rate and assumption
@@ -138,6 +141,7 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
     pipeline_flags = []
     measurements_by_key = OrderedDict()
     drawings = []
+    commercial = dict(commercial or {})
 
     for unit in results:
         costing = unit.get("costing") or {}
@@ -152,17 +156,40 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         flags = list(unit.get("flags") or [])
         pipeline_flags.extend(flags)
 
+        stored_brief_spec = unit.get("brief_spec")
+        if stored_brief_spec:
+            brief_spec = stored_brief_spec
+        else:
+            # Legacy records carry only an effective pricing spec, not field provenance.
+            # Show those values for context but keep every field visibly provisional.
+            brief_spec = build_brief_spec(
+                normalise_slab_type(section, text=drawing), effective_spec=spec,
+            )
+
         if area and rate is not None:
             # Existing rate is part of the key so stale/different priced results can never be
             # silently collapsed under one arbitrary rate. Matching specs/rates aggregate.
-            key = (section, _spec_key(costing), rate, assumed)
+            group_provisional = assumed or any(
+                field.get("provisional", True)
+                for field in (brief_spec.get("fields") or {}).values()
+                if isinstance(field, dict)
+            )
+            key = (section, _spec_key(costing, brief_spec), rate, group_provisional)
             group = groups.setdefault(key, {
-                "section": section, "spec": spec, "rate": rate, "assumed": assumed,
-                "area": 0.0, "drawings": [], "breakdown": costing.get("breakdown") or {},
+                "section": section, "spec": spec, "brief_spec": brief_spec,
+                "rate": rate, "assumed": group_provisional,
+                "area": 0.0, "drawings": [], "area_rows": [],
+                "breakdown": costing.get("breakdown") or {},
             })
             group["area"] += float(area)
             if drawing and drawing not in group["drawings"]:
                 group["drawings"].append(drawing)
+            area_label = (unit.get("unit_name") or unit.get("area_label") or drawing
+                          or f"Measured area {len(group['area_rows']) + 1}")
+            group["area_rows"].append({
+                "description": str(area_label), "qty": float(area), "unit": "m²",
+                "drawing": drawing,
+            })
 
         if assumed:
             declarations.append(f"{PROVISIONAL_LABEL}: {assumption_note(spec)}")
@@ -205,10 +232,16 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         if extras is None:
             for ex in costing.get("extras", []):
                 provisional = bool(ex.get("estimate", False))
+                item_rate = ex.get("rate")
+                item_value = ex.get("value")
+                if item_value is None and isinstance(item_rate, (int, float)):
+                    item_value = round(float(ex.get("qty") or 0) * item_rate, 2)
                 extra_rows.append({
                     "section": _normalise_section(ex.get("section"), section),
                     "description": ex["description"], "qty": ex["qty"], "unit": ex["unit"],
-                    "rate": ex["rate"], "value": ex["value"], "provisional": provisional,
+                    "rate": item_rate, "value": item_value,
+                    "value_status": ex.get("value_status") or "",
+                    "provisional": provisional,
                     "provisional_reason": PROVISIONAL_LABEL if provisional else "",
                     "drawings": [drawing] if drawing else [],
                 })
@@ -219,18 +252,38 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                     )
 
     line_items = []
-    for group in sorted(groups.values(), key=lambda g: _SECTION_RANK[g["section"]]):
+    specifications = []
+    for group_number, group in enumerate(
+            sorted(groups.values(), key=lambda g: _SECTION_RANK[g["section"]]), 1):
         spec = group["spec"]
         area = round(group["area"], 3)
-        depth_mm = spec.get("depth_mm", 190)
-        mesh = spec.get("mesh", "A252")
-        mix = spec.get("conc_mix", "C32/40")
-        layers = spec.get("layers", 1)
+        depth_mm = spec.get("depth_mm")
+        mesh = spec.get("mesh")
+        mix = spec.get("conc_mix")
+        layers = spec.get("layers")
+        group_id = f"spec-{group_number}"
+        specifications.append({
+            "id": group_id,
+            "section": group["section"],
+            "slab_type": group["brief_spec"].get("slab_type"),
+            "slab_type_label": group["brief_spec"].get("slab_type_label"),
+            "fields": group["brief_spec"].get("fields") or {},
+            "display_lines": brief_spec_display_lines(group["brief_spec"]),
+            "provisional": group["assumed"],
+            "drawings": group["drawings"],
+            "area_rows": group["area_rows"],
+            "area_m2": area,
+        })
         common = {
             "section": group["section"], "qty": area, "unit": "m²",
-            "drawings": group["drawings"],
+            "drawings": group["drawings"], "specification_id": group_id,
         }
-        slab_desc = f"{depth_mm}mm {mix} slab, {layers}× {mesh} mesh (supply & lay)"
+        known_parts = []
+        if depth_mm is not None: known_parts.append(f"{depth_mm}mm")
+        if mix: known_parts.append(str(mix))
+        known_parts.append("slab")
+        if layers is not None and mesh: known_parts.append(f"{layers}× {mesh} mesh")
+        slab_desc = " ".join(known_parts) + " (supply & lay)"
         line_items.append({
             **common, "description": slab_desc, "rate": group["rate"],
             "value": round(area * group["rate"], 2), "provisional": group["assumed"],
@@ -253,17 +306,24 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         fallback_section = quotation_section(results[0])
         for ex in extras:
             if isinstance(ex, dict):
-                desc, qty, unit_name, item_rate = (ex["description"], ex["qty"], ex["unit"], ex["rate"])
+                desc, qty, unit_name = (ex["description"], ex["qty"], ex["unit"])
+                item_rate = ex.get("rate")
                 section = _normalise_section(ex.get("section"), fallback_section)
                 provisional = bool(ex.get("estimate", False))
+                value_status = ex.get("value_status") or ""
+                item_value = ex.get("value")
             else:
                 desc, qty, unit_name, item_rate = ex
                 section = fallback_section
                 # Use the result's existing provenance; do not infer from wording alone.
                 provisional = bool(results[0].get("manhole_count_estimate") and "MH" in desc)
+                value_status = ""
+                item_value = None
+            if item_value is None and isinstance(item_rate, (int, float)):
+                item_value = round(qty * item_rate, 2)
             extra_rows.append({
                 "section": section, "description": desc, "qty": qty, "unit": unit_name,
-                "rate": item_rate, "value": round(qty * item_rate, 2),
+                "rate": item_rate, "value": item_value, "value_status": value_status,
                 "provisional": provisional,
                 "provisional_reason": PROVISIONAL_LABEL if provisional else "",
                 "drawings": [],
@@ -275,8 +335,18 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
     line_items.sort(key=lambda li: _SECTION_RANK.get(li["section"], len(SECTION_ORDER)))
     measurements = sorted(measurements_by_key.values(),
                           key=lambda item: _SECTION_RANK[item["section"]])
-    subtotal = round(sum(li["value"] for li in line_items), 2)
-    assumed = any(bool((unit.get("costing") or {}).get("assumed", True)) for unit in results)
+    subtotal = round(sum(float(li["value"]) for li in line_items
+                         if isinstance(li.get("value"), (int, float))), 2)
+    assumed = any(specification.get("provisional") for specification in specifications)
+    for specification in specifications:
+        provisional_labels = [
+            line["label"] for line in specification["display_lines"] if line["provisional"]
+        ]
+        if provisional_labels:
+            declarations.append(
+                f"{PROVISIONAL_LABEL}: {specification['slab_type_label'] or specification['section']} "
+                f"— {', '.join(provisional_labels)}."
+            )
 
     if extras is None:
         declarations.append(
@@ -301,16 +371,25 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         "perimeter_lm": total_perimeter,
         "measurements": measurements,
         "spec": {
-            "depth_mm": first_spec.get("depth_mm", 190),
-            "mesh": first_spec.get("mesh", "A252"),
-            "conc_mix": first_spec.get("conc_mix", "C32/40"),
-            "layers": first_spec.get("layers", 1),
+            "depth_mm": first_spec.get("depth_mm"),
+            "mesh": first_spec.get("mesh"),
+            "conc_mix": first_spec.get("conc_mix"),
+            "layers": first_spec.get("layers"),
         },
+        "specifications": specifications,
         "rate": first_costing.get("rate"), "breakdown": first_costing.get("breakdown") or {},
         "line_items": line_items, "section_order": list(SECTION_ORDER),
         "subtotal_gbp": subtotal, "total_gbp": subtotal,
         "assumed": assumed, "declarations": _unique_notes(declarations),
         "pipeline_flags": _unique_notes(pipeline_flags), "terms": STANDARD_TERMS,
+        # The real BOQ locates these fields in the header/post-total block.  They are
+        # project-specific and therefore optional; nothing is silently copied from one quote.
+        "revision": commercial.get("revision") or ref,
+        "measurement_basis": commercial.get("measurement_basis") or "",
+        "joint_layout_note": commercial.get("joint_layout_note") or "",
+        "joint_details_note": commercial.get("joint_details_note") or "",
+        "market_warning": commercial.get("market_warning") or "",
+        "commercial_terms": list(commercial.get("terms") or []),
     }
 
 
@@ -327,6 +406,18 @@ def quotation_text(q: dict) -> str:
         f"Client  : {q['client'] or '—'}",
         f"Drawing : {q['drawing']} ({q.get('drawing_type','')}, {q.get('discipline','')}'s drawing)",
         "",
+    ]
+    if q.get("specifications"):
+        lines.append("SLAB SPECIFICATION CHECKLIST:")
+        for specification in q["specifications"]:
+            lines.append(
+                f"  {specification['section']} — "
+                f"{specification.get('slab_type_label') or 'Specification'}"
+            )
+            for field in specification.get("display_lines", []):
+                lines.append(f"    {field['label']}: {field['value']}")
+        lines.append("")
+    lines += [
         "=" * 70,
         f"{'DESCRIPTION':<42}{'QTY':>8}{'UNIT':>6}{'RATE £':>9}{'VALUE £':>13}",
         "-" * 70,
@@ -337,9 +428,12 @@ def quotation_text(q: dict) -> str:
             lines.append(f"\n  {li['section'].upper()}")
             last_section = li["section"]
         description = _provisional_text(li)
+        rate_text = f"{li['rate']:.2f}" if isinstance(li.get("rate"), (int, float)) else ""
+        value_text = (str(li.get("value_status")) if li.get("value_status") else
+                      (f"{li['value']:,.2f}" if isinstance(li.get("value"), (int, float)) else ""))
         lines.append(
             f"  {description:<40}{li['qty']:>8,.0f}{li['unit']:>6}"
-            f"{li['rate']:>9.2f}{li['value']:>13,.2f}"
+            f"{rate_text:>9}{value_text:>13}"
         )
     lines += [
         "-" * 70,
@@ -372,29 +466,49 @@ def quotation_text(q: dict) -> str:
 
 def quotation_html(q: dict) -> str:
     """Self-contained HTML quotation — suitable for email or browser view."""
+    def _h(value):
+        return html.escape(str(value if value is not None else ""), quote=True)
+
     def _row(li):
         provisional = (f" <strong style='color:#9a6500'>{PROVISIONAL_LABEL}</strong>"
                        if li.get("provisional") else "")
-        return (f"<tr><td>{li['section']}</td><td>{li['description']}{provisional}</td>"
-                f"<td style='text-align:right'>{li['qty']:,.0f} {li['unit']}</td>"
-                f"<td style='text-align:right'>£{li['rate']:.2f}</td>"
-                f"<td style='text-align:right'>£{li['value']:,.2f}</td></tr>")
+        rate = (f"£{li['rate']:.2f}" if isinstance(li.get("rate"), (int, float)) else "")
+        value = (_h(li.get("value_status")) if li.get("value_status") else
+                 (f"£{li['value']:,.2f}" if isinstance(li.get("value"), (int, float)) else ""))
+        return (f"<tr><td>{_h(li['section'])}</td><td>{_h(li['description'])}{provisional}</td>"
+                f"<td style='text-align:right'>{li['qty']:,.0f} {_h(li['unit'])}</td>"
+                f"<td style='text-align:right'>{rate}</td>"
+                f"<td style='text-align:right'>{value}</td></tr>")
 
     assumed_banner = ""
     if q["assumed"]:
         assumed_banner = (
             f"<div style='background:#fef9ec;border-left:4px solid #e67e22;"
             f"padding:10px 16px;margin:16px 0;font-size:13px;color:#7a5200'>"
-            f"⚠ <b>Build-up assumed</b> — {q['declarations'][0] if q['declarations'] else ''}"
+            f"⚠ <b>Build-up assumed</b> — {_h(q['declarations'][0]) if q['declarations'] else ''}"
             f"</div>"
         )
 
     decl_html = ""
     if q["declarations"]:
-        items = "".join(f"<li>{d}</li>" for d in q["declarations"])
+        items = "".join(f"<li>{_h(d)}</li>" for d in q["declarations"])
         decl_html = f"<h3>Notes / Assumptions</h3><ul style='font-size:13px'>{items}</ul>"
 
     rows = "\n".join(_row(li) for li in q["line_items"])
+    specification_html = ""
+    if q.get("specifications"):
+        spec_blocks = []
+        for specification in q["specifications"]:
+            fields = "".join(
+                f"<tr><td>{_h(field['label'])}</td><td>{_h(field['value'])}</td></tr>"
+                for field in specification.get("display_lines", [])
+            )
+            spec_blocks.append(
+                f"<h4 style='margin:12px 0 4px'>{_h(specification['section'])} — "
+                f"{_h(specification.get('slab_type_label') or 'Specification')}</h4>"
+                f"<table style='margin:4px 0 12px'><tbody>{fields}</tbody></table>"
+            )
+        specification_html = "<h3>Slab specification checklist</h3>" + "".join(spec_blocks)
     measurement_html = ""
     if q.get("measurements"):
         measurement_rows = ""
@@ -402,10 +516,10 @@ def quotation_html(q: dict) -> str:
             marker = (f" <strong style='color:#9a6500'>{PROVISIONAL_LABEL}</strong>"
                       if measurement.get("provisional") else "")
             measurement_rows += (
-                f"<tr><td>{measurement['section']}</td>"
-                f"<td>{measurement['description']}{marker}</td>"
+                f"<tr><td>{_h(measurement['section'])}</td>"
+                f"<td>{_h(measurement['description'])}{marker}</td>"
                 f"<td style='text-align:right'>{measurement['qty']:,.1f} "
-                f"{measurement['unit']}</td></tr>"
+                f"{_h(measurement['unit'])}</td></tr>"
             )
         measurement_html = (
             "<h3>Informational measurements <small>(not priced)</small></h3>"
@@ -415,7 +529,7 @@ def quotation_html(q: dict) -> str:
         )
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Quotation {q['ref']}</title>
+<title>Quotation {_h(q['ref'])}</title>
 <style>
 body{{font-family:Arial,sans-serif;font-size:14px;color:#111;max-width:760px;margin:32px auto;padding:0 16px}}
 header{{background:#13294b;color:#fff;padding:20px 24px;border-radius:8px 8px 0 0}}
@@ -432,16 +546,17 @@ td{{padding:6px 10px;border-bottom:1px solid #eee;font-size:13px}}
 footer{{font-size:11px;color:#bbb;margin-top:20px;padding-top:12px;border-top:1px solid #eee}}
 </style></head><body>
 <header>
-  <h1>{FORTEL_NAME}</h1>
-  <p>Quotation {q['ref']} &nbsp;·&nbsp; {q['date']}</p>
+  <h1>{_h(FORTEL_NAME)}</h1>
+  <p>Quotation {_h(q['ref'])} &nbsp;·&nbsp; {_h(q['date'])}</p>
 </header>
 <div class="meta">
-  <div><b>Project</b><br>{q.get('project') or '—'}</div>
-  <div><b>Client</b><br>{q.get('client') or '—'}</div>
-  <div><b>Drawing</b><br>{q['drawing']}</div>
+  <div><b>Project</b><br>{_h(q.get('project') or '—')}</div>
+  <div><b>Client</b><br>{_h(q.get('client') or '—')}</div>
+  <div><b>Drawing</b><br>{_h(q['drawing'])}</div>
   <div><b>Area</b><br><b style='font-size:18px;color:#13294b'>{q['area_m2']:,.0f} m²</b></div>
 </div>
 {assumed_banner}
+{specification_html}
 <table>
   <thead><tr>
     <th>Section</th><th>Description</th><th style='text-align:right'>Qty</th>
@@ -457,8 +572,8 @@ footer{{font-size:11px;color:#bbb;margin-top:20px;padding-top:12px;border-top:1p
 </table>
 {measurement_html}
 {decl_html}
-<p class='terms'>{q['terms']}</p>
-<footer>{FORTEL_NAME} &nbsp;·&nbsp; {FORTEL_EMAIL} &nbsp;·&nbsp; {FORTEL_TEL}</footer>
+<p class='terms'>{_h(q['terms'])}</p>
+<footer>{_h(FORTEL_NAME)} &nbsp;·&nbsp; {_h(FORTEL_EMAIL)} &nbsp;·&nbsp; {_h(FORTEL_TEL)}</footer>
 </body></html>"""
 
 
@@ -516,56 +631,46 @@ def quotation_xlsx(q: dict) -> bytes:
     ws = wb.active
     ws.title = "REV_01"
     ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A9"
-    ws.sheet_properties.tabColor = "13294B"
+    ws.sheet_view.zoomScale = 130
 
-    navy = "13294B"
-    pale_blue = "EAF0F8"
     pale_gold = "FFF2CC"
-    pale_grey = "F4F6F8"
     section_blue = "0070C0"
     black = "000000"
     white = "FFFFFF"
-    muted = "667085"
-    thin_grey = Side(style="thin", color="D9DEE7")
+    red = "FF0000"
+    thin_grey = Side(style="thin", color="D9D9D9")
+    currency_format = ('_-[$£-809]* #,##0.00_-;\\-[$£-809]* #,##0.00_-;'
+                       '_-[$£-809]* "-"??_-;_-@_-')
 
-    ws.merge_cells("A1:E1")
-    ws["A1"] = FORTEL_NAME
-    ws["A1"].font = Font(name="Aptos Display", size=18, bold=True, color=white)
-    ws["A1"].fill = PatternFill("solid", fgColor=navy)
-    ws["A1"].alignment = Alignment(vertical="center")
-    ws.row_dimensions[1].height = 30
+    def _date_text(value):
+        parsed = _excel_date(value)
+        if isinstance(parsed, (datetime.date, datetime.datetime)):
+            return parsed.strftime("%d/%m/%Y")
+        return str(parsed or "")
 
-    ws["A2"], ws["B2"] = "Project:", _excel_text(q.get("project") or "—")
-    ws["A3"], ws["B3"] = "Client:", _excel_text(q.get("client") or "—")
-    ws["A4"], ws["B4"] = "Date:", _excel_date(q.get("date"))
-    ws["C4"], ws["D4"] = "Quotation Ref:", _excel_text(q.get("ref") or "—")
-    ws.merge_cells("B2:E2")
-    ws.merge_cells("B3:E3")
+    # Exact header shape in the supplied Winvic BOQ.  Project-specific notices remain blank
+    # unless explicitly provided; they are never copied into unrelated quotations.
+    ws["A1"] = _excel_text(f"Project: {q.get('project') or '—'}")
+    ws["B1"] = _excel_text(q.get("measurement_basis") or "")
+    ws["A2"] = _excel_text(f"Client: {q.get('client') or '—'}")
+    ws["B2"] = _excel_text(q.get("joint_layout_note") or "")
+    ws["A3"] = _excel_text(f"Date: {_date_text(q.get('date'))}")
+    ws["B3"] = _excel_text(q.get("joint_details_note") or "")
+    ws["A4"] = _excel_text(f"Rev: {q.get('revision') or q.get('ref') or '—'}")
     ws.merge_cells("D4:E4")
-    for cell in (ws["A2"], ws["A3"], ws["A4"], ws["C4"]):
-        cell.font = Font(bold=True, color=navy)
-    ws["B4"].number_format = "dd/mm/yyyy"
-
     drawings = q.get("drawings") or []
-    ws["A5"] = "Drawing ref available at tender:"
-    ws["A5"].font = Font(bold=True, color=navy)
+    ws["A5"] = _excel_text(
+        "Drawing ref available at tender:" +
+        (("\n" + "\n".join(str(item) for item in drawings)) if drawings else "")
+    )
     ws["A5"].alignment = Alignment(wrap_text=True, vertical="top")
-    ws["B5"] = _excel_text("\n".join(drawings) or "—")
-    ws.merge_cells("B5:E5")
-    ws["B5"].alignment = Alignment(wrap_text=True, vertical="top")
-    ws.row_dimensions[5].height = max(30, 15 * max(2, len(drawings)))
-    for row_index in range(2, 6):
-        for col_index in range(1, 6):
-            ws.cell(row_index, col_index).fill = PatternFill("solid", fgColor=pale_blue)
-
-    ws["A6"], ws["B6"] = "Measured area (m2)", float(q.get("area_m2") or 0)
-    ws["C6"] = "Slab perimeter (Lm)"
-    ws["D6"] = (float(q["perimeter_lm"]) if q.get("perimeter_lm") is not None else None)
-    for cell in (ws["A6"], ws["C6"]):
-        cell.font = Font(bold=True, color=muted)
-    ws["B6"].number_format = '#,##0.##'
-    ws["D6"].number_format = '#,##0.##'
+    ws.row_dimensions[5].height = max(30, 15 * max(2, len(drawings) + 1))
+    ws["A6"] = _excel_text(q.get("market_warning") or "")
+    ws["A6"].font = Font(name="Arial", size=8, color=red)
+    ws["A6"].alignment = Alignment(wrap_text=True, vertical="top")
+    for row_index in range(1, 6):
+        ws.cell(row_index, 1).font = Font(name="Arial", size=9, bold=row_index in (1, 2, 3, 4))
+        ws.cell(row_index, 2).font = Font(name="Arial", size=9)
 
     sections = OrderedDict()
     for item in q.get("line_items", []):
@@ -573,84 +678,133 @@ def quotation_xlsx(q: dict) -> bytes:
     ordered_sections = [section for section in q.get("section_order", SECTION_ORDER) if section in sections]
     ordered_sections += [section for section in sections if section not in ordered_sections]
 
-    row = 8
-    subtotal_rows = []
-    header_fill = PatternFill("solid", fgColor=pale_grey)
+    specifications = {specification["id"]: specification
+                      for specification in q.get("specifications", [])}
+    row = 7
     section_fill = PatternFill("solid", fgColor=section_blue)
     provisional_fill = PatternFill("solid", fgColor=pale_gold)
     headings = ("DESCRIPTION", "QTY", "UNIT", "RATE", "VALUE")
 
     for col, heading in enumerate(headings, 1):
         cell = ws.cell(row, col, heading)
-        cell.font = Font(bold=True, color=white, size=10)
+        cell.font = Font(name="Arial", bold=True, color=white, size=11)
         cell.fill = PatternFill("solid", fgColor=black)
         cell.alignment = Alignment(horizontal="right" if col in (2, 4, 5) else "left")
     ws.row_dimensions[row].height = 20
-    row += 1
+    row += 2  # the supplied workbook leaves row 8 blank
 
     for section in ordered_sections:
         section_items = sections[section]
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
         ws.cell(row, 1, _excel_section_title(section, section_items))
-        ws.cell(row, 1).font = Font(bold=True, color=white, size=12)
-        ws.cell(row, 1).fill = section_fill
-        ws.cell(row, 1).alignment = Alignment(vertical="center")
+        for col in range(1, 6):
+            ws.cell(row, col).fill = section_fill
+            ws.cell(row, col).font = Font(name="Arial", bold=True, color=white, size=9)
+        ws.cell(row, 1).alignment = Alignment(vertical="center", wrap_text=True)
         ws.row_dimensions[row].height = 22
         row += 1
 
-        first_item_row = row
-        for item in section_items:
+        group_ids = list(dict.fromkeys(
+            item.get("specification_id") for item in section_items
+            if item.get("specification_id")
+        ))
+        ungrouped = [item for item in section_items if not item.get("specification_id")]
+
+        def _write_item(item, qty_formula=None):
+            nonlocal row
             description = item["description"]
             if item.get("provisional"):
                 description += f"\n{PROVISIONAL_LABEL}"
             ws.cell(row, 1, _excel_text(description))
-            ws.cell(row, 2, float(item["qty"]))
+            ws.cell(row, 2, qty_formula or float(item["qty"]))
             ws.cell(row, 3, _excel_text(_excel_unit(item["unit"])))
-            ws.cell(row, 4, float(item["rate"]))
-            ws.cell(row, 5, f"=ROUND(B{row}*D{row},2)")
+            rate = item.get("rate")
+            if isinstance(rate, (int, float)):
+                ws.cell(row, 4, float(rate))
+            value_status = item.get("value_status")
+            if value_status:
+                ws.cell(row, 5, _excel_text(value_status))
+            elif isinstance(rate, (int, float)):
+                ws.cell(row, 5, f"=B{row}*D{row}")
+            elif isinstance(item.get("value"), (int, float)):
+                ws.cell(row, 5, float(item["value"]))
             ws.cell(row, 2).number_format = '#,##0.##'
-            ws.cell(row, 4).number_format = '£#,##0.00'
-            ws.cell(row, 5).number_format = '£#,##0.00'
+            ws.cell(row, 4).number_format = currency_format
+            ws.cell(row, 5).number_format = currency_format
             for col in range(1, 6):
                 ws.cell(row, col).border = Border(bottom=thin_grey)
                 ws.cell(row, col).alignment = Alignment(
                     horizontal="right" if col in (2, 4, 5) else "left",
                     vertical="top", wrap_text=col == 1)
+                ws.cell(row, col).font = Font(name="Arial", size=8)
                 if item.get("provisional"):
                     ws.cell(row, col).fill = provisional_fill
             if item.get("provisional"):
                 ws.row_dimensions[row].height = 30
             row += 1
 
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-        ws.cell(row, 1, f"Subtotal — {_excel_section_title(section, [])}")
-        ws.cell(row, 1).font = Font(bold=True, color=navy)
-        ws.cell(row, 5, f"=SUM(E{first_item_row}:E{row - 1})")
-        ws.cell(row, 5).font = Font(bold=True, color=navy)
-        ws.cell(row, 5).number_format = '£#,##0.00'
-        for col in range(1, 6):
-            ws.cell(row, col).fill = header_fill
-            ws.cell(row, col).border = Border(top=thin_grey, bottom=thin_grey)
-        subtotal_rows.append(row)
+        for group_id in group_ids:
+            specification = specifications.get(group_id) or {}
+            source_rows = specification.get("area_rows") or []
+            first_source_row = row
+            for source_row in source_rows:
+                ws.cell(row, 1, _excel_text(source_row.get("description") or "Measured area"))
+                ws.cell(row, 2, float(source_row.get("qty") or 0))
+                ws.cell(row, 3, _excel_unit(source_row.get("unit") or "m²"))
+                ws.cell(row, 2).number_format = '#,##0.##'
+                for col in range(1, 6):
+                    ws.cell(row, col).font = Font(name="Arial", size=8)
+                row += 1
+            if source_rows:
+                total_area_row = row
+                ws.cell(row, 1, "Total Area Take Off:")
+                ws.cell(row, 1).font = Font(name="Arial", size=8, bold=True)
+                ws.cell(row, 2, f"=SUM(B{first_source_row}:B{row - 1})")
+                ws.cell(row, 2).number_format = '#,##0.##'
+                ws.cell(row, 3, "m2")
+                row += 1
+            else:
+                total_area_row = None
+
+            display_lines = specification.get("display_lines") or []
+            if display_lines:
+                ws.cell(row, 1, _excel_text(
+                    f"Specification — {specification.get('slab_type_label') or section}\n" +
+                    "\n".join(f"{field['label']}: {field['value']}" for field in display_lines)
+                ))
+                ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.cell(row, 1).font = Font(name="Arial", size=8,
+                                            italic=bool(specification.get("provisional")),
+                                            color=red if specification.get("provisional") else black)
+                if specification.get("provisional"):
+                    for col in range(1, 6):
+                        ws.cell(row, col).fill = provisional_fill
+                ws.row_dimensions[row].height = max(30, 12 * (len(display_lines) + 1))
+                row += 1
+
+            qty_formula = f"=B{total_area_row}" if total_area_row else None
+            for item in section_items:
+                if item.get("specification_id") == group_id:
+                    _write_item(item, qty_formula=qty_formula)
+
+        for item in ungrouped:
+            _write_item(item)
+
         row += 2
 
     total_row = row
-    ws.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=4)
     ws.cell(total_row, 1, "TOTAL NETT")
-    subtotal_refs = ",".join(f"E{r}" for r in subtotal_rows)
-    ws.cell(total_row, 5, f"=SUM({subtotal_refs})" if subtotal_refs else "=0")
-    ws.cell(total_row, 5).number_format = '£#,##0.00'
-    for col in range(1, 6):
-        ws.cell(total_row, col).fill = PatternFill("solid", fgColor=navy)
-        ws.cell(total_row, col).font = Font(bold=True, color=white, size=12)
+    ws.cell(total_row, 1).font = Font(name="Arial", bold=True, size=9)
+    ws.cell(total_row, 5, f"=SUM(E7:E{total_row - 1})")
+    ws.cell(total_row, 5).number_format = currency_format
+    ws.cell(total_row, 5).font = Font(name="Arial", bold=True, size=9)
 
     row = total_row + 3
     measurements = q.get("measurements") or []
     if measurements:
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
         ws.cell(row, 1, "INFORMATIONAL MEASUREMENTS — NOT PRICED")
-        ws.cell(row, 1).font = Font(bold=True, color=white)
-        ws.cell(row, 1).fill = section_fill
+        for col in range(1, 6):
+            ws.cell(row, col).font = Font(name="Arial", bold=True, color=white, size=9)
+            ws.cell(row, col).fill = section_fill
         row += 1
         for measurement in measurements:
             description = f"{_excel_section_title(measurement['section'], [])} — {measurement['description']}"
@@ -668,33 +822,36 @@ def quotation_xlsx(q: dict) -> bytes:
         row += 1
 
     if q.get("declarations"):
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
         ws.cell(row, 1, "NOTES / ASSUMPTIONS")
-        ws.cell(row, 1).font = Font(bold=True, color=white)
-        ws.cell(row, 1).fill = section_fill
+        for col in range(1, 6):
+            ws.cell(row, col).font = Font(name="Arial", bold=True, color=white, size=9)
+            ws.cell(row, col).fill = section_fill
         row += 1
         for note in q["declarations"]:
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
             ws.cell(row, 1, f"• {note}")
             ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+            ws.cell(row, 1).font = Font(name="Arial", size=8)
             ws.row_dimensions[row].height = 30
             row += 1
 
-    ws.merge_cells(start_row=row + 1, start_column=1, end_row=row + 1, end_column=5)
     ws.cell(row + 1, 1, f"STANDARD TERMS: {q['terms']}")
-    ws.cell(row + 1, 1).font = Font(size=9, color=muted)
+    ws.cell(row + 1, 1).font = Font(name="Arial", size=8)
     ws.cell(row + 1, 1).alignment = Alignment(wrap_text=True, vertical="top")
     ws.row_dimensions[row + 1].height = 45
+    row += 2
+    for term in q.get("commercial_terms") or []:
+        ws.cell(row, 1, _excel_text(term))
+        ws.cell(row, 1).font = Font(name="Arial", size=8)
+        ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+        row += 1
 
-    widths = {"A": 68, "B": 14, "C": 10, "D": 15, "E": 18}
+    widths = {"A": 82.43, "B": 19.43, "C": 10.29, "D": 12.71, "E": 21.14}
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
-    ws.auto_filter.ref = f"A8:E{max(8, total_row - 2)}"
-    ws.print_title_rows = "1:8"
-    ws.print_area = f"A1:E{row + 1}"
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = "1:7"
+    ws.print_area = f"A1:E{row}"
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.oddFooter.center.text = f"{FORTEL_NAME} · {FORTEL_EMAIL} · {FORTEL_TEL}"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True

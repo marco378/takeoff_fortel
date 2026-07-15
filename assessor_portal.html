@@ -865,15 +865,111 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">Slab perimeter</span><span class="v">${perimeter!=null?perimeter.toLocaleString()+' m':'—'}</span></div>
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
   `;
-  renderCosting(job.costing || res.costing, job.status);
+  renderCosting(job.costing || res.costing, job.status, job);
 }
 
-function renderCosting(c, jobStatus) {
+const BRIEF_SPEC_SCHEMA = {
+  external_yard: {label:'External/Service Yard Slabs', fields:[
+    ['depth_mm','Thickness of slab'], ['conc_mix','Concrete Mix'],
+    ['mesh','Type of mesh'], ['layers','Nr of mesh layers'],
+    ['bay_sizes','Bay sizes if joint layout available'],
+    ['joint_details','Type and size of dowel bars- if joint details available + any special requirements for joints (thickening etc.)']
+  ]},
+  dock: {label:'Dock Slabs', fields:[
+    ['depth_mm','Thickness of slab'], ['conc_mix','Concrete Mix'],
+    ['mesh','Type of mesh'], ['layers','Nr of mesh layers'],
+    ['bay_sizes','Bay sizes if joint layout available'],
+    ['joint_details','Type and size of dowel bars- if joint details available + any special requirements for joints (thickening etc.)']
+  ]},
+  ground_floor: {label:'Ground Floor Slabs(Core Areas)', fields:[
+    ['depth_mm','Thickness of slab'], ['conc_mix','Concrete Mix'],
+    ['mesh','Type of mesh'], ['layers','Nr of mesh layers'],
+    ['joint_details','Type and size of dowel bars- if joint details available + any special requirements for joints (thickening etc.)']
+  ]},
+  upper_floor: {label:'Upper Floors', fields:[
+    ['depth_mm','Thickness of slab'], ['conc_mix','Concrete Mix'],
+    ['mesh','Type of mesh'], ['layers','Nr of mesh layers']
+  ]}
+};
+
+function inferredSlabType(job) {
+  const res = (job && job.result) || {};
+  const text = `${res.quotation_section||''} ${res.file||''} ${res.project_name||''} ${job&&job.project_name||''} ${res.type||''}`.toLowerCase();
+  if (text.includes('dock')) return 'dock';
+  if (/upper floor|first floor|mezzanine|level 1/.test(text)) return 'upper_floor';
+  if (/ground floor|office|transport|internal slab/.test(text)) return 'ground_floor';
+  return 'external_yard';
+}
+
+function effectiveBriefSpec(job, costing) {
+  const stored = (job && (job.brief_spec || ((job.result||{}).brief_spec))) || null;
+  if (stored && stored.fields) return stored;
+  const slabType = inferredSlabType(job);
+  const spec = (costing && costing.spec) || {};
+  const fields = {};
+  (BRIEF_SPEC_SCHEMA[slabType]||BRIEF_SPEC_SCHEMA.external_yard).fields.forEach(([key,label]) => {
+    fields[key] = {label, value: spec[key] == null ? null : spec[key],
+                   source: spec[key] == null ? 'not_provided' : 'assumed_default', provisional:true};
+  });
+  return {schema_version:1, slab_type:slabType,
+          slab_type_label:BRIEF_SPEC_SCHEMA[slabType].label, fields};
+}
+
+function specValueText(key, field) {
+  if (!field || field.value == null || field.value === '') return 'ASSUMED / no details provided';
+  const value = key === 'depth_mm' ? `${field.value} mm` : String(field.value);
+  return field.provisional ? `${value} — ASSUMED / provisional` : value;
+}
+
+function renderBriefSpecSummary(brief) {
+  const schema = BRIEF_SPEC_SCHEMA[brief.slab_type] || BRIEF_SPEC_SCHEMA.external_yard;
+  return `<div style="margin-top:8px;border:1px solid #28466f;border-radius:6px;padding:8px 10px">
+    <div style="font-size:11px;color:#aec3e0;font-weight:700;margin-bottom:5px">${esc(schema.label)}</div>
+    ${schema.fields.map(([key,label]) => {
+      const field = (brief.fields||{})[key] || {value:null,provisional:true};
+      return `<div class="kv" style="gap:8px"><span class="k" style="font-size:10px">${esc(label)}</span>
+        <span class="v" style="font-size:10px;color:${field.provisional?'#f4c56a':'#b8e1c3'}">
+          ${esc(specValueText(key,field))} · ${field.provisional?'PROVISIONAL':'CONFIRMED'}
+        </span></div>`;
+    }).join('')}
+  </div>`;
+}
+
+function renderSpecFieldInputs(slabType, brief) {
+  const target = document.getElementById('briefSpecFields');
+  if (!target) return;
+  const schema = BRIEF_SPEC_SCHEMA[slabType] || BRIEF_SPEC_SCHEMA.external_yard;
+  const storedFields = (brief && brief.slab_type === slabType && brief.fields) || {};
+  target.innerHTML = schema.fields.map(([key,label]) => {
+    const field = storedFields[key] || {value:null,provisional:true};
+    const confirmedValue = !field.provisional && field.value != null ? field.value : '';
+    const assumedHint = field.value != null
+      ? `Assumed for current pricing: ${field.value}${key==='depth_mm'?' mm':''}`
+      : 'No details provided — remains provisional';
+    const inputType = (key === 'depth_mm' || key === 'layers') ? 'number' : 'text';
+    return `<label style="font-size:11px;color:#8fa8cc;display:block">
+      ${esc(label)} <span style="color:${field.provisional?'#f4c56a':'#7fd394'}">${field.provisional?'PROVISIONAL':'CONFIRMED'}</span>
+      <input data-spec-key="${key}" type="${inputType}" ${inputType==='number'?'min="1" step="1"':''}
+             value="${esc(confirmedValue)}" placeholder="${esc(assumedHint)}"
+             style="width:100%;margin-top:3px;padding:5px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
+    </label>`;
+  }).join('');
+}
+
+function changeBriefSpecType(value) {
+  const job = currentJob || {};
+  renderSpecFieldInputs(value, effectiveBriefSpec(job, job.costing || (job.result||{}).costing));
+}
+
+function renderCosting(c, jobStatus, job={}) {
   const el = document.getElementById('costingBlock');
-  if (!c || !c.total_gbp) { el.innerHTML = '<span style="color:var(--muted)">—</span>'; return; }
+  c = c || {};
+  const hasCosting = c.total_gbp != null;
   const spec    = c.spec || {};
   const bdwn    = c.breakdown || {};
-  const assumed = c.assumed;
+  const assumed = c.assumed !== false;
+  const briefSpec = effectiveBriefSpec(job, c);
+  const slabType = briefSpec.slab_type || inferredSlabType(job);
   const numericRate = Number(c.rate);
   const rateDisplay = Number.isFinite(numericRate)
     ? numericRate.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})
@@ -890,65 +986,54 @@ function renderCosting(c, jobStatus) {
     ? `<div style="background:#fdecea;border:1px solid #e74c3c;border-radius:5px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:#c0392b;line-height:1.4">
          🚨 <strong>ESCALATION — do not approve.</strong> Quotation &gt; £200k with assumed spec requires human review before this job can be actioned. See L3 QA report in #fortel.
        </div>` : '';
+  const specPricingBanner = job.spec_pricing_warning
+    ? `<div style="background:#fdecea;border:1px solid #e74c3c;border-radius:5px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:#c0392b;line-height:1.4">
+         🚨 <strong>Specification saved; pricing review required.</strong> ${esc(job.spec_pricing_warning)}
+       </div>` : '';
 
   const canOverride = jobStatus === 'pending' || jobStatus === 'adjusted';
   const overrideForm = canOverride ? `
     <details id="specOverrideDetails" style="margin-top:8px">
       <summary style="cursor:pointer;font-size:12px;color:#8fa8cc;user-select:none;padding:4px 0">
-        ✏ Override spec &amp; re-price
+        ✏ Capture slab specification
       </summary>
       <form id="specOverrideForm" onsubmit="submitSpecOverride(event)"
             style="margin-top:8px;background:#0d1e38;border-radius:6px;padding:10px 12px;display:grid;gap:6px">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
-          <label style="font-size:11px;color:#8fa8cc">
-            Depth (mm)
-            <input type="number" name="depth_mm" min="100" max="400" step="5"
-                   value="${spec.depth_mm||190}"
-                   style="width:100%;margin-top:3px;padding:4px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
-          </label>
-          <label style="font-size:11px;color:#8fa8cc">
-            Layers
-            <select name="layers" style="width:100%;margin-top:3px;padding:4px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
-              <option value="1" ${(spec.layers||1)==1?'selected':''}>1 layer</option>
-              <option value="2" ${(spec.layers||1)==2?'selected':''}>2 layers</option>
-            </select>
-          </label>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
-          <label style="font-size:11px;color:#8fa8cc">
-            Mesh type
-            <select name="mesh" style="width:100%;margin-top:3px;padding:4px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
-              ${['A142','A193','A252','A393','B785'].map(m=>`<option value="${m}" ${esc(spec.mesh||'A252')===m?'selected':''}>${m}</option>`).join('')}
-            </select>
-          </label>
-          <label style="font-size:11px;color:#8fa8cc">
-            Concrete mix
-            <select name="conc_mix" style="width:100%;margin-top:3px;padding:4px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
-              ${['C25/30','C30/37','C32/40','C35/45','C40/50'].map(m=>`<option value="${m}" ${esc(spec.conc_mix||'C32/40')===m?'selected':''}>${m}</option>`).join('')}
-            </select>
-          </label>
-        </div>
+        <label style="font-size:11px;color:#8fa8cc">Slab type
+          <select name="slab_type" onchange="changeBriefSpecType(this.value)"
+                  style="width:100%;margin-top:3px;padding:5px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
+            ${Object.entries(BRIEF_SPEC_SCHEMA).map(([key,item]) =>
+              `<option value="${key}" ${key===slabType?'selected':''}>${esc(item.label)}</option>`).join('')}
+          </select>
+        </label>
+        <div id="briefSpecFields" style="display:grid;gap:6px"></div>
         <button type="submit"
                 style="margin-top:4px;padding:6px 0;background:#1d6fa4;border:none;border-radius:4px;color:#fff;font-size:12px;font-weight:700;cursor:pointer">
-          Re-price with this spec
+          Save specification
         </button>
+        <div style="font-size:10px;color:#8fa8cc;line-height:1.35">Blank fields remain visibly provisional. Supplying pricing fields uses the existing rate build-up; bay/joint details are informational only.</div>
         <div id="specOverrideMsg" style="font-size:11px;color:#8fa8cc;display:none"></div>
       </form>
     </details>` : '';
 
-  el.innerHTML = `
-    ${escalationBanner}
+  const costingCard = hasCosting ? `
     <div style="background:#13294b;border-radius:6px;padding:10px 12px;margin-bottom:8px;text-align:center">
       <div style="color:#aec3e0;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT)</div>
       <div style="color:#fff;font-size:26px;font-weight:800">£${(+c.total_gbp).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
       <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${rateDisplay}/m²</div>
-      <div style="color:#8fa8cc;font-size:11px">${spec.depth_mm||190}mm ${esc(spec.conc_mix||'C32/40')} / ${spec.layers||1}× ${esc(spec.mesh||'A252')}</div>
     </div>
     <div class="kv"><span class="k" style="font-size:11px">Rate breakdown (per m²)</span></div>
-    ${rows}
+    ${rows}` : '<div style="color:var(--muted);font-size:12px">No priced measurement yet.</div>';
+
+  el.innerHTML = `
+    ${specPricingBanner}
+    ${escalationBanner}
+    ${costingCard}
     ${assumedBanner}
+    ${renderBriefSpecSummary(briefSpec)}
     ${overrideForm}
   `;
+  if (canOverride) renderSpecFieldInputs(slabType, briefSpec);
 }
 
 async function submitSpecOverride(e) {
@@ -957,12 +1042,12 @@ async function submitSpecOverride(e) {
   const msg  = document.getElementById('specOverrideMsg');
   const btn  = form.querySelector('button[type=submit]');
   const fd   = new FormData(form);
-  const body = {
-    depth_mm: parseInt(fd.get('depth_mm'), 10),
-    layers:   parseInt(fd.get('layers'), 10),
-    mesh:     fd.get('mesh'),
-    conc_mix: fd.get('conc_mix'),
-  };
+  const body = {slab_type:fd.get('slab_type'), fields:{}};
+  form.querySelectorAll('[data-spec-key]').forEach(input => {
+    const raw = input.value.trim();
+    body.fields[input.dataset.specKey] = raw === '' ? null :
+      (input.type === 'number' ? parseInt(raw, 10) : raw);
+  });
   btn.disabled  = true;
   btn.textContent = 'Re-pricing…';
   msg.style.display = 'none';
@@ -977,17 +1062,31 @@ async function submitSpecOverride(e) {
     // Re-render costing inline without full panel reload
     const job = currentJob && currentJob.id === selectedJobId
       ? currentJob : (_jobs.find(j => j.id === selectedJobId) || {});
-    if (currentJob && currentJob.id === selectedJobId) currentJob.costing = d.costing;
-    renderCosting(d.costing, job.status);
+    if (currentJob && currentJob.id === selectedJobId) {
+      currentJob.costing = d.costing;
+      currentJob.brief_spec = d.brief_spec;
+      currentJob.spec_pricing_warning = d.pricing_warning || '';
+      if (currentJob.result) currentJob.result.brief_spec = d.brief_spec;
+    }
+    job.costing = d.costing;
+    job.brief_spec = d.brief_spec;
+    job.spec_pricing_warning = d.pricing_warning || '';
+    renderCosting(d.costing, job.status, job);
+    renderDecision(job);
     await loadLineItems(job);
     // Reopen the details element so assessor sees the updated form
     const det = document.getElementById('specOverrideDetails');
     if (det) det.open = true;
     const newMsg = document.getElementById('specOverrideMsg');
-    if (newMsg) { newMsg.textContent = '✅ Re-priced'; newMsg.style.display = 'block'; }
+    if (newMsg) {
+      newMsg.textContent = d.pricing_warning
+        ? '⚠ Specification saved; human pricing review required'
+        : (d.repriced ? '✅ Specification saved and rate refreshed' : '✅ Specification saved');
+      newMsg.style.display = 'block';
+    }
   } catch(err) {
     btn.disabled = false;
-    btn.textContent = 'Re-price with this spec';
+    btn.textContent = 'Save specification';
     msg.textContent = `❌ ${err.message}`;
     msg.style.display = 'block';
   }
@@ -1009,6 +1108,9 @@ function renderFlags(flags) {
 function renderDecision(job) {
   const el = document.getElementById('decisionBlock');
   const ql = document.getElementById('quotationLinks');
+  const projectPricingBlocked = !!job.spec_pricing_warning || !!(job.project_ref &&
+    _jobs.some(sibling => sibling.project_ref === job.project_ref && sibling.spec_pricing_warning &&
+      (sibling.decision === 'approved' || sibling.decision === 'adjusted')));
   if (!job.decision) {
     el.innerHTML = '<div style="color:var(--muted);font-size:13px">No decision yet</div>';
     ql.style.display = 'none';
@@ -1018,7 +1120,8 @@ function renderDecision(job) {
     ${esc(job.decision).toUpperCase()} · ${(job.decided_at||'').substring(0,16).replace('T',' ')}
   </div>`;
   // Quotation links (shown after approval / adjustment)
-  if (job.decision === 'approved' || job.decision === 'adjusted') {
+  if ((job.decision === 'approved' || job.decision === 'adjusted') &&
+      !projectPricingBlocked) {
     ql.style.display = 'block';
     document.getElementById('linkTxt').href  = `${BASE}/quotation/${job.id}.txt`;
     document.getElementById('linkHtml').href = `${BASE}/quotation/${job.id}.html`;

@@ -115,8 +115,9 @@ def extract_spec_from_text(text: str) -> dict:
         spec["layers"] = 2
     elif _SINGLE_LAYER_RX.search(text):
         spec["layers"] = 1
-    elif "mesh" in spec:
-        spec["layers"] = 1   # default if mesh is mentioned but layers aren't
+    # If a drawing names a mesh but not the number of layers, keep layers unknown.  Fortel's
+    # supplied Brief_Spec checklist treats these as separate fields; inferring one layer here
+    # would turn an unprovided construction detail into an apparently confirmed value.
 
     # ── concrete mix ─────────────────────────────────────────────────────────
     mixes = [m.group(1).replace(" ", "").upper() for m in _MIX_RX.finditer(text)]
@@ -188,8 +189,10 @@ def describe_spec(spec: dict) -> str:
     if "depth_mm" in spec:
         parts.append(f"{spec['depth_mm']} mm")
     if "mesh" in spec:
-        layers = spec.get("layers", 1)
-        parts.append(f"{layers}× {spec['mesh']} mesh")
+        if "layers" in spec:
+            parts.append(f"{spec['layers']}× {spec['mesh']} mesh")
+        else:
+            parts.append(f"{spec['mesh']} mesh (layers not provided)")
     if "conc_mix" in spec:
         parts.append(spec["conc_mix"])
     if not parts:
@@ -211,13 +214,13 @@ if __name__ == "__main__":
         print("Spec extractor — text-based tests\n")
         cases = [
             ("175 mm thick with A193 mesh, C32/40 concrete",
-             {"depth_mm": 175, "mesh": "A193", "layers": 1, "conc_mix": "C32/40"}),
+             {"depth_mm": 175, "mesh": "A193", "conc_mix": "C32/40"}),
             ("200mm slab with two layers of A393 reinforcement C35/45",
              {"depth_mm": 200, "mesh": "A393", "layers": 2, "conc_mix": "C35/45"}),
             ("250 mm C40/50 concrete slab with A393 x2",
              {"depth_mm": 250, "mesh": "A393", "layers": 2, "conc_mix": "C40/50"}),
             ("190mm thick concrete, A252 mesh, C32/40",
-             {"depth_mm": 190, "mesh": "A252", "layers": 1, "conc_mix": "C32/40"}),
+             {"depth_mm": 190, "mesh": "A252", "conc_mix": "C32/40"}),
             ("CONCRETE SERVICE YARD\n150 mm slab B785 single layer mix C30/37",
              {"depth_mm": 150, "mesh": "B785", "layers": 1, "conc_mix": "C30/37"}),
             ("No specification provided",
@@ -226,7 +229,7 @@ if __name__ == "__main__":
         passed = 0
         for text, expected in cases:
             got = extract_spec_from_text(text)
-            ok = all(got.get(k) == v for k, v in expected.items())
+            ok = got == expected
             passed += ok
             status = "PASS" if ok else "FAIL"
             print(f"  [{status}] {text[:55]!r}")

@@ -78,11 +78,7 @@ def _token_ok(supplied: str) -> bool:
 
 
 def _portal_login_page(error: bool = False) -> str:
-    """Rendered by _require_token() for GET/POST /portal with no valid cookie and no valid
-    ?token= — a plain <form method="post"> for the shared PORTAL_TOKEN secret, styled like the
-    other small inline-HTML pages in this file (see _html_confirm_page). No JS, no templating
-    library; _token_ok() (above) does the actual validation.
-    """
+    """Render a small shared-code login form without exposing the configured secret."""
     error_html = ('<p style="color:#c0392b;font-size:13px;margin:10px 0 0 0">Incorrect code</p>'
                   if error else "")
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -97,10 +93,9 @@ def _portal_login_page(error: bool = False) -> str:
         <input type="password" name="code" placeholder="Access code" autofocus required
                style="width:100%;box-sizing:border-box;padding:10px;font-size:14px;
                       border:1px solid #ccc;border-radius:6px;margin-top:14px">
-        <button type="submit" style="
-           display:block;width:100%;box-sizing:border-box;padding:12px;margin-top:10px;
-           background:#13294b;color:#fff;border:none;border-radius:8px;
-           font-size:15px;font-weight:700;cursor:pointer;">Enter</button>
+        <button type="submit" style="display:block;width:100%;box-sizing:border-box;
+               padding:12px;margin-top:10px;background:#13294b;color:#fff;border:none;
+               border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;">Enter</button>
       </form>
       {error_html}
     </div></body></html>"""
@@ -112,7 +107,7 @@ def _require_token():
         return None  # no token configured -> auth disabled (local/dev use)
     if request.method == "OPTIONS":
         return None
-    if request.path == "/status":
+    if request.path in ("/status", "/"):
         return None
     # One-time bootstrap: /portal?token=XXX sets the cookie, then redirects to the clean URL
     # so the token never lingers in browser history/bookmarks past the first visit.
@@ -125,9 +120,6 @@ def _require_token():
             return resp
         if _token_ok(request.cookies.get(_TOKEN_COOKIE, "")):
             return None
-        # No valid cookie, no valid ?token= — a human landed here directly (not via an
-        # emailed link). Let them in with the shared secret instead of a bare 401: a small
-        # inline login form, POSTing back to /portal.
         if request.method == "POST":
             if _token_ok(request.form.get("code", "")):
                 resp = redirect("/portal")
@@ -136,7 +128,8 @@ def _require_token():
                 return resp
             return Response(_portal_login_page(error=True), 200,
                              {"Content-Type": "text/html; charset=utf-8"})
-        return Response(_portal_login_page(), 200, {"Content-Type": "text/html; charset=utf-8"})
+        return Response(_portal_login_page(), 200,
+                        {"Content-Type": "text/html; charset=utf-8"})
     # Every other route: accept Bearer header, cookie, or (for emailed action links) ?token=
     supplied = ""
     auth_header = request.headers.get("Authorization", "")
@@ -362,6 +355,8 @@ def _approve_block_reason(job: dict) -> str | None:
     assessor has confirmed scale+extent (via /adjust, which sets scale_confirmed=True).
     Returns a reason string to block, or None to allow.
     """
+    if job.get("spec_pricing_warning"):
+        return "slab specification is saved but requires human pricing review before approval"
     state = job.get("measurement_state") or (job.get("result") or {}).get("measurement_state")
     if job.get("scale_confirmed"):
         return None
@@ -593,16 +588,26 @@ def adjust(job_id):
 
 @app.route("/spec-override/<job_id>", methods=["POST"])
 def spec_override(job_id):
-    """Assessor overrides the assumed spec (depth, mix, mesh, layers) and re-prices."""
+    """Capture Fortel's slab checklist and re-price only its supplied pricing fields.
+
+    The extra Brief_Spec fields are presentation/provenance only.  The existing rate
+    calculation remains unchanged; partial common specs continue to use the existing
+    costing fallbacks but remain visibly provisional instead of being marked confirmed.
+    """
     data = request.get_json(silent=True) or {}
-    override = {}
-    try:
-        if "depth_mm" in data: override["depth_mm"] = int(data["depth_mm"])
-        if "conc_mix"  in data: override["conc_mix"]  = str(data["conc_mix"])
-        if "mesh"      in data: override["mesh"]       = str(data["mesh"])
-        if "layers"    in data: override["layers"]     = int(data["layers"])
-    except (ValueError, TypeError) as e:
-        return jsonify({"error": f"invalid spec field: {e}"}), 400
+    nested_fields = data.get("fields")
+    if nested_fields is not None and not isinstance(nested_fields, dict):
+        return jsonify({"error": "fields must be an object"}), 400
+    from slab_spec import (COMMON_FIELDS, FIELD_LABELS, build_brief_spec,
+                           confirmed_values, normalise_slab_type, schema_definition)
+    supplied_slab_type = data.get("slab_type")
+    if supplied_slab_type and (
+            not isinstance(supplied_slab_type, str)
+            or supplied_slab_type not in schema_definition()):
+        return jsonify({"error": "unknown slab_type"}), 400
+    supplied_fields = dict(nested_fields) if nested_fields is not None else {
+        key: data[key] for key in FIELD_LABELS if key in data
+    }
 
     with _jobs_lock:
         jobs = load_jobs()
@@ -612,38 +617,119 @@ def spec_override(job_id):
         if job["status"] == "processing":
             return jsonify({"error": "job is still processing"}), 409
 
-        res     = job.get("result") or {}
+        res     = dict(job.get("result") or {})
         adj     = job.get("adjusted") or {}
         area_m2 = adj.get("area_m2") or res.get("area_m2")
-        if not area_m2:
-            return jsonify({"error": "no area_m2 on job — run takeoff first"}), 409
-
         try:
-            from defaults import spec_with_defaults, flag_assumed
-            from costing  import rate_buildup
-            spec, _ = spec_with_defaults(override)
-            rate, parts = rate_buildup(**{k: spec[k] for k in [
-                "depth_mm","conc_rate","conc_wastage","mesh","layers",
-                "steel_rate_t","steel_wastage","lap_acc","dpm","curing",
-                "labour","trim","margin"]})
-            costing = {
-                "area_m2":   area_m2,
-                "rate":      rate,
-                "total_gbp": round(area_m2 * rate, 2),
-                "spec":      spec,
-                "assumed":   False,
-                "note":      "Spec overridden by assessor",
-                "flags":     [],
-                "breakdown": parts,
-            }
+            existing_brief = job.get("brief_spec") or res.get("brief_spec") or {}
+            slab_type = normalise_slab_type(
+                data.get("slab_type") or existing_brief.get("slab_type"),
+                text=" ".join(str(res.get(key) or "") for key in
+                              ("quotation_section", "file", "project_name", "type")),
+            )
+            costing = dict(job.get("costing") or res.get("costing") or {})
+            effective_spec = costing.get("spec") or {}
+            brief_spec = build_brief_spec(
+                slab_type,
+                effective_spec=effective_spec,
+                confirmed=supplied_fields,
+                source="assessor",
+                existing=existing_brief,
+                replace=nested_fields is not None,
+            )
+            confirmed = confirmed_values(brief_spec)
+            pricing_override = {key: confirmed[key] for key in COMMON_FIELDS if key in confirmed}
+
+            # Optional checklist metadata never touches a rate.  When a common pricing field
+            # is submitted, preserve the legacy override behaviour and use the same existing
+            # defaults + rate_buildup calculation, while keeping missing fields provisional.
+            existing_confirmed = confirmed_values(existing_brief)
+            pricing_fields_submitted = any(
+                key in supplied_fields and supplied_fields.get(key) not in (None, "")
+                for key in COMMON_FIELDS
+            ) or any(
+                key in existing_confirmed and key in supplied_fields
+                and supplied_fields.get(key) in (None, "")
+                for key in COMMON_FIELDS
+            )
+            repriced = False
+            pricing_warning = job.get("spec_pricing_warning") or ""
+            if pricing_fields_submitted and not area_m2:
+                from costing import MESH_KG
+                if pricing_override.get("mesh") and pricing_override["mesh"] not in MESH_KG:
+                    pricing_warning = (
+                        "Specification saved, but the current rate build-up does not support "
+                        "one or more supplied pricing fields; human pricing review required."
+                    )
+                else:
+                    pricing_warning = ""
+            if pricing_fields_submitted and area_m2:
+                from defaults import spec_with_defaults, assumption_note, flag_assumed
+                from costing  import rate_buildup
+                try:
+                    spec, _ = spec_with_defaults(pricing_override)
+                    assumed = not all(key in pricing_override for key in COMMON_FIELDS)
+                    rate, parts = rate_buildup(**{key: spec[key] for key in [
+                        "depth_mm", "conc_rate", "conc_wastage", "mesh", "layers",
+                        "steel_rate_t", "steel_wastage", "lap_acc", "dpm", "curing",
+                        "labour", "trim", "margin"]})
+                    costing = {
+                        "area_m2": area_m2,
+                        "rate": rate,
+                        "total_gbp": round(area_m2 * rate, 2),
+                        "spec": spec,
+                        "assumed": assumed,
+                        "note": assumption_note(spec) if assumed else "Spec overridden by assessor",
+                        "flags": flag_assumed(spec, assumed),
+                        "breakdown": parts,
+                    }
+                    # Rebuild so fallback values used in the unchanged calculation are visible,
+                    # field-by-field, as assumed rather than as blank confirmed client data.
+                    brief_spec = build_brief_spec(
+                        slab_type,
+                        effective_spec=spec,
+                        confirmed=pricing_override | {
+                            key: value for key, value in confirmed.items() if key not in COMMON_FIELDS
+                        },
+                        source="assessor",
+                        replace=True,
+                    )
+                    repriced = True
+                    pricing_warning = ""
+                except Exception:
+                    # The client checklist deliberately accepts open text. Preserve an
+                    # unsupported-but-valid client specification without inventing a rate or
+                    # losing their entry; approval stays blocked for human pricing review.
+                    pricing_warning = (
+                        "Specification saved, but the current rate build-up does not support "
+                        "one or more supplied pricing fields; human pricing review required."
+                    )
+        except (TypeError, ValueError) as e:
+            return jsonify({"error": f"invalid spec field: {e}"}), 400
         except Exception as e:
             return jsonify({"error": f"costing failed: {e}"}), 500
 
-        jobs[job_id]["costing"]       = costing
-        jobs[job_id]["spec_override"] = override
+        res["brief_spec"] = brief_spec
+        if pricing_override:
+            res["engineer_spec"] = dict(pricing_override)
+        else:
+            res.pop("engineer_spec", None)
+        jobs[job_id]["result"] = res
+        jobs[job_id]["brief_spec"] = brief_spec
+        if costing:
+            jobs[job_id]["costing"] = costing
+        jobs[job_id]["spec_override"] = confirmed_values(brief_spec)
+        if pricing_warning:
+            jobs[job_id]["spec_pricing_warning"] = pricing_warning
+        else:
+            jobs[job_id].pop("spec_pricing_warning", None)
         save_jobs(jobs)
 
-    return jsonify({"status": "ok", "job_id": job_id, "costing": costing})
+    return jsonify({
+        "status": "ok", "job_id": job_id, "costing": costing,
+        "brief_spec": brief_spec, "spec_schema": schema_definition(),
+        "repriced": repriced, "pricing_warning": pricing_warning,
+    })
 
 
 # ── Soft delete (archive) ─────────────────────────────────────────────────────
@@ -745,12 +831,18 @@ def list_archived_jobs():
 
 # ── Costing / quotation helpers ───────────────────────────────────────────────
 
+class QuotationPricingBlocked(RuntimeError):
+    """A saved client specification has no supported current rate build-up."""
+
+
 def _quotation_result_for_job(job: dict, result_override=None, costing_override=None) -> dict:
     """Effective approved result, preferring assessor-adjusted measurements when present."""
     result = dict(result_override if result_override is not None else (job.get("result") or {}))
     costing = costing_override if costing_override is not None else job.get("costing")
     if costing:
         result["costing"] = dict(costing)
+    if job.get("brief_spec"):
+        result["brief_spec"] = dict(job["brief_spec"])
     adjusted = job.get("adjusted") or {}
     if adjusted.get("area_m2"):
         result["area_m2"] = adjusted["area_m2"]
@@ -790,6 +882,12 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
     else:
         siblings = [(job_id, anchor)]
 
+    if any(sibling.get("spec_pricing_warning") for _, sibling in siblings):
+        raise QuotationPricingBlocked(
+            "quotation blocked: a project drawing has a saved specification that requires "
+            "human pricing review"
+        )
+
     results = []
     for sibling_id, sibling in siblings:
         results.append(_quotation_result_for_job(
@@ -799,7 +897,10 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
         ))
     project = anchor.get("project_name") or (results[0].get("file", "") if results else "")
     client = anchor.get("client_name") or ""
-    return generate_quotation(results, project=project, client=client, ref=project_ref or None)
+    return generate_quotation(
+        results, project=project, client=client, ref=project_ref or None,
+        commercial=anchor.get("commercial") or None,
+    )
 
 def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:
     """Generate and save quotation files for this job. Returns paths dict."""
@@ -821,7 +922,10 @@ def _run_costing(area_m2, result: dict) -> dict | None:
         from costing  import rate_buildup
 
         engineer_spec = result.get("engineer_spec")  # None if architect-only
-        spec, assumed = spec_with_defaults(engineer_spec)
+        spec, _ = spec_with_defaults(engineer_spec)
+        from slab_spec import COMMON_FIELDS
+        supplied = engineer_spec or {}
+        assumed = not all(supplied.get(key) is not None for key in COMMON_FIELDS)
         rate, parts   = rate_buildup(**{k: spec[k] for k in [
             "depth_mm","conc_rate","conc_wastage","mesh","layers",
             "steel_rate_t","steel_wastage","lap_acc","dpm","curing",
@@ -948,6 +1052,8 @@ def quotation_download(job_id, fmt):
             )
         else:
             return jsonify({"error": f"unknown format {fmt!r}"}), 400
+    except QuotationPricingBlocked as e:
+        return jsonify({"error": str(e)}), 409
     except Exception:
         return jsonify({"error": traceback.format_exc()}), 500
 
@@ -1544,7 +1650,8 @@ def _sweep_stranded_processing_jobs():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Detect Railway: it injects RAILWAY_* vars and requires binding to 0.0.0.0.
+    # Railway injects PORT and requires binding to all interfaces. Bare-metal/local runs keep
+    # the safer loopback default and still refuse a wide bind without portal authentication.
     is_railway = bool(os.getenv("RAILWAY_PROJECT_ID"))
     _raw_port = (os.getenv("PORT") or "").strip()
     if _raw_port:
@@ -1553,8 +1660,6 @@ if __name__ == "__main__":
     else:
         port = int((os.getenv("APPROVAL_PORT") or "5001").strip())
         host = os.getenv("APPROVAL_HOST", "127.0.0.1")
-        # Safety check: refuse 0.0.0.0 on bare metal without auth.
-        # On Railway this is skipped — Railway's infrastructure handles external access.
         if not is_railway and host not in ("127.0.0.1", "localhost") and not APPROVAL_TOKEN:
             print(f"REFUSING to bind {host} without APPROVAL_TOKEN set — anyone on the network "
                   "could approve/reject/adjust jobs. Set APPROVAL_TOKEN, or leave APPROVAL_HOST "

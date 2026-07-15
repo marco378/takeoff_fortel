@@ -169,7 +169,14 @@ def price_with_defaults(area_m2: float, engineer_spec: dict = None,
     markers) takes priority over manhole_count_estimate (unmarked-path ESTIMATE, which is
     always flagged provisional and never silently folded in as if confirmed).
     """
-    spec, assumed = spec_with_defaults(engineer_spec)
+    spec, _ = spec_with_defaults(engineer_spec)
+    # Brief_Spec.xlsx makes the four construction fields independent.  Costing may still
+    # use the existing fallback spec, unchanged, but a partial engineer record must remain
+    # visibly provisional instead of being promoted to fully confirmed by the legacy
+    # all-or-nothing provenance bit.
+    from slab_spec import COMMON_FIELDS
+    supplied = engineer_spec or {}
+    assumed = not all(supplied.get(key) is not None for key in COMMON_FIELDS)
     aspec_flags   = flag_assumed(spec, assumed)
     val, rate, perr = price_zone(
         area_m2, spec["depth_mm"], spec["conc_rate"], spec["mesh"],
@@ -450,6 +457,30 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                                       manhole_count_estimate=r.get("manhole_count_estimate"))
         r["costing"] = costing
         r["flags"] = r["flags"] + costing["flags"]
+
+    # Carry Fortel's client-supplied slab checklist independently from pricing.  Values
+    # already used by fallback costing are useful context but remain field-by-field
+    # provisional; only fields actually read from an engineer source are confirmed.
+    from slab_spec import COMMON_FIELDS, build_brief_spec, normalise_slab_type
+    confirmed_spec = {
+        key: engineer_spec[key]
+        for key in COMMON_FIELDS
+        if engineer_spec and engineer_spec.get(key) is not None
+    }
+    if confirmed_spec:
+        # Persist only the client-facing construction fields, not extractor metadata.
+        r["engineer_spec"] = dict(confirmed_spec)
+    effective_spec = (r.get("costing") or {}).get("spec") or {}
+    slab_type = normalise_slab_type(
+        r.get("quotation_section"),
+        text=" ".join(str(r.get(key) or "") for key in ("file", "project_name", "type")),
+    )
+    r["brief_spec"] = build_brief_spec(
+        slab_type,
+        effective_spec=effective_spec,
+        confirmed=confirmed_spec,
+        source="engineer_drawing",
+    )
 
     r.setdefault("measurement_state", UNMEASURED if not r.get("area_m2") else MEASURED_UNVERIFIED)
     r.setdefault("needs_assessor", r["measurement_state"] != MEASURED_VERIFIED)

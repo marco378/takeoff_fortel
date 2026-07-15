@@ -233,7 +233,7 @@ ck("full engineer spec -> assumed=False", _a2 is False)
 ck("engineer depth 175 overrides default 190", _s2["depth_mm"] == 175)
 
 print("spec extractor (construction-detail PDF text parsing)")
-from spec_extractor import extract_spec_from_text
+from spec_extractor import describe_spec, extract_spec_from_text
 _e1 = extract_spec_from_text("175 mm thick with A193 mesh, C32/40 concrete")
 ck("depth 175",  _e1.get("depth_mm") == 175)
 ck("mesh A193",  _e1.get("mesh") == "A193")
@@ -245,6 +245,40 @@ _e3 = extract_spec_from_text("No specification provided")
 ck("empty text -> empty spec", not any(k in _e3 for k in ("depth_mm","mesh","conc_mix")))
 _e4 = extract_spec_from_text("A393 x2 250 mm C40/50")
 ck("x2 notation -> 2 layers", _e4.get("layers") == 2)
+_e5 = extract_spec_from_text("A252 mesh")
+ck("mesh without a layer count keeps layers unknown", "layers" not in _e5, _e5)
+ck("mesh-only human summary says layers not provided",
+   describe_spec(_e5) == "A252 mesh (layers not provided)", describe_spec(_e5))
+
+print("Fortel Brief_Spec schema + field provenance")
+from slab_spec import (COMMON_FIELDS as _SPEC_COMMON_FIELDS, SLAB_SPEC_SCHEMA as _SPEC_SCHEMA,
+                       brief_spec_signature as _brief_signature,
+                       build_brief_spec as _build_brief_spec,
+                       empty_brief_spec as _empty_brief_spec)
+_expected_spec_fields = {
+    "external_yard": ("depth_mm", "conc_mix", "mesh", "layers", "bay_sizes", "joint_details"),
+    "dock": ("depth_mm", "conc_mix", "mesh", "layers", "bay_sizes", "joint_details"),
+    "ground_floor": ("depth_mm", "conc_mix", "mesh", "layers", "joint_details"),
+    "upper_floor": ("depth_mm", "conc_mix", "mesh", "layers"),
+}
+ck("Brief_Spec schema has the exact four slab types and applicable fields",
+   set(_SPEC_SCHEMA) == set(_expected_spec_fields) and
+   all(tuple(_SPEC_SCHEMA[key]["fields"]) == fields
+       for key, fields in _expected_spec_fields.items()))
+_empty_yard_spec = _empty_brief_spec("external_yard")
+ck("blank Brief_Spec has no invented values and every field is provisional",
+   all(field["value"] is None and field["provisional"]
+       for field in _empty_yard_spec["fields"].values()), _empty_yard_spec)
+_effective_spec = {"depth_mm": 190, "conc_mix": "C32/40", "mesh": "A252", "layers": 1}
+_assumed_brief = _build_brief_spec("external_yard", effective_spec=_effective_spec)
+_confirmed_brief = _build_brief_spec(
+    "external_yard", effective_spec=_effective_spec, confirmed=_effective_spec,
+    source="engineer_drawing")
+ck("effective costing values remain field-by-field assumed until confirmed",
+   all(_assumed_brief["fields"][key]["provisional"] for key in _SPEC_COMMON_FIELDS) and
+   all(not _confirmed_brief["fields"][key]["provisional"] for key in _SPEC_COMMON_FIELDS))
+ck("assumed and confirmed copies of the same effective spec have different aggregation identity",
+   _brief_signature(_assumed_brief) != _brief_signature(_confirmed_brief))
 
 print("quotation generator")
 from quotation import (generate_quotation, quotation_text, quotation_html, quotation_json,
@@ -308,6 +342,20 @@ _q_diff_spec = generate_quotation([
 ], ref="TST-DIFF-SPEC")
 ck("different unit specs remain separate on one quotation",
    len([li for li in _q_diff_spec["line_items"] if "supply & lay" in li["description"]]) == 2)
+_confirmed_unit_a = _quotation_unit("Confirmed-A.pdf", "External yard slabs", 60)
+_confirmed_unit_b = _quotation_unit("Confirmed-B.pdf", "External yard slabs", 40)
+_confirmed_unit_a["brief_spec"] = _confirmed_brief
+_confirmed_unit_b["brief_spec"] = _copy.deepcopy(_confirmed_brief)
+_q_confirmed_aggregate = generate_quotation([_confirmed_unit_a, _confirmed_unit_b])
+ck("equally confirmed Brief_Spec units aggregate",
+   len([li for li in _q_confirmed_aggregate["line_items"]
+        if "supply & lay" in li["description"]]) == 1)
+_assumed_unit = _quotation_unit("Assumed.pdf", "External yard slabs", 40, assumed=True)
+_assumed_unit["brief_spec"] = _assumed_brief
+_q_provenance_split = generate_quotation([_confirmed_unit_a, _assumed_unit])
+ck("assumed and confirmed equal-value Brief_Spec units remain separate",
+   len([li for li in _q_provenance_split["line_items"]
+        if "supply & lay" in li["description"]]) == 2)
 
 _rect = [[0, 0], [40, 0], [40, 20], [0, 20]]
 ck("perimeter_lm rectangle: 20m × 10m -> 60.0m",
@@ -326,27 +374,40 @@ _q_html = quotation_html(_q)
 _q_json = quotation_json(_q)
 ck("assumed build-up is provisional in text/html/json",
    all(PROVISIONAL_LABEL in output for output in (_q_text, _q_html, _q_json)))
+ck("unknown client spec fields are visible in text/html/json",
+   all("ASSUMED / no details provided" in output for output in (_q_text, _q_html, _q_json)))
+_xss_brief = _build_brief_spec(
+    "external_yard", effective_spec=_effective_spec,
+    confirmed=dict(_effective_spec, joint_details="<script>alert(1)</script>"),
+)
+_xss_unit = _quotation_unit("Safe.pdf", "External yard slabs", 10)
+_xss_unit["brief_spec"] = _xss_brief
+_xss_html = quotation_html(generate_quotation(_xss_unit))
+ck("assessor-entered Brief_Spec text is HTML-escaped in served quotation",
+   "<script>alert(1)</script>" not in _xss_html and
+   "&lt;script&gt;alert(1)&lt;/script&gt;" in _xss_html)
 
 _xlsx_bytes = quotation_xlsx(_q_multi)
 _xlsx_wb = _load_workbook(_BytesIO(_xlsx_bytes), data_only=False)
 _xlsx_ws = _xlsx_wb["REV_01"]
 ck("xlsx export reopens as exactly one editable quotation tab", _xlsx_wb.sheetnames == ["REV_01"])
 ck("xlsx uses client BOQ column labels and order",
-   tuple(_xlsx_ws.cell(8, col).value for col in range(1, 6)) ==
+   tuple(_xlsx_ws.cell(7, col).value for col in range(1, 6)) ==
    ("DESCRIPTION", "QTY", "UNIT", "RATE", "VALUE"))
-ck("xlsx header carries project/client/date/ref and multiline drawing register",
-   _xlsx_ws["A2"].value == "Project:" and _xlsx_ws["B2"].value == "Multi-unit" and
-   _xlsx_ws["A3"].value == "Client:" and _xlsx_ws["B3"].value == "Fortel" and
-   _xlsx_ws["A4"].value == "Date:" and _xlsx_ws["B4"].number_format == "dd/mm/yyyy" and
-   _xlsx_ws["C4"].value == "Quotation Ref:" and _xlsx_ws["D4"].value == "TST-MULTI" and
-   _xlsx_ws["A5"].value == "Drawing ref available at tender:" and
-   "\n" in _xlsx_ws["B5"].value and
-   all(name in _xlsx_ws["B5"].value for name in ("Yard-A.pdf", "Yard-B.pdf")))
+ck("xlsx header matches real BOQ project/client/date/rev/drawing layout",
+   _xlsx_ws["A1"].value == "Project: Multi-unit" and
+   _xlsx_ws["A2"].value == "Client: Fortel" and
+   str(_xlsx_ws["A3"].value).startswith("Date: ") and
+   _xlsx_ws["A4"].value == "Rev: TST-MULTI" and
+   {str(cell_range) for cell_range in _xlsx_ws.merged_cells.ranges} == {"D4:E4"})
+ck("xlsx drawing register is multiline in the real BOQ's A5 cell",
+   _xlsx_ws["A5"].value.startswith("Drawing ref available at tender:\n") and
+   all(name in _xlsx_ws["A5"].value for name in ("Yard-A.pdf", "Yard-B.pdf")))
 _expected_xlsx_sections = (
     "External Yard Slabs- Provisional Cost (No Details)",
-    "Dock Slabs",
-    "Ground Floor Slabs (Ancillary Areas)",
-    "Upper Floors",
+    "Dock Slabs- Provisional Cost (No Details)",
+    "Ground Floor Slabs (Ancillary Areas)- Provisional Cost (No Details)",
+    "Upper Floors- Provisional Cost (No Details)",
     "Prelims",
 )
 _xlsx_section_rows = {
@@ -357,24 +418,50 @@ ck("xlsx section headers follow client order",
    tuple(_xlsx_section_rows) == _expected_xlsx_sections, _xlsx_section_rows)
 _xlsx_item_row = next(row for row in range(1, _xlsx_ws.max_row + 1)
                       if "supply & lay" in str(_xlsx_ws.cell(row, 1).value or ""))
-ck("xlsx qty/rate are numeric and row value is a live formula",
-   isinstance(_xlsx_ws.cell(_xlsx_item_row, 2).value, (int, float)) and
+_xlsx_source_rows = [row for row in range(1, _xlsx_ws.max_row + 1)
+                     if _xlsx_ws.cell(row, 1).value in ("Yard-A.pdf", "Yard-B.pdf")]
+_xlsx_area_total_row = next(row for row in range(1, _xlsx_ws.max_row + 1)
+                            if _xlsx_ws.cell(row, 1).value == "Total Area Take Off:")
+ck("xlsx keeps editable numeric per-unit source quantities and formula aggregate",
+   [float(_xlsx_ws.cell(row, 2).value) for row in _xlsx_source_rows] == [100.0, 150.0] and
+   _xlsx_ws.cell(_xlsx_area_total_row, 2).value ==
+   f"=SUM(B{_xlsx_source_rows[0]}:B{_xlsx_source_rows[-1]})")
+ck("xlsx priced qty references aggregate, rate is numeric, and value is direct qty*rate",
+   _xlsx_ws.cell(_xlsx_item_row, 2).value == f"=B{_xlsx_area_total_row}" and
    isinstance(_xlsx_ws.cell(_xlsx_item_row, 4).value, (int, float)) and
    _xlsx_ws.cell(_xlsx_item_row, 5).data_type == "f" and
-   _xlsx_ws.cell(_xlsx_item_row, 5).value == f"=ROUND(B{_xlsx_item_row}*D{_xlsx_item_row},2)")
+   _xlsx_ws.cell(_xlsx_item_row, 5).value == f"=B{_xlsx_item_row}*D{_xlsx_item_row}")
 ck("xlsx quantity/unit display matches client template without forced .00",
    _xlsx_ws.cell(_xlsx_item_row, 2).number_format == "#,##0.##" and
    _xlsx_ws.cell(_xlsx_item_row, 3).value == "m2")
-ck("xlsx section subtotals and nett total are formulas",
-   any(_xlsx_ws.cell(row, 5).data_type == "f" and
-       str(_xlsx_ws.cell(row, 1).value or "").startswith("Subtotal —")
-       for row in range(1, _xlsx_ws.max_row + 1)) and
-   any(_xlsx_ws.cell(row, 5).data_type == "f" and
-       _xlsx_ws.cell(row, 1).value == "TOTAL NETT"
-       for row in range(1, _xlsx_ws.max_row + 1)))
+_xlsx_total_row = next(row for row in range(1, _xlsx_ws.max_row + 1)
+                       if _xlsx_ws.cell(row, 1).value == "TOTAL NETT")
+ck("xlsx follows real BOQ: no section subtotals and one nett formula",
+   not any(str(_xlsx_ws.cell(row, 1).value or "").startswith("Subtotal —")
+           for row in range(1, _xlsx_ws.max_row + 1)) and
+   _xlsx_ws.cell(_xlsx_total_row, 5).value == f"=SUM(E7:E{_xlsx_total_row - 1})")
+ck("xlsx matches real BOQ widths, accounting display, and portrait layout",
+   abs(_xlsx_ws.column_dimensions["A"].width - 82.43) < .01 and
+   "£" in _xlsx_ws.cell(_xlsx_item_row, 5).number_format and
+   _xlsx_ws.page_setup.orientation == "portrait" and _xlsx_ws.freeze_panes is None and
+   _xlsx_ws.auto_filter.ref is None)
 ck("xlsx visibly marks assumed quantity provisional",
    any(PROVISIONAL_LABEL in str(_xlsx_ws.cell(row, 1).value or "")
        for row in range(1, _xlsx_ws.max_row + 1)))
+ck("xlsx visibly carries every unknown client checklist field",
+   any("Bay sizes if joint layout available: ASSUMED / no details provided" in
+       str(_xlsx_ws.cell(row, 1).value or "") for row in range(1, _xlsx_ws.max_row + 1)))
+_q_status = generate_quotation(
+    _quotation_unit("Status.pdf", "External yard slabs", 10),
+    extras=[{"section": "Prelims", "description": "Commercial option", "qty": 1,
+             "unit": "Item", "rate": 12.34, "value_status": "RATE ONLY"}],
+)
+_status_ws = _load_workbook(_BytesIO(quotation_xlsx(_q_status)), data_only=False)["REV_01"]
+_status_row = next(row for row in range(1, _status_ws.max_row + 1)
+                   if _status_ws.cell(row, 1).value == "Commercial option")
+ck("xlsx supports the real BOQ's explicit RATE ONLY value token without inferring it",
+   _status_ws.cell(_status_row, 4).value == 12.34 and
+   _status_ws.cell(_status_row, 5).value == "RATE ONLY")
 
 print("pipeline price_with_defaults")
 import contextlib, io as _io
@@ -385,7 +472,9 @@ ck("26,080 m² at defaults -> £1,175,425.60", _c["total_gbp"] == 1175425.60)
 ck("price_with_defaults assumed=True (no spec)", _c["assumed"] is True)
 _c2 = price_with_defaults(3172, {"depth_mm": 200, "mesh": "A393", "layers": 1,
                                   "conc_mix": "C32/40", "conc_rate": 128})
-ck("partial spec -> assumed=False", _c2["assumed"] is False)
+ck("all four client construction fields supplied -> assumed=False", _c2["assumed"] is False)
+_c3 = price_with_defaults(3172, {"depth_mm": 200})
+ck("partial client construction spec stays assumed/provisional", _c3["assumed"] is True)
 ck("approval trigger on assessor flag",
    _needs_approval({"type":"UNMARKED vector","confidence":"medium",
                     "flags":["assessor: confirm extent + scale"]}))
@@ -1037,7 +1126,88 @@ try:
            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" and
            "QUOTE-MULTI-001.xlsx" in _xlsx_route_resp.headers.get("Content-Disposition", ""))
         ck("xlsx route aggregates approved sibling units sharing project_ref",
-           _xlsx_route_ws.cell(_xlsx_route_slab_row, 2).value == 250)
+           _xlsx_route_ws.cell(_xlsx_route_slab_row, 2).data_type == "f" and
+           any(_xlsx_route_ws.cell(row, 1).value == "Total Area Take Off:" and
+               _xlsx_route_ws.cell(row, 2).data_type == "f"
+               for row in range(1, _xlsx_route_ws.max_row + 1)) and
+           sorted(float(_xlsx_route_ws.cell(row, 2).value)
+                  for row in range(1, _xlsx_route_ws.max_row + 1)
+                  if _xlsx_route_ws.cell(row, 1).value in ("Yard-A.pdf", "Yard-B.pdf"))
+           == [100.0, 150.0])
+
+        # Fortel's supplied Brief_Spec is a blank checklist. Capture applicable fields
+        # atomically without touching the job's four-state/measurement record; a partial
+        # pricing spec remains assumed even though the unchanged calculation can re-price.
+        _spec_job_id = "11111111-1111-4111-8111-111111111111"
+        _spec_jobs_before = _AS.load_jobs()
+        _spec_jobs_before[_spec_job_id]["measurement_state"] = "MEASURED_VERIFIED"
+        _spec_jobs_before[_spec_job_id]["adjusted"] = {
+            "area_m2": 100, "scale_k": 0.2,
+            "polygon_pts": [[0, 0], [1, 0], [1, 1]],
+        }
+        _AS.save_jobs(_spec_jobs_before)
+        _spec_resp = _client_up.post(f"/spec-override/{_spec_job_id}", json={
+            "slab_type": "external_yard",
+            "fields": {"depth_mm": 200, "conc_mix": None, "mesh": None, "layers": None,
+                       "bay_sizes": "5m x 5m", "joint_details": None},
+        })
+        _spec_json = _spec_resp.get_json()
+        _spec_saved_job = _AS.load_jobs()[_spec_job_id]
+        ck("partial Brief_Spec capture succeeds but keeps costing provisional",
+           _spec_resp.status_code == 200 and _spec_json["repriced"] is True and
+           _spec_json["costing"]["assumed"] is True and
+           not _spec_json["brief_spec"]["fields"]["depth_mm"]["provisional"] and
+           _spec_json["brief_spec"]["fields"]["mesh"]["provisional"], _spec_json)
+        ck("Brief_Spec optional fields persist without changing four-state or geometry",
+           _spec_saved_job["brief_spec"]["fields"]["bay_sizes"]["value"] == "5m x 5m" and
+           _spec_saved_job["measurement_state"] == "MEASURED_VERIFIED" and
+           _spec_saved_job["decision"] == "approved" and
+           _spec_saved_job["adjusted"] == _spec_jobs_before[_spec_job_id]["adjusted"])
+        _bad_spec_resp = _client_up.post(f"/spec-override/{_spec_job_id}", json={
+            "slab_type": "upper_floor", "fields": {"bay_sizes": "5m x 5m"},
+        })
+        ck("non-applicable Brief_Spec field is rejected cleanly",
+           _bad_spec_resp.status_code == 400 and "does not apply" in
+           (_bad_spec_resp.get_json().get("error") or ""), _bad_spec_resp.get_json())
+        _unsupported_resp = _client_up.post(f"/spec-override/{_spec_job_id}", json={
+            "slab_type": "external_yard",
+            "fields": {"depth_mm": 200, "conc_mix": "Client mix", "mesh": "CLIENT-MESH",
+                       "layers": 1, "bay_sizes": None, "joint_details": None},
+        })
+        _unsupported_json = _unsupported_resp.get_json()
+        _unsupported_saved = _AS.load_jobs()[_spec_job_id]
+        ck("unsupported open-text client spec is saved without inventing a rate",
+           _unsupported_resp.status_code == 200 and
+           _unsupported_json["repriced"] is False and
+           bool(_unsupported_json["pricing_warning"]) and
+           _unsupported_saved["brief_spec"]["fields"]["mesh"]["value"] == "CLIENT-MESH")
+        ck("unsupported client spec hard-blocks approval for human pricing review",
+           _AS._approve_block_reason(_unsupported_saved) is not None)
+        _blocked_quote_resp = _client_up.get(f"/quotation/{_spec_job_id}.json")
+        ck("unsupported client spec blocks stale quotation downloads even after prior decision",
+           _blocked_quote_resp.status_code == 409 and "human pricing review" in
+           (_blocked_quote_resp.get_json().get("error") or ""),
+           _blocked_quote_resp.get_json())
+
+        _unmeasured_spec_id = "33333333-3333-4333-8333-333333333333"
+        _unmeasured_jobs = _AS.load_jobs()
+        _unmeasured_jobs[_unmeasured_spec_id] = {
+            "id": _unmeasured_spec_id, "status": "error", "decision": None,
+            "measurement_state": "UNMEASURED",
+            "result": {"file": "Dock-Unmeasured.pdf", "measurement_state": "UNMEASURED"},
+        }
+        _AS.save_jobs(_unmeasured_jobs)
+        _unmeasured_spec_resp = _client_up.post(
+            f"/spec-override/{_unmeasured_spec_id}", json={
+                "slab_type": "dock", "fields": {"depth_mm": 225, "conc_mix": None,
+                                                    "mesh": None, "layers": None,
+                                                    "bay_sizes": None, "joint_details": None},
+            })
+        ck("Brief_Spec capture works before a drawing has a measurable area",
+           _unmeasured_spec_resp.status_code == 200 and
+           _unmeasured_spec_resp.get_json()["repriced"] is False and
+           _AS.load_jobs()[_unmeasured_spec_id]["brief_spec"]["fields"]["depth_mm"]["value"] == 225,
+           _unmeasured_spec_resp.get_json())
 
         _portal_html_up = (Path(_orig_server_file_up).parent / "assessor_portal.html").read_text()
         ck("portal file input allows multiple PDFs and ZIPs",
@@ -1051,6 +1221,14 @@ try:
         ck("portal exposes editable xlsx quotation download",
            'id="linkXlsx"' in _portal_html_up and
            "quotation/${job.id}.xlsx" in _portal_html_up)
+        ck("portal exposes exact Brief_Spec fields without silent fallback form values",
+           all(label in _portal_html_up for label in (
+               "External/Service Yard Slabs", "Dock Slabs", "Ground Floor Slabs(Core Areas)",
+               "Upper Floors", "Bay sizes if joint layout available", "Nr of mesh layers")) and
+           "${spec.depth_mm||190}" not in _portal_html_up and
+           "${esc(spec.mesh||'A252')}" not in _portal_html_up and
+           "ASSUMED / no details provided" in _portal_html_up and
+           "projectPricingBlocked" in _portal_html_up)
     finally:
         _AS.threading.Thread = _orig_thread_up
         _AS.__file__ = _orig_server_file_up
@@ -1498,6 +1676,11 @@ try:
         _r6d = _client6.get("/status")
         ck("/status is exempt from the token gate", _r6d.status_code == 200, _r6d.status_code)
 
+        # / stays reachable so it can redirect a browser into the portal login flow.
+        _r6d0 = _client6.get("/")
+        ck("/ is exempt from the token gate so the landing redirect works",
+           _r6d0.status_code in (301, 302), _r6d0.status_code)
+
         # /portal?token=<correct> sets a cookie and redirects
         _r6e = _client6.get(f"/portal?token=test-secret-token-123")
         ck("/portal?token=<correct> redirects (sets cookie)", _r6e.status_code in (301, 302), _r6e.status_code)
@@ -1507,9 +1690,6 @@ try:
 
         # /portal?token=<wrong> does not authorise — use a FRESH client (no cookie carried
         # over from the earlier correct-token request on _client6, which would mask this).
-        # It falls through to the same "no valid cookie/token" case as no token at all, which
-        # now renders the login form (200) instead of a bare 401 — see the /portal login test
-        # below for the full flow; here just confirm real portal content is NOT served.
         _client6fresh = _app6.test_client()
         _r6f = _client6fresh.get("/portal?token=nope")
         ck("/portal?token=<wrong> -> login form, not silently served",
@@ -1539,32 +1719,27 @@ try:
     import approval_server as _AS6b
 
     _orig_token6b = _AS6b.APPROVAL_TOKEN
-    _AS6b.APPROVAL_TOKEN = "test-login-secret-789"
+    _AS6b.APPROVAL_TOKEN = "test-login-code"
     try:
         _app6b = _AS6b.app
         _app6b.testing = True
 
-        # 1) No cookie, no token at all -> login form (200), not the real portal
         _client6b1 = _app6b.test_client()
         _r6b1 = _client6b1.get("/portal")
         ck("GET /portal with no cookie/token -> login form",
            _r6b1.status_code == 200 and b"Access code" in _r6b1.data
            and b"Review Portal" not in _r6b1.data, _r6b1.status_code)
 
-        # 2) Wrong code -> re-shows the form with an error, still 200 (a login failure, not an
-        # API auth failure)
         _r6b2 = _client6b1.post("/portal", data={"code": "wrong-code"})
         ck("POST /portal wrong code -> re-shown with error, 200",
            _r6b2.status_code == 200 and b"Incorrect code" in _r6b2.data, _r6b2.status_code)
 
-        # 3) Correct code -> redirect + sets the cookie
-        _r6b3 = _client6b1.post("/portal", data={"code": "test-login-secret-789"})
+        _r6b3 = _client6b1.post("/portal", data={"code": "test-login-code"})
         ck("POST /portal correct code -> redirect", _r6b3.status_code in (301, 302), _r6b3.status_code)
         ck("POST /portal correct code -> Set-Cookie contains the token cookie name",
            "approval_token" in _r6b3.headers.get("Set-Cookie", ""),
            _r6b3.headers.get("Set-Cookie", ""))
 
-        # 4) Follow-up GET with that cookie -> real portal content, not the login form
         _r6b4 = _client6b1.get("/portal")
         ck("GET /portal with cookie from login -> real portal, not the login form",
            _r6b4.status_code == 200 and b"Access code" not in _r6b4.data, _r6b4.status_code)
