@@ -1292,7 +1292,7 @@ try:
     def _gen_d77_footpath(out_path, chip_grey=0.878, yard_grey=0.878):
         """Same D77 yard geometry (page 1067.766x824.854pt, scale bar, 1:250 title) plus:
           - a darker 'Footpaths (ancillary): Concrete' strip (204 grey) sitting 0.65pt below
-            the yard's bottom edge — close enough for the close=9 binary_closing to bridge,
+            the yard's bottom edge — close enough for binary_closing (any close>=2) to bridge,
             reproducing the real-sheet CONNECTED over-measure (not a satellite blob).
           - a legend swatch chip + label 'Concrete Service Yard construction' (readable by
             find_concrete_swatch_rgb) so the swatch-lock path engages.
@@ -1317,8 +1317,8 @@ try:
                      color=(0, 0, 0), fill=yg, width=1.0)
 
         # Ancillary footpath strip: 230x9pt = 16.1 m² at k=0.08819, darker grey (204), 0.65pt
-        # gap below the yard's own bottom edge (bridged by close=9, same mechanism as the real
-        # sheet's kerb-line gap).
+        # gap below the yard's own bottom edge (bridged by binary_closing regardless of the
+        # exact close value, same mechanism as the real sheet's kerb-line gap).
         strip_grey = (0.80, 0.80, 0.80)
         pg.draw_rect(_fitz_fp.Rect(350.0, 625.503515625, 580.0, 634.503515625),
                      color=None, fill=strip_grey, width=0)
@@ -1507,9 +1507,14 @@ try:
 
         # /portal?token=<wrong> does not authorise — use a FRESH client (no cookie carried
         # over from the earlier correct-token request on _client6, which would mask this).
+        # It falls through to the same "no valid cookie/token" case as no token at all, which
+        # now renders the login form (200) instead of a bare 401 — see the /portal login test
+        # below for the full flow; here just confirm real portal content is NOT served.
         _client6fresh = _app6.test_client()
         _r6f = _client6fresh.get("/portal?token=nope")
-        ck("/portal?token=<wrong> -> 401, not silently served", _r6f.status_code == 401, _r6f.status_code)
+        ck("/portal?token=<wrong> -> login form, not silently served",
+           _r6f.status_code == 200 and b"Access code" in _r6f.data
+           and b"Fortel Approval Portal" in _r6f.data, _r6f.status_code)
 
         # Cookie-based auth works for a mutating route (mirrors what the portal's own fetch()
         # calls will do once the browser holds the cookie from the bootstrap redirect above)
@@ -1528,6 +1533,45 @@ try:
         shutil.rmtree(_tmpdir6, ignore_errors=True)
 except ImportError as _e:
     print(f"  [SKIP] approval_server auth-gate tests — missing dependency: {_e}")
+
+print("approval_server: /portal login form (no-token case posts a code instead of a bare 401)")
+try:
+    import approval_server as _AS6b
+
+    _orig_token6b = _AS6b.APPROVAL_TOKEN
+    _AS6b.APPROVAL_TOKEN = "test-login-secret-789"
+    try:
+        _app6b = _AS6b.app
+        _app6b.testing = True
+
+        # 1) No cookie, no token at all -> login form (200), not the real portal
+        _client6b1 = _app6b.test_client()
+        _r6b1 = _client6b1.get("/portal")
+        ck("GET /portal with no cookie/token -> login form",
+           _r6b1.status_code == 200 and b"Access code" in _r6b1.data
+           and b"Review Portal" not in _r6b1.data, _r6b1.status_code)
+
+        # 2) Wrong code -> re-shows the form with an error, still 200 (a login failure, not an
+        # API auth failure)
+        _r6b2 = _client6b1.post("/portal", data={"code": "wrong-code"})
+        ck("POST /portal wrong code -> re-shown with error, 200",
+           _r6b2.status_code == 200 and b"Incorrect code" in _r6b2.data, _r6b2.status_code)
+
+        # 3) Correct code -> redirect + sets the cookie
+        _r6b3 = _client6b1.post("/portal", data={"code": "test-login-secret-789"})
+        ck("POST /portal correct code -> redirect", _r6b3.status_code in (301, 302), _r6b3.status_code)
+        ck("POST /portal correct code -> Set-Cookie contains the token cookie name",
+           "approval_token" in _r6b3.headers.get("Set-Cookie", ""),
+           _r6b3.headers.get("Set-Cookie", ""))
+
+        # 4) Follow-up GET with that cookie -> real portal content, not the login form
+        _r6b4 = _client6b1.get("/portal")
+        ck("GET /portal with cookie from login -> real portal, not the login form",
+           _r6b4.status_code == 200 and b"Access code" not in _r6b4.data, _r6b4.status_code)
+    finally:
+        _AS6b.APPROVAL_TOKEN = _orig_token6b
+except ImportError as _e:
+    print(f"  [SKIP] approval_server /portal login-form tests — missing dependency: {_e}")
 
 print("approval_server: jobs-file backup rotation + corrupt-file preservation (prod-audit MUST)")
 try:

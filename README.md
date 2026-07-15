@@ -52,3 +52,4 @@ overlapping double-count; unknown mesh; zero/negative area. All fixed or flagged
 2. Assessor UI: polygon + scale over the drawing, one-click confirm/nudge, log corrections as training data.
 3. Scale-bar / grid CV detector as a second, cross-checked source.
 4. Wire measured area -> `costing.py` -> quote draft in the n8n flow.
+# takeoff_fortel

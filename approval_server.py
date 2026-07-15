@@ -77,6 +77,35 @@ def _token_ok(supplied: str) -> bool:
     return secrets.compare_digest(supplied, APPROVAL_TOKEN)
 
 
+def _portal_login_page(error: bool = False) -> str:
+    """Rendered by _require_token() for GET/POST /portal with no valid cookie and no valid
+    ?token= — a plain <form method="post"> for the shared PORTAL_TOKEN secret, styled like the
+    other small inline-HTML pages in this file (see _html_confirm_page). No JS, no templating
+    library; _token_ok() (above) does the actual validation.
+    """
+    error_html = ('<p style="color:#c0392b;font-size:13px;margin:10px 0 0 0">Incorrect code</p>'
+                  if error else "")
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+    <title>Fortel AI Takeoff — Sign in</title></head>
+    <body style="font-family:Arial,sans-serif;background:#f0f2f5;display:flex;
+                 align-items:center;justify-content:center;min-height:100vh;margin:0">
+    <div style="background:#fff;border-radius:12px;padding:40px;max-width:360px;
+                box-shadow:0 2px 20px rgba(0,0,0,.1);text-align:center">
+      <h2 style="color:#13294b;margin:0 0 8px 0">Fortel Approval Portal</h2>
+      <p style="color:#666;font-size:14px">Enter the access code to continue.</p>
+      <form method="post" action="/portal">
+        <input type="password" name="code" placeholder="Access code" autofocus required
+               style="width:100%;box-sizing:border-box;padding:10px;font-size:14px;
+                      border:1px solid #ccc;border-radius:6px;margin-top:14px">
+        <button type="submit" style="
+           display:block;width:100%;box-sizing:border-box;padding:12px;margin-top:10px;
+           background:#13294b;color:#fff;border:none;border-radius:8px;
+           font-size:15px;font-weight:700;cursor:pointer;">Enter</button>
+      </form>
+      {error_html}
+    </div></body></html>"""
+
+
 @app.before_request
 def _require_token():
     if not APPROVAL_TOKEN:
@@ -96,10 +125,18 @@ def _require_token():
             return resp
         if _token_ok(request.cookies.get(_TOKEN_COOKIE, "")):
             return None
-        return Response(
-            "Fortel Approval Portal — authorisation required.\n"
-            "Ask Jas for the portal link (it includes a one-time ?token=... parameter).",
-            401, {"Content-Type": "text/plain"})
+        # No valid cookie, no valid ?token= — a human landed here directly (not via an
+        # emailed link). Let them in with the shared secret instead of a bare 401: a small
+        # inline login form, POSTing back to /portal.
+        if request.method == "POST":
+            if _token_ok(request.form.get("code", "")):
+                resp = redirect("/portal")
+                resp.set_cookie(_TOKEN_COOKIE, APPROVAL_TOKEN, httponly=True, samesite="Lax",
+                                 max_age=60 * 60 * 24 * 30)
+                return resp
+            return Response(_portal_login_page(error=True), 200,
+                             {"Content-Type": "text/html; charset=utf-8"})
+        return Response(_portal_login_page(), 200, {"Content-Type": "text/html; charset=utf-8"})
     # Every other route: accept Bearer header, cookie, or (for emailed action links) ?token=
     supplied = ""
     auth_header = request.headers.get("Authorization", "")
@@ -253,7 +290,7 @@ def options(p=""):
 def root():
     return redirect("/portal")
 
-@app.route("/portal")
+@app.route("/portal", methods=["GET", "POST"])
 def portal():
     if PORTAL_HTML.exists():
         return PORTAL_HTML.read_text(), 200, {"Content-Type": "text/html; charset=utf-8"}
@@ -1507,17 +1544,22 @@ def _sweep_stranded_processing_jobs():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.getenv("APPROVAL_PORT", 5001))
-    # Single-team, LAN-only deployment: default to loopback so exposure to the network is an
-    # explicit opt-in, not the out-of-the-box behaviour. If someone does want 0.0.0.0 (the
-    # shared office Mac), require APPROVAL_TOKEN to be set first — binding wide open with no
-    # auth is exactly the "anyone on the LAN can approve six-figure quotes" hole this closes.
-    host = os.getenv("APPROVAL_HOST", "127.0.0.1")
-    if host not in ("127.0.0.1", "localhost") and not APPROVAL_TOKEN:
-        print(f"REFUSING to bind {host} without APPROVAL_TOKEN set — anyone on the network "
-              "could approve/reject/adjust jobs. Set APPROVAL_TOKEN, or leave APPROVAL_HOST "
-              "at the 127.0.0.1 default for local-only use. Falling back to 127.0.0.1.")
-        host = "127.0.0.1"
+    # Detect Railway: it injects RAILWAY_* vars and requires binding to 0.0.0.0.
+    is_railway = bool(os.getenv("RAILWAY_PROJECT_ID"))
+    _raw_port = (os.getenv("PORT") or "").strip()
+    if _raw_port:
+        port = int(_raw_port)
+        host = "0.0.0.0"
+    else:
+        port = int((os.getenv("APPROVAL_PORT") or "5001").strip())
+        host = os.getenv("APPROVAL_HOST", "127.0.0.1")
+        # Safety check: refuse 0.0.0.0 on bare metal without auth.
+        # On Railway this is skipped — Railway's infrastructure handles external access.
+        if not is_railway and host not in ("127.0.0.1", "localhost") and not APPROVAL_TOKEN:
+            print(f"REFUSING to bind {host} without APPROVAL_TOKEN set — anyone on the network "
+                  "could approve/reject/adjust jobs. Set APPROVAL_TOKEN, or leave APPROVAL_HOST "
+                  "at the 127.0.0.1 default for local-only use. Falling back to 127.0.0.1.")
+            host = "127.0.0.1"
 
     _sweep_stranded_processing_jobs()
 
