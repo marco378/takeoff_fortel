@@ -112,7 +112,7 @@ def _require_token():
         return None  # no token configured -> auth disabled (local/dev use)
     if request.method == "OPTIONS":
         return None
-    if request.path == "/status":
+    if request.path in ("/status", "/"):
         return None
     # One-time bootstrap: /portal?token=XXX sets the cookie, then redirects to the clean URL
     # so the token never lingers in browser history/bookmarks past the first visit.

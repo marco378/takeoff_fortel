@@ -1344,6 +1344,11 @@ try:
         _r6d = _client6.get("/status")
         ck("/status is exempt from the token gate", _r6d.status_code == 200, _r6d.status_code)
 
+        # / should also stay reachable so it can redirect users into the portal
+        _r6d0 = _client6.get("/")
+        ck("/ is exempt from the token gate so the landing redirect works",
+           _r6d0.status_code in (301, 302), _r6d0.status_code)
+
         # /portal?token=<correct> sets a cookie and redirects
         _r6e = _client6.get(f"/portal?token=test-secret-token-123")
         ck("/portal?token=<correct> redirects (sets cookie)", _r6e.status_code in (301, 302), _r6e.status_code)
