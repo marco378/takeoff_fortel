@@ -808,7 +808,7 @@ def _html_confirmation(action: str, job_id: str, costing) -> str:
             £{costing['total_gbp']:,.2f}
           </div>
           <div style="font-size:13px;color:#888">
-            {costing.get('area_m2',0):,.0f} m² @ £{costing.get('rate',0)}/m²
+            {costing.get('area_m2',0):,.0f} m² @ £{costing.get('rate',0):.2f}/m²
           </div>
           {f'<div style="font-size:12px;color:#e67e22;margin-top:6px">{costing.get("note","")}</div>'
            if costing.get("note") else ""}
@@ -844,7 +844,9 @@ def quotation_download(job_id, fmt):
 
     try:
         from quotation import generate_quotation, quotation_text, quotation_html, quotation_json
-        result  = j.get("result", {})
+        result  = dict(j.get("result") or {})
+        if j.get("costing"):
+            result["costing"] = dict(j["costing"])
         # Use adjusted area if assessor corrected it
         adj = j.get("adjusted", {})
         if adj and adj.get("area_m2"):
@@ -905,6 +907,9 @@ def n8n_webhook():
 
     try:
         from approval_email import create_job, render_snapshot, png_to_b64, build_html_email
+        if polygon_pts is not None and not result.get("polygon_pts"):
+            result = dict(result)
+            result["polygon_pts"] = polygon_pts
         job_id = create_job(pdf_path, result)
         # Snapshot (best-effort — PDF may not be on this server's disk)
         b64 = ""
@@ -1078,9 +1083,7 @@ MAX_EXTRACT_FILES  = 200                 # safety cap on member count
 CAD_EXTENSIONS     = (".dwg", ".dxf")
 
 
-def _create_rejected_job(project_name, project_ref, client_name, filename, reason) -> str:
-    """Create a REJECTED job record — visible in the portal job list with a human-readable
-    reason (never a bare HTTP 400 that vanishes)."""
+def _rejected_job_record(project_name, project_ref, client_name, filename, reason) -> tuple[str, dict]:
     job_id = str(uuid.uuid4())
     job = {
         "id":               job_id,
@@ -1110,11 +1113,58 @@ def _create_rejected_job(project_name, project_ref, client_name, filename, reaso
         "result":           {"file": filename, "measurement_state": "REJECTED",
                              "flags": [f"REJECTED: {reason}"]},
     }
+    return job_id, job
+
+
+def _create_rejected_job(project_name, project_ref, client_name, filename, reason) -> str:
+    """Create a REJECTED job record — visible in the portal job list with a human-readable
+    reason (never a bare HTTP 400 that vanishes)."""
+    job_id, job = _rejected_job_record(
+        project_name, project_ref, client_name, filename, reason)
     with _jobs_lock:
         jobs = load_jobs()
         jobs[job_id] = job
         save_jobs(jobs)
     return job_id
+
+
+def _processing_job_record(project_name, project_ref, client_name, pdf_path, flags) -> tuple[str, dict]:
+    job_id = str(uuid.uuid4())
+    return job_id, {
+        "id":               job_id,
+        "pdf_path":         str(pdf_path),
+        "project_name":     project_name,
+        "project_ref":      project_ref,
+        "client_name":      client_name,
+        "type":             None,
+        "method":           None,
+        "confidence":       None,
+        "source_discipline": None,
+        "area_m2":          None,
+        "measurement_state": None,
+        "needs_assessor":   None,
+        "scale_verified":   None,
+        "scale_confirmed":  False,
+        "scale_src":        None,
+        "scale_sources":    None,
+        "costing":          None,
+        "flags":            list(flags),
+        "polygon_pts":      None,
+        "status":           "processing",
+        "created_at":       datetime.datetime.utcnow().isoformat(),
+        "decision":         None,
+        "adjusted":         None,
+        "result":           {"file": Path(pdf_path).name},
+    }
+
+
+def _unique_prefixed_path(dest_dir: Path, prefix: str, filename: str) -> Path:
+    safe_name = _sanitise_filename(filename) or f"upload_{uuid.uuid4().hex[:8]}"
+    safe_prefix = _sanitise_filename(prefix) or "project"
+    target = dest_dir / f"{safe_prefix}_{safe_name}"
+    if target.exists():
+        target = dest_dir / f"{safe_prefix}_{Path(safe_name).stem}_{uuid.uuid4().hex[:8]}{Path(safe_name).suffix}"
+    return target
 
 
 def _safe_extract_zip(zip_path: Path, dest_dir: Path, prefix: str = "") -> tuple[list, list]:
@@ -1127,7 +1177,6 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path, prefix: str = "") -> tuple
     `{project_ref}_{filename}` convention already used for direct .pdf uploads below."""
     flags = []
     pdfs = []
-    pfx = f"{prefix}_" if prefix else ""
     try:
         with zipfile.ZipFile(zip_path) as zf:
             infos = zf.infolist()
@@ -1148,7 +1197,7 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path, prefix: str = "") -> tuple
                 member_name = _sanitise_filename(Path(info.filename).name)
                 if not member_name:
                     continue
-                target = (dest_dir / f"{pfx}{member_name}").resolve()
+                target = _unique_prefixed_path(dest_dir, prefix, member_name).resolve()
                 if not str(target).startswith(str(dest_dir.resolve())):
                     flags.append(f"skipped unsafe zip entry: {info.filename!r}")
                     continue
@@ -1217,10 +1266,10 @@ def upload():
     Accept a new drawing/enquiry from the assessor portal without CLI intervention.
 
     multipart/form-data fields:
-      pdf          – the uploaded file (required). Accepts:
+      pdf          – one or more uploaded files (required; repeat the multipart field). Accepts:
                        .pdf            -> takeoff runs directly
-                       .zip            -> PDFs extracted, best one (by router.drawing_priority
-                                          on filename) becomes the job; others listed in flags
+                       .zip            -> every contained PDF gets its own project job, ordered
+                                          by router.drawing_priority for deterministic display
                        .eml            -> PDF attachments extracted, same ranking
                        .png/.jpg/.jpeg -> wrapped into a single-page PDF, routed as raster/UNMEASURED
                        .dwg/.dxf/other -> REJECTED job, "CAD/unsupported format — please export PDF"
@@ -1229,158 +1278,150 @@ def upload():
       project_name – human-readable project name (required)
       project_ref  – Fortel reference / sequential number (required)
 
-    Returns 201 {"job_id": "...", "status": "processing"} for a takeoff-bound job, or
+    Returns 202 {"job_id": "...", "status": "processing"} for a takeoff-bound job, or
     201 {"job_id": "...", "status": "rejected"} for a REJECTED job — always 2xx with a job
-    record the portal can show, never a bare 400 that vanishes.
+    record the portal can show, never a bare 400 that vanishes. Multi-job responses also include
+    job_ids and jobs while retaining the legacy job_id/status fields.
     """
     # ── Validate required form fields
     project_name = (request.form.get("project_name") or "").strip()
     project_ref  = (request.form.get("project_ref")  or "").strip()
     client_name  = (request.form.get("client_name")  or "").strip()
-    up_file      = request.files.get("pdf")
+    up_files     = [f for f in request.files.getlist("pdf") if f and f.filename]
 
     if not project_name:
         return jsonify({"error": "project_name is required"}), 400
     if not project_ref:
         return jsonify({"error": "project_ref is required"}), 400
-    if up_file is None:
+    if not up_files:
         return jsonify({"error": "file is required"}), 400
-
-    original_filename = up_file.filename or "upload"
-    ext = Path(original_filename).suffix.lower()
 
     drawings_dir = Path(__file__).parent / "drawings"
     drawings_dir.mkdir(exist_ok=True)
+    upload_items = []
 
-    # ── Save the raw upload to a staging path first (needed for zip/eml parsing + safety checks)
-    safe_name  = _sanitise_filename(original_filename) or f"upload_{uuid.uuid4().hex[:8]}{ext}"
-    stage_name = f"{_sanitise_filename(project_ref)}_{safe_name}"
-    stage_path = drawings_dir / stage_name
-    try:
-        stage_resolved = stage_path.resolve()
-        stage_resolved.relative_to(drawings_dir.resolve())
-    except ValueError:
-        return jsonify({"error": "invalid filename (path traversal detected)"}), 400
-    up_file.save(str(stage_path))
-
-    extra_flags = []
-    pdf_path = None
-
-    if ext == ".pdf":
-        pdf_path = stage_path
-
-    elif ext == ".zip":
-        pdfs, flags = _safe_extract_zip(stage_path, drawings_dir, prefix=_sanitise_filename(project_ref))
-        extra_flags += flags
-        stage_path.unlink(missing_ok=True)
-        if not pdfs:
-            job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
-                                          "zip archive contained no extractable PDFs")
-            return jsonify({"job_id": job_id, "status": "rejected"}), 201
-        ranked = _rank_pdfs_by_priority(pdfs)
-        pdf_path = ranked[0]
-        if len(ranked) > 1:
-            others = ", ".join(p.name for p in ranked[1:6])
-            extra_flags.append(f"zip contained {len(ranked)} PDFs; measured '{pdf_path.name}' "
-                               f"(highest drawing_priority); others: {others}")
-
-    elif ext == ".eml":
-        pdfs, flags = _extract_eml_pdfs(stage_path, drawings_dir, prefix=_sanitise_filename(project_ref))
-        extra_flags += flags
-        stage_path.unlink(missing_ok=True)
-        if not pdfs:
-            job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
-                                          "no PDF attachments found in .eml")
-            return jsonify({"job_id": job_id, "status": "rejected"}), 201
-        ranked = _rank_pdfs_by_priority(pdfs)
-        pdf_path = ranked[0]
-        if len(ranked) > 1:
-            others = ", ".join(p.name for p in ranked[1:6])
-            extra_flags.append(f".eml contained {len(ranked)} PDF attachments; measured '{pdf_path.name}' "
-                               f"(highest drawing_priority); others: {others}")
-
-    elif ext in (".png", ".jpg", ".jpeg"):
+    for up_file in up_files:
+        original_filename = up_file.filename or "upload"
+        ext = Path(original_filename).suffix.lower()
+        stage_path = _unique_prefixed_path(drawings_dir, project_ref, original_filename)
         try:
-            import fitz
-            img_doc = fitz.open(str(stage_path))
-            pdf_doc = fitz.open()
-            rect = img_doc[0].rect
-            page = pdf_doc.new_page(width=rect.width, height=rect.height)
-            page.insert_image(rect, filename=str(stage_path))
-            pdf_path = stage_path.with_suffix(".pdf")
-            pdf_doc.save(str(pdf_path))
+            stage_path.resolve().relative_to(drawings_dir.resolve())
+        except ValueError:
+            return jsonify({"error": "invalid filename (path traversal detected)"}), 400
+        up_file.save(str(stage_path))
+
+        if ext == ".pdf":
+            upload_items.append({"path": stage_path, "filename": original_filename, "flags": []})
+        elif ext == ".zip":
+            pdfs, flags = _safe_extract_zip(stage_path, drawings_dir, prefix=project_ref)
             stage_path.unlink(missing_ok=True)
-            extra_flags.append(f"image ({ext}) wrapped into a single-page PDF for takeoff — "
-                               "raster source, routes to UNMEASURED/mandatory assessor trace")
-        except Exception as e:
-            job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
-                                          f"could not wrap image into PDF: {e}")
-            return jsonify({"job_id": job_id, "status": "rejected"}), 201
+            ranked = _rank_pdfs_by_priority(pdfs)
+            if not ranked:
+                upload_items.append({"filename": original_filename,
+                                     "reason": "zip archive contained no extractable PDFs"})
+            else:
+                zip_flags = list(flags)
+                zip_flags.append(f"zip contained {len(ranked)} PDFs; every PDF queued as a "
+                                 "separate drawing under this project")
+                for pdf_path in ranked:
+                    upload_items.append({"path": pdf_path, "filename": pdf_path.name,
+                                         "flags": zip_flags})
+        elif ext == ".eml":
+            pdfs, flags = _extract_eml_pdfs(stage_path, drawings_dir, prefix=project_ref)
+            stage_path.unlink(missing_ok=True)
+            ranked = _rank_pdfs_by_priority(pdfs)
+            if not ranked:
+                upload_items.append({"filename": original_filename,
+                                     "reason": "no PDF attachments found in .eml"})
+            else:
+                pdf_path = ranked[0]
+                eml_flags = list(flags)
+                if len(ranked) > 1:
+                    others = ", ".join(p.name for p in ranked[1:6])
+                    eml_flags.append(f".eml contained {len(ranked)} PDF attachments; measured "
+                                     f"'{pdf_path.name}' (highest drawing_priority); others: {others}")
+                upload_items.append({"path": pdf_path, "filename": pdf_path.name,
+                                     "flags": eml_flags})
+        elif ext in (".png", ".jpg", ".jpeg"):
+            try:
+                import fitz
+                img_doc = fitz.open(str(stage_path))
+                pdf_doc = fitz.open()
+                rect = img_doc[0].rect
+                page = pdf_doc.new_page(width=rect.width, height=rect.height)
+                page.insert_image(rect, filename=str(stage_path))
+                pdf_path = _unique_prefixed_path(
+                    drawings_dir, project_ref, f"{Path(original_filename).stem}.pdf")
+                pdf_doc.save(str(pdf_path))
+                pdf_doc.close()
+                img_doc.close()
+                stage_path.unlink(missing_ok=True)
+                upload_items.append({
+                    "path": pdf_path,
+                    "filename": original_filename,
+                    "flags": [f"image ({ext}) wrapped into a single-page PDF for takeoff — "
+                              "raster source, routes to UNMEASURED/mandatory assessor trace"],
+                })
+            except Exception as e:
+                stage_path.unlink(missing_ok=True)
+                upload_items.append({"filename": original_filename,
+                                     "reason": f"could not wrap image into PDF: {e}"})
+        elif ext in CAD_EXTENSIONS:
+            stage_path.unlink(missing_ok=True)
+            upload_items.append({"filename": original_filename,
+                                 "reason": "CAD/unsupported format — please export PDF"})
+        else:
+            stage_path.unlink(missing_ok=True)
+            upload_items.append({
+                "filename": original_filename,
+                "reason": f"unsupported file type '{ext or '(none)'}' — please upload PDF, "
+                          "ZIP, EML, PNG or JPG",
+            })
 
-    elif ext in CAD_EXTENSIONS:
-        stage_path.unlink(missing_ok=True)
-        job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
-                                      "CAD/unsupported format — please export PDF")
-        return jsonify({"job_id": job_id, "status": "rejected"}), 201
-
-    else:
-        stage_path.unlink(missing_ok=True)
-        job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
-                                      f"unsupported file type '{ext or '(none)'}' — please upload PDF, "
-                                      "ZIP, EML, PNG or JPG")
-        return jsonify({"job_id": job_id, "status": "rejected"}), 201
-
-    # ── Final gate: the chosen PDF must actually open (catches encrypted/corrupt/zero-byte
-    # at whatever stage it arrived — direct .pdf upload, zip member, or eml attachment).
-    doc, bad_reason = _open_pdf_safely(pdf_path)
-    if bad_reason:
-        job_id = _create_rejected_job(project_name, project_ref, client_name, original_filename,
-                                      bad_reason)
-        return jsonify({"job_id": job_id, "status": "rejected"}), 201
-    doc.close()
-
-    # ── Create a stub job record immediately (status=processing)
-    job_id = str(uuid.uuid4())
-    job = {
-        "id":               job_id,
-        "pdf_path":         str(pdf_path),
-        "project_name":     project_name,
-        "project_ref":      project_ref,
-        "client_name":      client_name,
-        "type":             None,
-        "method":           None,
-        "confidence":       None,
-        "source_discipline": None,
-        "area_m2":          None,
-        "measurement_state": None,
-        "needs_assessor":   None,
-        "scale_verified":   None,
-        "scale_confirmed":  False,
-        "scale_src":        None,
-        "scale_sources":    None,
-        "costing":          None,
-        "flags":            extra_flags,
-        "polygon_pts":      None,
-        "status":           "processing",
-        "created_at":       datetime.datetime.utcnow().isoformat(),
-        "decision":         None,
-        "adjusted":         None,
-        "result":           {},
-    }
+    records = []
+    workers = []
+    response_jobs = []
+    for item in upload_items:
+        pdf_path = item.get("path")
+        reason = item.get("reason")
+        if pdf_path and not reason:
+            doc, reason = _open_pdf_safely(pdf_path)
+            if doc is not None:
+                doc.close()
+        if reason:
+            job_id, job = _rejected_job_record(
+                project_name, project_ref, client_name, item["filename"], reason)
+            status = "rejected"
+        else:
+            job_id, job = _processing_job_record(
+                project_name, project_ref, client_name, pdf_path, item.get("flags", []))
+            status = "processing"
+            workers.append((job_id, str(pdf_path)))
+        records.append((job_id, job))
+        response_jobs.append({"job_id": job_id, "status": status, "filename": item["filename"]})
 
     with _jobs_lock:
         jobs = load_jobs()
-        jobs[job_id] = job
+        for job_id, job in records:
+            jobs[job_id] = job
         save_jobs(jobs)
 
-    # ── Launch takeoff in background; portal polls /jobs every 15 s
-    threading.Thread(
-        target=_run_takeoff,
-        args=(job_id, str(pdf_path), project_name, project_ref),
-        daemon=True,
-    ).start()
+    for job_id, pdf_path in workers:
+        threading.Thread(
+            target=_run_takeoff,
+            args=(job_id, pdf_path, project_name, project_ref),
+            daemon=True,
+        ).start()
 
-    return jsonify({"job_id": job_id, "status": "processing"}), 202
+    primary = next((j for j in response_jobs if j["status"] == "processing"), response_jobs[0])
+    payload = {"job_id": primary["job_id"], "status": primary["status"]}
+    if len(response_jobs) > 1:
+        payload.update({
+            "project_ref": project_ref,
+            "job_ids": [j["job_id"] for j in response_jobs],
+            "jobs": response_jobs,
+        })
+    return jsonify(payload), (202 if workers else 201)
 
 
 # ── Startup sweep ─────────────────────────────────────────────────────────────

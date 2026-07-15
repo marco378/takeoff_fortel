@@ -11,6 +11,13 @@ P = []
 def ck(n, c, g=""):
     P.append(bool(c)); print(f"  [{'PASS' if c else 'FAIL'}] {n} {g}")
 
+class _FixtureNotPresent(Exception):
+    pass
+
+def _require_fixture(path, reason):
+    if not Path(path).exists():
+        raise _FixtureNotPresent(reason)
+
 print("geometry")
 K = 0.1
 a, _ = measure_regions([[(0,0),(2000,0),(2000,1300),(0,1300)]], K,
@@ -422,6 +429,7 @@ except ImportError as _e:
 
 print("D77 accuracy invariant (measurement math unchanged)")
 try:
+    _require_fixture("drawings/_int_d77.pdf", "D77 accuracy test")
     from takeoff_unmarked import takeoff as _tu_takeoff
     _d77 = _tu_takeoff("drawings/_int_d77.pdf")
     ck("D77 area unchanged at 3,159 m² (Smita gold 3,156)", _d77.get("area_m2") == 3159.0)
@@ -429,12 +437,15 @@ try:
        _d77.get("scale_verified") is True)
     ck("D77 measurement_state MEASURED_VERIFIED", _d77.get("measurement_state") == MEASURED_VERIFIED)
     ck("D77 needs_assessor False", _d77.get("needs_assessor") is False)
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] D77 accuracy test — missing dependency or file: {_e}")
 
 print("D77 border/legend exclusion (Aryan field report: real SGP sheet over-measures by "
       "border strips + legend swatch that share the yard's grey)")
 try:
+    _require_fixture("drawings", "D77 border/legend exclusion test")
     import fitz as _fitz_b
     from takeoff_unmarked import takeoff as _tu_takeoff2, segment_hatch as _seg_b
 
@@ -525,11 +536,14 @@ try:
     ck("WITH exclusion: flag lists excluded border/legend components",
        any("excluded" in f and "border/legend" in f for f in _r_bord.get("flags", [])),
        _r_bord.get("flags"))
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] D77 border/legend exclusion test — missing dependency or file: {_e}")
 
 print("manhole counting — MARKED path (robust_takeoff.count_manholes_marked)")
 try:
+    _require_fixture("drawings", "manhole counting (marked path) test")
     import fitz as _fitz_mh
     from robust_takeoff import read_marked as _read_marked_mh, count_manholes_marked
 
@@ -610,11 +624,16 @@ try:
     if Path(_winvic_yard).is_file():
         ck("real Winvic yard PDF has 0 Circle annots today (no markers placed yet -> honest 0, "
            "not a fabricated 26)", count_manholes_marked(_winvic_yard) == 0)
+    else:
+        print("  [SKIP] real Winvic yard manhole regression — fixture not present")
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] manhole counting (marked path) test — missing dependency or file: {_e}")
 
 print("manhole counting — UNMARKED path (takeoff_unmarked.detect_manholes, conservative ESTIMATE)")
 try:
+    _require_fixture("drawings/_int_d77.pdf", "manhole counting (unmarked path) D77 test")
     import numpy as _np_mh, cv2 as _cv2_mh
     from takeoff_unmarked import detect_manholes, takeoff as _tu_takeoff3
 
@@ -672,6 +691,8 @@ try:
        f"assumed={_d77_mh.get('manhole_count_assumed')} area={_d77_mh.get('area_m2')}")
     ck("D77 manhole_count_assumed is 3 for the ~3,159 m² fixture",
        _d77_mh.get("manhole_count_assumed") == 3, f"got {_d77_mh.get('manhole_count_assumed')}")
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] manhole counting (unmarked path) test — missing dependency or file: {_e}")
 
@@ -690,8 +711,9 @@ try:
         "drawings/tender_pack/2-Enquiry/01-Tender/Planning-Documentation/Site_Location_Plan.pdf",
     ]
     _fp_present = [f for f in _fp_files if _os_rg.path.exists(f)]
-    if not _fp_present:
-        print("  [SKIP] refuse-guard regression — tender-pack drawings not present (gitignored)")
+    for _f in _fp_files:
+        if not _os_rg.path.exists(_f):
+            print(f"  [SKIP] refuse-guard regression for {_os_rg.path.basename(_f)} — fixture not present")
     for _f in _fp_present:
         _r = _tp_rg.takeoff(_f, send_approval=False)
         _b = _os_rg.path.basename(_f)
@@ -703,13 +725,17 @@ try:
            any("REFUSED" in _fl for _fl in _r.get("flags", [])))
     # Positive control: real D77 gold has a legend label, so the guard must NOT fire even though
     # its scale bar is unverified — it must still measure the slab (~3,156 m²).
+    _d77_positive_control_ran = False
     for _d77f in ("drawings/real_sgp/D77_Hard_Landscaping.pdf", "drawings/_int_d77.pdf"):
         if _os_rg.path.exists(_d77f):
             _rd = _tp_rg.takeoff(_d77f, send_approval=False)
             ck(f"legend'd D77 '{_os_rg.path.basename(_d77f)}' NOT refused by guard (area still emitted)",
                _rd.get("area_m2") is not None and _rd.get("area_m2") > 2500,
                f"got area={_rd.get('area_m2')}")
+            _d77_positive_control_ran = True
             break
+    if not _d77_positive_control_ran:
+        print("  [SKIP] refuse-guard D77 positive control — fixture not present")
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] refuse-guard regression — missing dependency or file: {_e}")
 
@@ -752,7 +778,7 @@ except ImportError as _e:
 print("approval_server: upload format handling + approve hard-block")
 try:
     import approval_server as _AS
-    import fitz as _fitz3, zipfile as _zipfile, tempfile as _tempfile
+    import fitz as _fitz3, zipfile as _zipfile, tempfile as _tempfile, io as _io3
 
     _tmpdir = Path(_tempfile.mkdtemp(prefix="ci_upload_"))
 
@@ -791,6 +817,92 @@ try:
     _doc2, _reason2 = _AS._open_pdf_safely(_enc)
     ck("encrypted PDF -> rejected with reason (not a crash)",
        _doc2 is None and "encrypted" in _reason2.lower())
+
+    _orig_jobs_file_up = _AS.JOBS_FILE
+    _orig_backup_dir_up = _AS.BACKUP_DIR
+    _orig_server_file_up = _AS.__file__
+    _orig_thread_up = _AS.threading.Thread
+    _started_up = []
+
+    class _NoStartThread:
+        def __init__(self, target, args, daemon):
+            self.target, self.args, self.daemon = target, args, daemon
+        def start(self):
+            _started_up.append(self.args)
+
+    try:
+        _AS.JOBS_FILE = _tmpdir / "multi_upload_jobs.json"
+        _AS.BACKUP_DIR = _tmpdir / "multi_upload_backups"
+        _AS.__file__ = str(_tmpdir / "approval_server.py")
+        _AS.threading.Thread = _NoStartThread
+        _client_up = _AS.app.test_client()
+        _pdf_a_bytes = _pdf_a.read_bytes()
+        _pdf_b_bytes = _pdf_b.read_bytes()
+
+        _AS.save_jobs({})
+        _started_up.clear()
+        _multi_resp = _client_up.post("/upload", data={
+            "project_ref": "MULTI-001",
+            "project_name": "Four Slab Project",
+            "client_name": "Fortel QA",
+            "pdf": [(_io3.BytesIO(_pdf_a_bytes), "Yard.pdf"),
+                    (_io3.BytesIO(_pdf_b_bytes), "Dock.pdf")],
+        }, content_type="multipart/form-data")
+        _multi_json = _multi_resp.get_json()
+        _multi_jobs = _AS.load_jobs()
+        ck("multi-file upload returns two job_ids", _multi_resp.status_code == 202 and
+           len(_multi_json.get("job_ids", [])) == 2, _multi_json)
+        ck("multi-file upload creates one job per drawing under one project",
+           len(_multi_jobs) == 2 and
+           {j.get("project_ref") for j in _multi_jobs.values()} == {"MULTI-001"} and
+           {j.get("project_name") for j in _multi_jobs.values()} == {"Four Slab Project"})
+        ck("multi-file upload preserves prefixed, non-overwriting source paths",
+           len({j.get("pdf_path") for j in _multi_jobs.values()}) == 2 and
+           all(Path(j["pdf_path"]).name.startswith("MULTI-001_") for j in _multi_jobs.values()))
+        ck("multi-file upload launches one independent takeoff worker per drawing",
+           len(_started_up) == 2)
+
+        _AS.save_jobs({})
+        _started_up.clear()
+        _single_resp = _client_up.post("/upload", data={
+            "project_ref": "SINGLE-001", "project_name": "Single Drawing Project",
+            "pdf": (_io3.BytesIO(_pdf_a_bytes), "Yard.pdf"),
+        }, content_type="multipart/form-data")
+        _single_json = _single_resp.get_json()
+        ck("single-file upload keeps legacy one-job response shape",
+           _single_resp.status_code == 202 and "job_id" in _single_json and
+           "job_ids" not in _single_json and len(_AS.load_jobs()) == 1, _single_json)
+
+        _AS.save_jobs({})
+        _started_up.clear()
+        _zip_resp = _client_up.post("/upload", data={
+            "project_ref": "ZIP-001", "project_name": "ZIP Slab Project",
+            "pdf": (_io3.BytesIO(_zip_path.read_bytes()), "slabs.zip"),
+        }, content_type="multipart/form-data")
+        _zip_json = _zip_resp.get_json()
+        _zip_jobs = _AS.load_jobs()
+        ck("ZIP upload creates a job for every contained PDF",
+           _zip_resp.status_code == 202 and len(_zip_json.get("job_ids", [])) == 2 and
+           len(_zip_jobs) == 2 and len(_started_up) == 2, _zip_json)
+        ck("ZIP jobs share the project ref and record all-drawings provenance",
+           {j.get("project_ref") for j in _zip_jobs.values()} == {"ZIP-001"} and
+           all(any("every PDF queued" in f for f in j.get("flags", []))
+               for j in _zip_jobs.values()))
+
+        _portal_html_up = (Path(_orig_server_file_up).parent / "assessor_portal.html").read_text()
+        ck("portal file input allows multiple PDFs and ZIPs",
+           'accept=".pdf,.zip" multiple' in _portal_html_up)
+        ck("portal submits every selected file under the backward-compatible pdf field",
+           "files.forEach(file => fd.append('pdf', file))" in _portal_html_up)
+        ck("portal groups repeated project refs under collapsible project headers",
+           "projectCounts.get(ref)" in _portal_html_up and
+           'class="project-group-header' in _portal_html_up and
+           "toggleProjectGroup(this)" in _portal_html_up)
+    finally:
+        _AS.threading.Thread = _orig_thread_up
+        _AS.__file__ = _orig_server_file_up
+        _AS.JOBS_FILE = _orig_jobs_file_up
+        _AS.BACKUP_DIR = _orig_backup_dir_up
 
     # approve hard-block mirrors the >£200k escalation guard mechanism (fb5b92b)
     ck("UNMEASURED job blocks approve",
@@ -1018,6 +1130,7 @@ print("D77 swatch-locked grey band vs 'Footpaths (ancillary): Concrete' annexati
       "the generic 214±14 grey band admitting a darker, adjacent ancillary-concrete legend "
       "colour and binary_closing fusing it into the yard's own connected component)")
 try:
+    _require_fixture("drawings/_int_d77.pdf", "D77 swatch-locked grey band test")
     import fitz as _fitz_fp
     from takeoff_unmarked import (takeoff as _tu_takeoff_fp, segment_hatch as _seg_fp,
                                    PLAUSIBLE_MIN_M2 as _PMIN_FP, PLAUSIBLE_MAX_M2 as _PMAX_FP)
@@ -1115,6 +1228,8 @@ try:
     _d77_regress = _tu_takeoff_fp("drawings/_int_d77.pdf")
     ck("GOLD GUARD: _int_d77.pdf still exactly 3,159 m² (swatch-lock did not touch it)",
        _d77_regress.get("area_m2") == 3159.0, _d77_regress.get("area_m2"))
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] D77 swatch-locked grey band test — missing dependency or file: {_e}")
 
@@ -1677,7 +1792,7 @@ try:
             ck(f"unrotated gold fixture {_pdf_path} still detects the same k as before the fix",
                _k_chk is not None and abs(_k_chk - _expected_k) < 1e-6, (_k_chk, _info_chk))
         else:
-            print(f"  [SKIP] {_pdf_path} not present locally")
+            print(f"  [SKIP] real-sheet scale regression for {_pdf_path} — fixture not present")
 
     # The real Winvic sheets (270/90-rotated) must no longer crash, and the two with a genuine
     # readable segmented bar (Yard, Dock — same title-block template) must now agree with each
@@ -1698,7 +1813,7 @@ try:
                 ck(f"{_wp} (rotation 270) no longer crashes calling detect_scale_bar",
                    False, f"{type(_e).__name__}: {_e}")
         else:
-            print(f"  [SKIP] {_wp} not present locally")
+            print(f"  [SKIP] rotated Winvic scale regression for {_wp} — fixture not present")
 
     if len(_winvic_ks) == 2 and all(_v is not None for _v in _winvic_ks.values()):
         _vals = list(_winvic_ks.values())
@@ -1720,7 +1835,7 @@ try:
         ck("...and it went through scale_consensus (both sources present), not a bypass",
            "scale_bar" in _sources_tp and "title_block" in _sources_tp, _sources_tp)
     else:
-        print(f"  [SKIP] {_tp_site_plan} not present locally")
+        print(f"  [SKIP] tender-pack scale verification for {_tp_site_plan} — fixture not present")
 except ImportError as _e:
     print(f"  [SKIP] scale.py real-sheet regression tests — missing dependency: {_e}")
 

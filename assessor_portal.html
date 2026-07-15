@@ -39,6 +39,15 @@ header span{opacity:.7;font-size:12px}
 .job-item .jid{font-size:11px;opacity:.6;font-family:monospace}
 .job-item .jfile{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .job-item .jmeta{font-size:11px;opacity:.7;margin-top:2px}
+.project-group{border-bottom:1px solid #1e3c6a}
+.project-group-header{width:100%;border:0;background:#142d56;color:#d0dff5;padding:8px 12px;display:flex;align-items:center;gap:7px;cursor:pointer;text-align:left}
+.project-group-header:hover{background:#1e3c6a}
+.project-group-header .project-title{min-width:0;flex:1;font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.project-group-header .project-count{font-size:10px;color:#8fa8cc;white-space:nowrap}
+.project-group-header .chevron{font-size:10px;transition:transform .2s}
+.project-group-header.collapsed .chevron{transform:rotate(-90deg)}
+.project-group-children.collapsed{display:none}
+.project-group-children .job-item{padding-left:25px}
 .badge{display:inline-block;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;text-transform:uppercase}
 .badge.pending{background:#e67e22;color:#fff}
 .badge.approved{background:#27ae60;color:#fff}
@@ -152,11 +161,12 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .line-items-toggle{width:100%;background:none;border:none;padding:6px 0 4px;color:var(--blue);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;cursor:pointer;display:flex;align-items:center;gap:5px;text-align:left}
 .line-items-toggle .chevron{margin-left:auto;font-size:10px;opacity:.5;transition:transform .2s}
 .line-items-toggle.open .chevron{transform:rotate(180deg)}
-.li-wrap{overflow:hidden;max-height:0;transition:max-height .3s ease}
+.li-wrap{overflow-x:auto;overflow-y:hidden;max-height:0;transition:max-height .3s ease}
 .li-wrap.open{max-height:1200px}
-.li-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:6px}
-.li-table th{text-align:left;padding:4px 5px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap}
-.li-table td{padding:3px 5px;border-bottom:1px solid #f0f2f5;vertical-align:top}
+.li-table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:11px;margin-top:6px}
+.li-table th{text-align:left;padding:4px 3px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap}
+.li-table td{padding:3px;border-bottom:1px solid #f0f2f5;vertical-align:top}
+.li-table td:first-child{overflow-wrap:anywhere}
 .li-table td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .li-section-hdr td{background:#f4f6fb;font-weight:700;color:var(--blue);font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:5px 5px 3px}
 .li-subtotal td{background:#f9f9f9;font-weight:600;color:#444;border-top:1px solid var(--border)}
@@ -204,8 +214,8 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
             <input type="text" id="upClient" name="client_name" placeholder="e.g. Winvic Construction">
           </div>
           <div class="upload-form-group">
-            <label for="upFile">PDF Drawing</label>
-            <input type="file" id="upFile" name="pdf" accept=".pdf" required>
+            <label for="upFile">PDF Drawing(s) or ZIP</label>
+            <input type="file" id="upFile" name="pdf" accept=".pdf,.zip" multiple required>
           </div>
           <button type="submit" class="btn-run-takeoff" id="btnRunTakeoff">
             🚀 Run Takeoff
@@ -384,6 +394,7 @@ let _lastJobs = null;           // cache for search re-filter
 let _jobSearchTerm = '';        // current search filter
 let _archivedJobs = {};         // cache of archived jobs (fetched only when the toggle is on)
 let _showArchived = false;      // "Show archived" sidebar toggle state
+let _collapsedProjects = new Set();
 // Monotonic generation counter guarding selectJob() against out-of-order completion.
 // selectJob is async (fetch /job/<id> then render); with no guard, rapidly switching
 // jobs (or a poll-triggered re-select racing a user click) can let an OLDER in-flight
@@ -488,7 +499,13 @@ function renderJobList(jobs) {
       const countBanner = q
         ? `<div style="padding:4px 12px;font-size:11px;color:#8ab4cc;border-bottom:1px solid #25426e">${filtered.length} of ${sorted.length} jobs</div>`
         : '';
-      html = countBanner + filtered.map(j => {
+      const projectCounts = new Map();
+      for (const j of sorted) {
+        const ref = String(j.project_ref || '').trim();
+        if (ref) projectCounts.set(ref, (projectCounts.get(ref) || 0) + 1);
+      }
+
+      const renderJobRow = (j, grouped=false) => {
         const active = currentJob && currentJob.id === j.id ? 'active' : '';
         const badge  = `<span class="badge ${j.status||'pending'}">${j.status||'pending'}</span>`;
         const mstate = j.measurement_state || (j.result && j.result.measurement_state);
@@ -496,7 +513,7 @@ function renderJobList(jobs) {
         const area   = j.result && j.result.area_m2 ? `${(+j.result.area_m2).toLocaleString()} m²` : '—';
         const ts      = j.created_at ? j.created_at.substring(0,16).replace('T',' ') : '';
         const ref     = j.project_ref  ? `<span style="opacity:.8;font-size:10px">#${esc(j.project_ref)} · </span>` : '';
-        const pname   = j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
+        const pname   = !grouped && j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
         if (j.archived) {
           return `<div class="job-item archived" style="opacity:.55">
             ${pname}
@@ -513,11 +530,54 @@ function renderJobList(jobs) {
           <div class="jfile">${esc(j.result&&j.result.file||j.id)}</div>
           <div class="jmeta">${area} · ${ts}</div>
         </div>`;
+      };
+
+      const projectGroups = new Map();
+      const renderOrder = [];
+      for (const j of filtered) {
+        const ref = String(j.project_ref || '').trim();
+        if (ref && (projectCounts.get(ref) || 0) > 1) {
+          if (!projectGroups.has(ref)) {
+            projectGroups.set(ref, []);
+            renderOrder.push({type:'project', ref});
+          }
+          projectGroups.get(ref).push(j);
+        } else {
+          renderOrder.push({type:'job', job:j});
+        }
+      }
+
+      html = countBanner + renderOrder.map(entry => {
+        if (entry.type === 'job') return renderJobRow(entry.job);
+        const children = projectGroups.get(entry.ref);
+        const first = children[0];
+        const total = projectCounts.get(entry.ref) || children.length;
+        const count = _jobSearchTerm && children.length !== total
+          ? `${children.length} of ${total} drawings` : `${total} drawings`;
+        const collapsed = !_jobSearchTerm && _collapsedProjects.has(entry.ref);
+        return `<div class="project-group">
+          <button class="project-group-header ${collapsed?'collapsed':''}" data-project-ref="${esc(entry.ref)}" onclick="toggleProjectGroup(this)">
+            <span class="chevron">▼</span>
+            <span class="project-title">#${esc(entry.ref)} · ${esc(first.project_name||'Unnamed project')}</span>
+            <span class="project-count">${count}</span>
+          </button>
+          <div class="project-group-children ${collapsed?'collapsed':''}">
+            ${children.map(j => renderJobRow(j, true)).join('')}
+          </div>
+        </div>`;
       }).join('');
     }
   }
   // Only repaint if content changed — prevents cosmetic flicker on every 15s poll
   if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+function toggleProjectGroup(button) {
+  if (_jobSearchTerm) return;
+  const ref = button.dataset.projectRef;
+  if (_collapsedProjects.has(ref)) _collapsedProjects.delete(ref);
+  else _collapsedProjects.add(ref);
+  if (_lastJobs) renderJobList(_lastJobs);
 }
 
 async function unarchiveJob(jobId) {
@@ -800,6 +860,10 @@ function renderCosting(c, jobStatus) {
   const spec    = c.spec || {};
   const bdwn    = c.breakdown || {};
   const assumed = c.assumed;
+  const numericRate = Number(c.rate);
+  const rateDisplay = Number.isFinite(numericRate)
+    ? numericRate.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})
+    : '—';
   const rows = ['concrete','steel','dpm','curing','labour','trim'].map(k =>
     bdwn[k] != null
       ? `<div class="kv"><span class="k" style="padding-left:8px">${k.charAt(0).toUpperCase()+k.slice(1)}</span><span class="v">£${(+bdwn[k]).toFixed(2)}/m²</span></div>`
@@ -863,7 +927,7 @@ function renderCosting(c, jobStatus) {
     <div style="background:#13294b;border-radius:6px;padding:10px 12px;margin-bottom:8px;text-align:center">
       <div style="color:#aec3e0;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT)</div>
       <div style="color:#fff;font-size:26px;font-weight:800">£${(+c.total_gbp).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
-      <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${(+c.rate).toFixed(2)}/m²</div>
+      <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${rateDisplay}/m²</div>
       <div style="color:#8fa8cc;font-size:11px">${spec.depth_mm||190}mm ${esc(spec.conc_mix||'C32/40')} / ${spec.layers||1}× ${esc(spec.mesh||'A252')}</div>
     </div>
     <div class="kv"><span class="k" style="font-size:11px">Rate breakdown (per m²)</span></div>
@@ -897,8 +961,11 @@ async function submitSpecOverride(e) {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || r.statusText);
     // Re-render costing inline without full panel reload
-    const job = _jobs.find(j => j.id === selectedJobId) || {};
+    const job = currentJob && currentJob.id === selectedJobId
+      ? currentJob : (_jobs.find(j => j.id === selectedJobId) || {});
+    if (currentJob && currentJob.id === selectedJobId) currentJob.costing = d.costing;
     renderCosting(d.costing, job.status);
+    await loadLineItems(job);
     // Reopen the details element so assessor sees the updated form
     const det = document.getElementById('specOverrideDetails');
     if (det) det.open = true;
@@ -1149,25 +1216,27 @@ function calcArea() {
 }
 
 function updateAreaDisplay() {
-  const a = calcArea();
-  const ai = currentJob && currentJob.result && currentJob.result.area_m2;
-  const adj = currentJob && currentJob.adjusted && currentJob.adjusted.area_m2;
-  // Prefer assessor trace > adjusted > AI area
-  const displayed = a || adj || ai;
-  const aStr = displayed ? `${displayed.toLocaleString(undefined,{maximumFractionDigits:0})} m²` : '—';
+  const tracedArea = calcArea();
+  const adjustedArea = Number(currentJob && currentJob.adjusted && currentJob.adjusted.area_m2) || null;
+  const aiArea = Number(currentJob && (
+    (currentJob.result && currentJob.result.area_m2) || currentJob.area_m2
+  )) || null;
+  const displayedArea = tracedArea || adjustedArea || aiArea;
+  const aStr = displayedArea
+    ? `${displayedArea.toLocaleString(undefined,{maximumFractionDigits:0})} m²` : '—';
   document.getElementById('areaDisplay').textContent = aStr;
   document.getElementById('scaleDisplay').textContent = mpp ? mpp.toFixed(5) : '—';
-  if (a && ai) {
-    const diff = ((a - ai)/ai*100).toFixed(1);
+  if (tracedArea && aiArea) {
+    const diff = ((tracedArea - aiArea)/aiArea*100).toFixed(1);
     const sign = diff > 0 ? '+' : '';
     document.getElementById('areaSource').textContent =
-      `Assessor trace · AI was ${ai.toLocaleString()} m² (${sign}${diff}% difference)`;
-  } else if (a) {
+      `Assessor trace · AI was ${aiArea.toLocaleString()} m² (${sign}${diff}% difference)`;
+  } else if (tracedArea) {
     document.getElementById('areaSource').textContent = 'Assessor trace';
-  } else if (adj && ai) {
-    document.getElementById('areaSource').textContent = `Adjusted · AI was ${ai.toLocaleString()} m²`;
-  } else if (ai) {
-    document.getElementById('areaSource').textContent = 'AI measured';
+  } else if (adjustedArea) {
+    document.getElementById('areaSource').textContent = 'Assessor adjustment';
+  } else if (aiArea) {
+    document.getElementById('areaSource').textContent = 'AI measurement';
   } else {
     document.getElementById('areaSource').textContent = 'No polygon traced yet';
   }
@@ -1392,19 +1461,19 @@ async function submitUpload(e) {
   const ref    = document.getElementById('upRef').value.trim();
   const name   = document.getElementById('upName').value.trim();
   const client = document.getElementById('upClient').value.trim();
-  const file   = document.getElementById('upFile').files[0];
+  const files  = Array.from(document.getElementById('upFile').files || []);
 
-  if (!ref || !name || !file) return;   // HTML5 required handles UI
+  if (!ref || !name || !files.length) return;   // HTML5 required handles UI
 
   // Spinner state
   btn.disabled = true;
-  btn.innerHTML = '<span class="upload-spinner"></span> Processing…';
+  btn.innerHTML = `<span class="upload-spinner"></span> Processing ${files.length} file${files.length===1?'':'s'}…`;
 
   const fd = new FormData();
   fd.append('project_ref',  ref);
   fd.append('project_name', name);
   fd.append('client_name',  client);
-  fd.append('pdf',          file);
+  files.forEach(file => fd.append('pdf', file));
 
   try {
     const r = await fetch(`${BASE}/upload`, { method: 'POST', body: fd });
@@ -1418,10 +1487,13 @@ async function submitUpload(e) {
       toggle.classList.remove('open');
       document.getElementById('uploadForm').reset();
 
-      toast('Job submitted — processing…');
+      const newIds = rj.job_ids || [rj.job_id || rj.id].filter(Boolean);
+      toast(newIds.length > 1
+        ? `${newIds.length} drawings submitted under project #${ref}`
+        : 'Job submitted — processing…');
 
-      // Auto-select the new job if the server returned a job_id
-      const newId = rj.job_id || rj.id;
+      // Auto-select the primary job while all project drawings process independently
+      const newId = rj.job_id || rj.id || newIds[0];
       if (newId) {
         await loadJobList();
         await selectJob(newId);
@@ -1492,8 +1564,12 @@ function renderLineItemsTable(items) {
     : (v ?? '—');
 
   let html = `<table class="li-table">
+    <colgroup>
+      <col style="width:29%"><col style="width:17%"><col style="width:10%">
+      <col style="width:17%"><col style="width:27%">
+    </colgroup>
     <thead><tr>
-      <th style="width:38%">Description</th>
+      <th>Description</th>
       <th class="num">Qty</th>
       <th>Unit</th>
       <th class="num">Rate&nbsp;(£)</th>
