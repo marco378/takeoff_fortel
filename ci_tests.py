@@ -1353,9 +1353,14 @@ try:
 
         # /portal?token=<wrong> does not authorise — use a FRESH client (no cookie carried
         # over from the earlier correct-token request on _client6, which would mask this).
+        # It falls through to the same "no valid cookie/token" case as no token at all, which
+        # now renders the login form (200) instead of a bare 401 — see the /portal login test
+        # below for the full flow; here just confirm real portal content is NOT served.
         _client6fresh = _app6.test_client()
         _r6f = _client6fresh.get("/portal?token=nope")
-        ck("/portal?token=<wrong> -> 401, not silently served", _r6f.status_code == 401, _r6f.status_code)
+        ck("/portal?token=<wrong> -> login form, not silently served",
+           _r6f.status_code == 200 and b"Access code" in _r6f.data
+           and b"Fortel Approval Portal" in _r6f.data, _r6f.status_code)
 
         # Cookie-based auth works for a mutating route (mirrors what the portal's own fetch()
         # calls will do once the browser holds the cookie from the bootstrap redirect above)
@@ -1374,6 +1379,45 @@ try:
         shutil.rmtree(_tmpdir6, ignore_errors=True)
 except ImportError as _e:
     print(f"  [SKIP] approval_server auth-gate tests — missing dependency: {_e}")
+
+print("approval_server: /portal login form (no-token case posts a code instead of a bare 401)")
+try:
+    import approval_server as _AS6b
+
+    _orig_token6b = _AS6b.APPROVAL_TOKEN
+    _AS6b.APPROVAL_TOKEN = "test-login-secret-789"
+    try:
+        _app6b = _AS6b.app
+        _app6b.testing = True
+
+        # 1) No cookie, no token at all -> login form (200), not the real portal
+        _client6b1 = _app6b.test_client()
+        _r6b1 = _client6b1.get("/portal")
+        ck("GET /portal with no cookie/token -> login form",
+           _r6b1.status_code == 200 and b"Access code" in _r6b1.data
+           and b"Review Portal" not in _r6b1.data, _r6b1.status_code)
+
+        # 2) Wrong code -> re-shows the form with an error, still 200 (a login failure, not an
+        # API auth failure)
+        _r6b2 = _client6b1.post("/portal", data={"code": "wrong-code"})
+        ck("POST /portal wrong code -> re-shown with error, 200",
+           _r6b2.status_code == 200 and b"Incorrect code" in _r6b2.data, _r6b2.status_code)
+
+        # 3) Correct code -> redirect + sets the cookie
+        _r6b3 = _client6b1.post("/portal", data={"code": "test-login-secret-789"})
+        ck("POST /portal correct code -> redirect", _r6b3.status_code in (301, 302), _r6b3.status_code)
+        ck("POST /portal correct code -> Set-Cookie contains the token cookie name",
+           "approval_token" in _r6b3.headers.get("Set-Cookie", ""),
+           _r6b3.headers.get("Set-Cookie", ""))
+
+        # 4) Follow-up GET with that cookie -> real portal content, not the login form
+        _r6b4 = _client6b1.get("/portal")
+        ck("GET /portal with cookie from login -> real portal, not the login form",
+           _r6b4.status_code == 200 and b"Access code" not in _r6b4.data, _r6b4.status_code)
+    finally:
+        _AS6b.APPROVAL_TOKEN = _orig_token6b
+except ImportError as _e:
+    print(f"  [SKIP] approval_server /portal login-form tests — missing dependency: {_e}")
 
 print("approval_server: jobs-file backup rotation + corrupt-file preservation (prod-audit MUST)")
 try:
