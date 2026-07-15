@@ -329,30 +329,51 @@ ck("assumed build-up is provisional in text/html/json",
 
 _xlsx_bytes = quotation_xlsx(_q_multi)
 _xlsx_wb = _load_workbook(_BytesIO(_xlsx_bytes), data_only=False)
-_xlsx_ws = _xlsx_wb["Quotation"]
-ck("xlsx export reopens as exactly one editable quotation tab", _xlsx_wb.sheetnames == ["Quotation"])
+_xlsx_ws = _xlsx_wb["REV_01"]
+ck("xlsx export reopens as exactly one editable quotation tab", _xlsx_wb.sheetnames == ["REV_01"])
+ck("xlsx uses client BOQ column labels and order",
+   tuple(_xlsx_ws.cell(8, col).value for col in range(1, 6)) ==
+   ("DESCRIPTION", "QTY", "UNIT", "RATE", "VALUE"))
+ck("xlsx header carries project/client/date/ref and multiline drawing register",
+   _xlsx_ws["A2"].value == "Project:" and _xlsx_ws["B2"].value == "Multi-unit" and
+   _xlsx_ws["A3"].value == "Client:" and _xlsx_ws["B3"].value == "Fortel" and
+   _xlsx_ws["A4"].value == "Date:" and _xlsx_ws["B4"].number_format == "dd/mm/yyyy" and
+   _xlsx_ws["C4"].value == "Quotation Ref:" and _xlsx_ws["D4"].value == "TST-MULTI" and
+   _xlsx_ws["A5"].value == "Drawing ref available at tender:" and
+   "\n" in _xlsx_ws["B5"].value and
+   all(name in _xlsx_ws["B5"].value for name in ("Yard-A.pdf", "Yard-B.pdf")))
+_expected_xlsx_sections = (
+    "External Yard Slabs- Provisional Cost (No Details)",
+    "Dock Slabs",
+    "Ground Floor Slabs (Ancillary Areas)",
+    "Upper Floors",
+    "Prelims",
+)
 _xlsx_section_rows = {
     _xlsx_ws.cell(row, 1).value: row for row in range(1, _xlsx_ws.max_row + 1)
-    if _xlsx_ws.cell(row, 1).value in SECTION_ORDER
+    if _xlsx_ws.cell(row, 1).value in _expected_xlsx_sections
 }
 ck("xlsx section headers follow client order",
-   list(_xlsx_section_rows) == list(SECTION_ORDER), _xlsx_section_rows)
+   tuple(_xlsx_section_rows) == _expected_xlsx_sections, _xlsx_section_rows)
 _xlsx_item_row = next(row for row in range(1, _xlsx_ws.max_row + 1)
                       if "supply & lay" in str(_xlsx_ws.cell(row, 1).value or ""))
 ck("xlsx qty/rate are numeric and row value is a live formula",
-   isinstance(_xlsx_ws.cell(_xlsx_item_row, 3).value, (int, float)) and
-   isinstance(_xlsx_ws.cell(_xlsx_item_row, 5).value, (int, float)) and
-   _xlsx_ws.cell(_xlsx_item_row, 6).data_type == "f" and
-   _xlsx_ws.cell(_xlsx_item_row, 6).value == f"=ROUND(C{_xlsx_item_row}*E{_xlsx_item_row},2)")
+   isinstance(_xlsx_ws.cell(_xlsx_item_row, 2).value, (int, float)) and
+   isinstance(_xlsx_ws.cell(_xlsx_item_row, 4).value, (int, float)) and
+   _xlsx_ws.cell(_xlsx_item_row, 5).data_type == "f" and
+   _xlsx_ws.cell(_xlsx_item_row, 5).value == f"=ROUND(B{_xlsx_item_row}*D{_xlsx_item_row},2)")
+ck("xlsx quantity/unit display matches client template without forced .00",
+   _xlsx_ws.cell(_xlsx_item_row, 2).number_format == "#,##0.##" and
+   _xlsx_ws.cell(_xlsx_item_row, 3).value == "m2")
 ck("xlsx section subtotals and nett total are formulas",
-   any(_xlsx_ws.cell(row, 6).data_type == "f" and
+   any(_xlsx_ws.cell(row, 5).data_type == "f" and
        str(_xlsx_ws.cell(row, 1).value or "").startswith("Subtotal —")
        for row in range(1, _xlsx_ws.max_row + 1)) and
-   any(_xlsx_ws.cell(row, 6).data_type == "f" and
-       _xlsx_ws.cell(row, 1).value == "TOTAL NETT (excl. VAT)"
+   any(_xlsx_ws.cell(row, 5).data_type == "f" and
+       _xlsx_ws.cell(row, 1).value == "TOTAL NETT"
        for row in range(1, _xlsx_ws.max_row + 1)))
 ck("xlsx visibly marks assumed quantity provisional",
-   any(_xlsx_ws.cell(row, 7).value == PROVISIONAL_LABEL
+   any(PROVISIONAL_LABEL in str(_xlsx_ws.cell(row, 1).value or "")
        for row in range(1, _xlsx_ws.max_row + 1)))
 
 print("pipeline price_with_defaults")
@@ -1006,7 +1027,7 @@ try:
         _xlsx_route_resp = _client_up.get(
             "/quotation/11111111-1111-4111-8111-111111111111.xlsx")
         _xlsx_route_wb = _load_workbook(_BytesIO(_xlsx_route_resp.data), data_only=False)
-        _xlsx_route_ws = _xlsx_route_wb["Quotation"]
+        _xlsx_route_ws = _xlsx_route_wb["REV_01"]
         _xlsx_route_slab_row = next(
             row for row in range(1, _xlsx_route_ws.max_row + 1)
             if "supply & lay" in str(_xlsx_route_ws.cell(row, 1).value or ""))
@@ -1016,7 +1037,7 @@ try:
            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" and
            "QUOTE-MULTI-001.xlsx" in _xlsx_route_resp.headers.get("Content-Disposition", ""))
         ck("xlsx route aggregates approved sibling units sharing project_ref",
-           _xlsx_route_ws.cell(_xlsx_route_slab_row, 3).value == 250)
+           _xlsx_route_ws.cell(_xlsx_route_slab_row, 2).value == 250)
 
         _portal_html_up = (Path(_orig_server_file_up).parent / "assessor_portal.html").read_text()
         ck("portal file input allows multiple PDFs and ZIPs",

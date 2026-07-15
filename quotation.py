@@ -472,11 +472,49 @@ def _excel_text(value):
     return f"'{text}" if text.startswith(("=", "+", "-", "@")) else text
 
 
+def _excel_date(value):
+    """Return a real Excel date when the quotation date is in a known format."""
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    for fmt in ("%d %B %Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(str(value), fmt).date()
+        except (TypeError, ValueError):
+            pass
+    return _excel_text(value)
+
+
+def _excel_unit(value):
+    """Match the unit spellings used in Fortel's editable BOQ template."""
+    text = str(value or "")
+    return {
+        "m²": "m2", "m2": "m2",
+        "m³": "m3", "m3": "m3",
+        "lm": "Lm", "nr": "Nr", "item": "Item", "t": "T",
+    }.get(text.casefold(), text)
+
+
+def _excel_section_title(section, items):
+    labels = {
+        "External yard slabs": "External Yard Slabs",
+        "Dock slabs": "Dock Slabs",
+        "Ground floor slabs": "Ground Floor Slabs (Ancillary Areas)",
+        "Upper floor slabs": "Upper Floors",
+        "Prelims": "Prelims",
+    }
+    title = labels.get(section, str(section))
+    if section != "Prelims" and any(item.get("provisional") for item in items):
+        title += "- Provisional Cost (No Details)"
+    return title
+
+
 def quotation_xlsx(q: dict) -> bytes:
-    """Editable one-sheet Excel quotation with numeric inputs and live formulas."""
+    """Editable one-sheet Excel quotation in Fortel's client-facing BOQ layout."""
     wb = Workbook()
     ws = wb.active
-    ws.title = "Quotation"
+    ws.title = "REV_01"
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A9"
     ws.sheet_properties.tabColor = "13294B"
@@ -485,44 +523,49 @@ def quotation_xlsx(q: dict) -> bytes:
     pale_blue = "EAF0F8"
     pale_gold = "FFF2CC"
     pale_grey = "F4F6F8"
+    section_blue = "0070C0"
+    black = "000000"
     white = "FFFFFF"
     muted = "667085"
     thin_grey = Side(style="thin", color="D9DEE7")
 
-    ws.merge_cells("A1:G1")
+    ws.merge_cells("A1:E1")
     ws["A1"] = FORTEL_NAME
     ws["A1"].font = Font(name="Aptos Display", size=18, bold=True, color=white)
     ws["A1"].fill = PatternFill("solid", fgColor=navy)
     ws["A1"].alignment = Alignment(vertical="center")
     ws.row_dimensions[1].height = 30
 
-    ws.merge_cells("A2:G2")
-    ws["A2"] = f"Quotation {q['ref']} · {q['date']}"
-    ws["A2"].font = Font(name="Aptos", size=11, color=white)
-    ws["A2"].fill = PatternFill("solid", fgColor=navy)
-    ws.row_dimensions[2].height = 22
+    ws["A2"], ws["B2"] = "Project:", _excel_text(q.get("project") or "—")
+    ws["A3"], ws["B3"] = "Client:", _excel_text(q.get("client") or "—")
+    ws["A4"], ws["B4"] = "Date:", _excel_date(q.get("date"))
+    ws["C4"], ws["D4"] = "Quotation Ref:", _excel_text(q.get("ref") or "—")
+    ws.merge_cells("B2:E2")
+    ws.merge_cells("B3:E3")
+    ws.merge_cells("D4:E4")
+    for cell in (ws["A2"], ws["A3"], ws["A4"], ws["C4"]):
+        cell.font = Font(bold=True, color=navy)
+    ws["B4"].number_format = "dd/mm/yyyy"
 
-    metadata = (
-        ("A4", "Project", "B4", q.get("project") or "—"),
-        ("D4", "Client", "E4", q.get("client") or "—"),
-        ("A5", "Drawings", "B5", ", ".join(q.get("drawings") or []) or "—"),
-    )
-    for label_cell, label, value_cell, value in metadata:
-        ws[label_cell] = label
-        ws[label_cell].font = Font(bold=True, color=muted)
-        ws[value_cell] = _excel_text(value)
-    ws.merge_cells("B5:G5")
+    drawings = q.get("drawings") or []
+    ws["A5"] = "Drawing ref available at tender:"
+    ws["A5"].font = Font(bold=True, color=navy)
+    ws["A5"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws["B5"] = _excel_text("\n".join(drawings) or "—")
+    ws.merge_cells("B5:E5")
     ws["B5"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws.row_dimensions[5].height = max(30, 15 * max(2, len(drawings)))
+    for row_index in range(2, 6):
+        for col_index in range(1, 6):
+            ws.cell(row_index, col_index).fill = PatternFill("solid", fgColor=pale_blue)
 
-    ws["A6"], ws["B6"] = "Measured area (m²)", float(q.get("area_m2") or 0)
+    ws["A6"], ws["B6"] = "Measured area (m2)", float(q.get("area_m2") or 0)
     ws["C6"] = "Slab perimeter (Lm)"
     ws["D6"] = (float(q["perimeter_lm"]) if q.get("perimeter_lm") is not None else None)
-    ws["E6"] = "TOTAL NETT (£)"
-    for cell in (ws["A6"], ws["C6"], ws["E6"]):
+    for cell in (ws["A6"], ws["C6"]):
         cell.font = Font(bold=True, color=muted)
-    ws["B6"].number_format = '#,##0.00'
-    ws["D6"].number_format = '#,##0.0'
-    ws["F6"].number_format = '£#,##0.00'
+    ws["B6"].number_format = '#,##0.##'
+    ws["D6"].number_format = '#,##0.##'
 
     sections = OrderedDict()
     for item in q.get("line_items", []):
@@ -533,123 +576,122 @@ def quotation_xlsx(q: dict) -> bytes:
     row = 8
     subtotal_rows = []
     header_fill = PatternFill("solid", fgColor=pale_grey)
-    section_fill = PatternFill("solid", fgColor=pale_blue)
+    section_fill = PatternFill("solid", fgColor=section_blue)
     provisional_fill = PatternFill("solid", fgColor=pale_gold)
-    headings = ("Description", "Drawing(s)", "Qty", "Unit", "Rate (£)", "Value (£)", "Status")
+    headings = ("DESCRIPTION", "QTY", "UNIT", "RATE", "VALUE")
+
+    for col, heading in enumerate(headings, 1):
+        cell = ws.cell(row, col, heading)
+        cell.font = Font(bold=True, color=white, size=10)
+        cell.fill = PatternFill("solid", fgColor=black)
+        cell.alignment = Alignment(horizontal="right" if col in (2, 4, 5) else "left")
+    ws.row_dimensions[row].height = 20
+    row += 1
 
     for section in ordered_sections:
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
-        ws.cell(row, 1, section)
-        ws.cell(row, 1).font = Font(bold=True, color=navy, size=12)
+        section_items = sections[section]
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+        ws.cell(row, 1, _excel_section_title(section, section_items))
+        ws.cell(row, 1).font = Font(bold=True, color=white, size=12)
         ws.cell(row, 1).fill = section_fill
         ws.cell(row, 1).alignment = Alignment(vertical="center")
         ws.row_dimensions[row].height = 22
         row += 1
 
-        for col, heading in enumerate(headings, 1):
-            cell = ws.cell(row, col, heading)
-            cell.font = Font(bold=True, color=muted, size=10)
-            cell.fill = header_fill
-            cell.border = Border(bottom=thin_grey)
-            cell.alignment = Alignment(horizontal="right" if col in (3, 5, 6) else "left")
-        row += 1
         first_item_row = row
-        for item in sections[section]:
-            ws.cell(row, 1, _excel_text(item["description"]))
-            ws.cell(row, 2, _excel_text(", ".join(item.get("drawings") or [])))
-            ws.cell(row, 3, float(item["qty"]))
-            ws.cell(row, 4, _excel_text(item["unit"]))
-            ws.cell(row, 5, float(item["rate"]))
-            ws.cell(row, 6, f"=ROUND(C{row}*E{row},2)")
-            ws.cell(row, 7, PROVISIONAL_LABEL if item.get("provisional") else "")
-            ws.cell(row, 3).number_format = '#,##0.00'
+        for item in section_items:
+            description = item["description"]
+            if item.get("provisional"):
+                description += f"\n{PROVISIONAL_LABEL}"
+            ws.cell(row, 1, _excel_text(description))
+            ws.cell(row, 2, float(item["qty"]))
+            ws.cell(row, 3, _excel_text(_excel_unit(item["unit"])))
+            ws.cell(row, 4, float(item["rate"]))
+            ws.cell(row, 5, f"=ROUND(B{row}*D{row},2)")
+            ws.cell(row, 2).number_format = '#,##0.##'
+            ws.cell(row, 4).number_format = '£#,##0.00'
             ws.cell(row, 5).number_format = '£#,##0.00'
-            ws.cell(row, 6).number_format = '£#,##0.00'
-            for col in range(1, 8):
+            for col in range(1, 6):
                 ws.cell(row, col).border = Border(bottom=thin_grey)
                 ws.cell(row, col).alignment = Alignment(
-                    horizontal="right" if col in (3, 5, 6) else "left",
-                    vertical="top", wrap_text=col in (1, 2, 7))
+                    horizontal="right" if col in (2, 4, 5) else "left",
+                    vertical="top", wrap_text=col == 1)
                 if item.get("provisional"):
                     ws.cell(row, col).fill = provisional_fill
+            if item.get("provisional"):
+                ws.row_dimensions[row].height = 30
             row += 1
 
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-        ws.cell(row, 1, f"Subtotal — {section}")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        ws.cell(row, 1, f"Subtotal — {_excel_section_title(section, [])}")
         ws.cell(row, 1).font = Font(bold=True, color=navy)
-        ws.cell(row, 6, f"=SUM(F{first_item_row}:F{row - 1})")
-        ws.cell(row, 6).font = Font(bold=True, color=navy)
-        ws.cell(row, 6).number_format = '£#,##0.00'
-        ws.cell(row, 7, "")
-        for col in range(1, 8):
+        ws.cell(row, 5, f"=SUM(E{first_item_row}:E{row - 1})")
+        ws.cell(row, 5).font = Font(bold=True, color=navy)
+        ws.cell(row, 5).number_format = '£#,##0.00'
+        for col in range(1, 6):
             ws.cell(row, col).fill = header_fill
             ws.cell(row, col).border = Border(top=thin_grey, bottom=thin_grey)
         subtotal_rows.append(row)
         row += 2
 
     total_row = row
-    ws.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=5)
-    ws.cell(total_row, 1, "TOTAL NETT (excl. VAT)")
-    subtotal_refs = ",".join(f"F{r}" for r in subtotal_rows)
-    ws.cell(total_row, 6, f"=SUM({subtotal_refs})" if subtotal_refs else "=0")
-    ws.cell(total_row, 6).number_format = '£#,##0.00'
-    for col in range(1, 8):
+    ws.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=4)
+    ws.cell(total_row, 1, "TOTAL NETT")
+    subtotal_refs = ",".join(f"E{r}" for r in subtotal_rows)
+    ws.cell(total_row, 5, f"=SUM({subtotal_refs})" if subtotal_refs else "=0")
+    ws.cell(total_row, 5).number_format = '£#,##0.00'
+    for col in range(1, 6):
         ws.cell(total_row, col).fill = PatternFill("solid", fgColor=navy)
         ws.cell(total_row, col).font = Font(bold=True, color=white, size=12)
-    ws["F6"] = f"=F{total_row}"
-    ws["F6"].number_format = '£#,##0.00'
 
     row = total_row + 3
     measurements = q.get("measurements") or []
     if measurements:
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
         ws.cell(row, 1, "INFORMATIONAL MEASUREMENTS — NOT PRICED")
-        ws.cell(row, 1).font = Font(bold=True, color=navy)
+        ws.cell(row, 1).font = Font(bold=True, color=white)
         ws.cell(row, 1).fill = section_fill
         row += 1
-        for col, heading in enumerate(("Section", "Measurement", "Qty", "Unit", "", "", "Status"), 1):
-            ws.cell(row, col, heading)
-            ws.cell(row, col).font = Font(bold=True, color=muted, size=10)
-            ws.cell(row, col).fill = header_fill
-        row += 1
         for measurement in measurements:
-            ws.cell(row, 1, measurement["section"])
-            ws.cell(row, 2, measurement["description"])
-            ws.cell(row, 3, float(measurement["qty"]))
-            ws.cell(row, 4, measurement["unit"])
-            ws.cell(row, 7, PROVISIONAL_LABEL if measurement.get("provisional") else "")
-            ws.cell(row, 3).number_format = '#,##0.0'
+            description = f"{_excel_section_title(measurement['section'], [])} — {measurement['description']}"
             if measurement.get("provisional"):
-                for col in range(1, 8):
+                description += f"\n{PROVISIONAL_LABEL}"
+            ws.cell(row, 1, description)
+            ws.cell(row, 2, float(measurement["qty"]))
+            ws.cell(row, 3, _excel_unit(measurement["unit"]))
+            ws.cell(row, 2).number_format = '#,##0.##'
+            if measurement.get("provisional"):
+                for col in range(1, 6):
                     ws.cell(row, col).fill = provisional_fill
+                ws.row_dimensions[row].height = 30
             row += 1
         row += 1
 
     if q.get("declarations"):
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
         ws.cell(row, 1, "NOTES / ASSUMPTIONS")
-        ws.cell(row, 1).font = Font(bold=True, color=navy)
+        ws.cell(row, 1).font = Font(bold=True, color=white)
         ws.cell(row, 1).fill = section_fill
         row += 1
         for note in q["declarations"]:
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
             ws.cell(row, 1, f"• {note}")
             ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
             ws.row_dimensions[row].height = 30
             row += 1
 
-    ws.merge_cells(start_row=row + 1, start_column=1, end_row=row + 1, end_column=7)
+    ws.merge_cells(start_row=row + 1, start_column=1, end_row=row + 1, end_column=5)
     ws.cell(row + 1, 1, f"STANDARD TERMS: {q['terms']}")
     ws.cell(row + 1, 1).font = Font(size=9, color=muted)
     ws.cell(row + 1, 1).alignment = Alignment(wrap_text=True, vertical="top")
     ws.row_dimensions[row + 1].height = 45
 
-    widths = {"A": 37, "B": 28, "C": 13, "D": 10, "E": 14, "F": 16, "G": 36}
+    widths = {"A": 68, "B": 14, "C": 10, "D": 15, "E": 18}
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
-    ws.auto_filter.ref = f"A9:G{max(9, total_row - 2)}"
-    ws.print_title_rows = "1:9"
-    ws.print_area = f"A1:G{row + 1}"
+    ws.auto_filter.ref = f"A8:E{max(8, total_row - 2)}"
+    ws.print_title_rows = "1:8"
+    ws.print_area = f"A1:E{row + 1}"
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.sheet_properties.pageSetUpPr.fitToPage = True
