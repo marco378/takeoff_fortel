@@ -1138,7 +1138,7 @@ try:
     def _gen_d77_footpath(out_path, chip_grey=0.878, yard_grey=0.878):
         """Same D77 yard geometry (page 1067.766x824.854pt, scale bar, 1:250 title) plus:
           - a darker 'Footpaths (ancillary): Concrete' strip (204 grey) sitting 0.65pt below
-            the yard's bottom edge — close enough for the close=9 binary_closing to bridge,
+            the yard's bottom edge — close enough for binary_closing (any close>=2) to bridge,
             reproducing the real-sheet CONNECTED over-measure (not a satellite blob).
           - a legend swatch chip + label 'Concrete Service Yard construction' (readable by
             find_concrete_swatch_rgb) so the swatch-lock path engages.
@@ -1163,8 +1163,8 @@ try:
                      color=(0, 0, 0), fill=yg, width=1.0)
 
         # Ancillary footpath strip: 230x9pt = 16.1 m² at k=0.08819, darker grey (204), 0.65pt
-        # gap below the yard's own bottom edge (bridged by close=9, same mechanism as the real
-        # sheet's kerb-line gap).
+        # gap below the yard's own bottom edge (bridged by binary_closing regardless of the
+        # exact close value, same mechanism as the real sheet's kerb-line gap).
         strip_grey = (0.80, 0.80, 0.80)
         pg.draw_rect(_fitz_fp.Rect(350.0, 625.503515625, 580.0, 634.503515625),
                      color=None, fill=strip_grey, width=0)

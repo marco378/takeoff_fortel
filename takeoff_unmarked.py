@@ -107,7 +107,7 @@ PLAUSIBLE_MIN_M2 = 200
 PLAUSIBLE_MAX_M2 = 50_000
 
 
-def segment_hatch(im_rgb, rgb, tol=14, close=9, k=None, S=2.0, max_void_m2=1.0,
+def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
                   title_block_frac=0.0, exclude_border=True, _diag=None):
     """Best-plausible connected region of the concrete-yard hatch.
 
