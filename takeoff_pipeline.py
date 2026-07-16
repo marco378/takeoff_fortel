@@ -24,7 +24,7 @@ MANUAL APPROVAL FLOW:
 import math, json, io, contextlib, os, fitz
 from pathlib import Path
 from router import classify, classify_page
-from robust_takeoff import read_marked, count_manholes_marked
+from robust_takeoff import read_marked, read_marked_zones, count_manholes_marked
 from geometry import measure_regions
 from scale import detect_scale_bar, user_unit
 from sanity import plausible, measurement_state, MEASURED_VERIFIED, MEASURED_UNVERIFIED, UNMEASURED, REJECTED
@@ -90,6 +90,56 @@ def _needs_approval(result: dict) -> bool:
     return any(any(t in f for t in _APPROVAL_TRIGGERS) for f in flags) or \
            result.get("type") in ("RASTER / scanned",) or \
            result.get("confidence") == "low"
+
+
+def _zone_reference_flags(pdf: str, zones: list[dict]) -> list[str]:
+    """Compare known client-sourced zone gold without changing any measured value.
+
+    Gold is documentary evidence, never a calibration knob.  Unknown drawings simply have no
+    comparison.  A known mismatch is surfaced for assessor resolution; the markup is not
+    rewritten to make it agree with the BOQ.
+    """
+    try:
+        gold_path = Path(__file__).with_name("gold.json")
+        gold = json.loads(gold_path.read_text())
+        rel = os.path.relpath(str(pdf), str(Path(__file__).parent))
+        entry = gold.get(rel)
+        if entry is None:
+            basename = Path(pdf).name
+            matches = [value for key, value in gold.items()
+                       if not key.startswith("_") and Path(key).name == basename]
+            entry = matches[0] if len(matches) == 1 else None
+        if not entry:
+            return []
+
+        actual_area = {}
+        actual_length = {}
+        for zone in zones or []:
+            category = zone.get("category")
+            if isinstance(zone.get("area_m2"), (int, float)):
+                actual_area[category] = actual_area.get(category, 0.0) + float(zone["area_m2"])
+            if isinstance(zone.get("length_lm"), (int, float)):
+                actual_length[category] = actual_length.get(category, 0.0) + float(zone["length_lm"])
+
+        flags = []
+        for values_key, actual, unit in (
+                ("zones_m2", actual_area, "m²"),
+                ("boq_reference_lm", actual_length, "Lm")):
+            tolerance = float(entry.get("zone_tol_pct", entry.get("tol_pct", 2)))
+            for category, expected in (entry.get(values_key) or {}).items():
+                measured = actual.get(category)
+                mismatch = measured is None or (
+                    expected and abs(measured - expected) / expected * 100 > tolerance)
+                if mismatch:
+                    measured_text = "missing" if measured is None else f"{measured:,.2f} {unit}"
+                    flags.append(
+                        f"assessor: zone-vs-BOQ mismatch — {category} measured {measured_text}; "
+                        f"client BOQ reference {expected:,.2f} {unit} (tolerance {tolerance:g}%)"
+                    )
+        return flags
+    except Exception:
+        # Reference comparison is advisory and must never crash an otherwise valid takeoff.
+        return []
 
 
 def _trigger_approval(pdf: str, result: dict, vision: dict = None,
@@ -314,9 +364,22 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     try:
         # ── Measurement
         if typ == "MARKED vector":
-            area, n = read_marked(meas_pdf)
+            marked = read_marked_zones(meas_pdf)
+            area, n = marked["area_m2"], marked["regions"]
             sflags = plausible(area)
-            r.update({"area_m2": area, "regions": n})
+            r.update({
+                "area_m2": area,
+                "regions": n,
+                "markup_annotations": marked.get("markup_annotations", []),
+                "zones": marked.get("zones", []),
+            })
+            if marked.get("flags"):
+                r["flags"] = r["flags"] + marked["flags"]
+            if any(zone.get("category") == "unclassified" for zone in r["zones"]):
+                # Zone allocation is orthogonal to the four-state measurement contract: the
+                # aggregate Bluebeam quantity remains verified, but approval/quotation must
+                # wait for an assessor to classify the unknown subject.
+                r["zone_classification_required"] = True
             state, sflags2 = measurement_state(area, scale_verified=True, confidence=conf)
             r["flags"] = r["flags"] + sflags + sflags2
             r["measurement_state"] = state
@@ -442,6 +505,12 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             except OSError:
                 pass
 
+    if r.get("zones"):
+        reference_flags = _zone_reference_flags(pdf, r["zones"])
+        if reference_flags:
+            r["flags"] = r["flags"] + reference_flags
+            r["zone_reference_mismatch"] = True
+
     # Informational formwork quantity only: polygon_pts are PDF points and scale_k is m/pt,
     # so closed polygon length × scale_k gives linear metres.  This never enters pricing.
     if r.get("polygon_pts") and r.get("scale_k"):
@@ -481,6 +550,28 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
         confirmed=confirmed_spec,
         source="engineer_drawing",
     )
+
+    # A marked drawing may contain several BOQ slab categories.  Carry one checklist per
+    # proven category so Yard/Dock/Ground/Upper can be reviewed independently.  A legacy
+    # job-level build-up cannot safely be assigned to two different zones (the client's BOQ
+    # proves Yard and Dock use different specifications/rates), so mixed-zone checklists start
+    # blank and provisional.  Single-zone drawings retain the existing effective context.
+    slab_categories = list(dict.fromkeys(
+        zone.get("category") for zone in r.get("zones", [])
+        if zone.get("category") in ("external_yard", "dock", "ground_floor", "upper_floor")
+        and zone.get("area_m2") is not None
+    ))
+    if slab_categories:
+        mixed_zones = len(slab_categories) > 1
+        r["brief_specs"] = {
+            category: build_brief_spec(
+                category,
+                effective_spec={} if mixed_zones else effective_spec,
+                confirmed={} if mixed_zones else confirmed_spec,
+                source="engineer_drawing",
+            )
+            for category in slab_categories
+        }
 
     r.setdefault("measurement_state", UNMEASURED if not r.get("area_m2") else MEASURED_UNVERIFIED)
     r.setdefault("needs_assessor", r["measurement_state"] != MEASURED_VERIFIED)

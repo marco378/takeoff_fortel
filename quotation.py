@@ -26,7 +26,7 @@ Usage:
 Run standalone:
   python3 quotation.py          # self-test with synthetic data
 """
-import datetime, html, json, uuid, io, contextlib
+import datetime, html, json, uuid, io, contextlib, re
 from collections import OrderedDict
 from pathlib import Path
 
@@ -62,6 +62,76 @@ SECTION_ORDER = (
 )
 _SECTION_RANK = {section: index for index, section in enumerate(SECTION_ORDER)}
 PROVISIONAL_LABEL = "PROVISIONAL — NO DETAILS PROVIDED"
+
+ZONE_SECTION = {
+    "external_yard": "External yard slabs",
+    "dock": "Dock slabs",
+    "ground_floor": "Ground floor slabs",
+    "upper_floor": "Upper floor slabs",
+}
+
+
+def _unit_name(result: dict) -> str:
+    """Return only a unit label proved by the drawing filename (never invent a plot code)."""
+    filename = str(result.get("file") or Path(str(result.get("pdf_path") or "")).name)
+    match = re.search(r"\bUnit[- _]?(\d+)\b", filename, re.I)
+    return f"Unit-{match.group(1)}" if match else filename
+
+
+def _expand_zone_results(results: list[dict]) -> list[dict]:
+    """Fan a mixed marked drawing into unpriced BOQ-area inputs by proven zone category.
+
+    A file-level rate/specification cannot be copied onto multiple zones: the client's real
+    BOQ proves, for example, that Yard and Dock use different build-ups.  Explicit per-zone
+    costing may be used when present; otherwise mixed-zone rate cells stay blank for the
+    assessor.  Legacy/no-zone and genuinely single-zone results are unchanged.
+    """
+    expanded = []
+    for parent in results:
+        zones = [zone for zone in (parent.get("zones") or [])
+                 if zone.get("category") in ZONE_SECTION and zone.get("area_m2") is not None]
+        if not zones:
+            expanded.append(parent)
+            continue
+
+        categories = {zone["category"] for zone in zones}
+        mixed = len(categories) > 1
+        parent_costing = dict(parent.get("costing") or {})
+        per_zone_costing = parent.get("zone_costings") or {}
+        per_zone_specs = parent.get("brief_specs") or {}
+        for index, zone in enumerate(zones):
+            category = zone["category"]
+            virtual = dict(parent)
+            virtual["_zone_expanded"] = True
+            virtual["zones"] = []
+            virtual.pop("perimeter_lm", None)
+            virtual.pop("polygon_pts", None)
+            virtual["area_m2"] = float(zone["area_m2"])
+            virtual["quotation_section"] = ZONE_SECTION[category]
+            virtual["unit_name"] = _unit_name(parent)
+            virtual["zone_category"] = category
+            virtual["brief_spec"] = per_zone_specs.get(category) or build_brief_spec(category)
+
+            explicit_costing = per_zone_costing.get(category)
+            if explicit_costing:
+                costing = dict(explicit_costing)
+                costing["area_m2"] = float(zone["area_m2"])
+            elif mixed:
+                # Preserve existing extras exactly once, but never inherit an aggregate rate,
+                # build-up, or value into a different zone.
+                costing = {
+                    "area_m2": float(zone["area_m2"]), "rate": None, "total_gbp": None,
+                    "assumed": True, "spec": {}, "breakdown": {},
+                    "extras": list(parent_costing.get("extras") or []) if index == 0 else [],
+                }
+            else:
+                costing = dict(parent_costing)
+                costing["area_m2"] = float(zone["area_m2"])
+            if index and costing.get("extras"):
+                costing["extras"] = []
+            virtual["costing"] = costing
+            expanded.append(virtual)
+    return expanded
 
 
 def quotation_section(result: dict) -> str:
@@ -129,9 +199,10 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
     provenance are aggregated into one quantity.  Differing specifications remain separate
     rows on the same quotation; no rate is recalculated here.
     """
-    results = [r for r in (result if isinstance(result, (list, tuple)) else [result]) if r]
-    if not results:
-        results = [{}]
+    source_results = [r for r in (result if isinstance(result, (list, tuple)) else [result]) if r]
+    if not source_results:
+        source_results = [{}]
+    results = _expand_zone_results(source_results)
     ref = ref or f"FTL-{datetime.date.today().strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
     today = datetime.date.today().strftime("%-d %B %Y")
 
@@ -166,7 +237,7 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 normalise_slab_type(section, text=drawing), effective_spec=spec,
             )
 
-        if area and rate is not None:
+        if area:
             # Existing rate is part of the key so stale/different priced results can never be
             # silently collapsed under one arbitrary rate. Matching specs/rates aggregate.
             group_provisional = assumed or any(
@@ -192,7 +263,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             })
 
         if assumed:
-            declarations.append(f"{PROVISIONAL_LABEL}: {assumption_note(spec)}")
+            if all(spec.get(key) is not None for key in ("depth_mm", "mesh")):
+                declaration = assumption_note(spec)
+            else:
+                declaration = "zone specification not provided; assessor must complete the slab checklist"
+            declarations.append(f"{PROVISIONAL_LABEL}: {declaration}")
         if unit.get("source_discipline") == "architect":
             declarations.append(
                 "Area measured from architect's hard-landscaping drawing — ±5% tolerance applies. "
@@ -251,6 +326,38 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                         "measurement provenance and must be confirmed before issue."
                     )
 
+    # Marked-zone lengths are source quantities, never implicit prices.  Keep the per-unit
+    # provenance so the workbook can expose editable source rows just like its area take-off.
+    for unit in source_results:
+        drawing = unit.get("file") or Path(str(unit.get("pdf_path") or "")).name
+        unit_label = _unit_name(unit)
+        for zone in unit.get("zones") or []:
+            category = zone.get("category")
+            quantities = []
+            if category in ("channel", "transition") and zone.get("length_lm") is not None:
+                quantities.append((
+                    "External yard slabs",
+                    "Channel length" if category == "channel" else "Transition length",
+                    float(zone["length_lm"]),
+                ))
+            if category in ZONE_SECTION and zone.get("perimeter_lm") is not None:
+                quantities.append((ZONE_SECTION[category], "Slab perimeter",
+                                   float(zone["perimeter_lm"])))
+            for section, description, quantity in quantities:
+                mkey = (section, description, "Lm", False)
+                measurement = measurements_by_key.setdefault(mkey, {
+                    "section": section, "description": description, "qty": 0.0,
+                    "unit": "Lm", "provisional": False, "drawings": [],
+                    "quantity_rows": [], "assessor_rate_required": True,
+                })
+                measurement["qty"] += quantity
+                measurement["quantity_rows"].append({
+                    "description": unit_label, "qty": quantity, "unit": "Lm",
+                    "drawing": drawing,
+                })
+                if drawing and drawing not in measurement["drawings"]:
+                    measurement["drawings"].append(drawing)
+
     line_items = []
     specifications = []
     for group_number, group in enumerate(
@@ -286,15 +393,18 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         slab_desc = " ".join(known_parts) + " (supply & lay)"
         line_items.append({
             **common, "description": slab_desc, "rate": group["rate"],
-            "value": round(area * group["rate"], 2), "provisional": group["assumed"],
+            "value": (round(area * group["rate"], 2)
+                      if isinstance(group.get("rate"), (int, float)) else None),
+            "assessor_rate_required": group.get("rate") is None,
+            "provisional": group["assumed"],
             "provisional_reason": PROVISIONAL_LABEL if group["assumed"] else "",
         })
         # Existing quotation adders are preserved unchanged; only their section/aggregated
         # quantity changes so all units share the client's requested one-tab structure.
-        adders = [
+        adders = ([
             ("Final trim ±50mm", area, "m²", 1.40),
             ("Saw cuts & bay joints", area, "m²", 4.85),
-        ]
+        ] if isinstance(group.get("rate"), (int, float)) else [])
         for desc, qty, unit_name, item_rate in adders:
             line_items.append({
                 **common, "description": desc, "qty": qty, "unit": unit_name,
@@ -675,6 +785,10 @@ def quotation_xlsx(q: dict) -> bytes:
     sections = OrderedDict()
     for item in q.get("line_items", []):
         sections.setdefault(item.get("section") or "External yard slabs", []).append(item)
+    assessor_measurements = [m for m in (q.get("measurements") or [])
+                             if m.get("assessor_rate_required")]
+    for measurement in assessor_measurements:
+        sections.setdefault(measurement.get("section") or "External yard slabs", [])
     ordered_sections = [section for section in q.get("section_order", SECTION_ORDER) if section in sections]
     ordered_sections += [section for section in sections if section not in ordered_sections]
 
@@ -725,6 +839,8 @@ def quotation_xlsx(q: dict) -> bytes:
                 ws.cell(row, 5, _excel_text(value_status))
             elif isinstance(rate, (int, float)):
                 ws.cell(row, 5, f"=B{row}*D{row}")
+            elif item.get("assessor_rate_required"):
+                ws.cell(row, 5, f'=IF(D{row}="","",B{row}*D{row})')
             elif isinstance(item.get("value"), (int, float)):
                 ws.cell(row, 5, float(item["value"]))
             ws.cell(row, 2).number_format = '#,##0.##'
@@ -789,6 +905,34 @@ def quotation_xlsx(q: dict) -> bytes:
         for item in ungrouped:
             _write_item(item)
 
+        for measurement in (m for m in assessor_measurements if m["section"] == section):
+            quantity_rows = measurement.get("quantity_rows") or []
+            first_quantity_row = row
+            for quantity_row in quantity_rows:
+                ws.cell(row, 1, _excel_text(quantity_row.get("description") or "Measured length"))
+                ws.cell(row, 2, float(quantity_row.get("qty") or 0))
+                ws.cell(row, 3, _excel_unit(quantity_row.get("unit") or "Lm"))
+                ws.cell(row, 2).number_format = '#,##0.##'
+                for col in range(1, 6):
+                    ws.cell(row, col).font = Font(name="Arial", size=8)
+                row += 1
+            quantity_formula = None
+            if quantity_rows:
+                total_quantity_row = row
+                ws.cell(row, 1, f"Total {measurement['description']}:")
+                ws.cell(row, 1).font = Font(name="Arial", size=8, bold=True)
+                ws.cell(row, 2, f"=SUM(B{first_quantity_row}:B{row - 1})")
+                ws.cell(row, 2).number_format = '#,##0.##'
+                ws.cell(row, 3, _excel_unit(measurement.get("unit") or "Lm"))
+                row += 1
+                quantity_formula = f"=B{total_quantity_row}"
+            _write_item({
+                "description": measurement["description"], "qty": measurement["qty"],
+                "unit": measurement["unit"], "rate": None, "value": None,
+                "provisional": measurement.get("provisional", False),
+                "assessor_rate_required": True,
+            }, qty_formula=quantity_formula)
+
         row += 2
 
     total_row = row
@@ -799,7 +943,8 @@ def quotation_xlsx(q: dict) -> bytes:
     ws.cell(total_row, 5).font = Font(name="Arial", bold=True, size=9)
 
     row = total_row + 3
-    measurements = q.get("measurements") or []
+    measurements = [m for m in (q.get("measurements") or [])
+                    if not m.get("assessor_rate_required")]
     if measurements:
         ws.cell(row, 1, "INFORMATIONAL MEASUREMENTS — NOT PRICED")
         for col in range(1, 6):

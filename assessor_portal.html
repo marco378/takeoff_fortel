@@ -841,6 +841,143 @@ function effectiveStoredPerimeter(job) {
   return Number(job && ((job.result && job.result.perimeter_lm) || job.perimeter_lm)) || null;
 }
 
+function effectiveZones(job) {
+  if (job && Array.isArray(job.zones)) return job.zones;
+  const nested = job && job.result && job.result.zones;
+  return Array.isArray(nested) ? nested : [];
+}
+
+function zoneReviewRequired(job) {
+  const res = (job && job.result) || {};
+  return !!(job && (
+    job.zone_classification_required || res.zone_classification_required ||
+    job.zone_allocation_stale || res.zone_allocation_stale ||
+    job.zone_reference_mismatch || res.zone_reference_mismatch ||
+    effectiveZones(job).some(z => z && String(z.category||'').trim().toLowerCase() === 'unclassified')
+  ));
+}
+
+function zoneQuantity(value, unit) {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return `${number.toLocaleString(undefined, {maximumFractionDigits:2})} ${unit}`;
+}
+
+function renderZoneSummary(job) {
+  const res = (job && job.result) || {};
+  const zones = effectiveZones(job);
+  const stale = !!(job.zone_allocation_stale || res.zone_allocation_stale);
+  const mismatch = !!(job.zone_reference_mismatch || res.zone_reference_mismatch);
+  const classificationRequired = zoneReviewRequired(job);
+  let warning = '';
+  if (classificationRequired) {
+    const reason = stale
+      ? 'Aggregate adjustment invalidated the previous zone allocation. Reclassify or remeasure every zone before approval.'
+      : mismatch
+        ? 'Measured zone quantities differ from the client reference beyond tolerance. Assessor review is required before approval.'
+        : 'One or more markup subjects could not be classified. Classify every zone before approval.';
+    const reviewAction = mismatch
+      ? `<button type="button" onclick="acknowledgeZoneReferenceMismatch()" style="margin-top:7px;font-size:10px;padding:4px 7px;cursor:pointer">I reviewed this mismatch — acknowledge</button>`
+      : '';
+    warning = `<div style="margin:8px 0;background:#fdecea;border:2px solid #c0392b;border-radius:6px;padding:9px 10px;color:#922b21;font-size:12px;line-height:1.4">
+      🚨 <strong>ZONE REVIEW REQUIRED</strong><br>${esc(reason)}${reviewAction}
+    </div>`;
+  }
+  if (!zones.length) return warning;
+
+  const labels = {
+    external_yard:'External yard', dock:'Dock', ground_floor:'Ground floor',
+    upper_floor:'Upper floor', channel:'Channel', transition:'Transition',
+    other:'Other', unclassified:'Unclassified'
+  };
+  const rows = zones.map((zone, zoneIndex) => {
+    zone = zone || {};
+    const category = String(zone.category || 'unclassified').trim().toLowerCase();
+    const subjects = Array.isArray(zone.subjects)
+      ? zone.subjects : (zone.subject ? [zone.subject] : []);
+    const quantities = [
+      zoneQuantity(zone.area_m2, 'm²'),
+      zoneQuantity(zone.length_lm, 'Lm'),
+      zoneQuantity(zone.perimeter_lm, 'Lm perimeter'),
+    ].filter(Boolean);
+    const count = zone.annotation_count == null || zone.annotation_count === ''
+      ? null : Number(zone.annotation_count);
+    let classifyControl = '—';
+    if (category === 'unclassified') {
+      const allowed = zone.area_m2 != null
+        ? [['external_yard','External yard'],['dock','Dock'],['ground_floor','Ground floor'],['upper_floor','Upper floor'],['other','Other / out of scope']]
+        : zone.length_lm != null
+          ? [['channel','Channel'],['transition','Transition'],['other','Other / out of scope']]
+          : [['other','Other / out of scope']];
+      classifyControl = `<div style="display:flex;gap:3px;justify-content:flex-end">
+        <select id="zoneClass-${zoneIndex}" style="max-width:112px;font-size:9px;padding:2px">
+          <option value="">Classify…</option>
+          ${allowed.map(([value,label]) => `<option value="${value}">${esc(label)}</option>`).join('')}
+        </select>
+        <button type="button" onclick="classifyZone(${zoneIndex})" style="font-size:9px;padding:2px 5px;cursor:pointer">Save</button>
+      </div>`;
+    }
+    return `<tr style="background:${category.toLowerCase()==='unclassified'?'#fff0ee':'#fff'}">
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8;font-weight:700;color:${category.toLowerCase()==='unclassified'?'#c0392b':'#13294b'}">${esc(labels[category]||category)}</td>
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8">${esc(subjects.length?subjects.join(', '):'—')}</td>
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8">${esc(zone.measurement_kind||'—')}</td>
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right;font-variant-numeric:tabular-nums">${esc(quantities.length?quantities.join(' · '):'—')}</td>
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right">${count != null && Number.isFinite(count)?count:'—'}</td>
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right">${classifyControl}</td>
+    </tr>`;
+  }).join('');
+  return `${warning}<div style="margin:8px 0;border:1px solid #c8d3df;border-radius:6px;overflow-x:auto">
+    <div style="padding:6px 8px;background:#eaf0f6;color:#13294b;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.4px">Measured zones</div>
+    <table style="border-collapse:collapse;width:100%;min-width:570px;font-size:10px;table-layout:auto">
+      <thead><tr style="background:#f5f7fa;color:#5f6f82">
+        <th style="padding:5px;text-align:left">Zone</th><th style="padding:5px;text-align:left">Bluebeam subject</th>
+        <th style="padding:5px;text-align:left">Kind</th><th style="padding:5px;text-align:right">Quantity</th>
+        <th style="padding:5px;text-align:right">Annots</th><th style="padding:5px;text-align:right">Assessor action</th>
+      </tr></thead><tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+async function classifyZone(zoneIndex) {
+  if (!currentJob) return;
+  const zone = effectiveZones(currentJob)[zoneIndex];
+  const select = document.getElementById(`zoneClass-${zoneIndex}`);
+  const category = select && select.value;
+  if (!zone || !category) {
+    toast('Choose a zone classification first', 'error');
+    return;
+  }
+  try {
+    const response = await fetch(`${BASE}/zones/${currentJob.id}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({classifications:[{zone_key:zone.zone_key, category}]})
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    toast('Zone classification saved');
+    await selectJob(currentJob.id);
+  } catch (error) {
+    toast(`Zone classification failed: ${error.message}`, 'error');
+  }
+}
+
+async function acknowledgeZoneReferenceMismatch() {
+  if (!currentJob) return;
+  try {
+    const response = await fetch(`${BASE}/zones/${currentJob.id}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({acknowledge_reference_mismatch:true})
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    toast('Zone reference mismatch acknowledged');
+    await selectJob(currentJob.id);
+  } catch (error) {
+    toast(`Acknowledgement failed: ${error.message}`, 'error');
+  }
+}
+
 function renderJobDetails(job) {
   const res = job.result || {};
   const perimeter = effectiveStoredPerimeter(job);
@@ -854,6 +991,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">Measurement state</span>
       <span class="v"><span class="badge mstate ${esc(mstate)}">${esc(mstate.replace('_',' '))}</span></span>
     </div>` : '';
+  const zoneSummary = renderZoneSummary(job);
   document.getElementById('jobDetails').innerHTML = `
     ${projRow}
     ${mstateRow}
@@ -864,6 +1002,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
     <div class="kv"><span class="k">Slab perimeter</span><span class="v">${perimeter!=null?perimeter.toLocaleString()+' m':'—'}</span></div>
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
+    ${zoneSummary}
   `;
   renderCosting(job.costing || res.costing, job.status, job);
 }
@@ -915,6 +1054,12 @@ function effectiveBriefSpec(job, costing) {
           slab_type_label:BRIEF_SPEC_SCHEMA[slabType].label, fields};
 }
 
+function effectiveBriefSpecs(job) {
+  const res = (job && job.result) || {};
+  const stored = (job && job.brief_specs) || res.brief_specs || {};
+  return stored && typeof stored === 'object' ? stored : {};
+}
+
 function specValueText(key, field) {
   if (!field || field.value == null || field.value === '') return 'ASSUMED / no details provided';
   const value = key === 'depth_mm' ? `${field.value} mm` : String(field.value);
@@ -961,6 +1106,11 @@ function changeBriefSpecType(value) {
   renderSpecFieldInputs(value, effectiveBriefSpec(job, job.costing || (job.result||{}).costing));
 }
 
+function changeZoneSpecCategory(value) {
+  const brief = effectiveBriefSpecs(currentJob || {})[value] || {slab_type:value,fields:{}};
+  renderSpecFieldInputs(value, brief);
+}
+
 function renderCosting(c, jobStatus, job={}) {
   const el = document.getElementById('costingBlock');
   c = c || {};
@@ -968,8 +1118,13 @@ function renderCosting(c, jobStatus, job={}) {
   const spec    = c.spec || {};
   const bdwn    = c.breakdown || {};
   const assumed = c.assumed !== false;
-  const briefSpec = effectiveBriefSpec(job, c);
+  const briefSpecs = effectiveBriefSpecs(job);
+  const zoneCategories = Object.keys(briefSpecs).filter(key => BRIEF_SPEC_SCHEMA[key]);
+  const briefSpec = zoneCategories.length ? briefSpecs[zoneCategories[0]] : effectiveBriefSpec(job, c);
   const slabType = briefSpec.slab_type || inferredSlabType(job);
+  const briefSummary = zoneCategories.length
+    ? zoneCategories.map(category => renderBriefSpecSummary(briefSpecs[category])).join('')
+    : renderBriefSpecSummary(briefSpec);
   const numericRate = Number(c.rate);
   const rateDisplay = Number.isFinite(numericRate)
     ? numericRate.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})
@@ -999,13 +1154,19 @@ function renderCosting(c, jobStatus, job={}) {
       </summary>
       <form id="specOverrideForm" onsubmit="submitSpecOverride(event)"
             style="margin-top:8px;background:#0d1e38;border-radius:6px;padding:10px 12px;display:grid;gap:6px">
-        <label style="font-size:11px;color:#8fa8cc">Slab type
+        ${zoneCategories.length ? `<label style="font-size:11px;color:#8fa8cc">Measured zone
+          <select name="zone_category" onchange="changeZoneSpecCategory(this.value)"
+                  style="width:100%;margin-top:3px;padding:5px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
+            ${zoneCategories.map(key => `<option value="${key}">${esc(BRIEF_SPEC_SCHEMA[key].label)}</option>`).join('')}
+          </select>
+          <input type="hidden" name="slab_type" value="${slabType}">
+        </label>` : `<label style="font-size:11px;color:#8fa8cc">Slab type
           <select name="slab_type" onchange="changeBriefSpecType(this.value)"
                   style="width:100%;margin-top:3px;padding:5px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
             ${Object.entries(BRIEF_SPEC_SCHEMA).map(([key,item]) =>
               `<option value="${key}" ${key===slabType?'selected':''}>${esc(item.label)}</option>`).join('')}
           </select>
-        </label>
+        </label>`}
         <div id="briefSpecFields" style="display:grid;gap:6px"></div>
         <button type="submit"
                 style="margin-top:4px;padding:6px 0;background:#1d6fa4;border:none;border-radius:4px;color:#fff;font-size:12px;font-weight:700;cursor:pointer">
@@ -1030,7 +1191,7 @@ function renderCosting(c, jobStatus, job={}) {
     ${escalationBanner}
     ${costingCard}
     ${assumedBanner}
-    ${renderBriefSpecSummary(briefSpec)}
+    ${briefSummary}
     ${overrideForm}
   `;
   if (canOverride) renderSpecFieldInputs(slabType, briefSpec);
@@ -1043,6 +1204,7 @@ async function submitSpecOverride(e) {
   const btn  = form.querySelector('button[type=submit]');
   const fd   = new FormData(form);
   const body = {slab_type:fd.get('slab_type'), fields:{}};
+  if (fd.get('zone_category')) body.zone_category = fd.get('zone_category');
   form.querySelectorAll('[data-spec-key]').forEach(input => {
     const raw = input.value.trim();
     body.fields[input.dataset.specKey] = raw === '' ? null :
@@ -1065,11 +1227,14 @@ async function submitSpecOverride(e) {
     if (currentJob && currentJob.id === selectedJobId) {
       currentJob.costing = d.costing;
       currentJob.brief_spec = d.brief_spec;
+      if (d.brief_specs) currentJob.brief_specs = d.brief_specs;
       currentJob.spec_pricing_warning = d.pricing_warning || '';
       if (currentJob.result) currentJob.result.brief_spec = d.brief_spec;
+      if (currentJob.result && d.brief_specs) currentJob.result.brief_specs = d.brief_specs;
     }
     job.costing = d.costing;
     job.brief_spec = d.brief_spec;
+    if (d.brief_specs) job.brief_specs = d.brief_specs;
     job.spec_pricing_warning = d.pricing_warning || '';
     renderCosting(d.costing, job.status, job);
     renderDecision(job);
@@ -1108,8 +1273,9 @@ function renderFlags(flags) {
 function renderDecision(job) {
   const el = document.getElementById('decisionBlock');
   const ql = document.getElementById('quotationLinks');
-  const projectPricingBlocked = !!job.spec_pricing_warning || !!(job.project_ref &&
-    _jobs.some(sibling => sibling.project_ref === job.project_ref && sibling.spec_pricing_warning &&
+  const projectPricingBlocked = !!job.spec_pricing_warning || zoneReviewRequired(job) || !!(job.project_ref &&
+    _jobs.some(sibling => sibling.project_ref === job.project_ref &&
+      (sibling.spec_pricing_warning || zoneReviewRequired(sibling)) &&
       (sibling.decision === 'approved' || sibling.decision === 'adjusted')));
   if (!job.decision) {
     el.innerHTML = '<div style="color:var(--muted);font-size:13px">No decision yet</div>';
@@ -1521,6 +1687,10 @@ async function submitDecision(action) {
   if (action === 'approve') {
     const res = currentJob.result || {};
     const c   = currentJob.costing || res.costing;
+    if (zoneReviewRequired(currentJob)) {
+      toast('Cannot approve: zone classification/reference review is still required. Review the red zone warning first.', 'error');
+      return;
+    }
     if (c && c.assumed && c.total_gbp > 200000) {
       toast('Cannot approve: quotation > £200k with assumed spec — human escalation required. See L3 QA report in #fortel.', 'error');
       return;

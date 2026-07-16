@@ -463,6 +463,130 @@ ck("xlsx supports the real BOQ's explicit RATE ONLY value token without inferrin
    _status_ws.cell(_status_row, 4).value == 12.34 and
    _status_ws.cell(_status_row, 5).value == "RATE ONLY")
 
+print("marked zone-aware measurement + multi-unit BOQ allocation")
+import fitz as _fitz_zones
+from robust_takeoff import read_marked as _read_marked_legacy, read_marked_zones as _read_marked_zones
+_zone_pdf = "/tmp/ci_marked_zones.pdf"
+_zone_doc = _fitz_zones.open()
+_zone_page = _zone_doc.new_page(width=600, height=600)
+for _subject, _value, _rect in (
+        ("Yard", 100, (20, 20, 220, 220)),
+        ("Dock ", 30, (250, 20, 400, 120)),
+        ("Mystery slab", 5, (250, 150, 350, 250))):
+    _annot = _zone_page.add_polygon_annot([
+        (_rect[0], _rect[1]), (_rect[2], _rect[1]),
+        (_rect[2], _rect[3]), (_rect[0], _rect[3]),
+    ])
+    _annot.set_info(title="Fortel QA", subject=_subject, content=f"Area\n{_value:.2f} sq m")
+    _annot.update()
+_channel_annot = _zone_page.add_polyline_annot([(20, 300), (120, 300), (160, 330)])
+_channel_annot.set_info(title="Fortel QA", subject="Channel", content="Channel\n12.50 m")
+_channel_annot.update()
+_zone_doc.save(_zone_pdf)
+_zone_doc.close()
+_zone_read = _read_marked_zones(_zone_pdf)
+_zone_by_category = {zone["category"]: zone for zone in _zone_read["zones"]}
+ck("marked zone reader preserves legacy aggregate across every labelled polygon",
+   _zone_read["area_m2"] == 135.0 and _zone_read["regions"] == 3 and
+   _read_marked_legacy(_zone_pdf) == (135.0, 3), _zone_read)
+ck("Bluebeam subjects separate Yard, Dock and Channel without colour fallback",
+   _zone_by_category["external_yard"]["area_m2"] == 100.0 and
+   _zone_by_category["dock"]["area_m2"] == 30.0 and
+   _zone_by_category["channel"]["length_lm"] == 12.5, _zone_by_category)
+ck("unknown measurable subject is unclassified and visibly flagged",
+   _zone_by_category["unclassified"]["area_m2"] == 5.0 and
+   any("assessor: classify zone 'Mystery slab'" in flag for flag in _zone_read["flags"]),
+   _zone_read["flags"])
+ck("zone reader retains per-annotation subject/author/colour evidence",
+   len(_zone_read["markup_annotations"]) == 4 and
+   all("subject" in record and "author" in record and "stroke_color" in record
+       for record in _zone_read["markup_annotations"]))
+
+_zone_quote_results = []
+for _unit_n in range(1, 5):
+    _unit = _quotation_unit(f"Castle Unit-{_unit_n}.pdf", "External yard slabs", 1)
+    _unit["zones"] = [
+        {"category":"external_yard", "area_m2":100 * _unit_n, "perimeter_lm":10 * _unit_n},
+        {"category":"dock", "area_m2":10 * _unit_n, "perimeter_lm":5 * _unit_n},
+        {"category":"ground_floor", "area_m2":5 * _unit_n, "perimeter_lm":3 * _unit_n},
+        {"category":"upper_floor", "area_m2":20 * _unit_n, "perimeter_lm":4 * _unit_n},
+        {"category":"channel", "length_lm":7 * _unit_n},
+        {"category":"transition", "length_lm":2 * _unit_n},
+    ]
+    _unit["brief_specs"] = {
+        category: _empty_brief_spec(category)
+        for category in ("external_yard", "dock", "ground_floor", "upper_floor")
+    }
+    _zone_quote_results.append(_unit)
+_q_zones = generate_quotation(_zone_quote_results, project="Castle", client="Winvic",
+                              ref="ZONE-001")
+ck("mixed marked files allocate into all four BOQ sections",
+   [spec["section"] for spec in _q_zones["specifications"]] == list(SECTION_ORDER[:4]))
+ck("each BOQ section keeps four numeric Unit-N source rows",
+   all([row["description"] for row in spec["area_rows"]] ==
+       ["Unit-1", "Unit-2", "Unit-3", "Unit-4"]
+       for spec in _q_zones["specifications"]), _q_zones["specifications"])
+ck("aggregate job rate is never copied onto mixed zones",
+   all(item.get("rate") is None and item.get("value") is None
+       for item in _q_zones["line_items"] if "supply & lay" in item["description"]))
+ck("channel, transition and zone perimeters remain unpriced Lm source quantities",
+   any(m["description"] == "Channel length" and m["qty"] == 70 for m in _q_zones["measurements"]) and
+   any(m["description"] == "Transition length" and m["qty"] == 20 for m in _q_zones["measurements"]) and
+   all(m.get("assessor_rate_required") for m in _q_zones["measurements"]))
+_zone_ws = _load_workbook(_BytesIO(quotation_xlsx(_q_zones)), data_only=False)["REV_01"]
+_zone_section_labels = [
+    _zone_ws.cell(row, 1).value for row in range(1, _zone_ws.max_row + 1)
+    if _zone_ws.cell(row, 1).value in _expected_xlsx_sections[:4]
+]
+_channel_row = next(row for row in range(1, _zone_ws.max_row + 1)
+                    if _zone_ws.cell(row, 1).value == "Channel length")
+ck("zone XLSX preserves section order with editable blank assessor rates",
+   _zone_section_labels == list(_expected_xlsx_sections[:4]) and
+   _zone_ws.cell(_channel_row, 4).value is None and
+   _zone_ws.cell(_channel_row, 5).value == f'=IF(D{_channel_row}="","",B{_channel_row}*D{_channel_row})')
+
+_castle_dir = Path("drawings/castle_donington")
+_castle_names = [
+    *(f"External Markup Unit-{number}.pdf" for number in range(1, 5)),
+    *(f"Office Floors Unit-{number}.pdf" for number in range(1, 5)),
+]
+try:
+    for _castle_name in _castle_names:
+        _require_fixture(_castle_dir / _castle_name, "Castle Donington client zone-gold checks")
+    import json as _json_zone_gold
+    from takeoff_pipeline import _zone_reference_flags as _zone_reference_flags_test
+    _zone_gold = _json_zone_gold.loads(Path("gold.json").read_text())
+    _castle_reads = {}
+    for _castle_name in _castle_names:
+        _castle_path = _castle_dir / _castle_name
+        _castle_marked = _read_marked_zones(str(_castle_path))
+        _castle_reads[_castle_name] = _castle_marked
+        _entry = _zone_gold[str(_castle_path)]
+        _actual = {z["category"]: z.get("area_m2") for z in _castle_marked["zones"]
+                   if z.get("area_m2") is not None}
+        _aggregate_delta = abs(_castle_marked["area_m2"] - _entry["net_m2"]) / _entry["net_m2"] * 100
+        _zones_pass = all(
+            category in _actual and abs(_actual[category] - expected) / expected * 100 <=
+            _entry["zone_tol_pct"]
+            for category, expected in _entry["zones_m2"].items()
+        )
+        ck(f"Castle zone gold: {_castle_name} aggregate + BOQ sections",
+           _aggregate_delta <= _entry["tol_pct"] and _zones_pass,
+           {"actual": _actual, "gold": _entry["zones_m2"]})
+    _dock_perimeter = sum(
+        next(z["perimeter_lm"] for z in _castle_reads[f"External Markup Unit-{n}.pdf"]["zones"]
+             if z["category"] == "dock") for n in range(1, 5)
+    )
+    ck("Castle Dock polygon perimeter reproduces client BOQ 967 Lm",
+       abs(_dock_perimeter - 967) / 967 * 100 <= 1, _dock_perimeter)
+    _unit3_path = _castle_dir / "External Markup Unit-3.pdf"
+    ck("Castle Unit-3 channel-vs-BOQ mismatch emits assessor flag",
+       any("channel measured 545.36 Lm" in flag
+           for flag in _zone_reference_flags_test(str(_unit3_path),
+                                                  _castle_reads[_unit3_path.name]["zones"])))
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
+
 print("pipeline price_with_defaults")
 import contextlib, io as _io
 with contextlib.redirect_stdout(_io.StringIO()):
@@ -1209,6 +1333,89 @@ try:
            _AS.load_jobs()[_unmeasured_spec_id]["brief_spec"]["fields"]["depth_mm"]["value"] == 225,
            _unmeasured_spec_resp.get_json())
 
+        _zone_job_id = "44444444-4444-4444-8444-444444444444"
+        _zone_jobs = _AS.load_jobs()
+        _zone_jobs[_zone_job_id] = {
+            "id": _zone_job_id, "status": "pending", "decision": None,
+            "measurement_state": "MEASURED_VERIFIED", "zone_classification_required": True,
+            "zones": [{"zone_key":"unclassified:fdns", "category":"unclassified",
+                       "subjects":["FDNS"], "measurement_kind":"unparsed",
+                       "area_m2":None, "length_lm":None, "annotation_count":4}],
+            "markup_annotations": [{"subject":"FDNS", "type":"Polygon"}],
+            "flags": ["assessor: classify zone 'FDNS'"],
+            "result": {"file":"External Markup Unit-1.pdf", "area_m2":3185.8,
+                       "measurement_state":"MEASURED_VERIFIED",
+                       "zone_classification_required":True,
+                       "zones":[{"zone_key":"unclassified:fdns", "category":"unclassified",
+                                 "subjects":["FDNS"], "measurement_kind":"unparsed",
+                                 "area_m2":None, "length_lm":None, "annotation_count":4}],
+                       "markup_annotations":[{"subject":"FDNS", "type":"Polygon"}],
+                       "flags":["assessor: classify zone 'FDNS'"]},
+        }
+        _AS.save_jobs(_zone_jobs)
+        ck("unclassified marked zone hard-blocks approval",
+           _AS._approve_block_reason(_zone_jobs[_zone_job_id]) is not None)
+        _classify_resp = _client_up.post(f"/zones/{_zone_job_id}", json={
+            "classifications":[{"zone_key":"unclassified:fdns", "category":"other"}],
+        })
+        _classified_job = _AS.load_jobs()[_zone_job_id]
+        ck("assessor can classify out-of-scope FDNS without changing its measurement",
+           _classify_resp.status_code == 200 and
+           _classified_job["zones"][0]["category"] == "other" and
+           not _classified_job["zone_classification_required"] and
+           _classified_job["markup_annotations"] == [{"subject":"FDNS", "type":"Polygon"}],
+           _classify_resp.get_json())
+        _ack_jobs = _AS.load_jobs()
+        _ack_jobs[_zone_job_id]["zone_reference_mismatch"] = True
+        _ack_jobs[_zone_job_id]["result"]["zone_reference_mismatch"] = True
+        _AS.save_jobs(_ack_jobs)
+        _ack_resp = _client_up.post(f"/zones/{_zone_job_id}", json={
+            "acknowledge_reference_mismatch": True,
+        })
+        _ack_job = _AS.load_jobs()[_zone_job_id]
+        ck("assessor can explicitly acknowledge a BOQ mismatch before approval",
+           _ack_resp.status_code == 200 and not _ack_job["zone_reference_mismatch"] and
+           _ack_job["result"].get("zone_reference_reviewed_at") and
+           _AS._approve_block_reason(_ack_job) is None, _ack_resp.get_json())
+
+        _mixed_zone_id = "55555555-5555-4555-8555-555555555555"
+        _mixed_jobs = _AS.load_jobs()
+        _mixed_costing = _copy.deepcopy(_demo_result["costing"])
+        _mixed_jobs[_mixed_zone_id] = {
+            "id": _mixed_zone_id, "status":"pending", "decision":None,
+            "measurement_state":"MEASURED_VERIFIED", "costing":_mixed_costing,
+            "zones":[{"zone_key":"external_yard", "category":"external_yard", "area_m2":100},
+                     {"zone_key":"dock", "category":"dock", "area_m2":20}],
+            "brief_specs":{"external_yard":_empty_brief_spec("external_yard"),
+                           "dock":_empty_brief_spec("dock")},
+            "result":{"file":"External Markup Unit-9.pdf", "area_m2":120,
+                      "measurement_state":"MEASURED_VERIFIED", "costing":_mixed_costing,
+                      "zones":[{"zone_key":"external_yard", "category":"external_yard", "area_m2":100},
+                               {"zone_key":"dock", "category":"dock", "area_m2":20}],
+                      "brief_specs":{"external_yard":_empty_brief_spec("external_yard"),
+                                     "dock":_empty_brief_spec("dock")}},
+        }
+        _AS.save_jobs(_mixed_jobs)
+        _zone_spec_resp = _client_up.post(f"/spec-override/{_mixed_zone_id}", json={
+            "zone_category":"dock", "slab_type":"dock",
+            "fields":{"depth_mm":250, "conc_mix":None, "mesh":None, "layers":None,
+                      "bay_sizes":None, "joint_details":None},
+        })
+        _zone_spec_job = _AS.load_jobs()[_mixed_zone_id]
+        ck("per-zone slab checklist persists without inheriting/recalculating aggregate rate",
+           _zone_spec_resp.status_code == 200 and not _zone_spec_resp.get_json()["repriced"] and
+           _zone_spec_job["brief_specs"]["dock"]["fields"]["depth_mm"]["value"] == 250 and
+           _zone_spec_job["costing"] == _mixed_costing,
+           _zone_spec_resp.get_json())
+        _zone_adjust_resp = _client_up.post(f"/adjust/{_mixed_zone_id}", json={
+            "assessed_area_m2":125, "note":"aggregate correction",
+        })
+        _zone_adjusted_job = _AS.load_jobs()[_mixed_zone_id]
+        ck("aggregate adjustment clears stale split and re-blocks zone approval",
+           _zone_adjust_resp.status_code == 200 and _zone_adjusted_job["zones"] == [] and
+           _zone_adjusted_job["zone_allocation_stale"] and
+           _AS._approve_block_reason(_zone_adjusted_job) is not None)
+
         _portal_html_up = (Path(_orig_server_file_up).parent / "assessor_portal.html").read_text()
         ck("portal file input allows multiple PDFs and ZIPs",
            'accept=".pdf,.zip" multiple' in _portal_html_up)
@@ -1229,6 +1436,10 @@ try:
            "${esc(spec.mesh||'A252')}" not in _portal_html_up and
            "ASSUMED / no details provided" in _portal_html_up and
            "projectPricingBlocked" in _portal_html_up)
+        ck("portal renders and captures per-zone quantities/classifications/specs",
+           all(marker in _portal_html_up for marker in (
+               "Measured zones", "ZONE REVIEW REQUIRED", "classifyZone(",
+               "acknowledgeZoneReferenceMismatch", "zone_category", "effectiveBriefSpecs")))
     finally:
         _AS.threading.Thread = _orig_thread_up
         _AS.__file__ = _orig_server_file_up

@@ -348,6 +348,34 @@ def snapshot(job_id):
 
 # ── Decision endpoints ────────────────────────────────────────────────────────
 
+def _zone_block_reason(job: dict) -> str | None:
+    """Return the assessor action needed before zone-aware approval/quotation is safe."""
+    result = job.get("result") or {}
+    zones = job.get("zones")
+    if not isinstance(zones, list):
+        zones = result.get("zones") if isinstance(result.get("zones"), list) else []
+    required = bool(
+        job.get("zone_classification_required")
+        or result.get("zone_classification_required")
+        or job.get("zone_allocation_stale")
+        or result.get("zone_allocation_stale")
+        or job.get("zone_reference_mismatch")
+        or result.get("zone_reference_mismatch")
+        or any((zone.get("category") or "").strip().lower() == "unclassified"
+               for zone in zones if isinstance(zone, dict))
+    )
+    if not required:
+        return None
+    if job.get("zone_allocation_stale") or result.get("zone_allocation_stale"):
+        return ("zone allocation is stale after an aggregate adjustment; assessor must "
+                "reclassify/remeasure the drawing zones")
+    if job.get("zone_reference_mismatch") or result.get("zone_reference_mismatch"):
+        return ("measured zone quantities do not match the client reference beyond tolerance; "
+                "assessor must review the mismatch before approval")
+    return ("one or more measured markup zones are unclassified; assessor must classify "
+            "every zone before approval")
+
+
 def _approve_block_reason(job: dict) -> str | None:
     """
     Server-side hard-block mirroring the escalation-guard mechanism (fb5b92b, >£200k
@@ -355,9 +383,13 @@ def _approve_block_reason(job: dict) -> str | None:
     assessor has confirmed scale+extent (via /adjust, which sets scale_confirmed=True).
     Returns a reason string to block, or None to allow.
     """
+    result = job.get("result") or {}
+    zone_reason = _zone_block_reason(job)
+    if zone_reason:
+        return zone_reason
     if job.get("spec_pricing_warning"):
         return "slab specification is saved but requires human pricing review before approval"
-    state = job.get("measurement_state") or (job.get("result") or {}).get("measurement_state")
+    state = job.get("measurement_state") or result.get("measurement_state")
     if job.get("scale_confirmed"):
         return None
     if state == "REJECTED":
@@ -541,7 +573,34 @@ def adjust(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job["status"] == "processing":
             return jsonify({"error": "job is still processing"}), 409
-        costing_result = _run_costing(area_m2, job.get("result", {})) if area_m2 else None
+        stored_result = dict(job.get("result") or {})
+        had_zone_allocation = bool(area_m2 and area_m2 > 0) and bool(
+            (isinstance(job.get("zones"), list) and job.get("zones"))
+            or (isinstance(stored_result.get("zones"), list) and stored_result.get("zones"))
+        )
+        zone_stale_flag = None
+        if had_zone_allocation:
+            # /adjust supplies one replacement aggregate polygon/area, not a per-zone edit.
+            # Keeping the old marked-PDF split would make the four quotation sections add up
+            # to the superseded measurement. Preserve raw annotation evidence, but clear the
+            # derived zones and hard-block approval/quotation until an assessor reclassifies
+            # or remeasures them.
+            zone_stale_flag = (
+                "ZONE ALLOCATION STALE: aggregate adjustment replaced the measured area; "
+                "assessor must reclassify/remeasure zones"
+            )
+            gflags = list(gflags) + [zone_stale_flag]
+            result_flags = list(stored_result.get("flags") or [])
+            if zone_stale_flag not in result_flags:
+                result_flags.append(zone_stale_flag)
+            stored_result.update({
+                "zones": [],
+                "zone_classification_required": True,
+                "zone_allocation_stale": True,
+                "flags": result_flags,
+                "needs_assessor": True,
+            })
+        costing_result = _run_costing(area_m2, stored_result) if area_m2 else None
         jobs[job_id].update({
             "status":            "adjusted",
             "decision":          "adjusted",
@@ -560,6 +619,18 @@ def adjust(job_id):
             },
             "costing": costing_result,
         })
+        if had_zone_allocation:
+            jobs[job_id].update({
+                "zones": [],
+                "zone_classification_required": True,
+                "zone_allocation_stale": True,
+                "needs_assessor": True,
+                "result": stored_result,
+            })
+            top_flags = list(jobs[job_id].get("flags") or [])
+            if zone_stale_flag not in top_flags:
+                top_flags.append(zone_stale_flag)
+            jobs[job_id]["flags"] = top_flags
         save_jobs(jobs)
 
     res = job.get("result", {})
@@ -586,6 +657,109 @@ def adjust(job_id):
     })
 
 
+@app.route("/zones/<job_id>", methods=["POST"])
+def classify_zones(job_id):
+    """Persist explicit assessor classifications for previously unknown markup subjects."""
+    data = request.get_json(silent=True) or {}
+    classifications = data.get("classifications") or []
+    acknowledge_mismatch = data.get("acknowledge_reference_mismatch") is True
+    if not isinstance(classifications, list) or (not classifications and not acknowledge_mismatch):
+        return jsonify({"error": "classifications or mismatch acknowledgement required"}), 400
+    requested = {
+        str(item.get("zone_key") or ""): str(item.get("category") or "").strip().lower()
+        for item in classifications if isinstance(item, dict)
+    }
+    allowed = {"external_yard", "dock", "ground_floor", "upper_floor",
+               "channel", "transition", "other"}
+    if any(not key or category not in allowed for key, category in requested.items()):
+        return jsonify({"error": "invalid zone_key/category"}), 400
+
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        result = dict(job.get("result") or {})
+        source_zones = job.get("zones") if isinstance(job.get("zones"), list) else result.get("zones")
+        zones = [dict(zone) for zone in (source_zones or []) if isinstance(zone, dict)]
+        seen = set()
+        for zone in zones:
+            zone_key = str(zone.get("zone_key") or "")
+            if zone_key not in requested:
+                continue
+            category = requested[zone_key]
+            is_area = isinstance(zone.get("area_m2"), (int, float))
+            is_length = isinstance(zone.get("length_lm"), (int, float))
+            if is_area and category not in {"external_yard", "dock", "ground_floor",
+                                            "upper_floor", "other"}:
+                return jsonify({"error": f"area zone {zone_key!r} cannot be {category}"}), 400
+            if is_length and category not in {"channel", "transition", "other"}:
+                return jsonify({"error": f"length zone {zone_key!r} cannot be {category}"}), 400
+            if not is_area and not is_length and category != "other":
+                return jsonify({"error": f"unparsed zone {zone_key!r} can only be other"}), 400
+            zone.update({
+                "category": category,
+                "classification_source": "assessor",
+                "needs_assessor": False,
+            })
+            seen.add(zone_key)
+        missing = set(requested) - seen
+        if missing:
+            return jsonify({"error": f"unknown zone_key(s): {', '.join(sorted(missing))}"}), 400
+
+        still_unclassified = any(zone.get("category") == "unclassified" for zone in zones)
+        result_flags = [flag for flag in (result.get("flags") or [])
+                        if not str(flag).startswith("assessor: classify zone")]
+        top_flags = [flag for flag in (job.get("flags") or [])
+                     if not str(flag).startswith("assessor: classify zone")]
+        if acknowledge_mismatch:
+            acknowledgement = "assessor acknowledged zone-vs-BOQ mismatch after review"
+            if acknowledgement not in result_flags:
+                result_flags.append(acknowledgement)
+            if acknowledgement not in top_flags:
+                top_flags.append(acknowledgement)
+            result["zone_reference_mismatch"] = False
+            result["zone_reference_reviewed_at"] = now_iso()
+        if still_unclassified:
+            for zone in zones:
+                if zone.get("category") == "unclassified":
+                    subject = ", ".join(zone.get("subjects") or []) or zone.get("zone_key")
+                    flag = f"assessor: classify zone '{subject}'"
+                    result_flags.append(flag)
+                    top_flags.append(flag)
+
+        brief_specs = dict(job.get("brief_specs") or result.get("brief_specs") or {})
+        from slab_spec import empty_brief_spec
+        for zone in zones:
+            category = zone.get("category")
+            if category in {"external_yard", "dock", "ground_floor", "upper_floor"}:
+                brief_specs.setdefault(category, empty_brief_spec(category))
+
+        result.update({
+            "zones": zones,
+            "brief_specs": brief_specs,
+            "zone_classification_required": still_unclassified,
+            "zone_reference_mismatch": False if acknowledge_mismatch else bool(
+                result.get("zone_reference_mismatch", False)),
+            "flags": result_flags,
+        })
+        job.update({
+            "zones": zones,
+            "brief_specs": brief_specs,
+            "zone_classification_required": still_unclassified,
+            "zone_reference_mismatch": False if acknowledge_mismatch else bool(
+                job.get("zone_reference_mismatch", result.get("zone_reference_mismatch", False))),
+            "flags": top_flags,
+            "result": result,
+        })
+        jobs[job_id] = job
+        save_jobs(jobs)
+    return jsonify({"status": "zones_updated", "zones": zones,
+                    "zone_classification_required": still_unclassified,
+                    "zone_reference_mismatch": False if acknowledge_mismatch else bool(
+                        result.get("zone_reference_mismatch", False))})
+
+
 @app.route("/spec-override/<job_id>", methods=["POST"])
 def spec_override(job_id):
     """Capture Fortel's slab checklist and re-price only its supplied pricing fields.
@@ -601,10 +775,15 @@ def spec_override(job_id):
     from slab_spec import (COMMON_FIELDS, FIELD_LABELS, build_brief_spec,
                            confirmed_values, normalise_slab_type, schema_definition)
     supplied_slab_type = data.get("slab_type")
+    zone_category = data.get("zone_category")
     if supplied_slab_type and (
             not isinstance(supplied_slab_type, str)
             or supplied_slab_type not in schema_definition()):
         return jsonify({"error": "unknown slab_type"}), 400
+    if zone_category and (
+            not isinstance(zone_category, str)
+            or zone_category not in schema_definition()):
+        return jsonify({"error": "unknown zone_category"}), 400
     supplied_fields = dict(nested_fields) if nested_fields is not None else {
         key: data[key] for key in FIELD_LABELS if key in data
     }
@@ -620,6 +799,37 @@ def spec_override(job_id):
         res     = dict(job.get("result") or {})
         adj     = job.get("adjusted") or {}
         area_m2 = adj.get("area_m2") or res.get("area_m2")
+        if zone_category:
+            # A mixed marked sheet has no safe job-level rate to inherit (the real BOQ uses
+            # different Yard/Dock build-ups). Capture the client checklist per zone, but leave
+            # its rate for explicit assessor entry in the editable quotation.
+            zones = job.get("zones") if isinstance(job.get("zones"), list) else res.get("zones") or []
+            if not any(zone.get("category") == zone_category for zone in zones
+                       if isinstance(zone, dict)):
+                return jsonify({"error": "zone_category is not present on this job"}), 400
+            brief_specs = dict(job.get("brief_specs") or res.get("brief_specs") or {})
+            try:
+                brief_spec = build_brief_spec(
+                    zone_category,
+                    confirmed=supplied_fields,
+                    source="assessor",
+                    existing=brief_specs.get(zone_category) or {},
+                    replace=nested_fields is not None,
+                )
+            except (TypeError, ValueError) as e:
+                return jsonify({"error": f"invalid spec field: {e}"}), 400
+            brief_specs[zone_category] = brief_spec
+            res["brief_specs"] = brief_specs
+            job["brief_specs"] = brief_specs
+            job["result"] = res
+            jobs[job_id] = job
+            save_jobs(jobs)
+            return jsonify({
+                "status": "ok", "job_id": job_id, "costing": job.get("costing"),
+                "brief_spec": brief_spec, "brief_specs": brief_specs,
+                "spec_schema": schema_definition(), "repriced": False,
+                "pricing_warning": "",
+            })
         try:
             existing_brief = job.get("brief_spec") or res.get("brief_spec") or {}
             slab_type = normalise_slab_type(
@@ -832,7 +1042,7 @@ def list_archived_jobs():
 # ── Costing / quotation helpers ───────────────────────────────────────────────
 
 class QuotationPricingBlocked(RuntimeError):
-    """A saved client specification has no supported current rate build-up."""
+    """A saved specification or zone-review state makes quotation output unsafe."""
 
 
 def _quotation_result_for_job(job: dict, result_override=None, costing_override=None) -> dict:
@@ -843,6 +1053,16 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["costing"] = dict(costing)
     if job.get("brief_spec"):
         result["brief_spec"] = dict(job["brief_spec"])
+    if isinstance(job.get("brief_specs"), dict):
+        result["brief_specs"] = dict(job["brief_specs"])
+    if isinstance(job.get("zones"), list):
+        result["zones"] = list(job["zones"])
+    if "zone_classification_required" in job:
+        result["zone_classification_required"] = bool(job["zone_classification_required"])
+    if job.get("zone_reference_mismatch"):
+        result["zone_reference_mismatch"] = True
+    if job.get("zone_allocation_stale"):
+        result["zone_allocation_stale"] = True
     adjusted = job.get("adjusted") or {}
     if adjusted.get("area_m2"):
         result["area_m2"] = adjusted["area_m2"]
@@ -881,6 +1101,17 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
         siblings.sort(key=lambda pair: (pair[1].get("created_at") or "", pair[0]))
     else:
         siblings = [(job_id, anchor)]
+
+    zone_blocks = []
+    for sibling_id, sibling in siblings:
+        reason = _zone_block_reason(sibling)
+        if reason:
+            zone_blocks.append((sibling_id, reason))
+    if zone_blocks:
+        sibling_id, reason = zone_blocks[0]
+        raise QuotationPricingBlocked(
+            f"quotation blocked: project drawing {sibling_id} {reason}"
+        )
 
     if any(sibling.get("spec_pricing_warning") for _, sibling in siblings):
         raise QuotationPricingBlocked(
@@ -1247,6 +1478,16 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "flags":            pre_flags + result.get("flags", []),
                 "polygon_pts":      result.get("polygon_pts"),
                 "perimeter_lm":     result.get("perimeter_lm"),
+                # Mirror zone-aware marked-PDF evidence at job level for the portal while
+                # retaining the canonical nested pipeline result for backward compatibility.
+                "zones":            result.get("zones", []),
+                "markup_annotations": result.get("markup_annotations", []),
+                "brief_specs":      result.get("brief_specs", {}),
+                "zone_classification_required": bool(
+                    result.get("zone_classification_required", False)),
+                "zone_reference_mismatch": bool(
+                    result.get("zone_reference_mismatch", False)),
+                "zone_allocation_stale": bool(result.get("zone_allocation_stale", False)),
                 "result":           result,
                 "status":           "pending",
             })
