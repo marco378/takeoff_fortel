@@ -1259,6 +1259,58 @@ try:
                   if _xlsx_route_ws.cell(row, 1).value in ("Yard-A.pdf", "Yard-B.pdf"))
            == [100.0, 150.0])
 
+        # Aryan field report 17 Jul: uploading a fresh case produced a SEPARATE xlsx per
+        # document (pending siblings were excluded from aggregation), and unmeasured office
+        # GA plans (line/hatch -> assessor trace) vanished from the output entirely. The
+        # case quotation must be ONE workbook: pending-but-measured siblings included
+        # (marked provisional), unmeasured documents listed as awaiting trace — never absent.
+        _pend_costing_a = _copy.deepcopy(_demo_result["costing"]); _pend_costing_a.update({"area_m2": 100, "assumed": True})
+        _pend_costing_b = _copy.deepcopy(_demo_result["costing"]); _pend_costing_b.update({"area_m2": 150, "assumed": True})
+        _pend_jobs = {
+            "aaaaaaaa-1111-4111-8111-111111111111": {
+                "id": "aaaaaaaa-1111-4111-8111-111111111111", "decision": None,
+                "status": "pending", "project_ref": "CASE-PEND-001",
+                "project_name": "Fresh Case", "client_name": "Fortel QA",
+                "created_at": "2026-07-17T10:00:00", "costing": _pend_costing_a,
+                "result": {"file": "Yard-A.pdf", "quotation_section": "External yard slabs",
+                           "area_m2": 100, "costing": _pend_costing_a, "flags": []},
+            },
+            "bbbbbbbb-2222-4222-8222-222222222222": {
+                "id": "bbbbbbbb-2222-4222-8222-222222222222", "decision": None,
+                "status": "pending", "project_ref": "CASE-PEND-001",
+                "project_name": "Fresh Case", "client_name": "Fortel QA",
+                "created_at": "2026-07-17T10:01:00", "costing": _pend_costing_b,
+                "result": {"file": "Yard-B.pdf", "quotation_section": "External yard slabs",
+                           "area_m2": 150, "costing": _pend_costing_b, "flags": []},
+            },
+            "cccccccc-3333-4333-8333-333333333333": {
+                "id": "cccccccc-3333-4333-8333-333333333333", "decision": None,
+                "status": "pending", "project_ref": "CASE-PEND-001",
+                "project_name": "Fresh Case", "client_name": "Fortel QA",
+                "created_at": "2026-07-17T10:02:00",
+                "result": {"file": "Office-Floors-U1.pdf", "area_m2": None,
+                           "measurement_state": "UNMEASURED",
+                           "flags": ["NON-COLOUR-CODED (line/hatch) drawing — assessor trace"]},
+            },
+        }
+        _AS.save_jobs(_pend_jobs)
+        _pend_resp = _client_up.get("/quotation/aaaaaaaa-1111-4111-8111-111111111111.xlsx")
+        ck("case xlsx succeeds for a fresh (all-pending) case", _pend_resp.status_code == 200,
+           _pend_resp.status_code)
+        _pend_ws = _load_workbook(_BytesIO(_pend_resp.data), data_only=False)["REV_01"]
+        _pend_cells = [str(_pend_ws.cell(r, 1).value or "") for r in range(1, _pend_ws.max_row + 1)]
+        ck("pending-but-measured siblings aggregate into ONE case workbook",
+           any("Yard-A.pdf" in c for c in _pend_cells) and any("Yard-B.pdf" in c for c in _pend_cells))
+        ck("unmeasured document is LISTED in the case workbook (never silently absent)",
+           any("Office-Floors-U1.pdf" in c and "NOT YET MEASURED" in c for c in _pend_cells),
+           [c for c in _pend_cells if "Office" in c])
+        ck("pending quantities are marked provisional pending approval",
+           any("not yet" in c.lower() and "approved" in c.lower() for c in _pend_cells))
+        _pend_json = _client_up.get("/quotation/aaaaaaaa-1111-4111-8111-111111111111.json").get_json()
+        ck("case quotation JSON carries the unmeasured document list",
+           any(d.get("file") == "Office-Floors-U1.pdf" for d in _pend_json.get("unmeasured", [])))
+        _AS.save_jobs(_route_jobs)   # restore the store for the spec-capture tests below
+
         # Fortel's supplied Brief_Spec is a blank checklist. Capture applicable fields
         # atomically without touching the job's four-state/measurement record; a partial
         # pricing spec remains assumed even though the unchanged calculation can re-price.

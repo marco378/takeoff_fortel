@@ -192,7 +192,8 @@ def _unique_notes(notes):
 # ── Core generator ────────────────────────────────────────────────────────────
 
 def generate_quotation(result: dict | list, project: str = "", client: str = "",
-                       ref: str = None, extras: list = None, commercial: dict = None) -> dict:
+                       ref: str = None, extras: list = None, commercial: dict = None,
+                       unmeasured: list = None, caveats: list = None) -> dict:
     """Build one structured quotation from one result or a project's result list.
 
     Units with the same canonical section, specification, existing rate and assumption
@@ -272,6 +273,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             declarations.append(
                 "Area measured from architect's hard-landscaping drawing — ±5% tolerance applies. "
                 "No engineer construction-detail drawing found in the pack."
+            )
+        if unit.get("pending_approval"):
+            declarations.append(
+                f"{PROVISIONAL_LABEL}: {drawing or 'measured document'} — measured but not yet "
+                "approved by the assessor; quantities provisional until approval."
             )
         declarations.extend(f for f in flags if (
             "ASSUMED" in f or "architect" in f.lower() or "tolerance" in f.lower()))
@@ -465,6 +471,20 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "and require manual assessment by the assessor before issue."
         )
 
+    # Documents in the case that have NO measured area yet (e.g. line/hatch office GA plans
+    # refused to assessor-trace).  They must be visible in the quotation — a document that
+    # silently vanishes from the case output reads as "skipped" (Aryan, 17 Jul).
+    for note in (caveats or []):
+        declarations.append(str(note))
+
+    unmeasured_docs = [dict(d) for d in (unmeasured or []) if d]
+    for doc in unmeasured_docs:
+        declarations.append(
+            f"NOT YET MEASURED — {doc.get('file', 'document')}: no area produced "
+            f"({doc.get('state', 'UNMEASURED')}); awaiting assessor trace before it can be "
+            "quantified and priced. Not included in the totals below."
+        )
+
     first_costing = results[0].get("costing") or {}
     first_spec = first_costing.get("spec") or {}
     disciplines = _unique_notes([unit.get("source_discipline", "unknown") for unit in results])
@@ -491,6 +511,7 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         "line_items": line_items, "section_order": list(SECTION_ORDER),
         "subtotal_gbp": subtotal, "total_gbp": subtotal,
         "assumed": assumed, "declarations": _unique_notes(declarations),
+        "unmeasured": unmeasured_docs,
         "pipeline_flags": _unique_notes(pipeline_flags), "terms": STANDARD_TERMS,
         # The real BOQ locates these fields in the header/post-total block.  They are
         # project-specific and therefore optional; nothing is silently copied from one quote.

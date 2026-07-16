@@ -564,6 +564,9 @@ function renderJobList(jobs) {
             <span class="chevron">▼</span>
             <span class="project-title">#${esc(entry.ref)} · ${esc(first.project_name||'Unnamed project')}</span>
             <span class="project-count">${count}</span>
+            <a class="project-quote-link" href="${BASE}/quotation/${esc(first.id)}.xlsx" target="_blank"
+               title="One Excel for the whole case — every document included (unmeasured ones listed as awaiting trace)"
+               onclick="event.stopPropagation()" style="font-size:10px;color:#9fd0ff;white-space:nowrap;text-decoration:none">📊 case xlsx</a>
           </button>
           <div class="project-group-children ${collapsed?'collapsed':''}">
             ${children.map(j => renderJobRow(j, true)).join('')}

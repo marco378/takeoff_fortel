@@ -1092,26 +1092,59 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
     all_jobs.update(hot_jobs)
     anchor = all_jobs.get(job_id, {})
     project_ref = anchor.get("project_ref")
+    unmeasured = []
     if project_ref:
-        siblings = [
-            (sibling_id, sibling) for sibling_id, sibling in all_jobs.items()
-            if sibling.get("project_ref") == project_ref
-            and sibling.get("decision") in ("approved", "adjusted")
-        ]
+        # ONE quotation per case (Aryan, 17 Jul: "it needs to be one that contains information
+        # of all the documents in one case"). Every sibling document participates:
+        #   - approved/adjusted -> firm quantities (as before)
+        #   - pending BUT measured -> included, marked PROVISIONAL (pending assessor approval)
+        #   - unmeasured/refused (e.g. line/hatch office GA plans awaiting a manual trace)
+        #     -> listed explicitly in the quotation as awaiting assessor measurement, so a
+        #        document can never silently vanish from the case output.
+        siblings, seen = [], set()
+        for sibling_id, sibling in all_jobs.items():
+            if sibling.get("project_ref") != project_ref or sibling_id in seen:
+                continue
+            seen.add(sibling_id)
+            res = sibling.get("result") or {}
+            area = (sibling.get("adjusted") or {}).get("area_m2") or res.get("area_m2")
+            if sibling.get("decision") in ("approved", "adjusted") or area:
+                siblings.append((sibling_id, sibling))
+            else:
+                fname = res.get("file") or Path(str(sibling.get("pdf") or "")).name or sibling_id
+                state = res.get("measurement_state") or sibling.get("status") or "UNMEASURED"
+                unmeasured.append({"file": fname, "state": state})
         siblings.sort(key=lambda pair: (pair[1].get("created_at") or "", pair[0]))
+        if not siblings:
+            siblings = [(job_id, anchor)]
     else:
         siblings = [(job_id, anchor)]
 
     zone_blocks = []
     for sibling_id, sibling in siblings:
+        # Zone gates only apply to documents CONTRIBUTING quantities — an unmeasured
+        # line/hatch sheet awaiting a trace must not block the whole case quotation.
+        res = sibling.get("result") or {}
+        if not ((sibling.get("adjusted") or {}).get("area_m2") or res.get("area_m2")):
+            continue
         reason = _zone_block_reason(sibling)
         if reason:
             zone_blocks.append((sibling_id, reason))
+    # A FIRM quotation (anchor approved/adjusted) keeps the hard zone gate. A DRAFT case
+    # (nothing approved yet — Aryan's fresh-upload flow) degrades the gate to a loud caveat
+    # inside the workbook instead of a 409, so the team can see the whole case early.
+    draft = anchor.get("decision") not in ("approved", "adjusted")
+    caveats = []
     if zone_blocks:
-        sibling_id, reason = zone_blocks[0]
-        raise QuotationPricingBlocked(
-            f"quotation blocked: project drawing {sibling_id} {reason}"
-        )
+        if not draft:
+            sibling_id, reason = zone_blocks[0]
+            raise QuotationPricingBlocked(
+                f"quotation blocked: project drawing {sibling_id} {reason}"
+            )
+        for sibling_id, reason in zone_blocks:
+            fname = ((all_jobs.get(sibling_id) or {}).get("result") or {}).get("file") or sibling_id
+            caveats.append(f"CLASSIFY BEFORE APPROVAL — {fname}: {reason}. Quantities from "
+                           "this drawing are provisional until the assessor classifies its zones.")
 
     if any(sibling.get("spec_pricing_warning") for _, sibling in siblings):
         raise QuotationPricingBlocked(
@@ -1121,16 +1154,21 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
 
     results = []
     for sibling_id, sibling in siblings:
-        results.append(_quotation_result_for_job(
+        unit = _quotation_result_for_job(
             sibling,
             result_override if sibling_id == job_id else None,
             costing_override if sibling_id == job_id else None,
-        ))
+        )
+        if sibling.get("decision") not in ("approved", "adjusted"):
+            unit = dict(unit)
+            unit["pending_approval"] = True
+        results.append(unit)
     project = anchor.get("project_name") or (results[0].get("file", "") if results else "")
     client = anchor.get("client_name") or ""
     return generate_quotation(
         results, project=project, client=client, ref=project_ref or None,
         commercial=anchor.get("commercial") or None,
+        unmeasured=unmeasured or None, caveats=caveats or None,
     )
 
 def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:
@@ -1258,11 +1296,24 @@ def _html_confirmation(action: str, job_id: str, costing) -> str:
 
 @app.route("/quotation/<job_id>.<fmt>")
 def quotation_download(job_id, fmt):
-    """Serve the project quotation for an approved/adjusted job."""
+    """Serve the ONE case quotation (all sibling documents) anchored at this job.
+
+    Previously gated on this job being approved/adjusted, which made a fresh case
+    undownloadable and (combined with approved-only sibling aggregation) produced a
+    separate workbook per document — Aryan's 17 Jul report. Now: a DRAFT case quotation
+    is available as soon as ANY document in the case has a measured area; every
+    not-yet-approved quantity is marked provisional inside the quotation itself, and
+    unmeasured documents are listed as awaiting assessor trace. Nothing firm is implied
+    before approval — the provisional markings carry that state."""
     j, err, code = require_job(job_id)
     if err: return err, code
-    if j.get("decision") not in ("approved", "adjusted"):
-        return jsonify({"error": "quotation only available after approval or adjustment"}), 400
+    _all = dict(_load_archive()); _all.update(load_jobs())
+    _ref = j.get("project_ref")
+    _case = [s for s in _all.values() if _ref and s.get("project_ref") == _ref] or [j]
+    if not any((s.get("adjusted") or {}).get("area_m2")
+               or (s.get("result") or {}).get("area_m2") for s in _case):
+        return jsonify({"error": "no measured documents in this case yet — measure or "
+                                 "assessor-trace at least one drawing first"}), 400
 
     try:
         from quotation import quotation_text, quotation_html, quotation_json, quotation_xlsx
