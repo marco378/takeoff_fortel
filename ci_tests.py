@@ -1309,6 +1309,37 @@ try:
         _pend_json = _client_up.get("/quotation/aaaaaaaa-1111-4111-8111-111111111111.json").get_json()
         ck("case quotation JSON carries the unmeasured document list",
            any(d.get("file") == "Office-Floors-U1.pdf" for d in _pend_json.get("unmeasured", [])))
+
+        # Aryan follow-up 18 Jul: a case containing ONLY unmeasurable docs (e.g. office GA
+        # plans, all awaiting assessor trace) previously 400'd on download — the office
+        # drawings "still skipped". An office-only case must still yield the case workbook.
+        _office_only = {
+            "dddddddd-4444-4444-8444-444444444444": {
+                "id": "dddddddd-4444-4444-8444-444444444444", "decision": None,
+                "status": "pending", "project_ref": "CASE-OFFICE-ONLY",
+                "project_name": "Office Only", "client_name": "Fortel QA",
+                "created_at": "2026-07-18T09:00:00",
+                "result": {"file": "Office-GA-L00.pdf", "area_m2": None,
+                           "measurement_state": "UNMEASURED", "flags": ["line/hatch"]},
+            },
+            "eeeeeeee-5555-4555-8555-555555555555": {
+                "id": "eeeeeeee-5555-4555-8555-555555555555", "decision": None,
+                "status": "pending", "project_ref": "CASE-OFFICE-ONLY",
+                "project_name": "Office Only", "client_name": "Fortel QA",
+                "created_at": "2026-07-18T09:01:00",
+                "result": {"file": "Office-GA-L01.pdf", "area_m2": None,
+                           "measurement_state": "UNMEASURED", "flags": ["line/hatch"]},
+            },
+        }
+        _AS.save_jobs(_office_only)
+        _oo_resp = _client_up.get("/quotation/dddddddd-4444-4444-8444-444444444444.xlsx")
+        ck("office-only case still yields the case workbook (no 400)",
+           _oo_resp.status_code == 200, _oo_resp.status_code)
+        _oo_ws = _load_workbook(_BytesIO(_oo_resp.data), data_only=False)["REV_01"]
+        _oo_cells = [str(_oo_ws.cell(r, 1).value or "") for r in range(1, _oo_ws.max_row + 1)]
+        ck("BOTH office docs listed as NOT YET MEASURED in the office-only workbook",
+           all(any(f in c and "NOT YET MEASURED" in c for c in _oo_cells)
+               for f in ("Office-GA-L00.pdf", "Office-GA-L01.pdf")), _oo_cells[-6:])
         _AS.save_jobs(_route_jobs)   # restore the store for the spec-capture tests below
 
         # Fortel's supplied Brief_Spec is a blank checklist. Capture applicable fields

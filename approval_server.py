@@ -1115,7 +1115,11 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
                 state = res.get("measurement_state") or sibling.get("status") or "UNMEASURED"
                 unmeasured.append({"file": fname, "state": state})
         siblings.sort(key=lambda pair: (pair[1].get("created_at") or "", pair[0]))
-        if not siblings:
+        # A case where NOTHING is measured yet (e.g. only office GA plans awaiting trace)
+        # must still produce the case workbook — every document listed as awaiting
+        # measurement, totals empty. Only fall back to the anchor when the case is
+        # genuinely empty (no unmeasured docs either).
+        if not siblings and not unmeasured:
             siblings = [(job_id, anchor)]
     else:
         siblings = [(job_id, anchor)]
@@ -1307,13 +1311,9 @@ def quotation_download(job_id, fmt):
     before approval — the provisional markings carry that state."""
     j, err, code = require_job(job_id)
     if err: return err, code
-    _all = dict(_load_archive()); _all.update(load_jobs())
-    _ref = j.get("project_ref")
-    _case = [s for s in _all.values() if _ref and s.get("project_ref") == _ref] or [j]
-    if not any((s.get("adjusted") or {}).get("area_m2")
-               or (s.get("result") or {}).get("area_m2") for s in _case):
-        return jsonify({"error": "no measured documents in this case yet — measure or "
-                                 "assessor-trace at least one drawing first"}), 400
+    # No "nothing measured yet" gate: an office-only case (all documents awaiting assessor
+    # trace) still gets its case workbook — every document listed, totals empty. A refused
+    # download here is exactly what read as "skipping the office drawings" in the field.
 
     try:
         from quotation import quotation_text, quotation_html, quotation_json, quotation_xlsx
