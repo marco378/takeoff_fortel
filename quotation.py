@@ -191,6 +191,24 @@ def _unique_notes(notes):
 
 # ── Core generator ────────────────────────────────────────────────────────────
 
+_UNIT_NO_RE = re.compile(r"unit[\s_\-]*(\d+)", re.I)
+_DREF_RE    = re.compile(r"\b(D\d{2,4})\b", re.I)
+
+
+def _unit_label_from_filename(drawing: str) -> str | None:
+    """Human unit label from Fortel filename conventions, e.g.
+    'External Markup Unit-1.pdf' + a D-ref -> 'Unit 1 (D77)'. Inderjit's BOQ keys its
+    per-unit rows this way; falls back to None (caller keeps the raw filename)."""
+    if not drawing:
+        return None
+    unit_m = _UNIT_NO_RE.search(drawing)
+    if not unit_m:
+        return None
+    dref_m = _DREF_RE.search(drawing)
+    label = f"Unit {unit_m.group(1)}"
+    return f"{label} ({dref_m.group(1).upper()})" if dref_m else label
+
+
 def generate_quotation(result: dict | list, project: str = "", client: str = "",
                        ref: str = None, extras: list = None, commercial: dict = None,
                        unmeasured: list = None, caveats: list = None) -> dict:
@@ -256,7 +274,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             group["area"] += float(area)
             if drawing and drawing not in group["drawings"]:
                 group["drawings"].append(drawing)
-            area_label = (unit.get("unit_name") or unit.get("area_label") or drawing
+            area_label = (unit.get("unit_name") or unit.get("area_label")
+                          or _unit_label_from_filename(drawing) or drawing
                           or f"Measured area {len(group['area_rows']) + 1}")
             group["area_rows"].append({
                 "description": str(area_label), "qty": float(area), "unit": "m²",

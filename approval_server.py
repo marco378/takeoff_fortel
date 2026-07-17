@@ -33,7 +33,7 @@ Environment:
                     colliding with the live jobs file (CLAUDE.md: "QA jobs out of
                     approval_jobs.json").
 """
-import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib
+import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib, math
 from email import policy
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
@@ -41,7 +41,14 @@ from flask import Flask, request, jsonify, send_file, redirect, Response
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
 
-JOBS_FILE    = Path(os.getenv("JOBS_FILE") or (Path(__file__).parent / "approval_jobs.json"))
+# Railway's container filesystem is EPHEMERAL — every deploy wiped approval_jobs.json
+# (observed live: job_count 2 -> 0 across the 16 Jul deploy). When a Railway volume is
+# attached, Railway sets RAILWAY_VOLUME_MOUNT_PATH; store the job state there so pending
+# client jobs survive deploys. Explicit JOBS_FILE env still wins; local dev unchanged.
+_VOLUME_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+JOBS_FILE    = Path(os.getenv("JOBS_FILE") or
+                    ((Path(_VOLUME_DIR) / "approval_jobs.json") if _VOLUME_DIR
+                     else (Path(__file__).parent / "approval_jobs.json")))
 # JOBS_ARCHIVE_FILE / BACKUP_DIR used to derive from JOBS_FILE.parent only — so a QA instance
 # started with JOBS_FILE=approval_jobs.qa.json still shared approval_jobs_archive.json and
 # backups/ with the live instance (both live in the same directory). Archive/backups now
@@ -521,7 +528,7 @@ def reject(job_id):
 @app.route("/adjust/<job_id>", methods=["GET", "POST"])
 def adjust(job_id):
     """
-    Adjust: assessor provides corrected polygon and/or scale (or a bare assessed area for
+    Adjust: assessor provides corrected polygon region(s) and/or scale (or a bare assessed area for
     UNMEASURED jobs where there's no AI polygon to correct — e.g. raster/scanned drawings).
     Re-runs geometry measurement with the assessor's inputs when a polygon+scale is given,
     then costs. Any assessor-supplied area (polygon-derived OR a direct assessed_area_m2)
@@ -540,17 +547,52 @@ def adjust(job_id):
         return redirect(f"/portal?job={job_id}")
 
     data = request.get_json(silent=True) or {}
-    vertices   = data.get("vertices", [])    # [[x,y], ...]
+    vertices   = data.get("vertices", [])    # legacy single [[x,y], ...]
+    regions_in = data.get("regions")         # new multi-region [[[x,y], ...], ...]
+    candidate_ids = data.get("candidate_ids") or []
     scale_k    = data.get("scale_k")         # m/px
     area_m2    = data.get("assessed_area_m2")
     note       = data.get("note", "")
 
-    # If assessor traced a polygon + scale, re-measure (heavy I/O — outside lock)
-    if vertices and scale_k and len(vertices) >= 3:
+    def _valid_region(region):
+        return (
+            isinstance(region, list)
+            and 3 <= len(region) <= 500
+            and all(isinstance(point, (list, tuple)) and len(point) == 2
+                    and all(isinstance(value, (int, float)) and math.isfinite(value)
+                            and abs(value) <= 10_000_000 for value in point)
+                    for point in region)
+        )
+
+    if regions_in is not None:
+        if (not isinstance(regions_in, list) or not 1 <= len(regions_in) <= 50
+                or not all(_valid_region(region) for region in regions_in)):
+            return jsonify({"error": "regions must contain 1-50 valid polygons"}), 400
+        regions = regions_in
+    elif vertices:
+        if not _valid_region(vertices):
+            return jsonify({"error": "vertices must contain a valid polygon"}), 400
+        regions = [vertices]
+    else:
+        regions = []
+
+    candidate_ids_valid = (
+        isinstance(candidate_ids, list)
+        and len(candidate_ids) <= len(regions)
+        and all(isinstance(candidate_id, str) and candidate_id for candidate_id in candidate_ids)
+    )
+    if (not candidate_ids_valid
+            or len(candidate_ids) != len(set(candidate_ids))):
+        return jsonify({"error": "candidate_ids must be unique known candidate identifiers"}), 400
+
+    # If assessor traced one or more polygons + scale, re-measure (heavy I/O — outside lock).
+    # Legacy `vertices` remains exactly one region; Office GA candidates can now be combined.
+    if regions and scale_k:
         try:
             from geometry import measure_regions, polygon_perimeter_lm
-            area_m2, gflags = measure_regions([vertices], scale_k)
-            perimeter_lm = polygon_perimeter_lm(vertices, scale_k)
+            area_m2, gflags = measure_regions(regions, scale_k)
+            perimeters = [polygon_perimeter_lm(region, scale_k) for region in regions]
+            perimeter_lm = round(sum(value for value in perimeters if value is not None), 2)
         except Exception as e:
             area_m2, perimeter_lm, gflags = None, None, [f"geometry error: {e}"]
     else:
@@ -573,6 +615,14 @@ def adjust(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job["status"] == "processing":
             return jsonify({"error": "job is still processing"}), 409
+        stored_candidates = {
+            candidate.get("candidate_id")
+            for candidate in (job.get("candidate_polygons")
+                              or (job.get("result") or {}).get("candidate_polygons") or [])
+            if isinstance(candidate, dict) and candidate.get("candidate_id")
+        }
+        if any(candidate_id not in stored_candidates for candidate_id in candidate_ids):
+            return jsonify({"error": "one or more candidate_ids are stale or unknown"}), 409
         stored_result = dict(job.get("result") or {})
         had_zone_allocation = bool(area_m2 and area_m2 > 0) and bool(
             (isinstance(job.get("zones"), list) and job.get("zones"))
@@ -580,7 +630,7 @@ def adjust(job_id):
         )
         zone_stale_flag = None
         if had_zone_allocation:
-            # /adjust supplies one replacement aggregate polygon/area, not a per-zone edit.
+            # /adjust supplies one replacement aggregate trace/area, not a per-zone edit.
             # Keeping the old marked-PDF split would make the four quotation sections add up
             # to the superseded measurement. Preserve raw annotation evidence, but clear the
             # derived zones and hard-block approval/quotation until an assessor reclassifies
@@ -610,7 +660,9 @@ def adjust(job_id):
                                   else "MEASURED_UNVERIFIED" if (area_m2 and plaus_flags)
                                   else job.get("measurement_state")),
             "adjusted": {
-                "vertices": vertices,
+                "vertices": regions[0] if len(regions) == 1 else [],
+                "regions":  regions,
+                "candidate_ids": candidate_ids,
                 "scale_k":  scale_k,
                 "area_m2":  area_m2,
                 "perimeter_lm": perimeter_lm,
@@ -641,7 +693,9 @@ def adjust(job_id):
         "ai_area_m2":     res.get("area_m2"),
         "assessed_area":  area_m2,
         "ai_polygon":     res.get("polygon_pts"),
-        "assessed_polygon": vertices,
+        "assessed_polygon": regions[0] if len(regions) == 1 else None,
+        "assessed_regions": regions,
+        "candidate_ids":    candidate_ids,
         "scale_k":        scale_k,
         "flags":          res.get("flags", []),
         "timestamp":      now_iso(),
@@ -652,6 +706,7 @@ def adjust(job_id):
         "job_id":   job_id,
         "area_m2":  area_m2,
         "perimeter_lm": perimeter_lm,
+        "region_count": len(regions),
         "costing":  costing_result,
         "flags":    gflags,
     })
@@ -1528,6 +1583,7 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "costing":          result.get("costing"),
                 "flags":            pre_flags + result.get("flags", []),
                 "polygon_pts":      result.get("polygon_pts"),
+                "candidate_polygons": result.get("candidate_polygons", []),
                 "perimeter_lm":     result.get("perimeter_lm"),
                 # Mirror zone-aware marked-PDF evidence at job level for the portal while
                 # retaining the canonical nested pipeline result for backward compatibility.
@@ -1769,6 +1825,11 @@ def upload():
     project_name = (request.form.get("project_name") or "").strip()
     project_ref  = (request.form.get("project_ref")  or "").strip()
     client_name  = (request.form.get("client_name")  or "").strip()
+    # Optional enquiry identification from the n8n workflow (Aryan, 16 Jul: "the request now
+    # include the subject and body information for better identification") — stored on every
+    # job in the batch so a failure/review is attributable to the right enquiry email.
+    email_subject = (request.form.get("email_subject") or request.form.get("subject") or "").strip()[:300]
+    email_body    = (request.form.get("email_body") or request.form.get("body") or "").strip()[:2000]
     up_files     = [f for f in request.files.getlist("pdf") if f and f.filename]
 
     if not project_name:
@@ -1879,6 +1940,10 @@ def upload():
                 project_name, project_ref, client_name, pdf_path, item.get("flags", []))
             status = "processing"
             workers.append((job_id, str(pdf_path)))
+        if email_subject:
+            job["email_subject"] = email_subject
+        if email_body:
+            job["email_body"] = email_body
         records.append((job_id, job))
         response_jobs.append({"job_id": job_id, "status": status, "filename": item["filename"]})
 

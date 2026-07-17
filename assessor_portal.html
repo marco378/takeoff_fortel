@@ -98,6 +98,13 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .flag.err{background:#fdecea;color:#c0392b;border-left:3px solid #c0392b}
 .flag.warn{background:#fef9ec;color:#9a6700;border-left:3px solid #e67e22}
 .flag.ok{background:#eafaf1;color:#1e8449;border-left:3px solid #27ae60}
+.candidate-panel{margin-top:8px;padding:8px;background:#fff8e8;border:1px solid #f1cf83;border-radius:6px}
+.candidate-panel .candidate-note{font-size:10px;color:#7a5200;line-height:1.35;margin-bottom:6px}
+.candidate-row{display:flex;align-items:center;gap:5px;padding:4px 0;border-top:1px solid #f3dfb0;font-size:11px}
+.candidate-row:first-of-type{border-top:0}
+.candidate-row .candidate-label{min-width:0;flex:1;color:#5d4300;font-weight:600}
+.candidate-row button{border:1px solid #d6a83e;background:#fff;color:#6a4900;border-radius:4px;padding:2px 5px;font-size:10px;cursor:pointer}
+.candidate-row button:hover{background:#fff1c9}
 
 /* Calibration row */
 .cal-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
@@ -255,6 +262,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <button id="btnTrace" class="on" title="Click to add/move polygon vertices">✏️ Trace</button>
       <button id="btnUndo">↩ Undo</button>
       <button id="btnClear">🗑 Clear</button>
+      <button id="btnNewRegion" title="Finish this outline and start another slab/core region">＋ Region</button>
       <div class="divider"></div>
       <button id="btnLoad" title="Load AI's proposed polygon">🤖 Load AI polygon</button>
       <div class="divider"></div>
@@ -413,6 +421,9 @@ let canvas = null, ctx = null;
 let img = null;
 let mode = 'trace';       // 'trace' | 'cal'
 let poly = [];            // [{x,y}]
+let traceRegions = [];    // completed assessor regions: [{points:[{x,y}], candidateId:?}]
+let activeCandidateId = null;
+let candidatePolygons = []; // assisted candidates in CANVAS pixels; never authoritative by themselves
 let cal  = [];            // [{x,y}] calibration line endpoints
 let mpp  = null;          // metres per CANVAS pixel
 let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapshot-Scale header).
@@ -637,7 +648,8 @@ async function selectJob(jobId) {
   // the new one loads. Clearing img/poly/cal/aiPoly + the visible canvas, and
   // resetting snapScale/mpp, guarantees the canvas reloads fresh for each job.
   img = null;
-  poly = []; cal = []; aiPoly = null; dragIdx = -1;
+  poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = [];
+  cal = []; aiPoly = null; dragIdx = -1;
   mpp = null; snapScale = 0.5;
   if (ctx && canvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -734,8 +746,7 @@ async function renderJobUI(job, gen) {
     // AI polygon (if any) + scale, so manual trace works even on a failed job.
     aiPoly = (res.polygon_pts || []).length
       ? res.polygon_pts.map(p => [p[0] * snapScale, p[1] * snapScale]) : null;
-    poly = []; cal = [];
-    mpp  = res.scale_k ? (res.scale_k / snapScale) : null;
+    initialiseTraceState(job, res);
     draw();              // redraw now that aiPoly/mpp are set (no-op if no canvas)
     updateAreaDisplay();
     _lastRenderedStatus = job.status;
@@ -763,13 +774,9 @@ async function renderJobUI(job, gen) {
   aiPoly = (res.polygon_pts || []).length
     ? res.polygon_pts.map(p => [p[0] * snapScale, p[1] * snapScale])
     : null;
-  poly = [];
-  cal  = [];
-  // scale_k is metres per PDF POINT (from the pipeline). The canvas is the snapshot PNG,
-  // rendered at snapScale px per PDF pt, so 1 canvas px = (1/snapScale) PDF pt. Convert to
-  // metres per CANVAS pixel: mpp = scale_k / snapScale. (Previously this used scale_k as if
-  // it were m/px, under-counting area by 1/snapScale² — e.g. 4× too small at snapScale=0.5.)
-  mpp  = res.scale_k ? (res.scale_k / snapScale) : null;
+  initialiseTraceState(job, res);
+  // initialiseTraceState converts pipeline scale_k (metres/PDF point) to canvas mpp and
+  // restores any prior assessor multi-region adjustment in its existing canvas coordinates.
   draw();   // redraw with the freshly-scaled aiPoly (the snapshot's onload draw() ran before
             // aiPoly/snapScale were set, so the interactive overlay needs one more pass)
 
@@ -848,6 +855,43 @@ function effectiveZones(job) {
   if (job && Array.isArray(job.zones)) return job.zones;
   const nested = job && job.result && job.result.zones;
   return Array.isArray(nested) ? nested : [];
+}
+
+function effectiveCandidatePolygons(job) {
+  if (job && Array.isArray(job.candidate_polygons) && job.candidate_polygons.length) {
+    return job.candidate_polygons;
+  }
+  const nested = job && job.result && job.result.candidate_polygons;
+  return Array.isArray(nested) ? nested : [];
+}
+
+function initialiseTraceState(job, res) {
+  candidatePolygons = effectiveCandidatePolygons(job).map(candidate => ({
+    ...candidate,
+    points: (candidate.polygon_pts || []).map(point => ({
+      x: point[0] * snapScale,
+      y: point[1] * snapScale
+    }))
+  })).filter(candidate => candidate.points.length >= 3);
+
+  const adjusted = job.adjusted || {};
+  let storedRegions = Array.isArray(adjusted.regions) ? adjusted.regions : [];
+  if (!storedRegions.length && Array.isArray(adjusted.vertices) && adjusted.vertices.length >= 3) {
+    storedRegions = [adjusted.vertices];
+  }
+  const storedIds = Array.isArray(adjusted.candidate_ids) ? adjusted.candidate_ids : [];
+  // candidate_ids is an audit list and can be shorter when manual and suggested
+  // regions were mixed. Only align IDs to regions when the cardinality matches.
+  const alignedStoredIds = storedIds.length === storedRegions.length ? storedIds : [];
+  traceRegions = storedRegions.map((region, index) => ({
+    points: region.map(point => ({x:Number(point[0]), y:Number(point[1])})),
+    candidateId: alignedStoredIds[index] || null
+  }));
+  poly = [];
+  activeCandidateId = null;
+  cal = [];
+  // An adjusted scale is already metres/canvas-pixel. Pipeline scale_k is metres/PDF-point.
+  mpp = Number(adjusted.scale_k) || (res.scale_k ? res.scale_k / snapScale : null);
 }
 
 function zoneReviewRequired(job) {
@@ -981,6 +1025,22 @@ async function acknowledgeZoneReferenceMismatch() {
   }
 }
 
+function renderCandidateSummary(job) {
+  const candidates = effectiveCandidatePolygons(job);
+  if (!candidates.length) return '';
+  const rows = candidates.map(candidate => `
+    <div class="candidate-row">
+      <span class="candidate-label">${esc(candidate.level_label || 'Candidate')} · ${esc((candidate.category||'').replace('_',' '))}</span>
+      <button type="button" data-candidate-id="${esc(candidate.candidate_id)}"
+              onclick="loadTraceCandidate(this.dataset.candidateId)">Add to trace</button>
+    </div>`).join('');
+  return `<div class="candidate-panel">
+    <div style="font-size:11px;font-weight:800;color:#6a4900;margin-bottom:3px">ASSISTED TRACE CANDIDATES</div>
+    <div class="candidate-note">These are low-confidence closed linework regions, not AI measurements. Add only the required slabs/cores, edit the outline, and submit the adjustment; missing levels must be traced manually.</div>
+    ${rows}
+  </div>`;
+}
+
 function renderJobDetails(job) {
   const res = job.result || {};
   const perimeter = effectiveStoredPerimeter(job);
@@ -995,6 +1055,7 @@ function renderJobDetails(job) {
       <span class="v"><span class="badge mstate ${esc(mstate)}">${esc(mstate.replace('_',' '))}</span></span>
     </div>` : '';
   const zoneSummary = renderZoneSummary(job);
+  const candidateSummary = renderCandidateSummary(job);
   document.getElementById('jobDetails').innerHTML = `
     ${projRow}
     ${mstateRow}
@@ -1005,6 +1066,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
     <div class="kv"><span class="k">Slab perimeter</span><span class="v">${perimeter!=null?perimeter.toLocaleString()+' m':'—'}</span></div>
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
+    ${candidateSummary}
     ${zoneSummary}
   `;
   renderCosting(job.costing || res.costing, job.status, job);
@@ -1448,6 +1510,41 @@ function draw() {
     ctx.restore();
   }
 
+  // Assisted Office GA candidates (amber/dashed). Merely drawing these never changes area,
+  // state or costing; the assessor must explicitly add/edit them and submit an adjustment.
+  candidatePolygons.forEach(candidate => {
+    if (!candidate.points || candidate.points.length < 3) return;
+    ctx.save();
+    ctx.setLineDash([4,4]);
+    ctx.beginPath();
+    candidate.points.forEach((point,index) => index
+      ? ctx.lineTo(point.x,point.y) : ctx.moveTo(point.x,point.y));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(230,126,34,0.05)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(230,126,34,0.75)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+  });
+
+  // Completed regions remain visible while another floor/core outline is edited.
+  traceRegions.forEach(region => {
+    if (!region.points || region.points.length < 3) return;
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    region.points.forEach((point,index) => index
+      ? ctx.lineTo(point.x,point.y) : ctx.moveTo(point.x,point.y));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(39,174,96,0.13)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(30,132,73,0.8)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  });
+
   // Assessor polygon
   if (poly.length) {
     ctx.beginPath();
@@ -1497,18 +1594,68 @@ function shoelace(pts) {
   return Math.abs(s)/2;
 }
 
+function traceRegionEntries() {
+  const entries = traceRegions.filter(region => region.points && region.points.length >= 3);
+  if (poly.length >= 3) entries.push({points:poly, candidateId:activeCandidateId});
+  return entries;
+}
+
+function stashActiveRegion() {
+  if (poly.length >= 3) {
+    traceRegions.push({
+      points: poly.map(point => ({x:point.x, y:point.y})),
+      candidateId: activeCandidateId
+    });
+  }
+  poly = [];
+  activeCandidateId = null;
+}
+
+function startNewTraceRegion() {
+  stashActiveRegion();
+  draw();
+  toast('Previous outline kept — trace the next slab/core region');
+}
+
+function loadTraceCandidate(candidateId) {
+  if (activeCandidateId === candidateId) {
+    toast('Candidate is already the active editable outline', 'warn');
+    return;
+  }
+  stashActiveRegion();
+  const existingIndex = traceRegions.findIndex(region => region.candidateId === candidateId);
+  if (existingIndex >= 0) {
+    const existing = traceRegions.splice(existingIndex, 1)[0];
+    poly = existing.points.map(point => ({x:point.x, y:point.y}));
+  } else {
+    const candidate = candidatePolygons.find(item => item.candidate_id === candidateId);
+    if (!candidate) { toast('Candidate is no longer available — reload the job', 'error'); return; }
+    poly = candidate.points.map(point => ({x:point.x, y:point.y}));
+  }
+  activeCandidateId = candidateId;
+  mode = 'trace';
+  document.getElementById('btnTrace').classList.add('on');
+  document.getElementById('btnCal').classList.remove('on');
+  draw();
+  toast('Candidate added — inspect and nudge it before Submit Adjustment');
+}
+
 function calcArea() {
-  if (!mpp || poly.length < 3) return null;
-  return shoelace(poly) * mpp * mpp;
+  const regions = traceRegionEntries();
+  if (!mpp || !regions.length) return null;
+  return regions.reduce((total,region) => total + shoelace(region.points), 0) * mpp * mpp;
 }
 
 function calcPerimeter() {
-  if (!mpp || poly.length < 3) return null;
+  const regions = traceRegionEntries();
+  if (!mpp || !regions.length) return null;
   let length = 0;
-  for (let i=0; i<poly.length; i++) {
-    const a=poly[i], b=poly[(i+1)%poly.length];
-    length += Math.hypot(b.x-a.x, b.y-a.y);
-  }
+  regions.forEach(region => {
+    for (let i=0; i<region.points.length; i++) {
+      const a=region.points[i], b=region.points[(i+1)%region.points.length];
+      length += Math.hypot(b.x-a.x, b.y-a.y);
+    }
+  });
   return length * mpp;
 }
 
@@ -1542,7 +1689,7 @@ function updateAreaDisplay() {
     document.getElementById('areaSource').textContent = 'No polygon traced yet';
   }
   document.getElementById('readout').textContent =
-    `area: ${aStr}  ·  ${poly.length} pts  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
+    `area: ${aStr}  ·  ${traceRegionEntries().length} region(s)  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
 }
 
 // ─────────────────────────────────────────────────
@@ -1618,9 +1765,14 @@ function setupButtons() {
     document.getElementById('btnCal').classList.remove('on');
   });
   document.getElementById('btnUndo').addEventListener('click', () => { poly.pop(); draw(); });
-  document.getElementById('btnClear').addEventListener('click', () => { poly=[]; cal=[]; draw(); });
+  document.getElementById('btnClear').addEventListener('click', () => {
+    poly=[]; traceRegions=[]; activeCandidateId=null; cal=[]; draw();
+  });
+  document.getElementById('btnNewRegion').addEventListener('click', startNewTraceRegion);
   document.getElementById('btnLoad').addEventListener('click', () => {
     if (!aiPoly) { toast('No AI polygon for this job', 'warn'); return; }
+    traceRegions = [];
+    activeCandidateId = null;
     poly = aiPoly.map(p => ({x: p[0], y: p[1]}));
     draw(); toast('AI polygon loaded — nudge as needed');
   });
@@ -1708,15 +1860,22 @@ async function submitDecision(action) {
       return;
     }
   }
+  const regionEntries = traceRegionEntries();
   const a = calcArea();
-  if (action === 'adjust' && (!poly.length || !a)) {
-    toast('Trace the polygon first, then Submit Adjustment', 'warn'); return;
+  if (action === 'adjust' && (!regionEntries.length || !a)) {
+    toast('Trace or add at least one polygon, then Submit Adjustment', 'warn'); return;
   }
+  const regionPayload = regionEntries.map(entry =>
+    entry.points.map(point => [Math.round(point.x), Math.round(point.y)]));
   const body = {
     action,
     assessed_area_m2: a || null,
     scale_k: mpp || null,
-    vertices: poly.map(p => [Math.round(p.x), Math.round(p.y)]),
+    // Keep the legacy single vertices field for older consumers while the server uses
+    // regions for several Office GA level/core outlines.
+    vertices: regionPayload.length === 1 ? regionPayload[0] : [],
+    regions: regionPayload,
+    candidate_ids: regionEntries.map(entry => entry.candidateId).filter(Boolean),
     note: ''
   };
   try {

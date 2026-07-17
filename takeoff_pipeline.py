@@ -384,8 +384,12 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             r["flags"] = r["flags"] + sflags + sflags2
             r["measurement_state"] = state
             # Manhole markers (Circle annots Fortel placed) — CONFIRMED count, not an estimate.
+            # None = the check itself failed (file/page unreadable) — say so, never treat as 0.
             mh_n = count_manholes_marked(meas_pdf)
-            if mh_n > 0:
+            if mh_n is None:
+                r["flags"].append("manhole markers could NOT be checked (file/page unreadable) — "
+                                  "not a confirmed zero; assessor confirm manhole count")
+            elif mh_n > 0:
                 r["manhole_count"] = mh_n
                 r["flags"].append(f"manhole_count={mh_n} (Circle markers on the marked drawing)")
 
@@ -451,6 +455,36 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     ]
                     r["measurement_state"] = UNMEASURED
                     r["needs_assessor"] = True
+                    # Office GA sheets are line/hatch drawings with several level plans on one
+                    # page.  Deterministic closed-vector faces are useful trace *candidates*, but
+                    # validation against Inderjit's marked truth misses the 5% auto-measure gate.
+                    # Carry geometry only: no area, costing or authoritative polygon is emitted
+                    # until an assessor selects/edits the regions and submits /adjust.
+                    try:
+                        from office_candidates import detect_office_candidates
+                        office_k, office_verified, office_note, office_sources = TU.scale_for(meas_pdf)
+                        assisted = detect_office_candidates(
+                            meas_pdf,
+                            scale_k=office_k,
+                            scale_verified=office_verified,
+                        )
+                        if assisted.get("candidate_polygons"):
+                            r.update({
+                                "method": "assisted office vector trace",
+                                "candidate_polygons": assisted["candidate_polygons"],
+                                "scale_k": round(office_k, 6) if office_k else None,
+                                "scale_src": office_note,
+                                "scale_verified": office_verified,
+                                "scale_sources": office_sources,
+                            })
+                            r["flags"] = r["flags"] + assisted.get("flags", [])
+                    except Exception as exc:
+                        # Candidate assistance is best-effort.  Failure preserves the existing
+                        # safe UNMEASURED/manual-trace outcome instead of failing the job.
+                        r["flags"].append(
+                            f"OFFICE ASSISTED TRACE unavailable ({type(exc).__name__}: {exc}); "
+                            "manual assessor trace remains required"
+                        )
         else:
             # RASTER / scanned or flattened drawing. The colour-segmentation path measures
             # rendered PIXELS, not vector paths, so a flattened-but-colour-coded sheet (e.g.

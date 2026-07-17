@@ -325,11 +325,13 @@ def count_manholes_marked(pdf, page=0):
     Circle-type annot on the page. If a future convention needs filtering (e.g. Circle
     annots used for something else too), narrow this by content/colour then.
 
-    Returns int count (0 if none / no annots / page has no Circle annots)."""
+    Returns int count (0 = CONFIRMED zero Circle annots), or None when the file/page could
+    not be opened — "couldn't check" must never masquerade as a confirmed zero (four-state:
+    no silent numbers, and a silent 0 is still a number)."""
     try:
         p = fitz.open(pdf)[page]
     except Exception:
-        return 0
+        return None
     return sum(1 for a in (p.annots() or []) if a.type[1] == "Circle")
 
 

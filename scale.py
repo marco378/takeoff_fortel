@@ -132,11 +132,36 @@ def detect_scale_bar(pdf, page=0):
         # prefer labels further toward bottom-right (larger x+y) — title block convention
         return -(x + y)
 
+    def ordered_labels(tier):
+        """Order graphical-bar tick labels without mistaking an intermediate tick for the end.
+
+        The Castle Donington Office GAs expose every graphical tick as a fused token on the
+        same raw PDF axis (``1m``, ``5m``, ``10m``).  Sorting those solely by page position chose
+        ``1m`` but paired it with the full 283 pt bar, producing a 10x scale error.  When two or
+        more fused values are visibly aligned, try the largest/terminal value first.  A lone
+        fused token and all bare ``m`` labels retain the existing title-block position order.
+        """
+        aligned_tol = 6.0
+
+        def key(lc):
+            x, y, value = lc
+            if value is not None:
+                aligned = [other for other in tier
+                           if other[2] is not None
+                           and (abs(other[0] - x) <= aligned_tol
+                                or abs(other[1] - y) <= aligned_tol)]
+                if len(aligned) >= 2:
+                    terminal = max(other[2] for other in aligned)
+                    return (0 if value == terminal else 1, -value, quadrant_key(lc))
+            return (2, 0, quadrant_key(lc))
+
+        return sorted(tier, key=key)
+
     any_found = False
     for tier in label_cand_tiers:
         if not tier:
             continue
-        for mx, my, forced_val in sorted(tier, key=quadrant_key):
+        for mx, my, forced_val in ordered_labels(tier):
             label_cross_h = my                  # cross-axis coord to match against horizontal candidates
             label_cross_v = mx                  # cross-axis coord to match against vertical candidates
             label_along_h = mx                  # along-axis coord (position within a horizontal bar's run)

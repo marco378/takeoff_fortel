@@ -34,6 +34,45 @@ print("scale")
 c = canvas.Canvas("/tmp/_sb.pdf", pagesize=(1400,2200)); c.rect(200,1000,1000,800); c.line(100,150,600,150); c.drawString(250,160,"0          50 m"); c.save()
 k, info = detect_scale_bar("/tmp/_sb.pdf"); ck("scale-bar k=0.1", k == 0.1, info)
 
+# Rotated Office GA bars expose intermediate ticks as fused 1m/5m/10m tokens. The terminal
+# value must win over the tick nearest the raw bottom-right corner.
+_ticks = canvas.Canvas("/tmp/_sb_fused_ticks.pdf", pagesize=(700, 500))
+_ticks.line(100, 80, 383.44, 80)
+_ticks.drawString(125, 90, "1m")
+_ticks.drawString(240, 90, "5m")
+_ticks.drawString(375, 90, "10m")
+_ticks.save()
+_tick_k, _tick_info = detect_scale_bar("/tmp/_sb_fused_ticks.pdf")
+ck("scale bar uses terminal 10m tick, not intermediate 1m",
+   _tick_k is not None and abs(_tick_k - 10 / 283.44) < 1e-5 and "10 m" in _tick_info,
+   (_tick_k, _tick_info))
+
+print("Office GA assisted-trace vector candidates")
+from office_candidates import detect_office_candidates as _office_candidates
+_office_pdf = "/tmp/_office_candidates.pdf"
+_office_canvas = canvas.Canvas(_office_pdf, pagesize=(900, 500))
+for _index, _level in enumerate((0, 1, 2)):
+    _x = 60 + _index * 280
+    _office_canvas.rect(_x, 220, 100, 100, stroke=1, fill=0)
+    _office_canvas.drawString(_x, 190, f"Office Plan Level {_level:02d}")
+_office_canvas.line(60, 120, 160, 120)  # open line: must not become a candidate
+_office_canvas.rect(800, 100, 5, 5, stroke=1, fill=0)  # symbol: below 20 m2
+_office_canvas.save()
+_office_detected = _office_candidates(_office_pdf, scale_k=0.1, scale_verified=True)
+_office_by_level = {candidate["level"]: candidate
+                    for candidate in _office_detected["candidate_polygons"]}
+ck("closed vector plates become one assisted candidate per labelled level",
+   set(_office_by_level) == {0, 1, 2} and len(_office_by_level) == 3,
+   _office_detected)
+ck("Level 00 maps to ground and upper levels stay separate",
+   _office_by_level[0]["category"] == "ground_floor" and
+   all(_office_by_level[level]["category"] == "upper_floor" for level in (1, 2)))
+ck("candidate records are geometry-only tracing aids",
+   all("area_m2" not in candidate and
+       candidate["coordinate_space"] == "rotated_pdf_points" and
+       candidate["confidence"] == "low"
+       for candidate in _office_detected["candidate_polygons"]))
+
 print("pricing")
 r, _ = slab_rate({"depth_mm":190,"conc_rate":128,"mesh":"A252","layers":1,"steel_rate_t":850,"margin":0.11})
 ck("yard rate 44.89", r == 44.89)
@@ -584,6 +623,53 @@ try:
        any("channel measured 545.36 Lm" in flag
            for flag in _zone_reference_flags_test(str(_unit3_path),
                                                   _castle_reads[_unit3_path.name]["zones"])))
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
+
+try:
+    _office_marked_paths = [
+        _castle_dir / f"Office Floors Unit-{number}.pdf" for number in range(1, 5)
+    ]
+    _office_stripped_paths = [
+        _castle_dir / "_stripped" / path.name for path in _office_marked_paths
+    ]
+    for _path in _office_marked_paths + _office_stripped_paths:
+        _require_fixture(_path, "Castle Donington stripped-office validation")
+    import json as _json_office_gold
+    from takeoff_pipeline import takeoff as _pipeline_takeoff_office
+    _office_gold = _json_office_gold.loads(Path("gold.json").read_text())
+    _outside_gate = []
+    for _marked_path, _stripped_path in zip(_office_marked_paths, _office_stripped_paths):
+        with _fitz_zones.open(_marked_path) as _marked_doc, _fitz_zones.open(_stripped_path) as _stripped_doc:
+            _marked_annots = sum(1 for page in _marked_doc for _ in (page.annots() or []))
+            _stripped_annots = sum(1 for page in _stripped_doc for _ in (page.annots() or []))
+        ck(f"stripped Office fixture removes every annotation: {_marked_path.name}",
+           _marked_annots > 0 and _stripped_annots == 0,
+           {"marked": _marked_annots, "stripped": _stripped_annots})
+
+        _assisted = _pipeline_takeoff_office(
+            str(_stripped_path), send_approval=False, auto_extract_spec=False)
+        _level_areas = {}
+        for _candidate in _assisted.get("candidate_polygons", []):
+            _candidate_area, _ = measure_regions(
+                [_candidate["polygon_pts"]], _assisted["scale_k"])
+            _level = _candidate["level"]
+            _level_areas[_level] = max(_level_areas.get(_level, 0), _candidate_area)
+        _detected_total = round(sum(_level_areas.values()), 2)
+        _markup_total = _read_marked_zones(str(_marked_path))["area_m2"]
+        _boq_total = _office_gold[str(_marked_path)]["net_m2"]
+        _delta_pct = (_detected_total - _markup_total) / _markup_total * 100
+        _outside_gate.append(abs(_delta_pct) > 5)
+        ck(f"Office auto gate fails safely (assisted trace only): {_marked_path.name}",
+           abs(_delta_pct) > 5 and _assisted.get("area_m2") is None and
+           _assisted.get("measurement_state") == "UNMEASURED" and
+           _assisted.get("needs_assessor") is True and
+           _assisted.get("costing") is None and _assisted.get("polygon_pts") is None and
+           bool(_assisted.get("candidate_polygons")),
+           {"detected": _detected_total, "markup": _markup_total,
+            "boq": _boq_total, "delta_pct": round(_delta_pct, 2)})
+    ck("all four Office units miss the 5% auto-measure bar — no silent number shipped",
+       len(_outside_gate) == 4 and all(_outside_gate), _outside_gate)
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
 
@@ -1212,6 +1298,47 @@ try:
            all(any("every PDF queued" in f for f in j.get("flags", []))
                for j in _zip_jobs.values()))
 
+        _candidate_job_id = "99999999-9999-4999-8999-999999999999"
+        _candidate_records = [
+            {"candidate_id":"office-p0-level-00-1", "page":0, "level":0,
+             "category":"ground_floor", "polygon_pts":[[0,0],[100,0],[100,100],[0,100]]},
+            {"candidate_id":"office-p0-level-01-1", "page":0, "level":1,
+             "category":"upper_floor", "polygon_pts":[[200,0],[300,0],[300,100],[200,100]]},
+        ]
+        _AS.save_jobs({_candidate_job_id: {
+            "id":_candidate_job_id, "status":"pending", "decision":None,
+            "measurement_state":"UNMEASURED", "scale_confirmed":False,
+            "candidate_polygons":_candidate_records,
+            "result":{"file":"Office-GA.pdf", "area_m2":None,
+                      "measurement_state":"UNMEASURED",
+                      "candidate_polygons":_candidate_records},
+        }})
+        _stale_candidate_resp = _client_up.post(f"/adjust/{_candidate_job_id}", json={
+            "regions":[[[0,0],[100,0],[100,100],[0,100]]], "scale_k":0.1,
+            "candidate_ids":["office-p0-level-99-1"],
+        })
+        ck("assisted adjustment rejects stale/unknown candidate IDs",
+           _stale_candidate_resp.status_code == 409, _stale_candidate_resp.get_json())
+        _multi_region_resp = _client_up.post(f"/adjust/{_candidate_job_id}", json={
+            "regions":[[[0,0],[100,0],[100,100],[0,100]],
+                       [[200,0],[300,0],[300,100],[200,100]]],
+            "scale_k":0.1,
+            "candidate_ids":["office-p0-level-00-1", "office-p0-level-01-1"],
+            "note":"assessor accepted two Office GA regions",
+        })
+        _multi_region_job = _AS.load_jobs()[_candidate_job_id]
+        ck("assessor adjustment measures several Office regions in one atomic decision",
+           _multi_region_resp.status_code == 200 and
+           _multi_region_resp.get_json()["area_m2"] == 200.0 and
+           _multi_region_resp.get_json()["region_count"] == 2 and
+           len(_multi_region_job["adjusted"]["regions"]) == 2 and
+           _multi_region_job["adjusted"]["candidate_ids"] ==
+           ["office-p0-level-00-1", "office-p0-level-01-1"],
+           _multi_region_resp.get_json())
+        ck("candidate selection alone stayed UNMEASURED; assessor POST performs confirmation",
+           _multi_region_job["scale_confirmed"] is True and
+           _multi_region_job["measurement_state"] == "MEASURED_VERIFIED")
+
         _route_costing_a = _copy.deepcopy(_demo_result["costing"])
         _route_costing_a.update({"area_m2": 100, "assumed": True})
         _route_costing_b = _copy.deepcopy(_demo_result["costing"])
@@ -1340,6 +1467,35 @@ try:
         ck("BOTH office docs listed as NOT YET MEASURED in the office-only workbook",
            all(any(f in c and "NOT YET MEASURED" in c for c in _oo_cells)
                for f in ("Office-GA-L00.pdf", "Office-GA-L01.pdf")), _oo_cells[-6:])
+        # Unit labels derived from Fortel filename conventions (per-unit BOQ rows)
+        from quotation import _unit_label_from_filename as _ulf
+        ck("unit label: 'External Markup Unit-1.pdf' + D-ref context -> 'Unit 1'",
+           _ulf("External Markup Unit-1.pdf") == "Unit 1")
+        ck("unit label: D-ref included when present",
+           _ulf("Unit_3 D410 Hard Landscaping.pdf") == "Unit 3 (D410)")
+        ck("unit label: no unit pattern -> None (caller keeps filename)",
+           _ulf("Proposed_Site_Plan.pdf") is None)
+
+        # /upload stores enquiry identification (subject/body) on every job in the batch
+        _AS.save_jobs({})
+        _id_resp = _client_up.post("/upload", data={
+            "project_ref": "IDENT-1", "project_name": "Ident Case",
+            "email_subject": "RE: Winwick tender enquiry",
+            "email_body": "Please price the attached drawings.",
+            "pdf": (_io3.BytesIO(_pdf_a_bytes), "yard.pdf"),
+        }, content_type="multipart/form-data")
+        _id_jobs = _AS.load_jobs()
+        ck("upload stores email_subject/email_body for enquiry identification",
+           _id_resp.status_code in (201, 202) and
+           all(j.get("email_subject") == "RE: Winwick tender enquiry" and
+               "attached drawings" in j.get("email_body", "") for j in _id_jobs.values()),
+           list(_id_jobs.values())[:1])
+
+        # count_manholes_marked: unreadable file -> None (couldn't check), never a silent 0
+        from robust_takeoff import count_manholes_marked as _cmm
+        ck("count_manholes_marked returns None (not 0) for an unreadable file",
+           _cmm("/nonexistent/nope.pdf") is None)
+
         _AS.save_jobs(_route_jobs)   # restore the store for the spec-capture tests below
 
         # Fortel's supplied Brief_Spec is a blank checklist. Capture applicable fields
@@ -1523,6 +1679,16 @@ try:
            all(marker in _portal_html_up for marker in (
                "Measured zones", "ZONE REVIEW REQUIRED", "classifyZone(",
                "acknowledgeZoneReferenceMismatch", "zone_category", "effectiveBriefSpecs")))
+        ck("portal exposes assisted Office candidates without auto-submitting them",
+           all(marker in _portal_html_up for marker in (
+               "ASSISTED TRACE CANDIDATES", "candidate_polygons", "loadTraceCandidate(",
+               "Add to trace", "btnNewRegion", "traceRegions")) and
+           "function loadTraceCandidate" in _portal_html_up and
+           "regions: regionPayload" in _portal_html_up)
+        _candidate_fn = _portal_html_up.split("function loadTraceCandidate", 1)[1].split(
+            "function calcArea", 1)[0]
+        ck("one-click candidate load is non-mutating until Submit Adjustment",
+           "fetch(" not in _candidate_fn and "poly = candidate.points" in _candidate_fn)
     finally:
         _AS.threading.Thread = _orig_thread_up
         _AS.__file__ = _orig_server_file_up
@@ -1680,7 +1846,9 @@ try:
         def _slow_takeoff(pdf_path, project_name=None, project_ref=None):
             _time3.sleep(2.2)
             return {"measurement_state": "MEASURED_VERIFIED", "area_m2": 3159.0,
-                    "flags": ["completed ok"], "project_name": project_name, "project_ref": project_ref}
+                    "flags": ["completed ok"], "project_name": project_name, "project_ref": project_ref,
+                    "candidate_polygons":[{"candidate_id":"office-p0-level-01-1",
+                                           "polygon_pts":[[0,0],[1,0],[1,1]]}]}
         _fake_pipeline.takeoff = _slow_takeoff
         _real_module = _sys3.modules.get("takeoff_pipeline")
         _sys3.modules["takeoff_pipeline"] = _fake_pipeline
@@ -1700,6 +1868,11 @@ try:
            not any("PIPELINE TIMEOUT" in f for f in _j_final.get("flags", [])), _j_final.get("flags"))
         ck("_watchdog_fired sentinel cleared after the race resolves",
            "_watchdog_fired" not in _j_final)
+        ck("background takeoff mirrors assisted candidates at job and result level",
+           _j_final.get("candidate_polygons") ==
+           _j_final.get("result", {}).get("candidate_polygons") and
+           _j_final.get("candidate_polygons", [])[0]["candidate_id"] ==
+           "office-p0-level-01-1")
 
         _jobs3 = _AS3.load_jobs()
         _jobs3.pop(_jid_wd, None); _jobs3.pop(_jid_wd2, None)
