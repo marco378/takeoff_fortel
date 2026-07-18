@@ -32,6 +32,8 @@ Environment:
                     this file) — lets QA/test instances point at a scratch file instead of
                     colliding with the live jobs file (CLAUDE.md: "QA jobs out of
                     approval_jobs.json").
+  CLIENT_RATES_FILE optional override path; otherwise client_rates.json is stored beside
+                    JOBS_FILE (including on the same Railway volume).
 """
 import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib, math
 from email import policy
@@ -49,6 +51,8 @@ _VOLUME_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
 JOBS_FILE    = Path(os.getenv("JOBS_FILE") or
                     ((Path(_VOLUME_DIR) / "approval_jobs.json") if _VOLUME_DIR
                      else (Path(__file__).parent / "approval_jobs.json")))
+from client_rates import rates_path_for_jobs
+CLIENT_RATES_FILE = Path(os.getenv("CLIENT_RATES_FILE") or rates_path_for_jobs(JOBS_FILE))
 # JOBS_ARCHIVE_FILE / BACKUP_DIR used to derive from JOBS_FILE.parent only — so a QA instance
 # started with JOBS_FILE=approval_jobs.qa.json still shared approval_jobs_archive.json and
 # backups/ with the live instance (both live in the same directory). Archive/backups now
@@ -77,6 +81,38 @@ APPROVAL_TOKEN = os.getenv("PORTAL_TOKEN") or os.getenv("APPROVAL_TOKEN", "")
 _TOKEN_COOKIE  = "approval_token"
 
 
+def _detect_build_info() -> dict:
+    """Resolve deploy SHA/date once at startup; health checks must never depend on git."""
+    sha = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "").strip()
+    date = (os.getenv("RAILWAY_GIT_COMMIT_DATE") or "").strip()
+    repo_dir = Path(__file__).parent
+    try:
+        import subprocess
+        if not sha:
+            sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True,
+                text=True, timeout=2, check=True,
+            ).stdout.strip()
+        if sha and not date:
+            date = subprocess.run(
+                ["git", "show", "-s", "--format=%cI", sha], cwd=repo_dir,
+                capture_output=True, text=True, timeout=2, check=True,
+            ).stdout.strip()
+    except Exception:
+        # Railway images may intentionally omit .git. The env SHA still remains useful.
+        pass
+    return {"sha": sha or "unknown", "date": date or "unknown"}
+
+
+BUILD_INFO = _detect_build_info()
+
+
+def _build_label() -> str:
+    sha = BUILD_INFO.get("sha") or "unknown"
+    short_sha = sha[:7] if sha != "unknown" else sha
+    return f"Build {short_sha} · {BUILD_INFO.get('date') or 'unknown'}"
+
+
 def _token_ok(supplied: str) -> bool:
     if not APPROVAL_TOKEN or not supplied:
         return False
@@ -86,8 +122,10 @@ def _token_ok(supplied: str) -> bool:
 
 def _portal_login_page(error: bool = False) -> str:
     """Render a small shared-code login form without exposing the configured secret."""
+    import html as _html
     error_html = ('<p style="color:#c0392b;font-size:13px;margin:10px 0 0 0">Incorrect code</p>'
                   if error else "")
+    build_label = _html.escape(_build_label())
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
     <title>Fortel AI Takeoff — Sign in</title></head>
     <body style="font-family:Arial,sans-serif;background:#f0f2f5;display:flex;
@@ -105,7 +143,10 @@ def _portal_login_page(error: bool = False) -> str:
                border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;">Enter</button>
       </form>
       {error_html}
-    </div></body></html>"""
+    </div>
+    <div id="buildFooter" style="position:fixed;right:12px;bottom:8px;color:#777;
+         font-size:11px">{build_label}</div>
+    </body></html>"""
 
 
 @app.before_request
@@ -305,6 +346,49 @@ def single_job(job_id):
     j, err, code = require_job(job_id)
     if err: return err, code
     return jsonify(j)
+
+
+def _client_rate_defaults() -> dict:
+    """Read current defaults without duplicating or modifying any value."""
+    from defaults import DEFAULT_SPEC
+    from takeoff_pipeline import MANHOLE_EO_RATE
+    from client_rates import RATE_FIELDS
+    return {
+        key: (MANHOLE_EO_RATE if key == "manhole_eo_rate" else DEFAULT_SPEC[key])
+        for key in RATE_FIELDS
+    }
+
+
+def _apply_current_client_rates(spec: dict, *, manhole_in_scope: bool = False):
+    """Apply the persisted layer to a resolved pricing spec; calculation stays elsewhere."""
+    from client_rates import apply_client_rates
+    from takeoff_pipeline import MANHOLE_EO_RATE
+    return apply_client_rates(
+        spec, MANHOLE_EO_RATE, path=CLIENT_RATES_FILE,
+        manhole_in_scope=manhole_in_scope)
+
+
+@app.route("/rates", methods=["GET", "POST"])
+def client_rates_endpoint():
+    """Show/save client rate overrides. The global token gate protects both methods."""
+    from client_rates import (ClientRatesError, effective_rate_payload,
+                              save_client_rates)
+    defaults = _client_rate_defaults()
+    try:
+        if request.method == "GET":
+            return jsonify(effective_rate_payload(defaults, path=CLIENT_RATES_FILE))
+        data = request.get_json(silent=True) or {}
+        who = "assessor-token-authenticated" if APPROVAL_TOKEN else "assessor-local"
+        saved, changes = save_client_rates(
+            data.get("rates"), defaults, path=CLIENT_RATES_FILE, who=who)
+        if not changes:
+            return jsonify({"error": "no rate values changed; no version was saved"}), 409
+        payload = effective_rate_payload(defaults, path=CLIENT_RATES_FILE)
+        payload.update({"status": "saved", "changes": changes,
+                        "version": saved["version"]})
+        return jsonify(payload)
+    except ClientRatesError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/snapshot/<job_id>")
@@ -918,6 +1002,7 @@ def spec_override(job_id):
                 for key in COMMON_FIELDS
             )
             repriced = False
+            rates_provenance = {}
             pricing_warning = job.get("spec_pricing_warning") or ""
             if pricing_fields_submitted and not area_m2:
                 from costing import MESH_KG
@@ -933,6 +1018,7 @@ def spec_override(job_id):
                 from costing  import rate_buildup
                 try:
                     spec, _ = spec_with_defaults(pricing_override)
+                    spec, _manhole_rate, rates_provenance = _apply_current_client_rates(spec)
                     assumed = not all(key in pricing_override for key in COMMON_FIELDS)
                     rate, parts = rate_buildup(**{key: spec[key] for key in [
                         "depth_mm", "conc_rate", "conc_wastage", "mesh", "layers",
@@ -948,6 +1034,7 @@ def spec_override(job_id):
                         "flags": flag_assumed(spec, assumed),
                         "breakdown": parts,
                     }
+                    costing.update(rates_provenance)
                     # Rebuild so fallback values used in the unchanged calculation are visible,
                     # field-by-field, as assumed rather than as blank confirmed client data.
                     brief_spec = build_brief_spec(
@@ -1251,6 +1338,10 @@ def _run_costing(area_m2, result: dict) -> dict | None:
 
         engineer_spec = result.get("engineer_spec")  # None if architect-only
         spec, _ = spec_with_defaults(engineer_spec)
+        manhole_in_scope = bool(result.get("manhole_count") or
+                                 result.get("manhole_count_estimate"))
+        spec, manhole_rate, rates_provenance = _apply_current_client_rates(
+            spec, manhole_in_scope=manhole_in_scope)
         from slab_spec import COMMON_FIELDS
         supplied = engineer_spec or {}
         assumed = not all(supplied.get(key) is not None for key in COMMON_FIELDS)
@@ -1259,7 +1350,7 @@ def _run_costing(area_m2, result: dict) -> dict | None:
             "steel_rate_t","steel_wastage","lap_acc","dpm","curing",
             "labour","trim","margin"]})
         total = round(area_m2 * rate, 2)
-        return {
+        costing = {
             "area_m2":   area_m2,
             "rate":      rate,
             "total_gbp": total,
@@ -1269,6 +1360,21 @@ def _run_costing(area_m2, result: dict) -> dict | None:
             "flags":     flag_assumed(spec, assumed),
             "breakdown": parts,
         }
+        if manhole_in_scope:
+            from takeoff_pipeline import manhole_eo_line
+            line, is_estimate = manhole_eo_line(
+                result.get("manhole_count"), result.get("manhole_count_estimate"),
+                rate=manhole_rate)
+            if line:
+                description, qty, unit, extra_rate = line
+                extra_value = round(qty * extra_rate, 2)
+                costing["extras"] = [{
+                    "description": description, "qty": qty, "unit": unit,
+                    "rate": extra_rate, "value": extra_value, "estimate": is_estimate,
+                }]
+                costing["grand_total_gbp"] = round(total + extra_value, 2)
+        costing.update(rates_provenance)
+        return costing
     except Exception as e:
         return {"error": str(e)}
 
@@ -1463,7 +1569,7 @@ def n8n_webhook():
 def status():
     """Health-check for deploy tests."""
     jobs = load_jobs()
-    return jsonify({"status": "ok", "job_count": len(jobs)})
+    return jsonify({"status": "ok", "job_count": len(jobs), "build": BUILD_INFO})
 
 
 # ── Upload endpoint ───────────────────────────────────────────────────────────
@@ -1545,7 +1651,13 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
     watchdog.start()
     try:
         import takeoff_pipeline
-        result = takeoff_pipeline.takeoff(pdf_path, project_name=project_name, project_ref=project_ref)
+        takeoff_kwargs = {"project_name": project_name, "project_ref": project_ref}
+        # A few integrations/tests provide a narrow takeoff-compatible callable. Preserve
+        # that interface while the real pipeline receives the explicit isolated rates path.
+        import inspect
+        if "client_rates_path" in inspect.signature(takeoff_pipeline.takeoff).parameters:
+            takeoff_kwargs["client_rates_path"] = CLIENT_RATES_FILE
+        result = takeoff_pipeline.takeoff(pdf_path, **takeoff_kwargs)
         watchdog.cancel()
         with _jobs_lock:
             jobs = load_jobs()
@@ -2038,6 +2150,7 @@ if __name__ == "__main__":
     print("Fortel Approval Server — config:")
     print(f"  host:port     = {host}:{os.getenv('APPROVAL_PORT', 5001)}")
     print(f"  jobs file     = {JOBS_FILE}")
+    print(f"  client rates  = {CLIENT_RATES_FILE}")
     print(f"  jobs archive  = {JOBS_ARCHIVE_FILE}")
     print(f"  backups dir   = {BACKUP_DIR}")
     print(f"  base url      = {os.getenv('APPROVAL_BASE_URL', 'http://localhost:5001')}")

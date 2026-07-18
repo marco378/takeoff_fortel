@@ -25,6 +25,9 @@ header{background:var(--blue);color:#fff;padding:0 20px;display:flex;align-items
 header b{font-size:16px;letter-spacing:.3px}
 header span{opacity:.7;font-size:12px}
 .hdr-right{margin-left:auto;display:flex;gap:8px;align-items:center}
+.hdr-button{border:1px solid rgba(255,255,255,.35);background:transparent;color:#fff;
+  border-radius:5px;padding:4px 9px;font-size:12px;font-weight:700;cursor:pointer}
+.hdr-button:hover{background:rgba(255,255,255,.12)}
 
 /* ── Main layout ─────────────────────────── */
 .main{display:flex;flex:1;overflow:hidden}
@@ -134,6 +137,36 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 /* Toast */
 #toast{position:fixed;bottom:24px;right:24px;background:#13294b;color:#fff;padding:12px 20px;border-radius:8px;font-size:14px;font-weight:600;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
 #toast.show{opacity:1}
+.build-footer{position:fixed;left:8px;bottom:5px;z-index:1001;color:#6d7784;
+  font-size:10px;background:rgba(240,242,245,.92);padding:2px 5px;border-radius:3px}
+
+/* Client-editable rates modal */
+.rates-modal{display:none;position:fixed;inset:0;z-index:1100;background:rgba(10,22,40,.45);
+  align-items:center;justify-content:center;padding:20px}
+.rates-modal.open{display:flex}
+.rates-card{width:min(680px,100%);max-height:90vh;overflow:auto;background:#fff;border-radius:10px;
+  box-shadow:0 12px 40px rgba(0,0,0,.25)}
+.rates-head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border)}
+.rates-head h2{font-size:16px;color:var(--blue);flex:1}
+.rates-close{border:0;background:none;font-size:22px;cursor:pointer;color:#666}
+.rates-warning{margin:12px 18px;padding:9px 11px;background:#fff6df;border-left:3px solid var(--amber);
+  color:#765000;font-size:12px}
+.rates-meta{padding:0 18px 8px;color:var(--muted);font-size:11px}
+.rates-grid{padding:0 18px;display:grid;grid-template-columns:1fr 150px;gap:0}
+.rate-row{display:contents}
+.rate-label,.rate-input-wrap{padding:8px 6px;border-top:1px solid #edf0f3}
+.rate-label b{display:block;font-size:12px;color:#27384f}
+.rate-help{font-size:10px;color:var(--muted)}
+.rate-tag{display:inline-block;margin-top:3px;padding:1px 5px;border-radius:8px;font-size:9px;font-weight:800}
+.rate-tag.default{background:#e8edf3;color:#516070}
+.rate-tag.client-edited{background:#fce4f1;color:#9c075a}
+.rate-input-wrap{display:flex;align-items:center;gap:5px}
+.rate-input-wrap input{width:94px;padding:5px 6px;border:1px solid var(--border);border-radius:5px;
+  text-align:right;font-variant-numeric:tabular-nums}
+.rate-unit{font-size:10px;color:var(--muted)}
+.rates-actions{display:flex;justify-content:flex-end;gap:8px;padding:14px 18px;border-top:1px solid var(--border)}
+.rates-actions button{padding:7px 13px;border-radius:5px;border:1px solid var(--border);cursor:pointer;font-weight:700}
+.rates-save{background:var(--blue);color:#fff;border-color:var(--blue)!important}
 
 /* Decision overlay */
 .decision-banner{padding:10px 16px;font-size:13px;font-weight:700;text-align:center}
@@ -193,6 +226,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
   <b>Fortel AI Takeoff</b>
   <span>Review Portal</span>
   <div class="hdr-right">
+    <button class="hdr-button" id="ratesButton" onclick="openRates()">Rates</button>
     <span id="hdr-job" style="font-size:12px;opacity:.7"></span>
   </div>
 </header>
@@ -386,6 +420,25 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 
 </div>
 
+<div class="rates-modal" id="ratesModal" role="dialog" aria-modal="true" aria-labelledby="ratesTitle">
+  <div class="rates-card">
+    <div class="rates-head">
+      <h2 id="ratesTitle">Client-editable rates</h2>
+      <button class="rates-close" onclick="closeRates()" aria-label="Close">×</button>
+    </div>
+    <div class="rates-warning">
+      Rate edits affect new pricing only. Already-generated quotations are not changed.
+    </div>
+    <div class="rates-meta" id="ratesMeta">Loading rates…</div>
+    <div class="rates-grid" id="ratesGrid"></div>
+    <div class="rates-actions">
+      <button onclick="closeRates()">Cancel</button>
+      <button class="rates-save" id="ratesSave" onclick="saveRates()">Save new rates version</button>
+    </div>
+  </div>
+</div>
+
+<div class="build-footer" id="buildFooter">Build … · …</div>
 <div id="toast"></div>
 
 <script>
@@ -438,6 +491,7 @@ let aiPoly = null;        // AI's proposed polygon (pre-loaded), already convert
 // Init
 // ─────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
+  loadBuild();
   loadJobList();
   setInterval(loadJobList, 15000);  // poll every 15s
   // Check URL for job_id param
@@ -445,6 +499,87 @@ window.addEventListener('DOMContentLoaded', () => {
   if (p.get('job')) selectJob(p.get('job'));
   setupButtons();
 });
+
+async function loadBuild() {
+  try {
+    const response = await fetch(`${BASE}/status`);
+    if (!response.ok) throw new Error(`status fetch failed: HTTP ${response.status}`);
+    const status = await response.json();
+    const build = status.build || {};
+    const sha = build.sha && build.sha !== 'unknown' ? String(build.sha).slice(0,7) : 'unknown';
+    document.getElementById('buildFooter').textContent = `Build ${sha} · ${build.date || 'unknown'}`;
+  } catch (error) {
+    document.getElementById('buildFooter').textContent = 'Build unknown · unknown';
+  }
+}
+
+let ratesSnapshot = null;
+const rateInputValue = value => Number(value).toFixed(6).replace(/\.?0+$/, '');
+
+async function openRates() {
+  const modal = document.getElementById('ratesModal');
+  modal.classList.add('open');
+  document.getElementById('ratesMeta').textContent = 'Loading rates…';
+  document.getElementById('ratesGrid').innerHTML = '';
+  try {
+    const response = await fetch(`${BASE}/rates`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    ratesSnapshot = payload;
+    const updated = payload.updated_at ? ` · updated ${payload.updated_at}` : '';
+    document.getElementById('ratesMeta').textContent =
+      `Rates version ${payload.version}${updated} · ${payload.audit_count || 0} audited change(s)`;
+    document.getElementById('ratesGrid').innerHTML = (payload.fields || []).map(field => `
+      <div class="rate-row">
+        <div class="rate-label">
+          <b>${esc(field.label)}</b>
+          <span class="rate-tag ${field.provenance.toLowerCase()}">${esc(field.provenance)}${
+            field.provenance === 'CLIENT-EDITED'
+              ? ` · v${esc(field.version || payload.version)} · ${esc(field.updated_at || payload.updated_at || 'date unknown')}`
+              : ''}</span>
+          ${field.help ? `<div class="rate-help">${esc(field.help)}</div>` : ''}
+        </div>
+        <div class="rate-input-wrap">
+          <input type="number" min="0" step="any" data-rate-key="${esc(field.key)}"
+                 value="${rateInputValue(field.value)}" aria-label="${esc(field.label)}">
+          <span class="rate-unit">${esc(field.unit)}</span>
+        </div>
+      </div>`).join('');
+  } catch (error) {
+    document.getElementById('ratesMeta').textContent = `Could not load rates: ${error.message}`;
+  }
+}
+
+function closeRates() {
+  document.getElementById('ratesModal').classList.remove('open');
+}
+
+async function saveRates() {
+  const saveButton = document.getElementById('ratesSave');
+  const rates = {};
+  for (const input of document.querySelectorAll('[data-rate-key]')) {
+    if (input.value === '' || !Number.isFinite(Number(input.value))) {
+      toast('Every rate must be a valid number', 'error');
+      return;
+    }
+    rates[input.dataset.rateKey] = Number(input.value);
+  }
+  saveButton.disabled = true;
+  try {
+    const response = await fetch(`${BASE}/rates`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({rates})
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    toast(`Rates version ${payload.version} saved`);
+    await openRates();
+  } catch (error) {
+    toast(`Rates not saved: ${error.message}`, 'error');
+  } finally {
+    saveButton.disabled = false;
+  }
+}
 
 // ─────────────────────────────────────────────────
 // Job list

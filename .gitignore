@@ -28,5 +28,7 @@ approval_jobs_archive.json
 approval_jobs_archive.json.tmp*
 approval_jobs.*.json
 approval_jobs.*_archive.json
+client_rates.json
+client_rates.json.tmp*
 training_log.jsonl
 quotations/

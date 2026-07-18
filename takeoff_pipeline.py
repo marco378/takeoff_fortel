@@ -188,7 +188,8 @@ def price_zone(area_m2, depth_mm, conc_rate, mesh, layers, steel_rate_t, margin,
 MANHOLE_EO_RATE = 75.00
 
 
-def manhole_eo_line(manhole_count: int = None, manhole_count_estimate: int = None):
+def manhole_eo_line(manhole_count: int = None, manhole_count_estimate: int = None,
+                    rate: float = MANHOLE_EO_RATE):
     """Build the (desc, qty, unit, rate) E/O BOQ line for manhole details, or (None, False)
     if neither a confirmed count nor an estimate is available. Confirmed counts (from the
     MARKED path's Circle markers) take priority and are NOT marked provisional; an
@@ -197,15 +198,16 @@ def manhole_eo_line(manhole_count: int = None, manhole_count_estimate: int = Non
 
     Returns (line, is_estimate) where line is an (desc, qty, unit, rate) BOQ tuple or None."""
     if manhole_count:
-        return ("E/O for MH details", manhole_count, "Nr", MANHOLE_EO_RATE), False
+        return ("E/O for MH details", manhole_count, "Nr", rate), False
     if manhole_count_estimate:
         return ("E/O for MH details (ESTIMATE — assessor confirm)",
-                manhole_count_estimate, "Nr", MANHOLE_EO_RATE), True
+                manhole_count_estimate, "Nr", rate), True
     return None, False
 
 
 def price_with_defaults(area_m2: float, engineer_spec: dict = None,
-                        manhole_count: int = None, manhole_count_estimate: int = None) -> dict:
+                        manhole_count: int = None, manhole_count_estimate: int = None,
+                        client_rates_path=None) -> dict:
     """
     Price a zone using engineer spec if available, otherwise Fortel defaults.
     Returns a costing dict with area, rate, total, flags, and assumption note.
@@ -220,6 +222,13 @@ def price_with_defaults(area_m2: float, engineer_spec: dict = None,
     always flagged provisional and never silently folded in as if confirmed).
     """
     spec, _ = spec_with_defaults(engineer_spec)
+    # Client-editable values are an overlay on the resolved spec.  The defaults and the
+    # existing rate calculation stay untouched; an absent/empty store returns no provenance
+    # keys so legacy costing output is byte-for-byte unchanged.
+    from client_rates import apply_client_rates
+    spec, manhole_rate, rates_provenance = apply_client_rates(
+        spec, MANHOLE_EO_RATE, path=client_rates_path,
+        manhole_in_scope=bool(manhole_count or manhole_count_estimate))
     # Brief_Spec.xlsx makes the four construction fields independent.  Costing may still
     # use the existing fallback spec, unchanged, but a partial engineer record must remain
     # visibly provisional instead of being promoted to fully confirmed by the legacy
@@ -235,7 +244,8 @@ def price_with_defaults(area_m2: float, engineer_spec: dict = None,
         spec["dpm"], spec["curing"], spec["labour"], spec["trim"])
 
     extras, extra_flags, grand_total = [], [], val
-    line, is_estimate = manhole_eo_line(manhole_count, manhole_count_estimate)
+    line, is_estimate = manhole_eo_line(
+        manhole_count, manhole_count_estimate, rate=manhole_rate)
     if line:
         desc, qty, unit, mrate = line
         mvalue = round(qty * mrate, 2)
@@ -251,7 +261,7 @@ def price_with_defaults(area_m2: float, engineer_spec: dict = None,
             extra_flags.append(f"E/O for MH details: {qty} Nr confirmed manhole markers x "
                                f"£{mrate:.2f} = £{mvalue:,.2f}")
 
-    return {
+    result = {
         "area_m2":         area_m2,
         "rate":            rate,
         "total_gbp":       val,
@@ -262,12 +272,14 @@ def price_with_defaults(area_m2: float, engineer_spec: dict = None,
         "extras":          extras,
         "grand_total_gbp": grand_total,
     }
+    result.update(rates_provenance)
+    return result
 
 
 # ── Main takeoff ──────────────────────────────────────────────────────────────
 
 def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extract_spec=True,
-            project_name: str = None, project_ref: str = None):
+            project_name: str = None, project_ref: str = None, client_rates_path=None):
     """
     vision (optional) = {'regions':[[...]], 'voids':{i:[...]}, 'scale_ref':[[x1,y1],[x2,y2],metres]}
     engineer_spec (optional) = dict from construction-detail drawing (depth_mm, mesh, etc.)
@@ -276,6 +288,7 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                               auto-extract the slab spec before falling back to defaults
     project_name (optional) = human-readable project name e.g. "TSL Agratas Battery Facility"
     project_ref  (optional) = Fortel sequential reference number e.g. "2131"
+    client_rates_path       = optional explicit client_rates.json store (server/test isolation)
     """
     # ── Multi-page tender pack: never assume page 0. Classify every page, rank candidates
     # by router.drawing_priority (external-works/hard-landscaping/construction-thickness
@@ -557,7 +570,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     if r.get("area_m2"):
         costing = price_with_defaults(r["area_m2"], engineer_spec,
                                       manhole_count=r.get("manhole_count"),
-                                      manhole_count_estimate=r.get("manhole_count_estimate"))
+                                      manhole_count_estimate=r.get("manhole_count_estimate"),
+                                      client_rates_path=client_rates_path)
         r["costing"] = costing
         r["flags"] = r["flags"] + costing["flags"]
 

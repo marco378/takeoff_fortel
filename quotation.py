@@ -231,10 +231,19 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
     pipeline_flags = []
     measurements_by_key = OrderedDict()
     drawings = []
+    rates_versions = []
+    rates_updated_at = []
+    client_rate_fields = []
     commercial = dict(commercial or {})
 
     for unit in results:
         costing = unit.get("costing") or {}
+        if costing.get("client_rates_applied"):
+            if isinstance(costing.get("rates_version"), int):
+                rates_versions.append(costing["rates_version"])
+            if costing.get("rates_updated_at"):
+                rates_updated_at.append(str(costing["rates_updated_at"]))
+            client_rate_fields.extend(costing.get("client_rate_fields") or [])
         area = costing.get("area_m2") or unit.get("area_m2") or 0
         spec = costing.get("spec") or {}
         assumed = bool(costing.get("assumed", True))
@@ -490,6 +499,16 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "and require manual assessment by the assessor before issue."
         )
 
+    distinct_rate_versions = sorted(set(rates_versions))
+    distinct_rate_fields = _unique_notes(client_rate_fields)
+    if distinct_rate_versions:
+        version_text = ", ".join(str(version) for version in distinct_rate_versions)
+        field_text = ", ".join(distinct_rate_fields)
+        declarations.append(
+            f"CLIENT-EDITED RATES — rates version {version_text} applied to this pricing"
+            + (f" ({field_text})." if field_text else ".")
+        )
+
     # Documents in the case that have NO measured area yet (e.g. line/hatch office GA plans
     # refused to assessor-trace).  They must be visible in the quotation — a document that
     # silently vanishes from the case output reads as "skipped" (Aryan, 17 Jul).
@@ -510,7 +529,7 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
     perimeter_measurements = [m for m in measurements if m["description"] == "Slab perimeter"]
     total_perimeter = (round(sum(float(m["qty"]) for m in perimeter_measurements), 1)
                        if perimeter_measurements else None)
-    return {
+    quotation = {
         "ref": ref, "date": today, "project": project, "client": client,
         "drawing": ", ".join(drawings), "drawings": drawings,
         "drawing_type": results[0].get("type", ""),
@@ -541,6 +560,16 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         "market_warning": commercial.get("market_warning") or "",
         "commercial_terms": list(commercial.get("terms") or []),
     }
+    if distinct_rate_versions:
+        quotation.update({
+            "rates_version": (distinct_rate_versions[0] if len(distinct_rate_versions) == 1
+                              else distinct_rate_versions[-1]),
+            "rates_versions": distinct_rate_versions,
+            "rates_updated_at": max(rates_updated_at) if rates_updated_at else None,
+            "client_rate_fields": distinct_rate_fields,
+            "client_rates_applied": True,
+        })
+    return quotation
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
@@ -807,6 +836,11 @@ def quotation_xlsx(q: dict) -> bytes:
     ws["A3"] = _excel_text(f"Date: {_date_text(q.get('date'))}")
     ws["B3"] = _excel_text(q.get("joint_details_note") or "")
     ws["A4"] = _excel_text(f"Rev: {q.get('revision') or q.get('ref') or '—'}")
+    if q.get("client_rates_applied"):
+        ws["D1"] = _excel_text(f"Client-edited rates version: {q.get('rates_version')}")
+        ws["D2"] = _excel_text(f"Rates date: {q.get('rates_updated_at') or '—'}")
+        ws["D1"].font = Font(name="Arial", size=9, bold=True)
+        ws["D2"].font = Font(name="Arial", size=9)
     ws.merge_cells("D4:E4")
     drawings = q.get("drawings") or []
     ws["A5"] = _excel_text(

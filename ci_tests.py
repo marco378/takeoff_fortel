@@ -691,6 +691,98 @@ ck("approval trigger on assessor flag",
 ck("no approval trigger on clean marked",
    not _needs_approval({"type":"MARKED vector","confidence":"high","flags":[]}))
 
+print("client-editable rate override layer — defaults untouched, versioned/audited, quotation-stamped")
+try:
+    import hashlib as _hashlib_rates
+    import tempfile as _tempfile_rates
+    import json as _json_rates
+    from client_rates import (apply_client_rates as _apply_client_rates_test,
+                              load_rate_store as _load_rate_store_test,
+                              save_client_rates as _save_client_rates_test)
+    from defaults import DEFAULT_SPEC as _DEFAULT_SPEC_RATES
+    from takeoff_pipeline import MANHOLE_EO_RATE as _MANHOLE_RATE_DEFAULT
+
+    _rates_tmpdir = Path(_tempfile_rates.mkdtemp(prefix="ci_client_rates_"))
+    _rates_path = _rates_tmpdir / "client_rates.json"
+    _rate_defaults = {
+        key: _DEFAULT_SPEC_RATES[key]
+        for key in ("conc_rate", "steel_rate_t", "margin", "labour", "dpm", "curing",
+                    "trim", "conc_wastage", "steel_wastage", "lap_acc")
+    }
+    _rate_defaults["manhole_eo_rate"] = _MANHOLE_RATE_DEFAULT
+    try:
+        _legacy_costing = price_with_defaults(26080, client_rates_path=_rates_path)
+        _legacy_bytes = _json_rates.dumps(
+            _legacy_costing, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        ck("absent client_rates.json keeps the complete legacy costing byte-identical",
+           _hashlib_rates.sha256(_legacy_bytes).hexdigest() ==
+           "38194af48023162689f095a4372d6293e7d4d0db87a71415b703ed576d0bab50" and
+           "rates_version" not in _legacy_costing and
+           "client_rates_applied" not in _legacy_costing)
+
+        _edited_concrete = _rate_defaults["conc_rate"] * 1.01
+        _edited_manhole = _rate_defaults["manhole_eo_rate"] * 1.01
+        _saved_rates, _rate_changes = _save_client_rates_test(
+            {"conc_rate": _edited_concrete, "manhole_eo_rate": _edited_manhole},
+            _rate_defaults, path=_rates_path, who="assessor-token-authenticated",
+            when="2026-07-18T10:00:00+00:00",
+        )
+        ck("first client-rates save creates version 1 and one audit row per changed field",
+           _saved_rates["version"] == 1 and len(_saved_rates["audit"]) == 2 and
+           {entry["field"] for entry in _saved_rates["audit"]} ==
+           {"conc_rate", "manhole_eo_rate"})
+        _audit_concrete = next(entry for entry in _saved_rates["audit"]
+                               if entry["field"] == "conc_rate")
+        ck("client-rates audit records authenticated assessor + exact old -> new",
+           _audit_concrete["who"] == "assessor-token-authenticated" and
+           _audit_concrete["old"] == _rate_defaults["conc_rate"] and
+           _audit_concrete["new"] == _edited_concrete)
+
+        _overridden_costing = price_with_defaults(
+            26080, manhole_count=2, client_rates_path=_rates_path)
+        ck("override changes only fresh pricing and carries rates provenance",
+           _overridden_costing["rate"] != _legacy_costing["rate"] and
+           _overridden_costing["total_gbp"] != _legacy_costing["total_gbp"] and
+           _overridden_costing["rates_version"] == 1 and
+           _overridden_costing["client_rates_applied"] is True)
+        ck("manhole E/O uses the client override without changing its built-in rate",
+           _overridden_costing["extras"][0]["rate"] == _edited_manhole and
+           _MANHOLE_RATE_DEFAULT == _rate_defaults["manhole_eo_rate"])
+
+        _rates_quote_result = {
+            "file": "Fresh-Rates.pdf", "area_m2": 26080,
+            "quotation_section": "External yard slabs",
+            "costing": _overridden_costing, "flags": [],
+        }
+        _rates_quote = generate_quotation(
+            _rates_quote_result, project="Rates Test", client="Fortel", ref="RATE-001")
+        ck("fresh quotation records rates_version + CLIENT-EDITED provenance declaration",
+           _rates_quote.get("rates_version") == 1 and
+           _rates_quote.get("client_rates_applied") is True and
+           any("CLIENT-EDITED RATES" in note and "version 1" in note
+               for note in _rates_quote["declarations"]))
+        ck("client-rate provenance is visible in text, HTML and JSON quotation outputs",
+           all("CLIENT-EDITED RATES" in output for output in (
+               quotation_text(_rates_quote), quotation_html(_rates_quote),
+               quotation_json(_rates_quote))))
+        _rates_book = _load_workbook(
+            _BytesIO(quotation_xlsx(_rates_quote)), data_only=False)["REV_01"]
+        ck("xlsx header records the applied client-rates version",
+           _rates_book["D1"].value == "Client-edited rates version: 1")
+
+        _rates_path.unlink()
+        _restored_costing = price_with_defaults(26080, client_rates_path=_rates_path)
+        _restored_bytes = _json_rates.dumps(
+            _restored_costing, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        ck("removing client_rates.json restores the exact default output",
+           _restored_bytes == _legacy_bytes and not _rates_path.exists())
+    finally:
+        shutil.rmtree(_rates_tmpdir, ignore_errors=True)
+except (ImportError, OSError, ValueError) as _e:
+    ck("client-editable rate override layer imports and runs", False, _e)
+
 print("spec extractor — supplier fields")
 from spec_extractor import extract_spec_from_text
 _s5 = extract_spec_from_text("20mm crushed aggregate, 0.45 w/c ratio, S3 slump, air-entrained")
@@ -2180,6 +2272,97 @@ try:
         shutil.rmtree(_tmpdir6, ignore_errors=True)
 except ImportError as _e:
     print(f"  [SKIP] approval_server auth-gate tests — missing dependency: {_e}")
+
+print("approval_server: token-gated rates API + build visibility")
+try:
+    import approval_server as _AS_rates
+    import tempfile as _tempfile_rates_api
+    import inspect as _inspect_rates_api
+    import os as _os_rates_api
+    import client_rates as _client_rates_api
+    from unittest import mock as _mock_rates_api
+
+    _rates_api_tmpdir = Path(_tempfile_rates_api.mkdtemp(prefix="ci_rates_api_"))
+    _orig_rates_file_api = _AS_rates.CLIENT_RATES_FILE
+    _orig_token_rates_api = _AS_rates.APPROVAL_TOKEN
+    _AS_rates.CLIENT_RATES_FILE = _rates_api_tmpdir / "client_rates.json"
+    _AS_rates.APPROVAL_TOKEN = "test-rates-token"
+    try:
+        _app_rates = _AS_rates.app
+        _app_rates.testing = True
+        _client_rates_http = _app_rates.test_client()
+
+        _unauth_rates = _client_rates_http.get("/rates")
+        ck("rates endpoint is protected by the existing portal token gate",
+           _unauth_rates.status_code == 401, _unauth_rates.status_code)
+        _headers_rates = {"Authorization": "Bearer test-rates-token"}
+        _get_rates = _client_rates_http.get("/rates", headers=_headers_rates)
+        _get_rates_json = _get_rates.get_json() or {}
+        ck("GET /rates returns every effective field as DEFAULT at version 0",
+           _get_rates.status_code == 200 and _get_rates_json.get("version") == 0 and
+           len(_get_rates_json.get("fields") or []) == len(_client_rates_api.RATE_FIELDS) and
+           all(field.get("provenance") == "DEFAULT"
+               for field in _get_rates_json.get("fields") or []))
+
+        _api_defaults = _AS_rates._client_rate_defaults()
+        _new_labour = _api_defaults["labour"] * 1.01
+        _post_rates_1 = _client_rates_http.post(
+            "/rates", headers=_headers_rates, json={"rates": {"labour": _new_labour}})
+        ck("POST /rates saves version 1 with CLIENT-EDITED provenance",
+           _post_rates_1.status_code == 200 and
+           _post_rates_1.get_json().get("version") == 1 and
+           next(field for field in _post_rates_1.get_json()["fields"]
+                if field["key"] == "labour")["provenance"] == "CLIENT-EDITED")
+        _server_fresh_costing = _AS_rates._run_costing(100, {})
+        ck("approval/adjust fresh-costing path applies the same saved rates version",
+           _server_fresh_costing.get("client_rates_applied") is True and
+           _server_fresh_costing.get("rates_version") == 1 and
+           _server_fresh_costing["rate"] != price_with_defaults(
+               100, client_rates_path=_rates_api_tmpdir / "absent.json")["rate"])
+
+        _post_rates_2 = _client_rates_http.post(
+            "/rates", headers=_headers_rates,
+            json={"rates": {"labour": _api_defaults["labour"]}})
+        _stored_rates_api = _client_rates_api.load_rate_store(_AS_rates.CLIENT_RATES_FILE)
+        ck("each actual save bumps version and restoring a default removes its override",
+           _post_rates_2.status_code == 200 and
+           _post_rates_2.get_json().get("version") == 2 and
+           "labour" not in _stored_rates_api["overrides"] and
+           len(_stored_rates_api["audit"]) == 2)
+        ck("rates writes use same-filesystem os.replace atomic replacement",
+           "os.replace(tmp, path)" in _inspect_rates_api.getsource(
+               _client_rates_api.save_client_rates))
+
+        _status_build = _client_rates_http.get("/status")
+        _status_build_json = _status_build.get_json() or {}
+        ck("/status carries build sha + date and remains health-check accessible",
+           _status_build.status_code == 200 and
+           set((_status_build_json.get("build") or {})) == {"sha", "date"} and
+           bool(_status_build_json["build"]["sha"]) and bool(_status_build_json["build"]["date"]))
+        with _mock_rates_api.patch.dict(
+                _os_rates_api.environ,
+                {"RAILWAY_GIT_COMMIT_SHA": "", "RAILWAY_GIT_COMMIT_DATE": ""}), \
+                _mock_rates_api.patch("subprocess.run", side_effect=FileNotFoundError("no git")):
+            _no_git_build = _AS_rates._detect_build_info()
+        ck("build detection never crashes when Railway env and git metadata are absent",
+           _no_git_build == {"sha": "unknown", "date": "unknown"}, _no_git_build)
+
+        _portal_source_rates = Path("assessor_portal.html").read_text()
+        ck("portal contains Rates panel, new-pricing warning, and fixed build footer",
+           all(marker in _portal_source_rates for marker in (
+               'id="ratesModal"', "field.provenance", ".rate-tag.client-edited",
+               "new pricing only",
+               'id="buildFooter"', "loadBuild()", "fetch(`${BASE}/rates`)")))
+        _login_build_html = _AS_rates._portal_login_page()
+        ck("login page also shows the build footer without exposing the token",
+           'id="buildFooter"' in _login_build_html and "Build " in _login_build_html and
+           "test-rates-token" not in _login_build_html)
+    finally:
+        _AS_rates.CLIENT_RATES_FILE = _orig_rates_file_api
+        _AS_rates.APPROVAL_TOKEN = _orig_token_rates_api
+        shutil.rmtree(_rates_api_tmpdir, ignore_errors=True)
+except (ImportError, OSError, ValueError, StopIteration) as _e:
+    ck("rates API and build visibility tests import and run", False, _e)
 
 print("approval_server: /portal login form (no-token case posts a code instead of a bare 401)")
 try:
