@@ -62,7 +62,9 @@ _office_detected = _office_candidates(_office_pdf, scale_k=0.1, scale_verified=T
 _office_by_level = {candidate["level"]: candidate
                     for candidate in _office_detected["candidate_polygons"]}
 ck("closed vector plates become one assisted candidate per labelled level",
-   set(_office_by_level) == {0, 1, 2} and len(_office_by_level) == 3,
+   set(_office_by_level) == {0, 1, 2} and len(_office_by_level) == 3 and
+   all(candidate["outline_status"] == "resolved"
+       for candidate in _office_detected["candidate_polygons"]),
    _office_detected)
 ck("Level 00 maps to ground and upper levels stay separate",
    _office_by_level[0]["category"] == "ground_floor" and
@@ -70,8 +72,34 @@ ck("Level 00 maps to ground and upper levels stay separate",
 ck("candidate records are geometry-only tracing aids",
    all("area_m2" not in candidate and
        candidate["coordinate_space"] == "rotated_pdf_points" and
-       candidate["confidence"] == "low"
+       candidate["confidence"] in {"low", "medium"} and
+       candidate.get("confidence_reasons")
        for candidate in _office_detected["candidate_polygons"]))
+from office_candidates import _dedupe_iou as _office_dedupe_iou
+from shapely.geometry import box as _office_box
+_iou_records = _office_dedupe_iou([
+    {"geometry": _office_box(0, 0, 100, 100), "source": "office-vector-closed-loop"},
+    {"geometry": _office_box(1, 1, 101, 101), "source": "office-vector-white-fill-loop"},
+    # Same area but disjoint: an area-only deduper would incorrectly remove this core.
+    {"geometry": _office_box(200, 0, 300, 100), "source": "office-vector-closed-loop"},
+])
+ck("office loop dedupe uses IoU and preserves equal-area disjoint regions",
+   len(_iou_records) == 2)
+
+_office_unresolved_pdf = "/tmp/_office_candidates_unresolved.pdf"
+_office_unresolved_canvas = canvas.Canvas(_office_unresolved_pdf, pagesize=(900, 500))
+_office_unresolved_canvas.drawString(60, 190, "Office Plan Level 00")
+_office_unresolved_canvas.drawString(340, 190, "Office Plan Level 01")
+_office_unresolved_canvas.save()
+_office_unresolved = _office_candidates(
+    _office_unresolved_pdf, scale_k=0.1, scale_verified=True)
+ck("detected level without a defensible outline is reported, never dropped",
+   [candidate["level"] for candidate in _office_unresolved["candidate_polygons"]] == [0, 1] and
+   all(candidate["outline_status"] == "unresolved"
+       for candidate in _office_unresolved["candidate_polygons"]) and
+   any("level detected but outline not resolved — trace manually" in flag
+       for flag in _office_unresolved["flags"]),
+   _office_unresolved)
 
 print("pricing")
 r, _ = slab_rate({"depth_mm":190,"conc_rate":128,"mesh":"A252","layers":1,"steel_rate_t":850,"margin":0.11})
@@ -649,27 +677,49 @@ try:
 
         _assisted = _pipeline_takeoff_office(
             str(_stripped_path), send_approval=False, auto_extract_spec=False)
+        _candidate_levels = [
+            candidate["level"] for candidate in _assisted.get("candidate_polygons", [])
+        ]
+        with _fitz_zones.open(_stripped_path) as _office_title_doc:
+            from office_candidates import _level_titles as _office_level_titles
+            _expected_levels = sorted(
+                title["level"] for title in _office_level_titles(_office_title_doc[0]))
+        ck(f"every Office level appears exactly once (no duplicate rows): {_marked_path.name}",
+           sorted(_candidate_levels) == _expected_levels and
+           len(_candidate_levels) == len(set(_candidate_levels)),
+           {"expected": _expected_levels, "actual": _candidate_levels})
+
         _level_areas = {}
         for _candidate in _assisted.get("candidate_polygons", []):
-            _candidate_area, _ = measure_regions(
-                [_candidate["polygon_pts"]], _assisted["scale_k"])
+            _candidate_area = 0.0
+            _regions = _candidate.get("regions") or [_candidate.get("polygon_pts", [])]
+            _region_holes = _candidate.get("region_holes") or [[] for _ in _regions]
+            for _region_index, _region in enumerate(_regions):
+                if len(_region) < 3:
+                    continue
+                _region_area, _ = measure_regions(
+                    [_region], _assisted["scale_k"],
+                    holes={0: _region_holes[_region_index]})
+                _candidate_area += _region_area
             _level = _candidate["level"]
-            _level_areas[_level] = max(_level_areas.get(_level, 0), _candidate_area)
+            _level_areas[_level] = _candidate_area
         _detected_total = round(sum(_level_areas.values()), 2)
         _markup_total = _read_marked_zones(str(_marked_path))["area_m2"]
         _boq_total = _office_gold[str(_marked_path)]["net_m2"]
         _delta_pct = (_detected_total - _markup_total) / _markup_total * 100
         _outside_gate.append(abs(_delta_pct) > 5)
-        ck(f"Office auto gate fails safely (assisted trace only): {_marked_path.name}",
-           abs(_delta_pct) > 5 and _assisted.get("area_m2") is None and
+        ck(f"Office candidates remain assisted geometry only: {_marked_path.name}",
+           _assisted.get("area_m2") is None and
            _assisted.get("measurement_state") == "UNMEASURED" and
            _assisted.get("needs_assessor") is True and
            _assisted.get("costing") is None and _assisted.get("polygon_pts") is None and
-           bool(_assisted.get("candidate_polygons")),
-           {"detected": _detected_total, "markup": _markup_total,
+           bool(_assisted.get("candidate_polygons")) and
+           all("area_m2" not in candidate
+               for candidate in _assisted.get("candidate_polygons", [])),
+           {"diagnostic_candidate_total": _detected_total, "markup": _markup_total,
             "boq": _boq_total, "delta_pct": round(_delta_pct, 2)})
-    ck("all four Office units miss the 5% auto-measure bar — no silent number shipped",
-       len(_outside_gate) == 4 and all(_outside_gate), _outside_gate)
+    ck("Office auto-measure bar remains closed unless every unit is within 5%",
+       len(_outside_gate) == 4 and any(_outside_gate), _outside_gate)
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
 
@@ -1777,10 +1827,14 @@ try:
                "Add to trace", "btnNewRegion", "traceRegions")) and
            "function loadTraceCandidate" in _portal_html_up and
            "regions: regionPayload" in _portal_html_up)
+        ck("portal explains candidate confidence and keeps unresolved levels visible",
+           all(marker in _portal_html_up for marker in (
+               "confidence_reasons", "confidence_score", "outline_status",
+               "Trace manually", "candidate.regions")))
         _candidate_fn = _portal_html_up.split("function loadTraceCandidate", 1)[1].split(
             "function calcArea", 1)[0]
         ck("one-click candidate load is non-mutating until Submit Adjustment",
-           "fetch(" not in _candidate_fn and "poly = candidate.points" in _candidate_fn)
+           "fetch(" not in _candidate_fn and "poly = regions[0]" in _candidate_fn)
     finally:
         _AS.threading.Thread = _orig_thread_up
         _AS.__file__ = _orig_server_file_up

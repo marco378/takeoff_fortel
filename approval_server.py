@@ -101,6 +101,13 @@ def _detect_build_info() -> dict:
     except Exception:
         # Railway images may intentionally omit .git. The env SHA still remains useful.
         pass
+    if sha and not date:
+        # Observed on the live Railway deploy: RAILWAY_GIT_COMMIT_SHA is set but
+        # RAILWAY_GIT_COMMIT_DATE is not, and the image has no .git — so the footer read
+        # "Build 435bbdd · unknown". Fall back to this process's start time, labelled as a
+        # deploy time (honest: it is when this build started serving, not when it was
+        # committed) so the footer always answers "how fresh is what I'm looking at".
+        date = f"deployed {datetime.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M %Z')}"
     return {"sha": sha or "unknown", "date": date or "unknown"}
 
 
