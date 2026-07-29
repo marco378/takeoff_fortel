@@ -483,7 +483,13 @@ def score_drawing(*, marked_path: Path, raw_label: str, raw_mode: str,
 
     pipeline = pipeline_run["payload"]
     state = pipeline.get("measurement_state") or pipeline.get("status") or "UNKNOWN"
-    measured = pipeline.get("area_m2")
+    # Raw external takeoff keeps its historic top-level area_m2 as the service-yard
+    # quantity so existing golds and Yard pricing do not change.  Once zones are
+    # available, their explicit mutually-exclusive total is the like-for-like
+    # comparison with read_marked_zones()' all-area truth.
+    measured = pipeline.get("zones_total_area_m2")
+    if not _is_number(measured):
+        measured = pipeline.get("area_m2")
     measured = float(measured) if _is_number(measured) else None
     delta = signed_delta_pct(measured, truth["area_m2"])
     zones = _compare_zones(truth, pipeline, tolerance_pct)

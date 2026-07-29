@@ -107,6 +107,279 @@ PLAUSIBLE_MIN_M2 = 200
 PLAUSIBLE_MAX_M2 = 50_000
 
 
+def _axis_segments(page):
+    """Yield axis-aligned vector segments in PDF-point space.
+
+    ``grey`` identifies the light-grey wall / dock-door construction lines used by the
+    raw Castle Donington external drawings.  It is deliberately only an evidence
+    discriminator: quantities still come from the segment geometry and verified scale.
+    """
+    for drawing in page.get_drawings():
+        colours = [drawing.get("color"), drawing.get("fill")]
+        grey_tones = [
+            sum(colour) / len(colour) * 255
+            for colour in colours
+            if (
+                colour
+                and max(colour) - min(colour) <= 0.04
+                and 0.55 <= sum(colour) / len(colour) <= 0.99
+            )
+        ]
+        grey = bool(grey_tones)
+        for item in drawing["items"]:
+            segments = []
+            if item[0] == "l":
+                segments = [(item[1], item[2])]
+            elif item[0] == "re":
+                rect = item[1]
+                segments = [
+                    (fitz.Point(rect.x0, rect.y0), fitz.Point(rect.x1, rect.y0)),
+                    (fitz.Point(rect.x1, rect.y0), fitz.Point(rect.x1, rect.y1)),
+                    (fitz.Point(rect.x1, rect.y1), fitz.Point(rect.x0, rect.y1)),
+                    (fitz.Point(rect.x0, rect.y1), fitz.Point(rect.x0, rect.y0)),
+                ]
+            for start, end in segments:
+                dx, dy = abs(end.x - start.x), abs(end.y - start.y)
+                if min(dx, dy) > 0.05 or max(dx, dy) <= 0.05:
+                    continue
+                if dx > dy:
+                    yield {
+                        "orientation": "H",
+                        "a0": min(start.x, end.x),
+                        "a1": max(start.x, end.x),
+                        "p0": min(start.y, end.y),
+                        "p1": max(start.y, end.y),
+                        "grey": grey,
+                        "grey_tones": grey_tones,
+                    }
+                else:
+                    yield {
+                        "orientation": "V",
+                        "a0": min(start.y, end.y),
+                        "a1": max(start.y, end.y),
+                        "p0": min(start.x, end.x),
+                        "p1": max(start.x, end.x),
+                        "grey": grey,
+                        "grey_tones": grey_tones,
+                    }
+
+
+def detect_raw_dock_zone(pdf, k, S=2.0, target_rgb=(214, 214, 214)):
+    """Measure a raw external dock only when its native CAD geometry is unambiguous.
+
+    Evidence from all four client-marked Castle Donington externals:
+    - the pink/yellow presentation is a Bluebeam annotation overlay and disappears from a
+      true raw upload;
+    - the raw CAD retains a repeated, light-grey dock-door/reveal family running along the
+      loading face;
+    - that family is adjacent to the segmented yard on exactly one side and a continuous
+      wall segment bounds the same run.
+
+    The detector requires all three signals.  It never uses a fixed dock area or a drawing
+    filename.  If any signal is absent/ambiguous it returns no quantity so the caller can
+    retain the yard measurement and ask the assessor to classify/trace the dock.
+    """
+    doc = fitz.open(pdf)
+    try:
+        segments = list(_axis_segments(doc[0]))
+    finally:
+        doc.close()
+
+    families = {}
+    for segment in segments:
+        if not segment["grey"]:
+            continue
+        depth_m = (segment["a1"] - segment["a0"]) * k
+        # The proven dock-door/reveal family is approximately 3.11 m deep in every
+        # client fixture. This is an identity/plausibility band, not an assumed area:
+        # the emitted quantity is reconstructed from each sheet's actual vectors.
+        if not (2.5 <= depth_m <= 3.7):
+            continue
+        key = (
+            segment["orientation"],
+            round(segment["a0"], 1),
+            round(segment["a1"], 1),
+        )
+        family = families.setdefault(key, {
+            "orientation": segment["orientation"],
+            "a0": segment["a0"],
+            "a1": segment["a1"],
+            "positions": set(),
+        })
+        family["positions"].add(round((segment["p0"] + segment["p1"]) / 2, 2))
+
+    candidates = []
+    evidence_seen = False
+    for family in families.values():
+        positions = sorted(family["positions"])
+        if len(positions) < 8:
+            continue
+        face0, face1 = positions[0], positions[-1]
+        face_span_m = (face1 - face0) * k
+        if face_span_m < 20:
+            continue
+        evidence_seen = True
+
+        # The door/reveal segments terminate at the continuous loading-face wall on one
+        # end only. This remains available on Unit 1 where loading-bay recesses leave no
+        # solid yard-mask pixels immediately outside the wall.
+        wall_orientation = "V" if family["orientation"] == "H" else "H"
+        end_walls = []
+        for end_edge in (family["a0"], family["a1"]):
+            options = []
+            for segment in segments:
+                if segment["orientation"] != wall_orientation:
+                    continue
+                wall_length = segment["a1"] - segment["a0"]
+                ratio = wall_length / max(face1 - face0, 1e-9)
+                wall_coordinate = (segment["p0"] + segment["p1"]) / 2
+                distance_m = abs(wall_coordinate - end_edge) * k
+                if 0.8 <= ratio <= 1.7 and distance_m <= 1.5:
+                    options.append(distance_m)
+            end_walls.append(min(options) if options else None)
+        if end_walls[0] is None and end_walls[1] is None:
+            continue
+        if end_walls[1] is None or (
+                end_walls[0] is not None and end_walls[0] + 0.15 < end_walls[1]):
+            near_edge, far_edge, direction = family["a0"], family["a1"], -1
+        elif end_walls[0] is None or end_walls[1] + 0.15 < end_walls[0]:
+            near_edge, far_edge, direction = family["a1"], family["a0"], +1
+        else:
+            # A long wall is equally close to both ends: identity is ambiguous.
+            continue
+
+        # Locate the full yard-hatch boundary on the identified side. The longest
+        # matching-grey vector there is the outer loading-face datum; using the first
+        # raster pixel is unsafe because loading-bay recesses are intentionally white.
+        target_grey = sum(target_rgb) / len(target_rgb)
+        boundary_options = []
+        for segment in segments:
+            if segment["orientation"] != wall_orientation or not segment["grey_tones"]:
+                continue
+            boundary_coordinate = (segment["p0"] + segment["p1"]) / 2
+            signed_distance_m = (boundary_coordinate - near_edge) * direction * k
+            segment_length_m = (segment["a1"] - segment["a0"]) * k
+            if not (0.05 <= signed_distance_m <= 1.0):
+                continue
+            if segment_length_m < 0.8 * face_span_m:
+                continue
+            if min(abs(tone - target_grey) for tone in segment["grey_tones"]) > 14:
+                continue
+            boundary_options.append((segment_length_m, boundary_coordinate))
+        if not boundary_options:
+            continue
+        _, yard_boundary = max(boundary_options, key=lambda option: option[0])
+        gap_pt = abs(yard_boundary - near_edge)
+
+        # The local continuous loading-face wall supplies the dock run; repeated door
+        # positions intentionally do not, because end bays have margins.
+        wall_options = []
+        for segment in segments:
+            if segment["orientation"] != wall_orientation:
+                continue
+            wall_length = segment["a1"] - segment["a0"]
+            ratio = wall_length / max(face1 - face0, 1e-9)
+            wall_coordinate = (segment["p0"] + segment["p1"]) / 2
+            distance_m = abs(wall_coordinate - yard_boundary) * k
+            if not (0.8 <= ratio <= 1.5 and distance_m <= 1.5):
+                continue
+            score = distance_m + abs(ratio - 1.05)
+            wall_options.append((score, segment, wall_coordinate))
+        if not wall_options:
+            continue
+        _, wall, wall_coordinate = min(wall_options, key=lambda option: option[0])
+
+        dock_depth_pt = abs(far_edge - near_edge) + 2 * gap_pt
+        dock_depth_m = dock_depth_pt * k
+        wall_length_m = (wall["a1"] - wall["a0"]) * k
+        if not (3.4 <= dock_depth_m <= 4.6 and wall_length_m >= 20):
+            continue
+
+        dock_far = far_edge - direction * gap_pt
+        if family["orientation"] == "H":
+            polygon = [
+                [yard_boundary, wall["a0"]],
+                [dock_far, wall["a0"]],
+                [dock_far, wall["a1"]],
+                [yard_boundary, wall["a1"]],
+            ]
+        else:
+            polygon = [
+                [wall["a0"], yard_boundary],
+                [wall["a1"], yard_boundary],
+                [wall["a1"], dock_far],
+                [wall["a0"], dock_far],
+            ]
+        area_m2 = wall_length_m * dock_depth_m
+        candidates.append({
+            "area_m2": round(area_m2, 1),
+            "polygon_pts": [[round(x, 2), round(y, 2)] for x, y in polygon],
+            "door_segment_count": len(positions),
+            "door_depth_m": round(abs(far_edge - near_edge) * k, 3),
+            "dock_depth_m": round(dock_depth_m, 3),
+            "loading_face_lm": round(wall_length_m, 2),
+            "score": len(positions) * wall_length_m,
+        })
+
+    # Stroke and fill paths describe the same door family independently. Collapse only
+    # near-identical rectangles; genuinely separate candidates remain an assessor decision.
+    deduped = []
+    for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
+        points = candidate["polygon_pts"]
+        box = (
+            min(point[0] for point in points), min(point[1] for point in points),
+            max(point[0] for point in points), max(point[1] for point in points),
+        )
+        duplicate = False
+        for kept in deduped:
+            kept_points = kept["polygon_pts"]
+            kept_box = (
+                min(point[0] for point in kept_points), min(point[1] for point in kept_points),
+                max(point[0] for point in kept_points), max(point[1] for point in kept_points),
+            )
+            ix = max(0.0, min(box[2], kept_box[2]) - max(box[0], kept_box[0]))
+            iy = max(0.0, min(box[3], kept_box[3]) - max(box[1], kept_box[1]))
+            intersection = ix * iy
+            union = (
+                (box[2] - box[0]) * (box[3] - box[1])
+                + (kept_box[2] - kept_box[0]) * (kept_box[3] - kept_box[1])
+                - intersection
+            )
+            if union > 0 and intersection / union >= 0.8:
+                duplicate = True
+                break
+        if not duplicate:
+            deduped.append(candidate)
+
+    if len(deduped) != 1:
+        return {
+            "zone": None,
+            "evidence_seen": evidence_seen,
+            "reason": (
+                "no unique repeated dock-door family adjacent to the yard"
+                if not deduped
+                else f"{len(deduped)} competing dock-door families"
+            ),
+        }
+
+    chosen = deduped[0]
+    zone = {
+        "zone_key": "dock",
+        "category": "dock",
+        "subjects": ["Dock slab"],
+        "measurement_kind": "area",
+        "area_m2": chosen["area_m2"],
+        "length_lm": None,
+        "perimeter_lm": None,
+        "annotation_count": 0,
+        "cutout_count": 0,
+        "classification_source": "raw CAD dock-door family adjacent to yard hatch",
+        "needs_assessor": False,
+        "polygon_pts": chosen["polygon_pts"],
+    }
+    return {"zone": zone, "diagnostics": chosen, "evidence_seen": True}
+
+
 def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
                   title_block_frac=0.0, exclude_border=True, _diag=None):
     """Best-plausible connected region of the concrete-yard hatch.
@@ -499,6 +772,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     GREY_TOL = 14
     rgb = GREY_FALLBACK
     swatch_locked = False
+    region_confidence = None
     swatch, label = find_concrete_swatch_rgb(pdf, im=im, S=S)
     legend_found = bool(label)   # True in both label branches below; False only in the no-legend else
     if label and swatch:
@@ -514,11 +788,13 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                          f"±{GREY_TOL} (other grey surfaces, e.g. 'Footpaths (ancillary): Concrete', "
                          f"fall outside the locked band and are excluded)")
         else:
+            region_confidence = "low"
             flags.append(f"legend '{label}' found but swatch {swatch} not grey — using SGP grey convention "
                          f"{GREY_FALLBACK} (lower confidence; assessor confirm)")
     elif label:
         flags.append(f"legend '{label}' found (swatch unreadable) — using SGP grey convention {GREY_FALLBACK}")
     else:
+        region_confidence = "low"
         flags.append(f"no concrete-yard legend label — grey-hatch heuristic {GREY_FALLBACK} (LOW confidence; assessor confirm)")
     if use_api:
         try:
@@ -554,6 +830,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             flags.append(f"swatch-locked band {swatch}±{GREY_TOL} produced no plausible yard region "
                          f"(candidate {cand_m2:.0f} m²) — FELL BACK to validated SGP grey band "
                          f"{GREY_FALLBACK}±{GREY_TOL}; assessor confirm region colour")
+            region_confidence = "low"
             rgb = GREY_FALLBACK
             _seg_diag = {}
             comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S, _diag=_seg_diag)
@@ -562,7 +839,24 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         return {"pdf": pdf, "area_m2": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "flags": flags + ["no hatch pixels matched — assessor must trace"]}
-    px = int(comp.sum())
+
+    # --- zone-aware raw external measurement ----------------------------------------------
+    # Yard remains the proven legend-swatch segmentation. Dock is added only when native
+    # loading-face CAD geometry passes detect_raw_dock_zone's three-signal gate.
+    dock_detection = detect_raw_dock_zone(pdf, k, S=S, target_rgb=rgb)
+    dock_zone = dock_detection.get("zone")
+    yard_comp = comp
+    overlap_m2 = 0.0
+    if dock_zone:
+        dock_mask = np.zeros_like(comp, dtype=np.uint8)
+        dock_points = np.asarray(dock_zone["polygon_pts"], dtype=float)
+        dock_points = np.rint(dock_points * S).astype(np.int32)
+        cv2.fillPoly(dock_mask, [dock_points], 1)
+        overlap_px = int((comp & dock_mask.astype(bool)).sum())
+        if overlap_px:
+            yard_comp = comp & ~dock_mask.astype(bool)
+            overlap_m2 = overlap_px * (1.0 / S) ** 2 * k * k
+    px = int(yard_comp.sum())
 
     # --- confidence cross-check: dominant grey value of the chosen component vs the band centre
     # actually used to select it (cheap sanity signal for the assessor, no behaviour change). ---
@@ -586,7 +880,71 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                      f"sheet-frame/border strip + {_seg_diag.get('excluded_satellite_m2', 0)} m² legend/satellite "
                      f"chip(s)) — not part of the measured yard region")
 
-    area = round(px * (1.0 / S) ** 2 * k * k, 0)
+    yard_area = round(px * (1.0 / S) ** 2 * k * k, 0)
+    zones = [{
+        "zone_key": "external_yard",
+        "category": "external_yard",
+        "subjects": [label or "Concrete Service Yard construction"],
+        "measurement_kind": "area",
+        "area_m2": yard_area,
+        "length_lm": None,
+        "perimeter_lm": None,
+        "annotation_count": 0,
+        "cutout_count": 0,
+        "classification_source": "legend-swatch colour segmentation",
+        "needs_assessor": region_confidence == "low",
+    }]
+    # Preserve the historic top-level area_m2 contract: on this raw path it is the
+    # grey service-yard quantity (and is what the pre-zone golds validate).  The
+    # explicit zone total below is what new zone-aware consumers compare with a
+    # marked drawing's all-area total.  In particular, Dock must never inherit the
+    # Yard rate merely because it was added to a top-level priced quantity.
+    area = yard_area
+    zones_total_area = yard_area
+    if dock_zone:
+        zones.append(dock_zone)
+        dock_diag = dock_detection["diagnostics"]
+        zones_total_area = round(yard_area + dock_zone["area_m2"], 1)
+        flags.append(
+            "raw Dock zone measured from native repeated dock-door/reveal geometry: "
+            f"{dock_diag['area_m2']:.1f} m² "
+            f"({dock_diag['loading_face_lm']:.2f} Lm loading face × "
+            f"{dock_diag['dock_depth_m']:.3f} m structural dock depth; "
+            f"{dock_diag['door_segment_count']} repeated vector segments)"
+        )
+        if overlap_m2 > 0:
+            flags.append(
+                f"Yard/Dock overlap removed from Yard: {overlap_m2:.1f} m² "
+                "(zones are mutually exclusive; zone total contains no double counting)"
+            )
+        flags.append(
+            f"raw zone total {zones_total_area:.1f} m² = Yard {yard_area:.1f} m² + "
+            f"Dock {dock_zone['area_m2']:.1f} m²; Dock remains an unpriced assessor-rate line"
+        )
+        flags.append(
+            "raw Channel/Transition lengths NOT ATTEMPTED — line identity is not reliable "
+            "without marked subjects; assessor must measure/classify these Lm quantities"
+        )
+    else:
+        if dock_detection.get("evidence_seen"):
+            region_confidence = "low"
+            zones.append({
+                "zone_key": "unclassified:raw-dock-candidate",
+                "category": "unclassified",
+                "subjects": ["Raw dock candidate"],
+                "measurement_kind": "area",
+                "area_m2": None,
+                "length_lm": None,
+                "perimeter_lm": None,
+                "annotation_count": 0,
+                "cutout_count": 0,
+                "classification_source": "ambiguous native loading-face geometry",
+                "needs_assessor": True,
+            })
+            flags.append(
+                f"assessor: classify/trace Dock zone — {dock_detection['reason']}; "
+                "Yard retained, no Dock area guessed"
+            )
 
     # --- refuse instead of guess (invariant 5) ------------------------------------------------
     # No concrete-yard legend label AND no verified scale means BOTH the region identity and the
@@ -629,7 +987,8 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # --- overlay for the record / vision confirm ---
     overlay = None
     if out_dir:
-        ov = im.copy(); ov[comp] = (0.4 * ov[comp] + 0.6 * np.array([235, 30, 30])).astype(np.uint8)
+        ov = im.copy()
+        ov[yard_comp] = (0.4 * ov[yard_comp] + 0.6 * np.array([235, 30, 30])).astype(np.uint8)
         overlay = f"{out_dir}/{os.path.basename(pdf).split('-')[5] if '-' in pdf else 'x'}_overlay.png"
         Image.fromarray(ov).resize((pix.width // 4, pix.height // 4)).save(overlay)
         if use_api:
@@ -646,10 +1005,10 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # (email + /snapshot overlay), the vision path, and measure_regions(). The portal scales
     # them to canvas pixels once (× snapScale). Storing snapshot pixels here used to double-scale
     # the overlay and mis-place the polygon on capped wide sheets.
-    polygon_pts = _hatch_contour(comp, S)
+    polygon_pts = _hatch_contour(yard_comp, S)
 
     # --- manhole count ESTIMATE (unmarked path — conservative, never authoritative) ---
-    manhole_count_estimate, _mh_centres = detect_manholes(im, comp, k, S=S)
+    manhole_count_estimate, _mh_centres = detect_manholes(im, yard_comp, k, S=S)
     if manhole_count_estimate > 0:
         flags.append(f"manhole_count_estimate={manhole_count_estimate} (small near-circular "
                      f"features inside the measured yard, {MANHOLE_DIAM_M_MIN}-{MANHOLE_DIAM_M_MAX} m "
@@ -665,10 +1024,10 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # floor of 1 matches the real Winvic sheet (26,080 m² → 26 Nr; ceil would over-count at 27).
     manhole_count_assumed = None
     if manhole_count_estimate == 0 and area and not blocked and legend_found:
-        manhole_count_assumed = max(1, round(area / 1000.0))
+        manhole_count_assumed = max(1, round(yard_area / 1000.0))
         flags.append(f"manhole_count_assumed={manhole_count_assumed} — ASSUMPTION per Inderjit's rule "
                      f"(1 per 1,000 m², placed corner-to-corner), applied because no drainage layout / "
-                     f"no manhole symbols were detected: round({area:,.0f} / 1,000), min 1. Assessor "
+                     f"no manhole symbols were detected: round({yard_area:,.0f} yard m² / 1,000), min 1. Assessor "
                      "confirms the count before any E/O manhole line is priced.")
 
     # --- measurement_state: the four-state contract (sanity.py) so downstream (pipeline,
@@ -678,7 +1037,8 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # Feed confidence="low" in that case so the state machine caps it at MEASURED_UNVERIFIED
     # (approve-blocked) rather than MEASURED_VERIFIED. A labelled sheet (e.g. D77) is unaffected.
     state, state_flags = sanity.measurement_state(
-        area, scale_verified=verified, confidence=(None if legend_found else "low"))
+        area, scale_verified=verified,
+        confidence=("low" if region_confidence == "low" or not legend_found else None))
     flags += state_flags
     needs_assessor = state != sanity.MEASURED_VERIFIED
 
@@ -686,9 +1046,12 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "scale_src": note, "scale_sources": scale_sources,
             "area_m2": area, "rate": rate, "price_gbp": price, "overlay": overlay,
             "polygon_pts": polygon_pts, "flags": flags,
+            "zones": zones,
+            "zones_total_area_m2": zones_total_area,
             "manhole_count_estimate": manhole_count_estimate,
             "manhole_count_assumed": manhole_count_assumed,
             "legend_found": legend_found,
+            "region_confidence": region_confidence,
             "measurement_state": state, "needs_assessor": needs_assessor}
 
 

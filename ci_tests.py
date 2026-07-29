@@ -738,6 +738,133 @@ try:
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
 
+print("raw external zone measurement — Yard/Dock split + low-confidence state cap")
+try:
+    _external_marked_paths = [
+        _castle_dir / f"External Markup Unit-{number}.pdf" for number in range(1, 5)
+    ]
+    for _path in _external_marked_paths:
+        _require_fixture(_path, "Castle Donington raw Yard/Dock validation")
+    from accuracy_report import strip_annotations as _strip_annotations_external
+    from takeoff_pipeline import takeoff as _pipeline_takeoff_external
+    import takeoff_unmarked as _takeoff_unmarked_external
+    import os as _os_external
+
+    _raw_external_results = {}
+    try:
+        for _unit_number, _marked_path in enumerate(_external_marked_paths, start=1):
+            _raw_path = Path(f"/tmp/ci_external_unit_{_unit_number}_stripped.pdf")
+            _strip_annotations_external(_marked_path, _raw_path)
+            _truth = _read_marked_zones(str(_marked_path))
+            _truth_by_zone = {
+                zone["category"]: zone
+                for zone in _truth["zones"]
+            }
+            _measured = _pipeline_takeoff_external(
+                str(_raw_path), send_approval=False, auto_extract_spec=False)
+            _raw_external_results[_unit_number] = _measured
+            _measured_by_zone = {
+                zone["category"]: zone
+                for zone in _measured.get("zones", [])
+            }
+            _yard_ok = (
+                "external_yard" in _measured_by_zone
+                and abs(
+                    _measured_by_zone["external_yard"]["area_m2"]
+                    - _truth_by_zone["external_yard"]["area_m2"]
+                ) / _truth_by_zone["external_yard"]["area_m2"] * 100 <= 5
+            )
+            _dock_ok = (
+                "dock" in _measured_by_zone
+                and abs(
+                    _measured_by_zone["dock"]["area_m2"]
+                    - _truth_by_zone["dock"]["area_m2"]
+                ) / _truth_by_zone["dock"]["area_m2"] * 100 <= 5
+            )
+            _zone_sum = sum(
+                zone.get("area_m2") or 0
+                for zone in _measured.get("zones", [])
+                if zone.get("category") in ("external_yard", "dock")
+            )
+            ck(f"raw External Unit-{_unit_number}: one Yard + one Dock, each within 5%",
+               _yard_ok and _dock_ok and
+               [zone["category"] for zone in _measured.get("zones", [])].count(
+                   "external_yard") == 1 and
+               [zone["category"] for zone in _measured.get("zones", [])].count("dock") == 1,
+               {"truth": {key: value.get("area_m2")
+                          for key, value in _truth_by_zone.items()},
+                "measured": {key: value.get("area_m2")
+                             for key, value in _measured_by_zone.items()}})
+            ck(f"raw External Unit-{_unit_number}: zone total reconciles exactly, no double count",
+               abs(_zone_sum - _measured["zones_total_area_m2"]) < 0.01
+               and _measured["area_m2"] == _measured_by_zone["external_yard"]["area_m2"],
+               {"zones": _zone_sum,
+                "zone_total": _measured["zones_total_area_m2"],
+                "legacy_yard_area": _measured["area_m2"]})
+    finally:
+        for _unit_number in range(1, 5):
+            try:
+                _os_external.remove(f"/tmp/ci_external_unit_{_unit_number}_stripped.pdf")
+            except FileNotFoundError:
+                pass
+
+    ck("raw external channels/transitions are explicitly not attempted, never fabricated",
+       all(
+           not any(zone.get("category") in ("channel", "transition")
+                   for zone in result.get("zones", []))
+           and any("Channel/Transition lengths NOT ATTEMPTED" in flag
+                   for flag in result.get("flags", []))
+           for result in _raw_external_results.values()
+       ))
+
+    # Direct takeoff proves the state cap is caused by the non-grey swatch fallback,
+    # independently of Unit 3's downstream portal/job handling.
+    _unit3_raw = Path("/tmp/ci_external_unit_3_state_cap.pdf")
+    try:
+        _strip_annotations_external(_external_marked_paths[2], _unit3_raw)
+        _unit3_direct = _takeoff_unmarked_external.takeoff(str(_unit3_raw))
+        ck("non-grey/white swatch fallback can never reach MEASURED_VERIFIED",
+           _unit3_direct.get("region_confidence") == "low" and
+           _unit3_direct.get("measurement_state") == "MEASURED_UNVERIFIED" and
+           _unit3_direct.get("needs_assessor") is True,
+           {"confidence": _unit3_direct.get("region_confidence"),
+            "state": _unit3_direct.get("measurement_state")})
+    finally:
+        try:
+            _os_external.remove(_unit3_raw)
+        except FileNotFoundError:
+            pass
+
+    # An ambiguous native loading-face signal must remain visible in the zone
+    # contract and must cap approval; it cannot be silently folded into Yard.
+    _ambiguous_raw = Path("/tmp/ci_external_ambiguous_dock.pdf")
+    _real_dock_detector = _takeoff_unmarked_external.detect_raw_dock_zone
+    try:
+        _strip_annotations_external(_external_marked_paths[0], _ambiguous_raw)
+        _takeoff_unmarked_external.detect_raw_dock_zone = lambda *args, **kwargs: {
+            "zone": None,
+            "reason": "multiple plausible loading faces",
+            "evidence_seen": True,
+        }
+        _ambiguous_result = _takeoff_unmarked_external.takeoff(str(_ambiguous_raw))
+        ck("ambiguous raw Dock stays unclassified + flagged and cannot be VERIFIED",
+           any(zone.get("category") == "unclassified"
+               and zone.get("needs_assessor") is True
+               for zone in _ambiguous_result.get("zones", []))
+           and _ambiguous_result.get("measurement_state") == "MEASURED_UNVERIFIED"
+           and any("classify/trace Dock zone" in flag
+                   for flag in _ambiguous_result.get("flags", [])),
+           {"zones": _ambiguous_result.get("zones"),
+            "state": _ambiguous_result.get("measurement_state")})
+    finally:
+        _takeoff_unmarked_external.detect_raw_dock_zone = _real_dock_detector
+        try:
+            _os_external.remove(_ambiguous_raw)
+        except FileNotFoundError:
+            pass
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
+
 try:
     _office_marked_paths = [
         _castle_dir / f"Office Floors Unit-{number}.pdf" for number in range(1, 5)
@@ -2248,8 +2375,10 @@ try:
        any("FELL BACK" in f for f in _r_fp_d4.get("flags", [])), _r_fp_d4.get("flags"))
     ck("DEMO-4 GUARD: fallback still produces a measurable area (never area=None)",
        _r_fp_d4.get("area_m2") is not None, _r_fp_d4.get("area_m2"))
-    ck("DEMO-4 GUARD: fallback state is MEASURED_VERIFIED (not silently UNMEASURED)",
-       _r_fp_d4.get("measurement_state") == MEASURED_VERIFIED, _r_fp_d4.get("measurement_state"))
+    ck("DEMO-4 GUARD: low-confidence fallback is MEASURED_UNVERIFIED (measurable, approve-blocked)",
+       _r_fp_d4.get("measurement_state") == MEASURED_UNVERIFIED
+       and _r_fp_d4.get("needs_assessor") is True,
+       f"state={_r_fp_d4.get('measurement_state')} needs_assessor={_r_fp_d4.get('needs_assessor')}")
 
     # GOLD GUARDS unchanged: both pre-existing synthetic fixtures have unreadable swatches
     # (title text IS the label match, no nearby swatch chip) -> always take the fallback path,

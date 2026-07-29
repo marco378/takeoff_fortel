@@ -440,6 +440,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                         "scale_verified": tu.get("scale_verified", False),
                         "scale_sources":  tu.get("scale_sources", {}),
                         "polygon_pts":    tu.get("polygon_pts"),
+                        "zones":          tu.get("zones", []),
+                        "zones_total_area_m2": tu.get("zones_total_area_m2"),
                     })
                     r["flags"] = r["flags"] + tu.get("flags", []) + ["assessor: confirm extent + scale"]
                     # A region measured WITHOUT a legend label is a generic grey-hatch guess — its
@@ -447,7 +449,12 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     # verifies. Force confidence low in that case so the state machine caps it at
                     # MEASURED_UNVERIFIED (matches the cap inside takeoff_unmarked; the pipeline
                     # re-derives state here with the router's confidence, so the cap must be re-applied).
-                    eff_conf = "low" if not tu.get("legend_found", True) else conf
+                    eff_conf = (
+                        "low"
+                        if (not tu.get("legend_found", True)
+                            or tu.get("region_confidence") == "low")
+                        else conf
+                    )
                     state, sflags2 = measurement_state(tu["area_m2"], scale_verified=tu.get("scale_verified", False),
                                                        confidence=eff_conf)
                     r["flags"] = r["flags"] + sflags2
@@ -518,13 +525,20 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     "scale_verified": tu.get("scale_verified", False),
                     "scale_sources":  tu.get("scale_sources", {}),
                     "polygon_pts":    tu.get("polygon_pts"),
+                    "zones":          tu.get("zones", []),
+                    "zones_total_area_m2": tu.get("zones_total_area_m2"),
                 })
                 r["flags"] = r["flags"] + tu.get("flags", []) + [
                     "flattened/raster drawing measured from the RENDER (no vector geometry) — "
                     "assessor: confirm extent + scale"]
                 # Same no-legend cap as the vector path: an unlabelled grey-hatch guess stays
                 # MEASURED_UNVERIFIED even if the scale verifies.
-                eff_conf = "low" if not tu.get("legend_found", True) else conf
+                eff_conf = (
+                    "low"
+                    if (not tu.get("legend_found", True)
+                        or tu.get("region_confidence") == "low")
+                    else conf
+                )
                 state, sflags2 = measurement_state(tu["area_m2"],
                                                    scale_verified=tu.get("scale_verified", False),
                                                    confidence=eff_conf)
