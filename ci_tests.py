@@ -101,6 +101,90 @@ ck("detected level without a defensible outline is reported, never dropped",
        for flag in _office_unresolved["flags"]),
    _office_unresolved)
 
+print("accuracy scorecard harness")
+from accuracy_report import (
+    discover_pairs as _accuracy_discover_pairs,
+    normalise_drawing_name as _accuracy_normalise_name,
+    pair_marked_and_raw as _accuracy_pair,
+    score_drawing as _accuracy_score_drawing,
+    scorecard as _accuracy_scorecard,
+    signed_delta_pct as _accuracy_delta,
+    within_tolerance as _accuracy_within,
+)
+_accuracy_marked_record = {
+    "path": Path("/tmp/Markup Project-Alpha_marked.pdf"),
+    "truth": {"area_m2": 100.0, "zones": []},
+}
+_accuracy_raw_record = {"path": Path("/tmp/raw/Project Alpha.pdf")}
+_accuracy_other_raw = {"path": Path("/tmp/raw/Project Beta.pdf")}
+_accuracy_pairs, _accuracy_unused = _accuracy_pair(
+    [_accuracy_marked_record], [_accuracy_raw_record, _accuracy_other_raw])
+ck("accuracy pairing normalises marked/raw prefixes and suffixes without cross-pairing",
+   _accuracy_normalise_name(_accuracy_marked_record["path"]) == "projectalpha" and
+   _accuracy_normalise_name("MarkupProject Alpha.pdf") == "projectalpha" and
+   len(_accuracy_pairs) == 1 and
+   _accuracy_pairs[0]["raw_path"] == _accuracy_raw_record["path"] and
+   len(_accuracy_unused) == 1 and "Project Beta.pdf" in _accuracy_unused[0],
+   {"pairs": _accuracy_pairs, "unused": _accuracy_unused})
+ck("accuracy tolerance maths is signed and inclusive at exactly 5%",
+   _accuracy_delta(95, 100) == -5 and
+   _accuracy_within(105, 100, 5) and
+   not _accuracy_within(105.01, 100, 5))
+
+_accuracy_not_measured = _accuracy_score_drawing(
+    marked_path=Path("/tmp/marked.pdf"),
+    raw_label="temporary stripped copy",
+    raw_mode="derived-stripped",
+    pairing="test",
+    truth={"area_m2": 100.0,
+           "zones": [{"category": "external_yard", "area_m2": 100.0}]},
+    pipeline_run={
+        "ok": True, "elapsed_s": 0.1,
+        "payload": {
+            "area_m2": None, "measurement_state": "UNMEASURED",
+            "flags": ["REFUSED: no reliable slab region"], "zones": [],
+        },
+    },
+    tolerance_pct=5,
+)
+ck("accuracy NOT MEASURED is an explicit client miss, never a silent pass",
+   _accuracy_not_measured["verdict"] == "NOT MEASURED" and
+   _accuracy_not_measured["failure_mode"] == "not measured" and
+   _accuracy_not_measured["measured_total_m2"] is None,
+   _accuracy_not_measured)
+
+_accuracy_summary = _accuracy_scorecard([
+    {"verdict": "PASS", "failure_mode": None},
+    {"verdict": "FAIL", "failure_mode": "over-measured"},
+    {"verdict": "FAIL", "failure_mode": "under-measured"},
+    {"verdict": "FAIL", "failure_mode": "zone mis-split"},
+    {"verdict": "NOT MEASURED", "failure_mode": "not measured"},
+], 5)
+ck("accuracy scorecard arithmetic counts passes and each failure mode",
+   _accuracy_summary["passed"] == 1 and
+   _accuracy_summary["drawings"] == 5 and
+   _accuracy_summary["accuracy_pct"] == 20.0 and
+   _accuracy_summary["summary_line"] == "1 of 5 within 5% (20.0%)" and
+   all(_accuracy_summary["breakdown"][mode] == 1 for mode in (
+       "not measured", "over-measured", "under-measured", "zone mis-split")),
+   _accuracy_summary)
+
+try:
+    _require_fixture("drawings/castle_donington",
+                     "accuracy harness Castle Donington pairing integration")
+    _accuracy_castle_pairs = _accuracy_discover_pairs(
+        ["drawings/castle_donington"])["pairs"]
+    ck("accuracy harness pairs all 8 Castle truths without measuring a marked answer",
+       len(_accuracy_castle_pairs) == 8 and
+       sum(pair["raw_mode"] == "existing" for pair in _accuracy_castle_pairs) == 4 and
+       sum(pair["raw_mode"] == "derived-stripped" for pair in _accuracy_castle_pairs) == 4 and
+       all(pair["raw_path"] is None or "_stripped" in str(pair["raw_path"])
+           for pair in _accuracy_castle_pairs),
+       [(pair["marked_path"].name, pair["raw_mode"], str(pair["raw_path"]))
+        for pair in _accuracy_castle_pairs])
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
+
 print("pricing")
 r, _ = slab_rate({"depth_mm":190,"conc_rate":128,"mesh":"A252","layers":1,"steel_rate_t":850,"margin":0.11})
 ck("yard rate 44.89", r == 44.89)
