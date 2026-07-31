@@ -136,6 +136,11 @@ def _expand_zone_results(results: list[dict]) -> list[dict]:
 
 def quotation_section(result: dict) -> str:
     """Return the client's canonical BOQ section for a drawing/result."""
+    # A measured/assessor-confirmed zone is stronger evidence than a drawing filename.  In
+    # particular, one Office GA sheet may carry both ground-floor cores and upper floors.
+    zone_category = str(result.get("zone_category") or "").strip().lower()
+    if zone_category in ZONE_SECTION:
+        return ZONE_SECTION[zone_category]
     explicit = str(result.get("quotation_section") or "").strip()
     if explicit:
         for section in SECTION_ORDER:
@@ -392,6 +397,58 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 if drawing and drawing not in measurement["drawings"]:
                     measurement["drawings"].append(drawing)
 
+    # Accepted channel proposals remain assumptions, but an assessor decision makes their
+    # quantity quoteable as a provisional, blank-rate line.  Pending proposals are never
+    # smuggled into totals: they produce an explicit declaration instead.
+    for unit in source_results:
+        drawing = unit.get("file") or Path(str(unit.get("pdf_path") or "")).name
+        proposals = [proposal for proposal in (unit.get("channel_proposals") or [])
+                     if isinstance(proposal, dict) and proposal.get("proposal_id")]
+        decisions = unit.get("channel_proposal_decisions") or {}
+        for proposal in proposals:
+            proposal_id = proposal["proposal_id"]
+            decision = decisions.get(proposal_id) if isinstance(decisions, dict) else None
+            decision = decision if isinstance(decision, dict) else {}
+            status = decision.get("decision")
+            component = proposal.get("component")
+            component_label = (
+                "dock retaining-wall/loading-face run"
+                if component == "dock_retaining_wall"
+                else "yard retaining-wall-adjacent run"
+                if component in {"yard_longest_contained_run", "yard_wall_adjacent_run"}
+                else str(component or "channel run").replace("_", " ")
+            )
+            basis = str(proposal.get("basis") or "assessor-reviewed channel assumption")
+            if status == "accepted":
+                length_lm = decision.get("length_lm")
+                if (isinstance(length_lm, (int, float)) and not isinstance(length_lm, bool)
+                        and length_lm > 0):
+                    edited = "assessor-edited" if decision.get("edited") else "assessor-accepted"
+                    extra_rows.append({
+                        "section": "External yard slabs",
+                        "description": f"Channel — {component_label} ({edited} proposal)",
+                        "qty": round(float(length_lm), 2), "unit": "Lm",
+                        "rate": None, "value": None, "assessor_rate_required": True,
+                        "provisional": True, "provisional_reason": PROVISIONAL_LABEL,
+                        "assumption_basis": basis,
+                        "drawings": [drawing] if drawing else [],
+                    })
+                    declarations.append(
+                        f"{PROVISIONAL_LABEL}: {component_label} — {length_lm:g} Lm included "
+                        f"as an {edited} assumption with rate left blank; basis: {basis}."
+                    )
+                else:
+                    declarations.append(
+                        f"{PROVISIONAL_LABEL}: accepted channel proposal {proposal_id!r} has no "
+                        "valid length and is not included; assessor must correct it before issue."
+                    )
+            elif status != "removed":
+                declarations.append(
+                    f"{PROVISIONAL_LABEL}: channel proposal {component_label} on "
+                    f"{drawing or 'drawing'} has not been actioned; no channel quantity or "
+                    "price is included."
+                )
+
     line_items = []
     specifications = []
     for group_number, group in enumerate(
@@ -574,6 +631,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
 
 # ── Formatters ────────────────────────────────────────────────────────────────
 
+def _display_qty(value) -> str:
+    """Human quantity with at most two decimals; never round accepted Lm to an integer."""
+    return f"{float(value):,.2f}".rstrip("0").rstrip(".")
+
+
 def quotation_text(q: dict) -> str:
     """Plain-text quotation — suitable for email body or Word paste."""
     lines = [
@@ -610,8 +672,9 @@ def quotation_text(q: dict) -> str:
         rate_text = f"{li['rate']:.2f}" if isinstance(li.get("rate"), (int, float)) else ""
         value_text = (str(li.get("value_status")) if li.get("value_status") else
                       (f"{li['value']:,.2f}" if isinstance(li.get("value"), (int, float)) else ""))
+        qty_text = _display_qty(li["qty"])
         lines.append(
-            f"  {description:<40}{li['qty']:>8,.0f}{li['unit']:>6}"
+            f"  {description:<40}{qty_text:>8}{li['unit']:>6}"
             f"{rate_text:>9}{value_text:>13}"
         )
     lines += [
@@ -655,7 +718,7 @@ def quotation_html(q: dict) -> str:
         value = (_h(li.get("value_status")) if li.get("value_status") else
                  (f"£{li['value']:,.2f}" if isinstance(li.get("value"), (int, float)) else ""))
         return (f"<tr><td>{_h(li['section'])}</td><td>{_h(li['description'])}{provisional}</td>"
-                f"<td style='text-align:right'>{li['qty']:,.0f} {_h(li['unit'])}</td>"
+                f"<td style='text-align:right'>{_display_qty(li['qty'])} {_h(li['unit'])}</td>"
                 f"<td style='text-align:right'>{rate}</td>"
                 f"<td style='text-align:right'>{value}</td></tr>")
 

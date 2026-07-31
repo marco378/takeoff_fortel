@@ -331,6 +331,8 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <button id="btnClearAi" title="Clear AI polygon overlay">❌ Clear AI</button>
       <div class="divider"></div>
       <button id="btnApprove" class="approve">✅ Approve</button>
+      <button id="btnConfirmExisting" class="adjust" style="display:none"
+              title="Confirm the existing AI scale and extent without replacing its measured zones">✅ Confirm scale + extent</button>
       <button id="btnReject"  class="reject">✗ Reject</button>
       <button id="btnAdjust"  class="adjust">✏️ Submit Adjustment</button>
       <div class="divider"></div>
@@ -512,7 +514,7 @@ let canvas = null, ctx = null;
 let img = null;
 let mode = 'trace';       // 'trace' | 'cal'
 let poly = [];            // [{x,y}]
-let traceRegions = [];    // completed assessor regions: [{points:[{x,y}], candidateId:?}]
+let traceRegions = [];    // completed assessor regions: [{points:[{x,y}], candidateId:?, category:?}]
 let activeCandidateId = null;
 let candidatePolygons = []; // assisted candidates in CANVAS pixels; never authoritative by themselves
 let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never measured/priced
@@ -884,6 +886,15 @@ async function renderJobUI(job, gen) {
   document.getElementById('btnApprove').style.display = isActionable ? '' : 'none';
   document.getElementById('btnReject') .style.display = isActionable ? '' : 'none';
   document.getElementById('btnAdjust') .style.display = isActionable ? '' : 'none';
+  const measurementState = job.measurement_state || res.measurement_state;
+  const existingArea = Number(res.area_m2);
+  const existingScale = Number(job.scale_k || res.scale_k);
+  const staleZones = !!(job.zone_allocation_stale || res.zone_allocation_stale);
+  const hasExistingZones = effectiveZones(job).length > 0;
+  const canConfirmExisting = isActionable && job.decision !== 'approved' &&
+    !job.scale_confirmed && measurementState === 'MEASURED_UNVERIFIED' &&
+    existingArea > 0 && existingScale > 0 && (!staleZones || hasExistingZones);
+  document.getElementById('btnConfirmExisting').style.display = canConfirmExisting ? '' : 'none';
   // Delete: hidden while a takeoff is still running (server 409s on 'processing' anyway —
   // this just avoids a pointless round-trip), and hidden for already-approved jobs — those
   // represent a committed client quotation and the server hard-blocks archiving them too
@@ -1117,12 +1128,15 @@ function initialiseTraceState(job, res) {
     storedRegions = [adjusted.vertices];
   }
   const storedIds = Array.isArray(adjusted.candidate_ids) ? adjusted.candidate_ids : [];
+  const storedCategories = Array.isArray(adjusted.region_categories)
+    ? adjusted.region_categories : [];
   // candidate_ids is an audit list and can be shorter when manual and suggested
   // regions were mixed. Only align IDs to regions when the cardinality matches.
   const alignedStoredIds = storedIds.length === storedRegions.length ? storedIds : [];
   traceRegions = storedRegions.map((region, index) => ({
     points: region.map(point => ({x:Number(point[0]), y:Number(point[1])})),
-    candidateId: alignedStoredIds[index] || null
+    candidateId: alignedStoredIds[index] || null,
+    category: storedCategories[index] || candidateCategory(alignedStoredIds[index])
   }));
   poly = [];
   activeCandidateId = null;
@@ -2187,8 +2201,17 @@ function shoelace(pts) {
 
 function traceRegionEntries() {
   const entries = traceRegions.filter(region => region.points && region.points.length >= 3);
-  if (poly.length >= 3) entries.push({points:poly, candidateId:activeCandidateId});
+  if (poly.length >= 3) entries.push({
+    points:poly, candidateId:activeCandidateId, category:candidateCategory(activeCandidateId)
+  });
   return entries;
+}
+
+function candidateCategory(candidateId) {
+  const candidate = candidatePolygons.find(item => item.candidate_id === candidateId);
+  const category = candidate && String(candidate.category || '').trim().toLowerCase();
+  return ['external_yard','dock','ground_floor','upper_floor','other'].includes(category)
+    ? category : 'unclassified';
 }
 
 function stashActiveRegion() {
@@ -2196,7 +2219,8 @@ function stashActiveRegion() {
     traceRegions.push({
       points: poly.map(point => ({x:point.x, y:point.y})),
       candidateId: activeCandidateId,
-      candidateGroupId: activeCandidateId
+      candidateGroupId: activeCandidateId,
+      category: candidateCategory(activeCandidateId)
     });
   }
   poly = [];
@@ -2226,7 +2250,8 @@ function loadTraceCandidate(candidateId) {
   regions.slice(1).forEach(region => traceRegions.push({
     points: region.map(point => ({x:point.x, y:point.y})),
     candidateId: null,
-    candidateGroupId: candidateId
+    candidateGroupId: candidateId,
+    category: candidateCategory(candidateId)
   }));
   activeCandidateId = candidateId;
   mode = 'trace';
@@ -2492,6 +2517,7 @@ function setupButtons() {
     if (v > 0) { mpp = v; toast(`Scale overridden: ${mpp} m/px`); draw(); }
   });
   document.getElementById('btnApprove').addEventListener('click', () => submitDecision('approve'));
+  document.getElementById('btnConfirmExisting').addEventListener('click', confirmExistingMeasurement);
   document.getElementById('btnReject') .addEventListener('click', () => submitDecision('reject'));
   document.getElementById('btnAdjust') .addEventListener('click', () => submitDecision('adjust'));
   document.getElementById('btnDelete') .addEventListener('click', deleteCurrentJob);
@@ -2558,7 +2584,7 @@ async function submitDecision(action) {
     // avoid a round-trip for the common case).
     const mstate = currentJob.measurement_state || res.measurement_state;
     if (!currentJob.scale_confirmed && (mstate === 'UNMEASURED' || mstate === 'MEASURED_UNVERIFIED' || mstate === 'REJECTED')) {
-      toast(`Cannot approve: ${mstate.replace('_',' ')} — trace/confirm the area via Adjust first.`, 'error');
+      toast(`Cannot approve: ${mstate.replace('_',' ')} — use Confirm scale + extent to keep the existing zones, or submit a real per-region adjustment.`, 'error');
       return;
     }
   }
@@ -2578,6 +2604,9 @@ async function submitDecision(action) {
     vertices: regionPayload.length === 1 ? regionPayload[0] : [],
     regions: regionPayload,
     candidate_ids: regionEntries.map(entry => entry.candidateId).filter(Boolean),
+    // Every traced region carries an explicit BOQ category. Suggested Office levels inherit
+    // the detector's ground/upper category; a manual region remains visibly unclassified.
+    region_categories: regionEntries.map(entry => entry.category || 'unclassified'),
     note: ''
   };
   try {
@@ -2595,6 +2624,22 @@ async function submitDecision(action) {
     }
   } catch(e) {
     toast('Server error — is approval_server.py running?', 'error');
+  }
+}
+
+async function confirmExistingMeasurement() {
+  if (!currentJob) { toast('No job selected', 'warn'); return; }
+  try {
+    const response = await fetch(`${BASE}/confirm-measurement/${currentJob.id}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({confirm_scale_extent:true, note:'confirmed in assessor portal'})
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    toast(`✅ Existing scale + extent confirmed; ${payload.zone_count} zone(s) preserved`);
+    await selectJob(currentJob.id);
+  } catch (error) {
+    toast(`Confirmation failed: ${error.message}`, 'error');
   }
 }
 

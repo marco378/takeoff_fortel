@@ -694,9 +694,55 @@ ck("xlsx supports the real BOQ's explicit RATE ONLY value token without inferrin
    _status_ws.cell(_status_row, 4).value == 12.34 and
    _status_ws.cell(_status_row, 5).value == "RATE ONLY")
 
+_channel_quote_unit = _quotation_unit("External Unit-1.pdf", "External yard slabs", 100)
+_channel_quote_unit["channel_proposals"] = [{
+    "proposal_id":"channel-dock-loading-face", "component":"dock_retaining_wall",
+    "proposed_length_lm":90.0,
+    "basis":"two straight runs where channels are not drawn",
+}]
+_channel_quote_unit["channel_proposal_decisions"] = {
+    "channel-dock-loading-face": {
+        "decision":"accepted", "length_lm":96.7, "edited":True,
+    }
+}
+_q_channel = generate_quotation(_channel_quote_unit, ref="CHANNEL-QUOTE-001")
+_channel_rows = [item for item in _q_channel["line_items"]
+                 if item["description"].startswith("Channel —")]
+ck("accepted/edited channel proposal becomes a provisional blank-rate Lm quote line",
+   len(_channel_rows) == 1 and _channel_rows[0]["qty"] == 96.7 and
+   _channel_rows[0]["unit"] == "Lm" and _channel_rows[0]["rate"] is None and
+   _channel_rows[0]["value"] is None and _channel_rows[0]["assessor_rate_required"] and
+   _channel_rows[0]["provisional"], _channel_rows)
+_channel_ws = _load_workbook(_BytesIO(quotation_xlsx(_q_channel)), data_only=False)["REV_01"]
+_channel_row = next(row for row in range(1, _channel_ws.max_row + 1)
+                    if str(_channel_ws.cell(row, 1).value or "").startswith("Channel —"))
+ck("accepted channel quantity is exact in text/HTML/XLSX and is never auto-priced",
+   "96.7" in quotation_text(_q_channel) and "96.7 Lm" in quotation_html(_q_channel) and
+   _channel_ws.cell(_channel_row, 2).value == 96.7 and
+   _channel_ws.cell(_channel_row, 4).value is None and
+   _channel_ws.cell(_channel_row, 5).data_type == "f" and
+   PROVISIONAL_LABEL in str(_channel_ws.cell(_channel_row, 1).value))
+_pending_channel_unit = _copy.deepcopy(_channel_quote_unit)
+_pending_channel_unit["channel_proposal_decisions"] = {}
+_q_pending_channel = generate_quotation(_pending_channel_unit, ref="CHANNEL-PENDING-001")
+ck("unactioned channel proposal is declared explicitly and never becomes a quote quantity",
+   not any(item["description"].startswith("Channel —")
+           for item in _q_pending_channel["line_items"]) and
+   any("has not been actioned" in note and "no channel quantity or price is included" in note
+       for note in _q_pending_channel["declarations"]))
+
 print("marked zone-aware measurement + multi-unit BOQ allocation")
 import fitz as _fitz_zones
 from robust_takeoff import read_marked as _read_marked_legacy, read_marked_zones as _read_marked_zones
+from markup import parse_area_m2 as _parse_area_m2
+ck("prefix-free Bluebeam measurement lines parse without accepting incidental area prose",
+   _parse_area_m2("Unit-1&2\r235.37 sq m") == 235.37 and
+   _parse_area_m2("Unit-3\r133.79 sq m") == 133.79 and
+   _parse_area_m2("Rate note: allow 12.50 sq m at this location") is None and
+   _parse_area_m2("Pricing note A = 12.50 sq m at this rate") is None and
+   _parse_area_m2("This note contains 12.50 sq m for context only") is None)
+ck("area truth parser still rejects linear, thickness and scale labels",
+   all(_parse_area_m2(label) is None for label in ("12.30 m", "150 mm", "1:200")))
 _zone_pdf = "/tmp/ci_marked_zones.pdf"
 _zone_doc = _fitz_zones.open()
 _zone_page = _zone_doc.new_page(width=600, height=600)
@@ -1890,6 +1936,7 @@ try:
                        [[200,0],[300,0],[300,100],[200,100]]],
             "scale_k":0.1,
             "candidate_ids":["office-p0-level-00-1", "office-p0-level-01-1"],
+            "region_categories":["ground_floor", "upper_floor"],
             "note":"assessor accepted two Office GA regions",
         })
         _multi_region_job = _AS.load_jobs()[_candidate_job_id]
@@ -1904,6 +1951,30 @@ try:
         ck("candidate selection alone stayed UNMEASURED; assessor POST performs confirmation",
            _multi_region_job["scale_confirmed"] is True and
            _multi_region_job["measurement_state"] == "MEASURED_VERIFIED")
+        ck("assisted Office adjustment persists one real BOQ zone per supplied region category",
+           {zone["category"]:zone["area_m2"] for zone in _multi_region_job["zones"]} ==
+           {"ground_floor":100.0, "upper_floor":100.0} and
+           not _multi_region_job.get("zone_allocation_stale") and
+           _multi_region_job["adjusted"]["region_categories"] ==
+           ["ground_floor", "upper_floor"], _multi_region_job.get("zones"))
+        _office_adjust_quote = _AS._quotation_for_job(_candidate_job_id)
+        ck("real Office region categories override the filename and reach separate BOQ sections",
+           [spec["section"] for spec in _office_adjust_quote["specifications"]] ==
+           ["Ground floor slabs", "Upper floor slabs"],
+           _office_adjust_quote["specifications"])
+        _manual_unknown_resp = _client_up.post(f"/adjust/{_candidate_job_id}", json={
+            "regions":[[[0,0],[100,0],[100,100],[0,100]]], "scale_k":0.1,
+            "region_categories":["unclassified"],
+            "note":"manual outline; floor level not resolved",
+        })
+        _manual_unknown_job = _AS.load_jobs()[_candidate_job_id]
+        ck("unresolved manual region is preserved as unclassified and visibly blocks approval",
+           _manual_unknown_resp.status_code == 200 and
+           _manual_unknown_job["zones"][0]["area_m2"] == 100.0 and
+           _manual_unknown_job["zones"][0]["category"] == "unclassified" and
+           _manual_unknown_job["zone_classification_required"] and
+           "unclassified" in (_AS._approve_block_reason(_manual_unknown_job) or ""),
+           _manual_unknown_job.get("zones"))
 
         _channel_job_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         _channel_zones = [
@@ -1997,6 +2068,83 @@ try:
            not any(z.get("category") == "channel" for z in _channel_reviewed_job["zones"]) and
            _channel_reviewed_job["costing"] == _channel_costing and
            _channel_reviewed_job["result"]["costing"] == _channel_costing)
+        _channel_approve = _client_up.post(f"/approve/{_channel_job_id}", json={
+            "note":"channel assumptions reviewed",
+        })
+        _channel_approved_job = _AS.load_jobs()[_channel_job_id]
+        _channel_quote_paths = _channel_approved_job.get("quotation_paths") or {}
+        _channel_saved_quote = (__import__("json").loads(
+            Path(_channel_quote_paths["json"]).read_text())
+            if _channel_quote_paths.get("json") and
+            Path(_channel_quote_paths["json"]).exists() else {})
+        _channel_saved_rows = [item for item in _channel_saved_quote.get("line_items", [])
+                               if str(item.get("description") or "").startswith("Channel —")]
+        ck("approved server quotation carries accepted channel Lm with blank assessor rate",
+           _channel_approve.status_code == 200 and len(_channel_saved_rows) == 1 and
+           _channel_saved_rows[0]["qty"] == 35.0 and
+           _channel_saved_rows[0]["rate"] is None and
+           _channel_saved_rows[0]["value"] is None and
+           _channel_saved_rows[0]["provisional"],
+           _channel_saved_rows)
+
+        # Critical assisted-loop regression: begin with a real /upload-created record, then
+        # install the completed zoned MEASURED_UNVERIFIED takeoff that the background worker
+        # would save. Confirming the existing scale/extent must preserve both zones, release
+        # the gate, approve, and write a real quotation — no destructive /adjust in between.
+        _AS.save_jobs({})
+        _started_up.clear()
+        _loop_upload = _client_up.post("/upload", data={
+            "project_ref":"E2E-ZONE-001", "project_name":"Zoned confirmation loop",
+            "client_name":"Fortel QA",
+            "pdf":(_io3.BytesIO(_pdf_a_bytes), "External Unit-1.pdf"),
+        }, content_type="multipart/form-data")
+        _loop_job_id = _loop_upload.get_json()["job_id"]
+        _loop_zones = [
+            {"zone_key":"external_yard", "category":"external_yard", "area_m2":100.0},
+            {"zone_key":"dock", "category":"dock", "area_m2":20.0},
+        ]
+        _loop_jobs = _AS.load_jobs()
+        _loop_jobs[_loop_job_id].update({
+            "status":"pending", "measurement_state":"MEASURED_UNVERIFIED",
+            "scale_confirmed":False, "zone_allocation_stale":True,
+            "zones":_copy.deepcopy(_loop_zones),
+            "flags":["ZONE ALLOCATION STALE: retained zones await assessor confirmation"],
+            "result":{
+                "file":"E2E-ZONE-001_External Unit-1.pdf", "area_m2":120.0,
+                "scale_k":0.1, "measurement_state":"MEASURED_UNVERIFIED",
+                "zones":_copy.deepcopy(_loop_zones), "zone_allocation_stale":True,
+                "flags":["ZONE ALLOCATION STALE: retained zones await assessor confirmation"],
+            },
+        })
+        _AS.save_jobs(_loop_jobs)
+        _loop_confirm = _client_up.post(f"/confirm-measurement/{_loop_job_id}", json={
+            "confirm_scale_extent":True, "note":"scale and coloured extents checked",
+        })
+        _loop_confirmed_job = _AS.load_jobs()[_loop_job_id]
+        ck("existing scale+extent confirmation preserves zoned measurement and clears stale gate",
+           _loop_confirm.status_code == 200 and
+           _loop_confirm.get_json()["zone_count"] == 2 and
+           _loop_confirmed_job["zones"] == _loop_zones and
+           _loop_confirmed_job["result"]["zones"] == _loop_zones and
+           _loop_confirmed_job["scale_confirmed"] is True and
+           not _loop_confirmed_job["zone_allocation_stale"] and
+           _AS._approve_block_reason(_loop_confirmed_job) is None,
+           _loop_confirm.get_json())
+        _loop_approve = _client_up.post(f"/approve/{_loop_job_id}", json={
+            "note":"approved after non-destructive confirmation",
+        })
+        _loop_approved_job = _AS.load_jobs()[_loop_job_id]
+        _loop_paths = _loop_approved_job.get("quotation_paths") or {}
+        _loop_quote = (__import__("json").loads(Path(_loop_paths["json"]).read_text())
+                       if _loop_paths.get("json") and Path(_loop_paths["json"]).exists() else {})
+        ck("E2E upload -> confirm -> approve terminates in an APPROVED zoned quotation",
+           _loop_approve.status_code == 200 and
+           _loop_approved_job["status"] == "approved" and
+           Path(_loop_paths.get("xlsx", "missing")).exists() and
+           [spec["section"] for spec in _loop_quote.get("specifications", [])] ==
+           ["External yard slabs", "Dock slabs"],
+           {"confirm":_loop_confirm.get_json(), "approve":_loop_approve.get_json(),
+            "status":_loop_approved_job.get("status"), "quotation_paths":_loop_paths})
 
         _route_costing_a = _copy.deepcopy(_demo_result["costing"])
         _route_costing_a.update({"area_m2": 100, "assumed": True})
@@ -2313,6 +2461,12 @@ try:
            _zone_adjust_resp.status_code == 200 and _zone_adjusted_job["zones"] == [] and
            _zone_adjusted_job["zone_allocation_stale"] and
            _AS._approve_block_reason(_zone_adjusted_job) is not None)
+        _empty_stale_confirm = _client_up.post(
+            f"/confirm-measurement/{_mixed_zone_id}", json={"confirm_scale_extent":True})
+        ck("confirmation cannot resurrect zones erased by a true aggregate replacement",
+           _empty_stale_confirm.status_code == 409 and
+           _AS.load_jobs()[_mixed_zone_id]["zone_allocation_stale"],
+           _empty_stale_confirm.get_json())
 
         _portal_html_up = (Path(_orig_server_file_up).parent / "assessor_portal.html").read_text()
         ck("portal file input allows multiple PDFs and ZIPs",
@@ -2343,7 +2497,12 @@ try:
                "ASSISTED TRACE CANDIDATES", "candidate_polygons", "loadTraceCandidate(",
                "Add to trace", "btnNewRegion", "traceRegions")) and
            "function loadTraceCandidate" in _portal_html_up and
-           "regions: regionPayload" in _portal_html_up)
+           "regions: regionPayload" in _portal_html_up and
+           "region_categories: regionEntries.map" in _portal_html_up)
+        ck("portal offers non-destructive existing scale+extent confirmation",
+           all(marker in _portal_html_up for marker in (
+               "btnConfirmExisting", "confirmExistingMeasurement",
+               "/confirm-measurement/", "Confirm scale + extent")))
         ck("portal explains candidate confidence and keeps unresolved levels visible",
            all(marker in _portal_html_up for marker in (
                "confidence_reasons", "confidence_score", "outline_status",

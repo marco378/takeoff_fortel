@@ -459,6 +459,8 @@ def _zone_block_reason(job: dict) -> str | None:
         or result.get("zone_allocation_stale")
         or job.get("zone_reference_mismatch")
         or result.get("zone_reference_mismatch")
+        or job.get("zone_geometry_overlap")
+        or result.get("zone_geometry_overlap")
         or any((zone.get("category") or "").strip().lower() == "unclassified"
                for zone in zones if isinstance(zone, dict))
     )
@@ -470,6 +472,9 @@ def _zone_block_reason(job: dict) -> str | None:
     if job.get("zone_reference_mismatch") or result.get("zone_reference_mismatch"):
         return ("measured zone quantities do not match the client reference beyond tolerance; "
                 "assessor must review the mismatch before approval")
+    if job.get("zone_geometry_overlap") or result.get("zone_geometry_overlap"):
+        return ("assessor trace regions overlap, so their per-zone quantities do not reconcile "
+                "to the measured union; edit and resubmit the region outlines")
     return ("one or more measured markup zones are unclassified; assessor must classify "
             "every zone before approval")
 
@@ -648,6 +653,93 @@ def reject(job_id):
     return jsonify({"status": "rejected", "job_id": job_id})
 
 
+def _without_zone_stale_flags(flags) -> list:
+    """Keep diagnostic evidence while removing only the superseded stale-allocation gate."""
+    return [flag for flag in (flags or [])
+            if not str(flag).startswith("ZONE ALLOCATION STALE:")]
+
+
+@app.route("/confirm-measurement/<job_id>", methods=["POST"])
+def confirm_measurement(job_id):
+    """Assessor confirms the existing scale and extent without replacing its geometry.
+
+    This is deliberately separate from ``/adjust``.  An aggregate adjustment invalidates a
+    zone split because its new outline has no per-zone allocation; confirming an already
+    measured drawing must instead preserve those zones.  The explicit boolean prevents an
+    accidental empty POST from mutating a job.
+    """
+    data = request.get_json(silent=True) or {}
+    if data.get("confirm_scale_extent") is not True:
+        return jsonify({"error": "confirm_scale_extent=true is required"}), 400
+
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        if job.get("status") == "processing":
+            return jsonify({"error": "job is still processing"}), 409
+
+        result = dict(job.get("result") or {})
+        area_m2 = result.get("area_m2")
+        scale_k = job.get("scale_k") or result.get("scale_k")
+        state = job.get("measurement_state") or result.get("measurement_state")
+        zones = job.get("zones") if isinstance(job.get("zones"), list) else result.get("zones")
+        zones = list(zones or [])
+        if state != "MEASURED_UNVERIFIED":
+            return jsonify({
+                "error": "only an existing MEASURED_UNVERIFIED result can be confirmed"
+            }), 409
+        if (not isinstance(area_m2, (int, float)) or isinstance(area_m2, bool)
+                or not math.isfinite(area_m2) or area_m2 <= 0):
+            return jsonify({"error": "existing measured area is required; use Adjust"}), 409
+        if (not isinstance(scale_k, (int, float)) or isinstance(scale_k, bool)
+                or not math.isfinite(scale_k) or scale_k <= 0):
+            return jsonify({"error": "existing scale is required; use Calibrate/Adjust"}), 409
+        # A prior aggregate replacement has destroyed the old allocation.  Confirmation
+        # cannot reconstruct it and must not clear the gate unless real zones still exist.
+        stale = bool(job.get("zone_allocation_stale") or result.get("zone_allocation_stale"))
+        if stale and not zones:
+            return jsonify({
+                "error": "zone allocation is stale and empty; remeasure/classify zones"
+            }), 409
+
+        confirmed_at = now_iso()
+        result.update({
+            "measurement_state": "MEASURED_VERIFIED",
+            "scale_confirmed": True,
+            "extent_confirmed": True,
+            "zone_allocation_stale": False,
+            "flags": _without_zone_stale_flags(result.get("flags")),
+        })
+        job.update({
+            "measurement_state": "MEASURED_VERIFIED",
+            "scale_confirmed": True,
+            "extent_confirmed": True,
+            "zone_allocation_stale": False,
+            "measurement_confirmed_at": confirmed_at,
+            "measurement_confirmation_note": str(data.get("note") or ""),
+            "flags": _without_zone_stale_flags(job.get("flags")),
+            "result": result,
+        })
+        jobs[job_id] = job
+        save_jobs(jobs)
+
+    log_training({
+        "event": "confirm_existing_measurement",
+        "job_id": job_id,
+        "file": result.get("file"),
+        "area_m2": area_m2,
+        "zone_count": len(zones),
+        "timestamp": confirmed_at,
+    })
+    return jsonify({
+        "status": "measurement_confirmed", "job_id": job_id,
+        "area_m2": area_m2, "zone_count": len(zones),
+        "measurement_state": "MEASURED_VERIFIED",
+    })
+
+
 @app.route("/adjust/<job_id>", methods=["GET", "POST"])
 def adjust(job_id):
     """
@@ -673,6 +765,7 @@ def adjust(job_id):
     vertices   = data.get("vertices", [])    # legacy single [[x,y], ...]
     regions_in = data.get("regions")         # new multi-region [[[x,y], ...], ...]
     candidate_ids = data.get("candidate_ids") or []
+    region_categories_in = data.get("region_categories")
     scale_k    = data.get("scale_k")         # m/px
     area_m2    = data.get("assessed_area_m2")
     note       = data.get("note", "")
@@ -708,17 +801,37 @@ def adjust(job_id):
             or len(candidate_ids) != len(set(candidate_ids))):
         return jsonify({"error": "candidate_ids must be unique known candidate identifiers"}), 400
 
+    area_categories = {
+        "external_yard", "dock", "ground_floor", "upper_floor", "other", "unclassified"
+    }
+    if region_categories_in is not None:
+        if (not isinstance(region_categories_in, list)
+                or len(region_categories_in) != len(regions)
+                or any(not isinstance(category, str)
+                       or category.strip().lower() not in area_categories
+                       for category in region_categories_in)):
+            return jsonify({
+                "error": "region_categories must classify every region with a valid area category"
+            }), 400
+        region_categories = [category.strip().lower() for category in region_categories_in]
+    else:
+        region_categories = []
+
     # If assessor traced one or more polygons + scale, re-measure (heavy I/O — outside lock).
     # Legacy `vertices` remains exactly one region; Office GA candidates can now be combined.
     if regions and scale_k:
         try:
             from geometry import measure_regions, polygon_perimeter_lm
             area_m2, gflags = measure_regions(regions, scale_k)
+            region_areas = [measure_regions([region], scale_k)[0] for region in regions]
             perimeters = [polygon_perimeter_lm(region, scale_k) for region in regions]
             perimeter_lm = round(sum(value for value in perimeters if value is not None), 2)
         except Exception as e:
-            area_m2, perimeter_lm, gflags = None, None, [f"geometry error: {e}"]
+            area_m2, perimeter_lm, region_areas, perimeters, gflags = (
+                None, None, [], [], [f"geometry error: {e}"])
     else:
+        region_areas = []
+        perimeters = []
         perimeter_lm = None
         gflags = []
 
@@ -738,21 +851,38 @@ def adjust(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job["status"] == "processing":
             return jsonify({"error": "job is still processing"}), 409
-        stored_candidates = {
-            candidate.get("candidate_id")
+        stored_candidate_records = {
+            candidate.get("candidate_id"): candidate
             for candidate in (job.get("candidate_polygons")
                               or (job.get("result") or {}).get("candidate_polygons") or [])
             if isinstance(candidate, dict) and candidate.get("candidate_id")
         }
-        if any(candidate_id not in stored_candidates for candidate_id in candidate_ids):
+        if any(candidate_id not in stored_candidate_records for candidate_id in candidate_ids):
             return jsonify({"error": "one or more candidate_ids are stale or unknown"}), 409
         stored_result = dict(job.get("result") or {})
+        # Older clients supplied one candidate id per region but no category list.  Preserve
+        # that flow by taking the detector's explicit category.  New clients send a category
+        # for every region, including ``unclassified`` for a manual outline.
+        effective_region_categories = list(region_categories)
+        if (not effective_region_categories and regions
+                and len(candidate_ids) == len(regions)):
+            effective_region_categories = [
+                str(stored_candidate_records[candidate_id].get("category")
+                    or "unclassified").strip().lower()
+                for candidate_id in candidate_ids
+            ]
+            if any(category not in area_categories for category in effective_region_categories):
+                effective_region_categories = []
+        categorized_remeasure = bool(
+            confirmed and regions and len(effective_region_categories) == len(regions)
+            and len(region_areas) == len(regions)
+        )
         had_zone_allocation = bool(area_m2 and area_m2 > 0) and bool(
             (isinstance(job.get("zones"), list) and job.get("zones"))
             or (isinstance(stored_result.get("zones"), list) and stored_result.get("zones"))
         )
         zone_stale_flag = None
-        if had_zone_allocation:
+        if had_zone_allocation and not categorized_remeasure:
             # /adjust supplies one replacement aggregate trace/area, not a per-zone edit.
             # Keeping the old marked-PDF split would make the four quotation sections add up
             # to the superseded measurement. Preserve raw annotation evidence, but clear the
@@ -773,6 +903,69 @@ def adjust(job_id):
                 "flags": result_flags,
                 "needs_assessor": True,
             })
+
+        replacement_zones = []
+        zone_geometry_overlap = False
+        zone_classification_required = False
+        brief_specs = dict(job.get("brief_specs") or stored_result.get("brief_specs") or {})
+        if categorized_remeasure:
+            grouped = {}
+            for index, (category, region_area, region_perimeter) in enumerate(zip(
+                    effective_region_categories, region_areas, perimeters), 1):
+                zone = grouped.setdefault(category, {
+                    "zone_key": f"assessor-trace:{category}",
+                    "category": category,
+                    "subjects": [],
+                    "measurement_kind": "area",
+                    "area_m2": 0.0,
+                    "perimeter_lm": 0.0,
+                    "annotation_count": 0,
+                    "region_indices": [],
+                    "classification_source": (
+                        "assessor-assisted-trace" if category != "unclassified"
+                        else "assessor-classification-required"
+                    ),
+                    "needs_assessor": category == "unclassified",
+                })
+                candidate_id = candidate_ids[index - 1] if len(candidate_ids) == len(regions) else None
+                candidate = stored_candidate_records.get(candidate_id, {})
+                subject = (candidate.get("level_label") or candidate.get("source_label")
+                           or f"Assessor region {index}")
+                if subject not in zone["subjects"]:
+                    zone["subjects"].append(subject)
+                zone["area_m2"] += float(region_area)
+                zone["perimeter_lm"] += float(region_perimeter or 0)
+                zone["annotation_count"] += 1
+                zone["region_indices"].append(index - 1)
+            replacement_zones = list(grouped.values())
+            for zone in replacement_zones:
+                zone["area_m2"] = round(zone["area_m2"], 1)
+                zone["perimeter_lm"] = round(zone["perimeter_lm"], 2)
+            zone_geometry_overlap = any(str(flag).startswith("regions overlap") for flag in gflags)
+            zone_classification_required = any(
+                zone["category"] == "unclassified" for zone in replacement_zones
+            )
+            if zone_classification_required:
+                gflags = list(gflags) + [
+                    "assessor: classify zone 'Assessor-traced unclassified region'"
+                ]
+            if zone_geometry_overlap:
+                gflags = list(gflags) + [
+                    "assessor: edit overlapping trace regions before zone approval"
+                ]
+            from slab_spec import empty_brief_spec
+            for category in effective_region_categories:
+                if category in {"external_yard", "dock", "ground_floor", "upper_floor"}:
+                    brief_specs.setdefault(category, empty_brief_spec(category))
+            stored_result.update({
+                "zones": replacement_zones,
+                "brief_specs": brief_specs,
+                "zone_classification_required": zone_classification_required,
+                "zone_allocation_stale": False,
+                "zone_geometry_overlap": zone_geometry_overlap,
+                "flags": _without_zone_stale_flags(stored_result.get("flags")) + list(gflags),
+                "needs_assessor": bool(zone_classification_required or zone_geometry_overlap),
+            })
         costing_result = _run_costing(area_m2, stored_result) if area_m2 else None
         jobs[job_id].update({
             "status":            "adjusted",
@@ -786,6 +979,7 @@ def adjust(job_id):
                 "vertices": regions[0] if len(regions) == 1 else [],
                 "regions":  regions,
                 "candidate_ids": candidate_ids,
+                "region_categories": effective_region_categories,
                 "scale_k":  scale_k,
                 "area_m2":  area_m2,
                 "perimeter_lm": perimeter_lm,
@@ -795,17 +989,40 @@ def adjust(job_id):
             "costing": costing_result,
         })
         if had_zone_allocation:
+            if categorized_remeasure:
+                jobs[job_id].update({
+                    "zones": replacement_zones,
+                    "brief_specs": brief_specs,
+                    "zone_classification_required": zone_classification_required,
+                    "zone_allocation_stale": False,
+                    "zone_geometry_overlap": zone_geometry_overlap,
+                    "needs_assessor": bool(zone_classification_required or zone_geometry_overlap),
+                    "result": stored_result,
+                    "flags": _without_zone_stale_flags(jobs[job_id].get("flags")) + list(gflags),
+                })
+            else:
+                jobs[job_id].update({
+                    "zones": [],
+                    "zone_classification_required": True,
+                    "zone_allocation_stale": True,
+                    "needs_assessor": True,
+                    "result": stored_result,
+                })
+                top_flags = list(jobs[job_id].get("flags") or [])
+                if zone_stale_flag not in top_flags:
+                    top_flags.append(zone_stale_flag)
+                jobs[job_id]["flags"] = top_flags
+        elif categorized_remeasure:
             jobs[job_id].update({
-                "zones": [],
-                "zone_classification_required": True,
-                "zone_allocation_stale": True,
-                "needs_assessor": True,
+                "zones": replacement_zones,
+                "brief_specs": brief_specs,
+                "zone_classification_required": zone_classification_required,
+                "zone_allocation_stale": False,
+                "zone_geometry_overlap": zone_geometry_overlap,
+                "needs_assessor": bool(zone_classification_required or zone_geometry_overlap),
                 "result": stored_result,
+                "flags": _without_zone_stale_flags(jobs[job_id].get("flags")) + list(gflags),
             })
-            top_flags = list(jobs[job_id].get("flags") or [])
-            if zone_stale_flag not in top_flags:
-                top_flags.append(zone_stale_flag)
-            jobs[job_id]["flags"] = top_flags
         save_jobs(jobs)
 
     res = job.get("result", {})
@@ -819,6 +1036,7 @@ def adjust(job_id):
         "assessed_polygon": regions[0] if len(regions) == 1 else None,
         "assessed_regions": regions,
         "candidate_ids":    candidate_ids,
+        "region_categories": effective_region_categories,
         "scale_k":        scale_k,
         "flags":          res.get("flags", []),
         "timestamp":      now_iso(),
@@ -830,6 +1048,7 @@ def adjust(job_id):
         "area_m2":  area_m2,
         "perimeter_lm": perimeter_lm,
         "region_count": len(regions),
+        "zone_count": len(replacement_zones),
         "costing":  costing_result,
         "flags":    gflags,
     })
@@ -1380,6 +1599,10 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["brief_specs"] = dict(job["brief_specs"])
     if isinstance(job.get("zones"), list):
         result["zones"] = list(job["zones"])
+    if isinstance(job.get("channel_proposals"), list):
+        result["channel_proposals"] = list(job["channel_proposals"])
+    if isinstance(job.get("channel_proposal_decisions"), dict):
+        result["channel_proposal_decisions"] = dict(job["channel_proposal_decisions"])
     if "zone_classification_required" in job:
         result["zone_classification_required"] = bool(job["zone_classification_required"])
     if job.get("zone_reference_mismatch"):
