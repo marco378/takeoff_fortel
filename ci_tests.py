@@ -101,6 +101,28 @@ ck("detected level without a defensible outline is reported, never dropped",
        for flag in _office_unresolved["flags"]),
    _office_unresolved)
 
+_office_no_sibling_pdf = "/tmp/_office_candidates_no_sibling_copy.pdf"
+_office_no_sibling_canvas = canvas.Canvas(_office_no_sibling_pdf, pagesize=(900, 500))
+_office_no_sibling_canvas.rect(60, 220, 100, 100, stroke=1, fill=0)
+_office_no_sibling_canvas.drawString(60, 190, "Office Plan Level 01")
+_office_no_sibling_canvas.drawString(340, 190, "Office Plan Level 02")
+_office_no_sibling_canvas.save()
+_office_no_sibling = _office_candidates(
+    _office_no_sibling_pdf, scale_k=0.1, scale_verified=True)
+_office_no_sibling_by_level = {
+    candidate["level"]: candidate
+    for candidate in _office_no_sibling["candidate_polygons"]
+}
+ck("missing local Office loop is never replaced by a translated sibling area",
+   _office_no_sibling_by_level[1]["outline_status"] == "resolved" and
+   _office_no_sibling_by_level[2]["outline_status"] == "unresolved" and
+   not _office_no_sibling_by_level[2]["regions"] and
+   "no level-local dark closed plate loop" in
+       " ".join(_office_no_sibling_by_level[2]["confidence_reasons"]) and
+   all("sibling-level-template" not in candidate["source"]
+       for candidate in _office_no_sibling["candidate_polygons"]),
+   _office_no_sibling)
+
 print("accuracy scorecard harness")
 from accuracy_report import (
     discover_pairs as _accuracy_discover_pairs,

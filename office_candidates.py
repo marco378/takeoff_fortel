@@ -17,7 +17,6 @@ import math
 import re
 
 import fitz
-from shapely import affinity
 from shapely.geometry import LineString, Polygon
 from shapely.ops import polygonize, unary_union
 
@@ -246,8 +245,49 @@ def _ground_regions(records: list[dict], scale_k: float | None,
     return selected or [max(records, key=lambda record: record["geometry"].area)]
 
 
+def _upper_regions(records: list[dict], scale_k: float | None) -> tuple[list[dict], str | None]:
+    """Select a level-local upper-floor loop, or explain why none is defensible.
+
+    A white CAD fill rectangle is useful corroboration, but it is not itself proof of the
+    slab edge: in the client GA files those rectangles can include plant/stair wings.  Dark
+    closed linework retains the local notches and void topology.  If the two sources overlap
+    substantially but are not the same geometry, a dark loop without any retained topology
+    is ambiguous and must remain a manual trace.
+
+    Deliberately do not copy a sibling level.  Units 2/3 prove that nominally similar floors
+    have different extents; translating the largest sibling silently manufactured an area.
+    """
+    dark = [
+        record for record in records
+        if record["source"] == "office-vector-closed-loop"
+        and ((scale_k and _diagnostic_m2(record, scale_k) >= 80)
+             or (not scale_k and record["geometry"].area > 0))
+        and _aspect_ratio(record["geometry"]) <= 5
+    ]
+    if not dark:
+        return [], "no level-local dark closed plate loop was found"
+
+    selected = max(dark, key=lambda record: record["geometry"].area)
+    if not selected["geometry"].interiors:
+        white = [
+            record for record in records
+            if record["source"] == "office-vector-white-fill-loop"
+        ]
+        overlaps = [
+            _geometry_iou(selected["geometry"], record["geometry"])
+            for record in white
+        ]
+        if any(0.50 <= overlap < IOU_DEDUPE_THRESHOLD for overlap in overlaps):
+            return [], (
+                "level-local dark and white CAD loops disagree, with no retained void/notch "
+                "topology to identify the slab edge"
+            )
+    return [selected], None
+
+
 def _candidate_record(page, page_number: int, title: dict, records: list[dict],
-                      *, translated: bool, scale_verified: bool) -> dict:
+                      *, translated: bool, scale_verified: bool,
+                      unresolved_detail: str | None = None) -> dict:
     level = title["level"]
     resolved = bool(records)
     confidence, score, reasons = _confidence(
@@ -273,6 +313,8 @@ def _candidate_record(page, page_number: int, title: dict, records: list[dict],
     if not resolved and UNRESOLVED_REASON not in reasons:
         confidence, score, reasons = _confidence(
             resolved=False, translated=False, scale_verified=scale_verified, region_count=0)
+    if unresolved_detail:
+        reasons.append(unresolved_detail)
     sources = sorted({record["source"] for record in records})
     return {
         "candidate_id": f"office-p{page_number}-level-{level:02d}",
@@ -296,7 +338,10 @@ def _candidate_record(page, page_number: int, title: dict, records: list[dict],
         "flags": [
             "ASSISTED TRACE candidate only — assessor must inspect/edit exterior doors, "
             "partitions and voids before submitting an adjustment"
-        ] + ([] if resolved else [UNRESOLVED_REASON]),
+        ] + ([] if resolved else [
+            UNRESOLVED_REASON
+            + (f" ({unresolved_detail})" if unresolved_detail else "")
+        ]),
     }
 
 
@@ -336,58 +381,21 @@ def detect_office_candidates(pdf: str, page: int = 0, *, scale_k: float | None =
             nearest = min(titles, key=lambda title: abs(pos - title[title_axis]))
             grouped[nearest["level"]].append(record)
 
-        title_by_level = {title["level"]: title for title in titles}
-        upper_records = [
-            record
-            for title in titles if title["level"] > 0
-            for record in grouped[title["level"]]
-            if ((scale_k and _diagnostic_m2(record, scale_k) >= 80)
-                or (not scale_k and record["geometry"].area / pg.mediabox.get_area() >= 0.04))
-            and _aspect_ratio(record["geometry"]) <= 5
-        ]
-        upper_template = (
-            max(upper_records, key=lambda record: record["geometry"].area)
-            if upper_records else None
-        )
-        template_level = None
-        if upper_template is not None:
-            centre = upper_template["geometry"].centroid
-            template_pos = centre.x if title_axis == "x" else centre.y
-            template_level = min(
-                (title for title in titles if title["level"] > 0),
-                key=lambda title: abs(template_pos - title[title_axis]),
-            )["level"]
-
         candidates = []
         for title in sorted(titles, key=lambda item: item["level"]):
             level = title["level"]
             translated = False
             selected = []
+            unresolved_detail = None
             if level == 0:
                 selected = _ground_regions(grouped[level], scale_k, scale_verified)
-            elif upper_template is not None:
-                local = [
-                    record for record in grouped[level]
-                    if record["geometry"].area >= upper_template["geometry"].area * 0.85
-                    and _aspect_ratio(record["geometry"]) <= 5
-                ]
-                if local:
-                    selected = [max(local, key=lambda record: record["geometry"].area)]
-                else:
-                    shift = title[title_axis] - title_by_level[template_level][title_axis]
-                    selected = [{
-                        "geometry": affinity.translate(
-                            upper_template["geometry"],
-                            xoff=shift if title_axis == "x" else 0,
-                            yoff=shift if title_axis == "y" else 0,
-                        ),
-                        "source": "office-vector-sibling-level-template",
-                    }]
-                    translated = True
+            else:
+                selected, unresolved_detail = _upper_regions(grouped[level], scale_k)
             candidates.append(_candidate_record(
                 pg, page, title, selected,
                 translated=translated,
                 scale_verified=scale_verified,
+                unresolved_detail=unresolved_detail,
             ))
 
         unresolved = [
