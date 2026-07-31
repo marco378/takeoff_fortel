@@ -432,7 +432,7 @@ def snapshot(job_id):
                     page = 0
         except Exception:
             page = 0
-        png = render_snapshot(pdf, page=page, polygon_pts=poly)
+        png = render_snapshot(pdf, page=page)
         resp = send_file(io.BytesIO(png), mimetype="image/png")
         # Expose the ACTUAL render scale (snapshot px per PDF point) so the portal can
         # convert scale_k (m/pt) -> metres per canvas pixel:  mpp = scale_k / snap_scale.

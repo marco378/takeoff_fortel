@@ -85,8 +85,16 @@ header span{opacity:.7;font-size:12px}
 .divider{width:1px;background:var(--border);height:24px;margin:0 4px}
 
 /* ── Canvas area ─────────────────────────── */
-.canvas-wrap{flex:1;overflow:auto;display:flex;align-items:flex-start;justify-content:center;padding:16px;background:var(--bg)}
-canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.08);cursor:crosshair;max-width:100%}
+.canvas-wrap{flex:1;overflow:hidden;position:relative;padding:16px;background:var(--bg)}
+canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.08);cursor:crosshair;position:absolute;transform-origin:0 0}
+
+/* ── Zoom controls ─────────────────────────── */
+.zoom-controls{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:4px;background:#fff;border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:10}
+.zoom-controls button{width:32px;height:32px;border:none;background:transparent;border-radius:5px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;transition:background .12s}
+.zoom-controls button:hover{background:#f0f2f5}
+.zoom-controls button:active{background:#e0e2e5}
+.zoom-controls .zoom-level{min-width:50px;text-align:center;font-size:12px;font-weight:700;color:var(--blue);display:flex;align-items:center;justify-content:center;border-left:1px solid var(--border);margin-left:4px;padding-left:8px}
+.zoom-controls .zoom-level:hover{background:transparent;cursor:default}
 
 /* ── Info panel (right) ──────────────────── */
 .info{width:280px;background:#fff;border-left:1px solid var(--border);flex-shrink:0;display:flex;flex-direction:column;overflow-y:auto}
@@ -301,6 +309,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <button id="btnNewRegion" title="Finish this outline and start another slab/core region">＋ Region</button>
       <div class="divider"></div>
       <button id="btnLoad" title="Load AI's proposed polygon">🤖 Load AI polygon</button>
+      <button id="btnClearAi" title="Clear AI polygon overlay">❌ Clear AI</button>
       <div class="divider"></div>
       <button id="btnApprove" class="approve">✅ Approve</button>
       <button id="btnReject"  class="reject">✗ Reject</button>
@@ -328,7 +337,15 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <div style="font-size:16px;font-weight:600;color:#333">Select a job to review</div>
       <div>or wait for the AI to flag one for approval</div>
     </div>
-    <div class="canvas-wrap" id="canvasWrap" style="display:none"></div>
+    <div class="canvas-wrap" id="canvasWrap" style="display:none">
+      <div class="zoom-controls" id="zoomControls">
+        <button id="btnZoomIn" title="Zoom in (Ctrl++)">+</button>
+        <button id="btnZoomOut" title="Zoom out (Ctrl+-)">−</button>
+        <button id="btnZoomFit" title="Fit to window">⊞</button>
+        <button id="btnZoomReset" title="Reset zoom to 100%">1:1</button>
+        <div class="zoom-level" id="zoomLevel">100%</div>
+      </div>
+    </div>
   </div>
 
   <!-- ── Info panel ── -->
@@ -483,11 +500,18 @@ let cal  = [];            // [{x,y}] calibration line endpoints
 let mpp  = null;          // metres per CANVAS pixel
 let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapshot-Scale header).
                           // The canvas is the snapshot PNG at 1:1, so 1 canvas px = (1/snapScale) PDF pt.
-                          // Pipeline scale_k is m/pt, hence mpp = scale_k / snapScale. Default 0.5 matches
-                          // render_snapshot(scale=0.5); the header overrides it for capped (wide) sheets.
+                          // Pipeline scale_k is m/pt, hence mpp = scale_k / snapScale. Default 0.5 is a
+                          // fallback; the header overrides it for the actual render (now 2.0 by default).
 let dragIdx = -1;
 let aiPoly = null;        // AI's proposed polygon (pre-loaded), already converted to CANVAS pixels
                           // (res.polygon_pts arrive in PDF points; renderJobUI scales them × snapScale)
+let zoom = 1;             // current zoom level (1 = 100%)
+let panX = 0;             // pan offset X in canvas-wrap CSS pixels
+let panY = 0;             // pan offset Y in canvas-wrap CSS pixels
+let isPanning = false;    // true while middle-mouse or space+drag is active
+let panStartX = 0;        // mouse X at pan start
+let panStartY = 0;        // mouse Y at pan start
+let spaceHeld = false;    // true while spacebar is held (pan modifier)
 
 // ─────────────────────────────────────────────────
 // Init
@@ -500,6 +524,10 @@ window.addEventListener('DOMContentLoaded', () => {
   const p = new URLSearchParams(location.search);
   if (p.get('job')) selectJob(p.get('job'));
   setupButtons();
+  // Global listeners (added once, not per-canvas)
+  window.addEventListener('mouseup', () => { dragIdx = -1; isPanning = false; });
+  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keyup', onKeyUp);
 });
 
 async function loadBuild() {
@@ -1600,9 +1628,20 @@ function loadImage(url, forJobId) {
     if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
     const wrap = document.getElementById('canvasWrap');
     wrap.innerHTML = '';
+    // Re-add zoom controls after innerHTML reset
+    wrap.insertAdjacentHTML('beforeend', `<div class="zoom-controls" id="zoomControls">
+      <button id="btnZoomIn" title="Zoom in (Ctrl++)">+</button>
+      <button id="btnZoomOut" title="Zoom out (Ctrl+-)">−</button>
+      <button id="btnZoomFit" title="Fit to window">⊞</button>
+      <button id="btnZoomReset" title="Reset zoom to 100%">1:1</button>
+      <div class="zoom-level" id="zoomLevel">100%</div>
+    </div>`);
     canvas = document.createElement('canvas');
     ctx    = canvas.getContext('2d');
     wrap.appendChild(canvas);
+    // Reset zoom/pan for new image
+    zoom = 1; panX = 0; panY = 0;
+    updateZoomDisplay();
     img = new Image();
     img.onload = () => {
       // forJobId is set by loadSnapshot(); if a newer selectJob() has since taken over
@@ -1613,6 +1652,7 @@ function loadImage(url, forJobId) {
       canvas.width  = img.width;
       canvas.height = img.height;
       setupCanvasEvents();
+      zoomFit();
       draw();
       res();
     };
@@ -1632,6 +1672,71 @@ function loadImagePlaceholder() {
   ctx.fillText('No snapshot available — drawing was not rendered', 100, 300);
   wrap.appendChild(canvas);
   setupCanvasEvents();
+}
+
+// ─────────────────────────────────────────────────
+// Zoom & Pan
+// ─────────────────────────────────────────────────
+function updateZoomDisplay() {
+  const el = document.getElementById('zoomLevel');
+  if (el) el.textContent = Math.round(zoom * 100) + '%';
+}
+
+function applyCanvasTransform() {
+  if (!canvas) return;
+  canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+}
+
+function zoomFit() {
+  if (!canvas || !img) return;
+  const wrap = document.getElementById('canvasWrap');
+  const wrapRect = wrap.getBoundingClientRect();
+  const pad = 32; // 16px padding each side
+  const availW = wrapRect.width - pad;
+  const availH = wrapRect.height - pad;
+  const scaleX = availW / img.width;
+  const scaleY = availH / img.height;
+  zoom = Math.min(scaleX, scaleY, 1); // never upscale beyond 100%
+  // Center the canvas
+  const scaledW = img.width * zoom;
+  const scaledH = img.height * zoom;
+  panX = Math.max(0, (availW - scaledW) / 2);
+  panY = Math.max(0, (availH - scaledH) / 2);
+  applyCanvasTransform();
+  updateZoomDisplay();
+}
+
+function zoomReset() {
+  zoom = 1; panX = 0; panY = 0;
+  applyCanvasTransform();
+  updateZoomDisplay();
+}
+
+function zoomIn() {
+  zoomAtPoint(1.25, null);
+}
+
+function zoomOut() {
+  zoomAtPoint(0.8, null);
+}
+
+function zoomAtPoint(factor, clientPt) {
+  if (!canvas) return;
+  const wrap = document.getElementById('canvasWrap');
+  const wrapRect = wrap.getBoundingClientRect();
+  // Center of viewport
+  const cx = clientPt ? (clientPt.x - wrapRect.left) : wrapRect.width / 2;
+  const cy = clientPt ? (clientPt.y - wrapRect.top) : wrapRect.height / 2;
+
+  const oldZoom = zoom;
+  zoom = Math.max(0.1, Math.min(10, zoom * factor));
+
+  // Adjust pan so the point under the cursor stays fixed
+  panX = cx - (cx - panX) * (zoom / oldZoom);
+  panY = cy - (cy - panY) * (zoom / oldZoom);
+
+  applyCanvasTransform();
+  updateZoomDisplay();
 }
 
 // ── Thumbnail helpers (info panel) ───────────────────
@@ -1872,17 +1977,24 @@ function updateAreaDisplay() {
 function setupCanvasEvents() {
   canvas.addEventListener('mousedown', onDown);
   canvas.addEventListener('mousemove', onMove);
-  window.addEventListener('mouseup', () => dragIdx = -1);
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  // Wire up zoom control buttons
+  const zIn  = document.getElementById('btnZoomIn');
+  const zOut = document.getElementById('btnZoomOut');
+  const zFit = document.getElementById('btnZoomFit');
+  const zRst = document.getElementById('btnZoomReset');
+  if (zIn)  zIn.addEventListener('click', zoomIn);
+  if (zOut) zOut.addEventListener('click', zoomOut);
+  if (zFit) zFit.addEventListener('click', zoomFit);
+  if (zRst) zRst.addEventListener('click', zoomReset);
 }
 
 function pos(e) {
-  // Map a CSS-pixel mouse coordinate into the canvas BACKING-STORE pixel space
-  // (canvas.width/height == snapshot PNG natural size). The (canvas.width / r.width) ratio
-  // already absorbs BOTH the CSS max-width:100% shrink AND window.devicePixelRatio, because
-  // getBoundingClientRect() returns CSS px while canvas.width is backing-store px. Do NOT
-  // multiply by devicePixelRatio here — the backing store is not DPR-scaled, so that would
-  // double-count. Calibration distance and polygon vertices both live in this space, so
-  // mpp (metres per canvas px) applies uniformly.
+  // Map a CSS-pixel mouse coordinate into the canvas BACKING-STORE pixel space.
+  // With zoom/pan transforms, getBoundingClientRect() returns the TRANSFORMED box,
+  // so the ratio (canvas.width / r.width) already accounts for zoom. Pan offset is
+  // also absorbed because getBoundingClientRect() includes the visual position.
   const r = canvas.getBoundingClientRect();
   return {
     x: (e.clientX - r.left) * canvas.width  / r.width,
@@ -1890,7 +2002,60 @@ function pos(e) {
   };
 }
 
+function onWheel(e) {
+  e.preventDefault();
+  if (e.ctrlKey || e.metaKey) {
+    // Ctrl+scroll = zoom
+    const factor = e.deltaY < 0 ? 1.1 : 0.9;
+    zoomAtPoint(factor, { x: e.clientX, y: e.clientY });
+  } else {
+    // Plain scroll = pan
+    panX -= e.deltaX;
+    panY -= e.deltaY;
+    applyCanvasTransform();
+  }
+}
+
+function onKeyDown(e) {
+  if (e.code === 'Space' && !e.repeat && document.activeElement === document.body) {
+    e.preventDefault();
+    spaceHeld = true;
+    if (canvas) canvas.style.cursor = 'grab';
+  }
+  // Keyboard zoom shortcuts
+  if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+')) {
+    e.preventDefault(); zoomIn();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === '-') {
+    e.preventDefault(); zoomOut();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === '0') {
+    e.preventDefault(); zoomReset();
+  }
+}
+
+function onKeyUp(e) {
+  if (e.code === 'Space') {
+    spaceHeld = false;
+    if (canvas) canvas.style.cursor = mode === 'cal' ? 'crosshair' : 'crosshair';
+  }
+}
+
+function getCursorForMode() {
+  return 'crosshair';
+}
+
 function onDown(e) {
+  // Middle-click or space+left-click = start panning
+  if (e.button === 1 || (e.button === 0 && spaceHeld)) {
+    e.preventDefault();
+    isPanning = true;
+    panStartX = e.clientX - panX;
+    panStartY = e.clientY - panY;
+    if (canvas) canvas.style.cursor = 'grabbing';
+    return;
+  }
+
   const p = pos(e);
 
   if (mode === 'cal') {
@@ -1921,6 +2086,12 @@ function onDown(e) {
 }
 
 function onMove(e) {
+  if (isPanning) {
+    panX = e.clientX - panStartX;
+    panY = e.clientY - panStartY;
+    applyCanvasTransform();
+    return;
+  }
   if (dragIdx >= 0) { poly[dragIdx] = pos(e); draw(); }
 }
 
@@ -1949,6 +2120,9 @@ function setupButtons() {
     activeCandidateId = null;
     poly = aiPoly.map(p => ({x: p[0], y: p[1]}));
     draw(); toast('AI polygon loaded — nudge as needed');
+  });
+  document.getElementById('btnClearAi').addEventListener('click', () => {
+    aiPoly = null; draw(); toast('AI polygon cleared');
   });
   document.getElementById('btnCalSet').addEventListener('click', () => {
     if (cal.length < 2) { toast('Draw calibration line first (click two points)', 'warn'); return; }

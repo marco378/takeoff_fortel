@@ -62,7 +62,7 @@ JOBS_FILE = Path(os.getenv("JOBS_FILE") or (Path(__file__).parent / "approval_jo
 # Snapshot rendering
 # ---------------------------------------------------------------------------
 def snapshot_scale(pdf_path: str, page: int = 0,
-                   scale: float = 0.5, max_width: int = 700) -> float:
+                   scale: float = 4.0, max_width: int = 5600) -> float:
     """The ACTUAL render scale (snapshot px per PDF point) render_snapshot() produces.
 
     render_snapshot caps the requested `scale` so the PNG is never wider than
@@ -84,8 +84,8 @@ def snapshot_scale(pdf_path: str, page: int = 0,
 
 
 def render_snapshot(pdf_path: str, page: int = 0,
-                    polygon_pts: list = None, scale: float = 0.5,
-                    max_width: int = 700) -> bytes:
+                    polygon_pts: list = None, scale: float = 4.0,
+                    max_width: int = 5600) -> bytes:
     """
     Render the drawing page as PNG.  If polygon_pts is given (list of [x,y] in PDF pts),
     overlay the AI's proposed region in translucent pink + dashed outline.
