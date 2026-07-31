@@ -1055,6 +1055,13 @@ function effectiveChannelProposalDecisions(job) {
   return nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : {};
 }
 
+function effectiveSegmentationComponents(job) {
+  const direct = job && job.segmentation_components;
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+  const nested = job && job.result && job.result.segmentation_components;
+  return nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : {};
+}
+
 function initialiseTraceState(job, res) {
   candidatePolygons = effectiveCandidatePolygons(job).map(candidate => ({
     ...candidate,
@@ -1232,6 +1239,35 @@ async function acknowledgeZoneReferenceMismatch() {
   }
 }
 
+function renderSegmentationComponentSummary(job) {
+  const evidence = effectiveSegmentationComponents(job);
+  const components = Array.isArray(evidence.component_candidates)
+    ? evidence.component_candidates.filter(component => component.plausible) : [];
+  const rawComponents = Array.isArray(evidence.raw_component_candidates)
+    ? evidence.raw_component_candidates.filter(component => component.plausible) : [];
+  if (!components.length) return '';
+  const rowHtml = (component, status) => {
+    const bbox = Array.isArray(component.bbox_pdf_pts)
+      ? component.bbox_pdf_pts.map(value => Number(value).toFixed(1)).join(', ') : '—';
+    return `<tr style="background:${component.chosen?'#eef7ed':'#fff8e8'}">
+      <td style="padding:4px;border-top:1px solid #e0d8c6;font-weight:700">${esc(status)}</td>
+      <td style="padding:4px;border-top:1px solid #e0d8c6;text-align:right">${Number(component.area_m2).toLocaleString()} m²</td>
+      <td style="padding:4px;border-top:1px solid #e0d8c6;font-family:monospace;font-size:9px">${esc(bbox)}</td>
+    </tr>`;
+  };
+  const rows = components.map(component => rowHtml(
+    component, component.chosen ? 'CHOSEN AFTER LINE-GAP CLOSING' : 'CO-COMPONENT (NOT SUMMED)'
+  )).join('');
+  const rawRows = rawComponents.map(component => rowHtml(
+    component, component.chosen ? 'RAW LARGEST COMPONENT' : 'RAW CO-COMPONENT (NOT SUMMED)'
+  )).join('');
+  return `<div style="margin:8px 0;border:1px solid #d8b96d;border-radius:6px;overflow:hidden;background:#fffdf6">
+    <div style="padding:6px 8px;background:#fff1c9;color:#664700;font-size:11px;font-weight:800">SURFACE-TINT COMPONENT REVIEW</div>
+    <div style="padding:6px 8px;font-size:10px;color:#6b5730">Only the chosen component feeds the displayed area. Co-components are matching-colour evidence and are never silently summed. Raw largest: ${esc(evidence.raw_largest_component_m2 ?? '—')} m² · all matching-tint pixels: ${esc(evidence.raw_tint_union_m2 ?? '—')} m².</div>
+    <table style="width:100%;border-collapse:collapse;font-size:10px"><thead><tr><th style="text-align:left;padding:4px">Status</th><th style="text-align:right;padding:4px">Area</th><th style="text-align:left;padding:4px">BBox (PDF pt)</th></tr></thead><tbody>${rows}${rawRows}</tbody></table>
+  </div>`;
+}
+
 function renderCandidateSummary(job) {
   const candidates = effectiveCandidatePolygons(job);
   if (!candidates.length) return '';
@@ -1335,6 +1371,7 @@ function renderJobDetails(job) {
       <span class="v"><span class="badge mstate ${esc(mstate)}">${esc(mstate.replace('_',' '))}</span></span>
     </div>` : '';
   const zoneSummary = renderZoneSummary(job);
+  const segmentationComponentSummary = renderSegmentationComponentSummary(job);
   const candidateSummary = renderCandidateSummary(job);
   const channelProposalSummary = renderChannelProposalSummary(job);
   document.getElementById('jobDetails').innerHTML = `
@@ -1349,6 +1386,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
     ${channelProposalSummary}
     ${candidateSummary}
+    ${segmentationComponentSummary}
     ${zoneSummary}
   `;
   renderCosting(job.costing || res.costing, job.status, job);

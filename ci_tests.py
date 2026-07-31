@@ -240,7 +240,10 @@ ck("engineer external-works beats architect hard-landscaping",
 print("unmarked pipeline (legend-anchored colour segmentation)")
 try:
     import numpy as _np
-    from takeoff_unmarked import segment_hatch
+    from takeoff_unmarked import (segment_hatch, find_concrete_swatch_rgb,
+                                   _choose_vector_swatch, _choose_raster_swatch,
+                                   _is_plausible_surface_tint,
+                                   _swatch_body_agrees)
     _im = _np.full((200, 300, 3), 255, _np.uint8); _im[50:150, 60:210] = (216, 216, 216)  # 100x150 grey
     _comp = segment_hatch(_im, (216, 216, 216))
     ck("segment grey hatch ~15,000 px", _comp is not None and abs(int(_comp.sum()) - 15000) < 900)
@@ -250,6 +253,61 @@ try:
     ck("white-segmentation blowup blocked by plausibility", len(plausible(279905)) >= 1)
     _w = segment_hatch(_im, (255, 0, 0))   # colour not present
     ck("absent hatch colour -> no region", _w is None or int(_w.sum()) == 0)
+
+    print("client legend-swatch regressions (rotation, bright tints, pattern overlays)")
+    import fitz as _fitz_swatch
+    _swatch_pdf = "/tmp/_ci_rotated_bright_swatch.pdf"
+    _sd = _fitz_swatch.open()
+    _sp = _sd.new_page(width=400, height=600)
+    # Text and chip are authored in unrotated PDF coordinates; get_pixmap() applies /Rotate.
+    # The regression is the same coordinate-space mismatch as the real 270-degree sheet.
+    _sp.insert_text((100, 450), "Concrete Service Yard", fontsize=12, rotate=90)
+    _sp.draw_rect(_fitz_swatch.Rect(92, 300, 108, 340),
+                  color=None, fill=(1.0, 180 / 255, 1.0))
+    _sp.set_rotation(270)
+    _sd.save(_swatch_pdf)
+    _sd.close()
+    with _fitz_swatch.open(_swatch_pdf) as _rd:
+        _rp = _rd[0]
+        _rpx = _rp.get_pixmap(matrix=_fitz_swatch.Matrix(2, 2), alpha=False)
+        _rim = _np.frombuffer(_rpx.samples, _np.uint8).reshape(
+            _rpx.height, _rpx.width, _rpx.n)[..., :3]
+        _raw_bbox = _rp.search_for("Concrete Service Yard")[0]
+        _rendered_bbox = _raw_bbox * _rp.rotation_matrix
+        ck("rotated label bbox transformed into rendered-page coordinates",
+           _rendered_bbox != _raw_bbox and _rendered_bbox.y1 <= _rp.rect.height)
+    _rrgb, _rlabel = find_concrete_swatch_rgb(_swatch_pdf, im=_rim, S=2.0)
+    ck("rotation-corrected raster swatch reads saturated bright tint",
+       _rrgb == (255, 180, 255) and "concrete service yard" in _rlabel,
+       f"rgb={_rrgb} label={_rlabel}")
+    ck("surface-tint plausibility accepts bright hue and 239 tint, rejects ink/paper",
+       _is_plausible_surface_tint((255, 180, 255)) and
+       _is_plausible_surface_tint((239, 239, 240)) and
+       not _is_plausible_surface_tint((0, 0, 0)) and
+       not _is_plausible_surface_tint((255, 255, 255)))
+
+    _vr = _fitz_swatch.Rect(10, 10, 40, 24)
+    _overlay_candidates = [
+        (2.0, (0, 0, 0), _fitz_swatch.Rect(_vr)),
+        (2.1, (239, 239, 240), _fitz_swatch.Rect(_vr)),
+    ]
+    ck("co-located black pattern overlay yields to its non-black base tint",
+       _choose_vector_swatch(_overlay_candidates) == (239, 239, 240))
+    _two_row_patch = _np.full((20, 120, 3), 255, _np.uint8)
+    _two_row_patch[:, 85:105] = (239, 239, 240)  # target chip nearest its label
+    _two_row_patch[:, 0:50] = (156, 192, 207)    # larger neighbouring legend chip
+    ck("wide raster window chooses nearest legend chip, not a larger neighbouring row",
+       _choose_raster_swatch(_two_row_patch) == (239, 239, 240))
+    ck("legend/body agreement is a strict gate, not an informational warning",
+       _swatch_body_agrees((239, 239, 240), (238, 238, 240)) and
+       not _swatch_body_agrees((239, 239, 240), (214, 214, 214)))
+    _rgb_lock = _np.full((80, 120, 3), 255, _np.uint8)
+    _rgb_lock[10:70, 10:55] = (239, 239, 240)
+    _rgb_lock[10:70, 65:110] = (239, 220, 240)  # same R/B; G is outside the lock
+    _strict_rgb = segment_hatch(_rgb_lock, (239, 239, 240), tol=5,
+                                exclude_border=False, full_rgb=True)
+    ck("swatch lock constrains every RGB channel, including near-grey tints",
+       _strict_rgb is not None and int(_strict_rgb.sum()) < 60 * 55)
 
     print("team feedback fixes (DEMO4)")
     from takeoff_unmarked import drawing_style

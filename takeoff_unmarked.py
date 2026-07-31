@@ -45,17 +45,102 @@ CHANNEL_PROPOSAL_BASIS = (
 # ---------------------------------------------------------------- legend -> hatch colour
 def _label_bbox(pdf, page=0):
     """Find the legend text line naming the priced concrete area; return (bbox_pt, text) or None."""
-    pg = fitz.open(pdf)[page]
-    lines = {}
-    for w in pg.get_text("words"):        # (x0,y0,x1,y1, word, block,line,wordno)
-        lines.setdefault((w[5], w[6]), []).append(w)
-    for ws in lines.values():
-        ws = sorted(ws, key=lambda w: w[0])
-        text = " ".join(w[4] for w in ws).lower()
-        if any(lbl in text for lbl in CONCRETE_LABELS):
-            return (min(w[0] for w in ws), min(w[1] for w in ws),
-                    max(w[2] for w in ws), max(w[3] for w in ws)), text[:40]
+    with fitz.open(pdf) as doc:
+        pg = doc[page]
+        lines = {}
+        for w in pg.get_text("words"):        # (x0,y0,x1,y1, word, block,line,wordno)
+            lines.setdefault((w[5], w[6]), []).append(w)
+        for ws in lines.values():
+            ws = sorted(ws, key=lambda w: w[0])
+            text = " ".join(w[4] for w in ws).lower()
+            if any(lbl in text for lbl in CONCRETE_LABELS):
+                return (min(w[0] for w in ws), min(w[1] for w in ws),
+                        max(w[2] for w in ws), max(w[3] for w in ws)), text[:40]
     return None
+
+
+def _is_plausible_surface_tint(rgb):
+    """A legend surface can be any hue; reject only ink-black and paper-white.
+
+    Saturated bright colours (for example a channel at 255) and very light architectural
+    tints must survive.  This deliberately classifies no specific architect or RGB value.
+    """
+    return bool(rgb) and max(rgb) > 30 and min(rgb) < 245
+
+
+SWATCH_BODY_AGREE_TOL = 5
+
+
+def _swatch_body_agrees(swatch_rgb, body_rgb, tol=SWATCH_BODY_AGREE_TOL):
+    """Require the legend proposal and selected surface to agree channel-by-channel."""
+    if not swatch_rgb or not body_rgb:
+        return False
+    return max(abs(int(body_rgb[i]) - int(swatch_rgb[i])) for i in range(3)) <= tol
+
+
+def _dominant_rgb(im_rgb, mask):
+    """Return the exact modal RGB tuple inside a component without a huge 3-D histogram."""
+    pixels = im_rgb[mask]
+    if not pixels.size:
+        return None
+    packed = ((pixels[:, 0].astype(np.uint32) << 16)
+              | (pixels[:, 1].astype(np.uint32) << 8)
+              | pixels[:, 2].astype(np.uint32))
+    values, counts = np.unique(packed, return_counts=True)
+    mode = int(values[int(np.argmax(counts))])
+    return ((mode >> 16) & 255, (mode >> 8) & 255, mode & 255)
+
+
+def _rect_iou(a, b):
+    ix = max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
+    iy = max(0.0, min(a.y1, b.y1) - max(a.y0, b.y0))
+    intersection = ix * iy
+    union = a.get_area() + b.get_area() - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _choose_vector_swatch(candidates):
+    """Choose the nearest vector swatch, preferring its non-black co-located base fill."""
+    if not candidates:
+        return None
+    nearest = min(candidates, key=lambda candidate: candidate[0])
+    colocated = [candidate for candidate in candidates
+                 if _rect_iou(candidate[2], nearest[2]) >= 0.90]
+    surface_fills = [candidate for candidate in colocated
+                     if _is_plausible_surface_tint(candidate[1])]
+    chosen = min(surface_fills or colocated, key=lambda candidate: candidate[0])
+    return chosen[1]
+
+
+def _choose_raster_swatch(patch):
+    """Choose the nearest solid surface chip left of a rendered legend label.
+
+    The sample window is deliberately wide for legends with indented chips.  Choosing the
+    global modal colour across that window can therefore steal a larger chip from the next
+    legend row.  Connected components preserve spatial association: the nearest filled block
+    wins, while small text/border antialias fragments are ignored.
+    """
+    if patch is None or patch.size == 0:
+        return None
+    keep_mask = (patch.min(2) < 245) & (patch.max(2) > 30)
+    labels, count = ndi.label(keep_mask)
+    candidates = []
+    for component_id in range(1, count + 1):
+        mask = labels == component_id
+        yy, xx = np.where(mask)
+        if len(xx) < 20:
+            continue
+        width = int(xx.max() - xx.min() + 1)
+        height = int(yy.max() - yy.min() + 1)
+        density = len(xx) / (width * height)
+        if width < 3 or height < 3 or density < 0.15:
+            continue
+        rgb = _dominant_rgb(patch, mask)
+        if not _is_plausible_surface_tint(rgb):
+            continue
+        distance_from_label = int(patch.shape[1] - 1 - xx.max())
+        candidates.append((distance_from_label, -len(xx), rgb))
+    return min(candidates)[2] if candidates else None
 
 
 def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
@@ -65,8 +150,17 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
     found = _label_bbox(pdf, page)
     if not found:
         return None, None
-    (lx0, ly0, lx1, ly1), text = found
-    cy = (ly0 + ly1) / 2
+    raw_bbox, text = found
+    raw_lx0, raw_ly0, raw_lx1, raw_ly1 = raw_bbox
+    raw_cy = (raw_ly0 + raw_ly1) / 2
+
+    # get_text() / get_drawings() use unrotated coordinates, while get_pixmap() returns the
+    # visually rotated page.  Transform the complete bbox before raster pixel arithmetic.
+    with fitz.open(pdf) as doc:
+        pg = doc[page]
+        rendered_bbox = fitz.Rect(raw_bbox) * pg.rotation_matrix
+        lx0, ly0, lx1, ly1 = rendered_bbox
+        cy = (ly0 + ly1) / 2
 
     # (a) raster sample: dominant non-white/non-black colour in a box just left of the label
     if im is not None:
@@ -75,30 +169,35 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
         y0 = int((cy - 7) * S);  y1 = int((cy + 7) * S)
         x0, x1 = max(0, x0), max(0, min(W, x1)); y0, y1 = max(0, y0), min(H, y1)
         if x1 - x0 > 4 and y1 - y0 > 2:
-            patch = im[y0:y1, x0:x1].reshape(-1, 3)
-            keep = patch[(patch.max(1) < 240) & (patch.min(1) > 30)]   # drop white bg + black ink
-            if len(keep) > 8:
-                from collections import Counter
-                rgb = Counter(map(tuple, keep)).most_common(1)[0][0]
-                return tuple(int(c) for c in rgb), text
+            patch = im[y0:y1, x0:x1]
+            # Drop only paper-like near-white and ink-like near-black.  The old max<240
+            # predicate discarded any tint with one bright channel (including saturated
+            # colours) and every 239/240 architectural tint before it could be considered.
+            rgb = _choose_raster_swatch(patch)
+            if rgb:
+                return rgb, text
 
     # (b) vector fill rect beside the label
-    pg = fitz.open(pdf)[page]
-    best = None
-    for dr in pg.get_drawings():
-        fill = dr.get("fill")
-        if not fill:
-            continue
-        r = dr["rect"]
-        if not (2 < r.width < 70 and 2 < r.height < 32):
-            continue
-        if r.x1 > lx0 + 3 or r.y1 < cy - 16 or r.y0 > cy + 16:
-            continue
-        d = lx0 - r.x1
-        if best is None or d < best[0]:
-            best = (d, tuple(int(round(c * 255)) for c in fill))
-    if best:
-        return best[1], text
+    candidates = []
+    with fitz.open(pdf) as doc:
+        pg = doc[page]
+        for dr in pg.get_drawings():
+            fill = dr.get("fill")
+            if not fill:
+                continue
+            r = dr["rect"]
+            if not (2 < r.width < 70 and 2 < r.height < 32):
+                continue
+            if r.x1 > raw_lx0 + 3 or r.y1 < raw_cy - 16 or r.y0 > raw_cy + 16:
+                continue
+            candidates.append((
+                raw_lx0 - r.x1,
+                tuple(int(round(c * 255)) for c in fill),
+                fitz.Rect(r),
+            ))
+    vector_rgb = _choose_vector_swatch(candidates)
+    if vector_rgb:
+        return vector_rgb, text
     return None, text
 
 
@@ -583,7 +682,7 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
 
 
 def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
-                  title_block_frac=0.0, exclude_border=True, _diag=None):
+                  title_block_frac=0.0, exclude_border=True, full_rgb=False, _diag=None):
     """Best-plausible connected region of the concrete-yard hatch.
 
     Changes vs original:
@@ -620,7 +719,7 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
     """
     r, g, b = im_rgb[..., 0].astype(int), im_rgb[..., 1].astype(int), im_rgb[..., 2].astype(int)
     R, G, B = rgb
-    if max(rgb) - min(rgb) <= 6:                       # grey hatch
+    if not full_rgb and max(rgb) - min(rgb) <= 6:      # generic grey fallback
         mask = (np.abs(r - g) < 12) & (np.abs(g - b) < 12) & (r >= R - tol) & (r <= R + tol)
     else:
         mask = (np.abs(r - R) <= tol) & (np.abs(g - G) <= tol) & (np.abs(b - B) <= tol)
@@ -649,10 +748,13 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
     if title_block_frac > 0:
         cutoff = int(im_rgb.shape[0] * (1.0 - title_block_frac))
         active = mask[:cutoff, :]
+        raw_mask = np.zeros_like(mask)
+        raw_mask[:cutoff, :] = active
         closed_active = ndi.binary_closing(active, structure=np.ones((close, close)))
         mask = np.zeros_like(mask)
         mask[:cutoff, :] = closed_active
     else:
+        raw_mask = mask.copy()
         mask = ndi.binary_closing(mask, structure=np.ones((close, close)))
 
     if mask.sum() == 0:
@@ -682,6 +784,50 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
         # found nothing in the 200-50,000 m² band, fell back to the largest blob and emitted
         # 8 m² for a site-wide external works drawing. A number that small is not a yard.
         _diag["no_plausible_component"] = no_plausible_component
+        if k is not None:
+            px_per_m2 = (S * S) / (k * k)
+
+            def _records(component_labels, component_sizes, component_order, chosen=None):
+                slices = ndi.find_objects(component_labels)
+                records = []
+                for idx in component_order[:20]:
+                    area_m2 = float(component_sizes[idx]) / px_per_m2
+                    sl = slices[idx] if idx < len(slices) else None
+                    if sl is None:
+                        continue
+                    ys, xs = sl
+                    records.append({
+                        "component_id": int(idx + 1),
+                        "area_m2": round(area_m2, 1),
+                        "bbox_pdf_pts": [
+                            round(xs.start / S, 1), round(ys.start / S, 1),
+                            round(xs.stop / S, 1), round(ys.stop / S, 1),
+                        ],
+                        "plausible": bool(
+                            PLAUSIBLE_MIN_M2 <= area_m2 <= PLAUSIBLE_MAX_M2),
+                        "chosen": bool(idx == chosen),
+                    })
+                return records
+
+            _diag["component_candidates"] = _records(lab, sizes, order, best_idx)
+            _diag["selected_component_m2"] = round(float(sizes[best_idx]) / px_per_m2, 1)
+            _diag["plausible_component_union_m2"] = round(sum(
+                float(sizes[idx]) / px_per_m2 for idx in order
+                if PLAUSIBLE_MIN_M2 <= float(sizes[idx]) / px_per_m2 <= PLAUSIBLE_MAX_M2
+            ), 1)
+
+            # Preserve the unclosed evidence too. Closing is intentionally retained for the
+            # measured component (thin paint/line gaps), but it must never hide a material
+            # largest-component-vs-all-tint ambiguity from the assessor.
+            raw_lab, raw_n = ndi.label(raw_mask)
+            if raw_n:
+                raw_sizes = ndi.sum(np.ones_like(raw_lab), raw_lab, range(1, raw_n + 1))
+                raw_order = list(np.argsort(raw_sizes)[::-1])
+                _diag["raw_component_candidates"] = _records(
+                    raw_lab, raw_sizes, raw_order, raw_order[0])
+                _diag["raw_largest_component_m2"] = round(
+                    float(raw_sizes[raw_order[0]]) / px_per_m2, 1)
+                _diag["raw_tint_union_m2"] = round(int(raw_mask.sum()) / px_per_m2, 1)
     comp = lab == best_idx + 1              # NOT hole-filled yet
 
     # ── Drop satellite components (legend swatches, stray chips) ─────────────
@@ -859,6 +1005,22 @@ def _implausible_scale_ratio(k_m_per_pt):
     return not (PLAUSIBLE_SCALE_RATIO_MIN <= implied_n <= PLAUSIBLE_SCALE_RATIO_MAX)
 
 
+def _title_scale_denominators(text):
+    """Return 1:N candidates by viewport prevalence, preserving reading order for ties.
+
+    Tender sheets routinely carry small 1:75 details and a 1:500 yard plan.  The denominator
+    repeated across the main viewport labels is the safest text candidate; an equal-frequency
+    tie keeps PDF reading order (the long-established behaviour) and remains subject to the
+    normal scale-consensus disagreement gate.
+    """
+    all_candidates = [int(value) for value in re.findall(
+        r"\b1\s*:\s*(\d{2,4})\b", text)]
+    plausible = [value for value in all_candidates
+                 if PLAUSIBLE_SCALE_RATIO_MIN <= value <= PLAUSIBLE_SCALE_RATIO_MAX]
+    first_seen = {value: plausible.index(value) for value in set(plausible)}
+    return sorted(set(plausible), key=lambda value: (-plausible.count(value), first_seen[value]))
+
+
 def scale_for(pdf, page=0):
     """(k_m_per_pt, verified_bool, note, sources).
 
@@ -878,16 +1040,23 @@ def scale_for(pdf, page=0):
 
     sources: dict with keys 'title_block' and/or 'scale_bar' recording the contributing values.
     """
-    pg = fitz.open(pdf)[page]
-    m = re.search(r"1\s*:\s*(\d{2,4})", pg.get_text())
-    denom = int(m.group(1)) if m else None
-    k_title = SC.title_block_k(denom)
+    with fitz.open(pdf) as doc:
+        page_text = doc[page].get_text()
+    denoms = _title_scale_denominators(page_text)
     kbar, info = SC.detect_scale_bar(pdf, page)
     uu = SC.user_unit(pdf, page)
+
+    # A sheet can contain detail scales as well as its yard-plan viewport scale. Candidate order
+    # is determined from page-text prevalence above; the independent bar still has to pass the
+    # normal consensus gate and never selects a convenient printed scale merely because it agrees.
+    denom = denoms[0] if denoms else None
+    k_title = SC.title_block_k(denom)
 
     sources = {}
     if k_title:
         sources["title_block"] = {"denom": denom, "k": round(k_title * uu, 6)}
+        if len(denoms) > 1:
+            sources["title_block_candidates"] = denoms
 
     if kbar:
         kbar *= uu
@@ -951,6 +1120,15 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # --- drawing-style guard (team feedback #2: don't give a wrong number on non-colour-coded sheets) ---
     style, solid = drawing_style(im)
     flags.append(f"drawing style: {style} (solid-fill {solid*100:.0f}%)")
+    sheet_identity = f"{os.path.basename(pdf)}\n{pg.get_text()}".lower()
+    if re.search(r"\bsite\s+location\s+plan\b", sheet_identity):
+        return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style,
+                "price_gbp": None, "measurement_state": sanity.UNMEASURED,
+                "needs_assessor": True,
+                "flags": flags + [
+                    "REFUSED — sheet identifies itself as a Site Location Plan, not a slab/yard "
+                    "measurement viewport. A matching colour legend cannot override drawing "
+                    "identity; route the actual external-works/surfacing sheet to takeoff."]}
     if style == "line/hatch":
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
@@ -971,9 +1149,9 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # (3,172 vs Smita's Bluebeam 3,156) that is invisible to the border/satellite exclusion above
     # because it is CONNECTED, not a separate blob.
     #
-    # Fix: LOCK the segmentation band centre to the legend-confirmed swatch colour when the swatch
-    # is readable and grey (e.g. 224 here) — the darker ancillary-concrete grey then falls outside
-    # the locked ±tol band and is never admitted into the mask, regardless of closing. A plausibility
+    # Fix: LOCK the segmentation band centre to any plausible legend-confirmed surface tint — not
+    # only grey.  The darker ancillary-concrete grey then falls outside the locked ±tol band and is
+    # never admitted into the mask, regardless of closing. A plausibility
     # gate (same PLAUSIBLE_MIN_M2/MAX_M2 range segment_hatch already uses for best-component choice)
     # falls back to the validated generic 214 band if the locked band yields nothing plausible —
     # this is what prevents a repeat of the Demo-4 regression (swatch reads in [195,199]∪[229,236]
@@ -988,21 +1166,18 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     swatch, label = find_concrete_swatch_rgb(pdf, im=im, S=S)
     legend_found = bool(label)   # True in both label branches below; False only in the no-legend else
     if label and swatch:
-        is_grey = (max(swatch) - min(swatch) <= 18) and (188 <= sum(swatch) / 3 <= 236)
-        if is_grey:
-            # LOCK the band centre to the legend-confirmed swatch colour. Other grey surfaces on
-            # the sheet (e.g. "Footpaths (ancillary): Concrete") that render at a different grey
-            # fall outside this locked band and are excluded, even if they would have fallen inside
-            # the old generic [200,228] band.
+        if _is_plausible_surface_tint(swatch):
+            # LOCK the full RGB band to the legend-confirmed tint. Other surfaces on the sheet
+            # that render at a different tint fall outside the locked band and are excluded.
             rgb = swatch
             swatch_locked = True
-            flags.append(f"legend '{label}': swatch {swatch} grey — band LOCKED to swatch centre "
-                         f"±{GREY_TOL} (other grey surfaces, e.g. 'Footpaths (ancillary): Concrete', "
-                         f"fall outside the locked band and are excluded)")
+            flags.append(f"legend '{label}': plausible surface swatch {swatch} — full RGB band "
+                         f"LOCKED to swatch centre ±{GREY_TOL}")
         else:
             region_confidence = "low"
-            flags.append(f"legend '{label}' found but swatch {swatch} not grey — using SGP grey convention "
-                         f"{GREY_FALLBACK} (lower confidence; assessor confirm)")
+            flags.append(f"legend '{label}' found but swatch {swatch} is near-black/near-white, "
+                         f"not a plausible surface tint — using SGP grey convention {GREY_FALLBACK} "
+                         "(lower confidence; assessor confirm)")
     elif label:
         flags.append(f"legend '{label}' found (swatch unreadable) — using SGP grey convention {GREY_FALLBACK}")
     else:
@@ -1029,7 +1204,8 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 "flags": flags + ["no scale — cannot measure"]}
 
     _seg_diag = {}
-    comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S, _diag=_seg_diag)
+    comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S,
+                         full_rgb=swatch_locked, _diag=_seg_diag)
 
     # --- swatch-lock plausibility gate: fall back to the validated generic grey band if the
     # locked swatch band produced nothing plausible (closes the Demo-4 regression class — a
@@ -1044,8 +1220,35 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                          f"{GREY_FALLBACK}±{GREY_TOL}; assessor confirm region colour")
             region_confidence = "low"
             rgb = GREY_FALLBACK
+            swatch_locked = False
             _seg_diag = {}
             comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S, _diag=_seg_diag)
+
+    # The legend proposes a colour; the measured body must independently confirm it. The
+    # segmentation band is intentionally wider than this agreement gate to tolerate rendering,
+    # but a modal body colour more than five RGB levels away is not silently accepted.
+    if swatch_locked and comp is not None and comp.sum() > 0:
+        body_rgb = _dominant_rgb(im, comp)
+        body_diff = max(abs(int(body_rgb[i]) - int(swatch[i])) for i in range(3)) \
+            if body_rgb else 256
+        if not _swatch_body_agrees(swatch, body_rgb):
+            flags.append(
+                f"legend/body colour DISAGREE: swatch {swatch}, selected component dominant "
+                f"RGB {body_rgb}, max channel difference {body_diff} > "
+                f"{SWATCH_BODY_AGREE_TOL} — FELL BACK to validated SGP grey band "
+                f"{GREY_FALLBACK}±{GREY_TOL}; assessor confirm region colour"
+            )
+            region_confidence = "low"
+            rgb = GREY_FALLBACK
+            swatch_locked = False
+            _seg_diag = {}
+            comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S, _diag=_seg_diag)
+        else:
+            flags.append(
+                f"legend/body colour cross-check PASSED: swatch {swatch}, selected component "
+                f"dominant RGB {body_rgb} (max channel difference {body_diff} ≤ "
+                f"{SWATCH_BODY_AGREE_TOL})"
+            )
 
     if comp is None or comp.sum() == 0:
         return {"pdf": pdf, "area_m2": None,
@@ -1070,17 +1273,61 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             overlap_m2 = overlap_px * (1.0 / S) ** 2 * k * k
     px = int(yard_comp.sum())
 
-    # --- confidence cross-check: dominant grey value of the chosen component vs the band centre
-    # actually used to select it (cheap sanity signal for the assessor, no behaviour change). ---
-    try:
-        comp_pixels = im[comp]
-        if comp_pixels.size:
-            dom_mode = int(np.bincount(comp_pixels[:, 0]).argmax())
-            matches = abs(dom_mode - rgb[0]) <= GREY_TOL
-            flags.append(f"component dominant grey {dom_mode} — "
-                         f"{'matches' if matches else 'DIFFERS from'} segmentation centre {rgb}")
-    except Exception:
-        pass
+    body_rgb = _dominant_rgb(im, comp)
+    flags.append(f"selected surface component dominant RGB {body_rgb}; segmentation centre {rgb}")
+
+    component_evidence = {
+        key: _seg_diag.get(key)
+        for key in (
+            "selected_component_m2", "plausible_component_union_m2",
+            "raw_largest_component_m2", "raw_tint_union_m2",
+            "component_candidates", "raw_component_candidates",
+        )
+        if _seg_diag.get(key) is not None
+    }
+    component_records = component_evidence.get("component_candidates") or []
+    selected_record = next((record for record in component_records if record.get("chosen")), None)
+    co_components = [record for record in component_records
+                     if not record.get("chosen") and record.get("plausible")]
+    if selected_record:
+        flags.append(
+            "surface-tint component chosen (pre-void-fill): "
+            f"{selected_record['area_m2']:,.1f} m² at bbox {selected_record['bbox_pdf_pts']} PDF pt"
+        )
+    if co_components:
+        component_text = "; ".join(
+            f"{record['area_m2']:,.1f} m² bbox {record['bbox_pdf_pts']}"
+            for record in co_components[:10]
+        )
+        flags.append(
+            "assessor: co-components matching the legend tint were NOT summed into the measured "
+            f"total — {component_text}"
+        )
+        region_confidence = "low"
+
+    raw_largest = component_evidence.get("raw_largest_component_m2") or 0
+    raw_union = component_evidence.get("raw_tint_union_m2") or 0
+    raw_records = component_evidence.get("raw_component_candidates") or []
+    raw_co_components = [record for record in raw_records if not record.get("chosen")]
+    if raw_co_components:
+        raw_component_text = "; ".join(
+            f"{record['area_m2']:,.1f} m² bbox {record['bbox_pdf_pts']}"
+            for record in raw_co_components[:10]
+        )
+        flags.append(
+            "assessor: pre-closing matching-tint co-components (not summed separately) — "
+            f"{raw_component_text}"
+        )
+    if raw_largest > 0 and raw_union > raw_largest * 1.05:
+        swing_pct = (raw_union - raw_largest) / raw_largest * 100
+        flags.append(
+            "assessor: matching tint is materially fragmented before line-gap closing — raw "
+            f"largest component {raw_largest:,.1f} m² vs all matching-tint pixels "
+            f"{raw_union:,.1f} m² ({swing_pct:.1f}% difference). The deterministic chosen "
+            "component is reported above; assessor decides whether separated co-components "
+            "belong to the Yard."
+        )
+        region_confidence = "low"
 
     flags.append("dock-bay recesses & interior islands kept as DEDUCTIONS (not filled); thin paint bridged by closing")
     if _seg_diag.get('void_fill_m2', 0) > 0:
@@ -1292,6 +1539,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "polygon_pts": polygon_pts, "flags": flags,
             "zones": zones,
             "zones_total_area_m2": zones_total_area,
+            "segmentation_components": component_evidence,
             "channel_proposals": channel_proposals,
             "manhole_count_estimate": manhole_count_estimate,
             "manhole_count_assumed": manhole_count_assumed,

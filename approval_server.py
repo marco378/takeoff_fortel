@@ -1839,6 +1839,7 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 # Mirror zone-aware marked-PDF evidence at job level for the portal while
                 # retaining the canonical nested pipeline result for backward compatibility.
                 "zones":            result.get("zones", []),
+                "segmentation_components": result.get("segmentation_components", {}),
                 "markup_annotations": result.get("markup_annotations", []),
                 "brief_specs":      result.get("brief_specs", {}),
                 "zone_classification_required": bool(
