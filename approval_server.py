@@ -474,6 +474,35 @@ def _zone_block_reason(job: dict) -> str | None:
             "every zone before approval")
 
 
+def _channel_proposal_block_reason(job: dict) -> str | None:
+    """Pending channel assumptions require an explicit accept/edit/remove decision.
+
+    The decisions do not turn proposals into measured zones and do not alter costing.  This
+    gate merely prevents an assessor from approving the drawing while an assumption panel is
+    still awaiting review.
+    """
+    result = job.get("result") or {}
+    proposals = job.get("channel_proposals")
+    if not isinstance(proposals, list):
+        proposals = (result.get("channel_proposals")
+                     if isinstance(result.get("channel_proposals"), list) else [])
+    proposals = [proposal for proposal in proposals
+                 if isinstance(proposal, dict) and proposal.get("proposal_id")]
+    if not proposals:
+        return None
+    decisions = job.get("channel_proposal_decisions")
+    if not isinstance(decisions, dict):
+        decisions = (result.get("channel_proposal_decisions")
+                     if isinstance(result.get("channel_proposal_decisions"), dict) else {})
+    pending = [proposal["proposal_id"] for proposal in proposals
+               if decisions.get(proposal["proposal_id"], {}).get("decision")
+               not in {"accepted", "removed"}]
+    if pending:
+        return (f"{len(pending)} assumed channel proposal(s) require assessor "
+                "accept/edit/remove review before approval")
+    return None
+
+
 def _approve_block_reason(job: dict) -> str | None:
     """
     Server-side hard-block mirroring the escalation-guard mechanism (fb5b92b, >£200k
@@ -485,6 +514,9 @@ def _approve_block_reason(job: dict) -> str | None:
     zone_reason = _zone_block_reason(job)
     if zone_reason:
         return zone_reason
+    channel_reason = _channel_proposal_block_reason(job)
+    if channel_reason:
+        return channel_reason
     if job.get("spec_pricing_warning"):
         return "slab specification is saved but requires human pricing review before approval"
     state = job.get("measurement_state") or result.get("measurement_state")
@@ -904,6 +936,104 @@ def classify_zones(job_id):
                     "zone_classification_required": still_unclassified,
                     "zone_reference_mismatch": False if acknowledge_mismatch else bool(
                         result.get("zone_reference_mismatch", False))})
+
+
+@app.route("/channel-proposals/<job_id>", methods=["POST"])
+def review_channel_proposals(job_id):
+    """Record assessor accept/edit/remove decisions without creating measured quantities."""
+    data = request.get_json(silent=True) or {}
+    submitted = data.get("decisions")
+    if not isinstance(submitted, list) or not submitted:
+        return jsonify({"error": "decisions must be a non-empty list"}), 400
+
+    normalised = []
+    for item in submitted:
+        if not isinstance(item, dict):
+            return jsonify({"error": "each decision must be an object"}), 400
+        proposal_id = str(item.get("proposal_id") or "").strip()
+        action = str(item.get("action") or "").strip().lower()
+        if not proposal_id or action not in {"accept", "remove"}:
+            return jsonify({"error": "proposal_id and action accept/remove are required"}), 400
+        length_lm = item.get("length_lm")
+        if action == "accept":
+            if (not isinstance(length_lm, (int, float)) or isinstance(length_lm, bool)
+                    or not math.isfinite(length_lm) or not 0 < length_lm <= 100_000):
+                return jsonify({"error": "accepted length_lm must be a positive number"}), 400
+            length_lm = round(float(length_lm), 2)
+        else:
+            length_lm = None
+        normalised.append((proposal_id, action, length_lm))
+    if len({proposal_id for proposal_id, _, _ in normalised}) != len(normalised):
+        return jsonify({"error": "proposal_id decisions must be unique"}), 400
+
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        result = dict(job.get("result") or {})
+        proposals = job.get("channel_proposals")
+        if not isinstance(proposals, list):
+            proposals = (result.get("channel_proposals")
+                         if isinstance(result.get("channel_proposals"), list) else [])
+        known = {
+            proposal.get("proposal_id"): proposal
+            for proposal in proposals
+            if isinstance(proposal, dict) and proposal.get("proposal_id")
+        }
+        unknown = [proposal_id for proposal_id, _, _ in normalised
+                   if proposal_id not in known]
+        if unknown:
+            return jsonify({"error": "unknown channel proposal_id(s): "
+                            + ", ".join(sorted(unknown))}), 409
+
+        decisions = dict(job.get("channel_proposal_decisions")
+                         or result.get("channel_proposal_decisions") or {})
+        decided_at = now_iso()
+        for proposal_id, action, length_lm in normalised:
+            proposal = known[proposal_id]
+            decisions[proposal_id] = {
+                "proposal_id": proposal_id,
+                "decision": "accepted" if action == "accept" else "removed",
+                "length_lm": length_lm,
+                "original_proposed_length_lm": proposal.get("proposed_length_lm"),
+                "edited": bool(
+                    action == "accept"
+                    and length_lm != proposal.get("proposed_length_lm")
+                ),
+                "decided_at": decided_at,
+                # Retain the proposed geometry as audit/display evidence. A numeric edit does
+                # not pretend that the original two-point line has also been re-measured.
+                "polyline_pts": proposal.get("polyline_pts", []),
+            }
+        reviewed = bool(known) and all(
+            decisions.get(proposal_id, {}).get("decision") in {"accepted", "removed"}
+            for proposal_id in known
+        )
+        result.update({
+            "channel_proposal_decisions": decisions,
+            "channel_proposals_reviewed": reviewed,
+        })
+        job.update({
+            "channel_proposal_decisions": decisions,
+            "channel_proposals_reviewed": reviewed,
+            "result": result,
+        })
+        jobs[job_id] = job
+        save_jobs(jobs)
+
+    log_training({
+        "event": "channel_proposals_reviewed",
+        "job_id": job_id,
+        "proposal_ids": [proposal_id for proposal_id, _, _ in normalised],
+        "review_complete": reviewed,
+        "timestamp": decided_at,
+    })
+    return jsonify({
+        "status": "channel_proposals_updated",
+        "decisions": decisions,
+        "review_complete": reviewed,
+    })
 
 
 @app.route("/spec-override/<job_id>", methods=["POST"])
@@ -1703,6 +1833,8 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "flags":            pre_flags + result.get("flags", []),
                 "polygon_pts":      result.get("polygon_pts"),
                 "candidate_polygons": result.get("candidate_polygons", []),
+                "channel_proposals": result.get("channel_proposals", []),
+                "channel_proposal_decisions": {},
                 "perimeter_lm":     result.get("perimeter_lm"),
                 # Mirror zone-aware marked-PDF evidence at job level for the portal while
                 # retaining the canonical nested pipeline result for backward compatibility.

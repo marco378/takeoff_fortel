@@ -830,14 +830,41 @@ try:
             except FileNotFoundError:
                 pass
 
-    ck("raw external channels/transitions are explicitly not attempted, never fabricated",
+    ck("raw channel assumptions stay outside measured zones and accuracy totals",
        all(
            not any(zone.get("category") in ("channel", "transition")
                    for zone in result.get("zones", []))
-           and any("Channel/Transition lengths NOT ATTEMPTED" in flag
+           and len(result.get("channel_proposals", [])) == 2
+           and {proposal.get("component") for proposal in result["channel_proposals"]} ==
+               {"dock_retaining_wall", "yard_longest_contained_run"}
+           and all(proposal.get("assumed") is True
+                   and proposal.get("requires_assessor_confirmation") is True
+                   and len(proposal.get("polyline_pts", [])) == 2
+                   for proposal in result["channel_proposals"])
+           and any("Channel MEASUREMENT not attempted" in flag
                    for flag in result.get("flags", []))
            for result in _raw_external_results.values()
        ))
+
+    _marked_with_real_channel = _pipeline_takeoff_external(
+        str(_external_marked_paths[0]), send_approval=False, auto_extract_spec=False)
+    ck("real marked Channel linework wins; no assumed proposal is created",
+       any(zone.get("category") == "channel" and zone.get("length_lm")
+           for zone in _marked_with_real_channel.get("zones", []))
+       and not _marked_with_real_channel.get("channel_proposals"),
+       {"zones": _marked_with_real_channel.get("zones"),
+        "proposals": _marked_with_real_channel.get("channel_proposals")})
+
+    _dock_only_proposals, _dock_only_flags = _takeoff_unmarked_external.propose_channels(
+        [], {
+            "loading_face_lm": 42.0,
+            "loading_face_pts": [[10.0, 20.0], [10.0, 62.0]],
+        }, 1.0, scale_verified=True)
+    ck("unconfident Yard geometry refuses its run instead of guessing",
+       len(_dock_only_proposals) == 1
+       and _dock_only_proposals[0]["component"] == "dock_retaining_wall"
+       and any("Yard run refused" in flag for flag in _dock_only_flags),
+       {"proposals": _dock_only_proposals, "flags": _dock_only_flags})
 
     # Direct takeoff proves the state cap is caused by the non-grey swatch fallback,
     # independently of Unit 3's downstream portal/job handling.
@@ -1714,6 +1741,69 @@ try:
            _multi_region_job["scale_confirmed"] is True and
            _multi_region_job["measurement_state"] == "MEASURED_VERIFIED")
 
+        _channel_job_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        _channel_zones = [
+            {"zone_key":"external_yard", "category":"external_yard", "area_m2":100.0},
+            {"zone_key":"dock", "category":"dock", "area_m2":20.0,
+             "loading_face_lm":30.0, "loading_face_pts":[[10,10],[10,310]]},
+        ]
+        _channel_proposals = [
+            {"proposal_id":"channel-dock-loading-face", "component":"dock_retaining_wall",
+             "proposed_length_lm":30.0, "polyline_pts":[[10,10],[10,310]],
+             "assumed":True, "requires_assessor_confirmation":True},
+            {"proposal_id":"channel-yard-longest-contained-run",
+             "component":"yard_longest_contained_run", "proposed_length_lm":90.0,
+             "polyline_pts":[[20,20],[920,20]], "assumed":True,
+             "requires_assessor_confirmation":True},
+        ]
+        _channel_costing = _copy.deepcopy(_demo_result["costing"])
+        _AS.save_jobs({_channel_job_id: {
+            "id":_channel_job_id, "status":"pending", "decision":None,
+            "measurement_state":"MEASURED_VERIFIED", "scale_confirmed":False,
+            "zones":_copy.deepcopy(_channel_zones),
+            "channel_proposals":_copy.deepcopy(_channel_proposals),
+            "channel_proposal_decisions":{}, "costing":_copy.deepcopy(_channel_costing),
+            "result":{"file":"Raw External.pdf", "area_m2":120.0,
+                      "measurement_state":"MEASURED_VERIFIED",
+                      "zones":_copy.deepcopy(_channel_zones),
+                      "channel_proposals":_copy.deepcopy(_channel_proposals),
+                      "channel_proposal_decisions":{},
+                      "costing":_copy.deepcopy(_channel_costing)},
+        }})
+        ck("unreviewed assumed channel proposals block approval",
+           "accept/edit/remove" in (_AS._approve_block_reason(
+               _AS.load_jobs()[_channel_job_id]) or ""))
+        _channel_first_resp = _client_up.post(
+            f"/channel-proposals/{_channel_job_id}", json={"decisions":[{
+                "proposal_id":"channel-dock-loading-face", "action":"accept",
+                "length_lm":31.25,
+            }]})
+        _channel_first_job = _AS.load_jobs()[_channel_job_id]
+        ck("assessor can edit and accept a proposed channel length without measuring it",
+           _channel_first_resp.status_code == 200 and
+           not _channel_first_resp.get_json()["review_complete"] and
+           _channel_first_job["channel_proposal_decisions"][
+               "channel-dock-loading-face"]["length_lm"] == 31.25 and
+           _channel_first_job["channel_proposal_decisions"][
+               "channel-dock-loading-face"]["edited"] is True)
+        ck("one pending channel proposal continues to block approval",
+           _AS._approve_block_reason(_channel_first_job) is not None)
+        _channel_second_resp = _client_up.post(
+            f"/channel-proposals/{_channel_job_id}", json={"decisions":[{
+                "proposal_id":"channel-yard-longest-contained-run", "action":"remove",
+            }]})
+        _channel_reviewed_job = _AS.load_jobs()[_channel_job_id]
+        ck("assessor remove completes channel-proposal review and releases its gate",
+           _channel_second_resp.status_code == 200 and
+           _channel_second_resp.get_json()["review_complete"] and
+           _AS._approve_block_reason(_channel_reviewed_job) is None)
+        ck("channel decisions never enter measured zones or an approvable costing total",
+           _channel_reviewed_job["zones"] == _channel_zones and
+           _channel_reviewed_job["result"]["zones"] == _channel_zones and
+           not any(z.get("category") == "channel" for z in _channel_reviewed_job["zones"]) and
+           _channel_reviewed_job["costing"] == _channel_costing and
+           _channel_reviewed_job["result"]["costing"] == _channel_costing)
+
         _route_costing_a = _copy.deepcopy(_demo_result["costing"])
         _route_costing_a.update({"area_m2": 100, "assumed": True})
         _route_costing_b = _copy.deepcopy(_demo_result["costing"])
@@ -2064,6 +2154,11 @@ try:
            all(marker in _portal_html_up for marker in (
                "confidence_reasons", "confidence_score", "outline_status",
                "Trace manually", "candidate.regions")))
+        ck("portal labels channel proposals as assumptions and provides review controls",
+           all(marker in _portal_html_up for marker in (
+               "ASSUMED CHANNEL PROPOSALS - NOT MEASURED OR PRICED",
+               "channel_proposals", "reviewChannelProposal(",
+               "/channel-proposals/", "Accept / save edit", "Remove")))
         _candidate_fn = _portal_html_up.split("function loadTraceCandidate", 1)[1].split(
             "function calcArea", 1)[0]
         ck("one-click candidate load is non-mutating until Submit Adjustment",

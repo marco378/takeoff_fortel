@@ -29,6 +29,18 @@ ASSUMED = dict(depth_mm=190, conc_rate=128, mesh="A252", layers=1, steel_rate_t=
 CONCRETE_LABELS = ("concrete service yard", "service yard", "external yard",
                    "yard construction", "type c", "gv areas")
 
+# Inderjit has supplied the assumption rule, but has not yet confirmed that Fortel wants the
+# portal to offer it.  This is the single kill-switch: set CHANNEL_PROPOSALS_ENABLED=0 in the
+# environment (or change this default to "0") to suppress every proposal without touching
+# measurement, zones, costing or portal approval behaviour.
+CHANNEL_PROPOSALS_ENABLED = os.getenv("CHANNEL_PROPOSALS_ENABLED", "1").strip().lower() \
+    not in {"0", "false", "no", "off"}
+CHANNEL_PROPOSAL_BASIS = (
+    "ASSUMED per Inderjit's rule when channels are not drawn: two proposed runs - one "
+    "between the dock retaining walls/loading face and one along the longest straight run "
+    "inside the calculated yard area. Assessor must accept, edit or remove each proposal."
+)
+
 
 # ---------------------------------------------------------------- legend -> hatch colour
 def _label_bbox(pdf, page=0):
@@ -181,7 +193,9 @@ def detect_raw_dock_zone(pdf, k, S=2.0, target_rgb=(214, 214, 214)):
     """
     doc = fitz.open(pdf)
     try:
-        segments = list(_axis_segments(doc[0]))
+        page = doc[0]
+        segments = list(_axis_segments(page))
+        rotation_matrix = page.rotation_matrix
     finally:
         doc.close()
 
@@ -311,13 +325,36 @@ def detect_raw_dock_zone(pdf, k, S=2.0, target_rgb=(214, 214, 214)):
                 [wall["a0"], dock_far],
             ]
         area_m2 = wall_length_m * dock_depth_m
+        if family["orientation"] == "H":
+            loading_face_pts = [
+                [wall_coordinate, wall["a0"]],
+                [wall_coordinate, wall["a1"]],
+            ]
+        else:
+            loading_face_pts = [
+                [wall["a0"], wall_coordinate],
+                [wall["a1"], wall_coordinate],
+            ]
+        # get_drawings() returns the raw/pre-/Rotate coordinates on these landscape sheets,
+        # while the rendered Yard mask, snapshot canvas and _hatch_contour use rotated page
+        # coordinates. Convert once here so Dock masks and proposal overlays share the same
+        # canonical coordinate space.
+        rotated_polygon = []
+        for x, y in polygon:
+            point = fitz.Point(x, y) * rotation_matrix
+            rotated_polygon.append([round(point.x, 2), round(point.y, 2)])
+        rotated_loading_face = []
+        for x, y in loading_face_pts:
+            point = fitz.Point(x, y) * rotation_matrix
+            rotated_loading_face.append([round(point.x, 2), round(point.y, 2)])
         candidates.append({
             "area_m2": round(area_m2, 1),
-            "polygon_pts": [[round(x, 2), round(y, 2)] for x, y in polygon],
+            "polygon_pts": rotated_polygon,
             "door_segment_count": len(positions),
             "door_depth_m": round(abs(far_edge - near_edge) * k, 3),
             "dock_depth_m": round(dock_depth_m, 3),
             "loading_face_lm": round(wall_length_m, 2),
+            "loading_face_pts": rotated_loading_face,
             "score": len(positions) * wall_length_m,
         })
 
@@ -376,8 +413,173 @@ def detect_raw_dock_zone(pdf, k, S=2.0, target_rgb=(214, 214, 214)):
         "classification_source": "raw CAD dock-door family adjacent to yard hatch",
         "needs_assessor": False,
         "polygon_pts": chosen["polygon_pts"],
+        # Retain the actual CAD wall evidence instead of making downstream consumers
+        # reconstruct a line from the Dock rectangle.
+        "loading_face_lm": chosen["loading_face_lm"],
+        "loading_face_pts": chosen["loading_face_pts"],
     }
     return {"zone": zone, "diagnostics": chosen, "evidence_seen": True}
+
+
+def _has_explicit_channel_linework(pdf):
+    """True only for semantically labelled channel markup already carrying a real line.
+
+    Anonymous black CAD strokes are not classified here: the supplied raw sheets contain many
+    indistinguishable walls and grid lines, so treating one as a channel would violate the
+    refuse-instead-of-guess rule.  Marked ``Channel`` Line/PolyLine annotations take the normal
+    marked pipeline and therefore always win over this assumption layer.
+    """
+    try:
+        with fitz.open(pdf) as doc:
+            for page in doc:
+                for annot in page.annots() or []:
+                    subject = " ".join(str((annot.info or {}).get("subject") or "")
+                                       .strip().casefold().split())
+                    if subject == "channel" and annot.type[1] in {"Line", "PolyLine"}:
+                        return True
+    except Exception:
+        return False
+    return False
+
+
+def _longest_contained_yard_run(polygon_pts, k):
+    """Farthest boundary-vertex chord whose complete line lies inside the Yard polygon.
+
+    This is a geometry construction, not a fitted correction.  For a simple polygon the
+    longest visibility chord has boundary endpoints; the raster contour already supplies
+    those ordered boundary vertices.  Slight contour self-crossings may be repaired only
+    when the repair changes area by <=1% and one component retains >=99.5% of the area.
+    Otherwise no run is returned.
+    """
+    if not k or k <= 0 or not isinstance(polygon_pts, list) or len(polygon_pts) < 3:
+        return None, "Yard outline or scale is missing"
+    try:
+        from itertools import combinations
+        from shapely.geometry import LineString, Polygon
+
+        raw = Polygon(polygon_pts)
+        if raw.is_empty or abs(raw.area) <= 0:
+            return None, "Yard outline is empty or degenerate"
+        repaired = raw if raw.is_valid else raw.buffer(0)
+        if repaired.is_empty:
+            return None, "Yard outline could not be repaired into a valid polygon"
+        parts = list(repaired.geoms) if repaired.geom_type == "MultiPolygon" else [repaired]
+        total_area = sum(part.area for part in parts)
+        yard = max(parts, key=lambda part: part.area)
+        repair_delta = abs(total_area - abs(raw.area)) / max(abs(raw.area), 1e-9)
+        dominance = yard.area / max(total_area, 1e-9)
+        if repair_delta > 0.01 or dominance < 0.995:
+            return None, (
+                "Yard outline repair is ambiguous "
+                f"(area change {repair_delta * 100:.2f}%, largest component "
+                f"{dominance * 100:.2f}%)"
+            )
+
+        vertices = list(yard.exterior.coords)[:-1]
+        if len(vertices) < 3 or len(vertices) > 180:
+            return None, f"Yard outline has an unsupported {len(vertices)} vertices"
+        candidates = []
+        tested = 0
+        for start, end in combinations(vertices, 2):
+            tested += 1
+            line = LineString([start, end])
+            # Exact covers(): boundary is allowed, but no part of the proposed run may
+            # cross a notch or leave the calculated Yard polygon.
+            if yard.covers(line):
+                candidates.append((line.length, start, end))
+        if not candidates:
+            return None, "No boundary-to-boundary straight run is fully contained in Yard"
+        length_pt, start, end = max(candidates, key=lambda candidate: candidate[0])
+        length_lm = length_pt * k
+        if length_lm < 20:
+            return None, f"Longest contained Yard run is only {length_lm:.2f} Lm"
+        return {
+            "length_lm": round(length_lm, 2),
+            "polyline_pts": [
+                [round(start[0], 2), round(start[1], 2)],
+                [round(end[0], 2), round(end[1], 2)],
+            ],
+            "tested_chords": tested,
+            "repair_delta_pct": round(repair_delta * 100, 3),
+            "largest_component_pct": round(dominance * 100, 3),
+        }, None
+    except Exception as exc:
+        return None, f"Yard straight-run geometry failed ({type(exc).__name__}: {exc})"
+
+
+def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
+                     explicit_channel_linework=False):
+    """Return separate, non-measured channel assumptions plus visible refusal reasons."""
+    if not CHANNEL_PROPOSALS_ENABLED:
+        return [], ["CHANNEL PROPOSALS disabled by CHANNEL_PROPOSALS_ENABLED"]
+    if explicit_channel_linework:
+        return [], [
+            "CHANNEL PROPOSAL not created: explicit Channel linework exists; the real marked "
+            "measurement takes precedence over an assumption"
+        ]
+    if not isinstance(dock_zone, dict):
+        return [], [
+            "CHANNEL PROPOSAL refused: no unique Dock loading face was resolved; neither of "
+            "Inderjit's two assumed runs is emitted"
+        ]
+
+    loading_face_lm = dock_zone.get("loading_face_lm")
+    loading_face_pts = dock_zone.get("loading_face_pts")
+    if (not isinstance(loading_face_lm, (int, float)) or loading_face_lm <= 0
+            or not isinstance(loading_face_pts, list) or len(loading_face_pts) != 2):
+        return [], [
+            "CHANNEL PROPOSAL refused: Dock exists but its loading-face line evidence is missing"
+        ]
+
+    scale_reason = ("drawing scale independently verified" if scale_verified
+                    else "drawing scale unverified; assessor must confirm proposed Lm")
+    proposals = [{
+        "proposal_id": "channel-dock-loading-face",
+        "component": "dock_retaining_wall",
+        "proposed_length_lm": round(float(loading_face_lm), 2),
+        "polyline_pts": loading_face_pts,
+        "coordinate_space": "pdf_points",
+        "basis": CHANNEL_PROPOSAL_BASIS,
+        "confidence": "medium" if scale_verified else "low",
+        "confidence_reasons": [
+            "unique loading face reconstructed from repeated dock-door/reveal vectors, "
+            "adjacent Yard hatch and continuous retaining-wall CAD line",
+            scale_reason,
+            "placement is geometric; channel existence is an explicit client assumption",
+        ],
+        "assumed": True,
+        "requires_assessor_confirmation": True,
+    }]
+
+    yard_run, refusal = _longest_contained_yard_run(yard_polygon_pts, k)
+    if yard_run:
+        proposals.append({
+            "proposal_id": "channel-yard-longest-contained-run",
+            "component": "yard_longest_contained_run",
+            "proposed_length_lm": yard_run["length_lm"],
+            "polyline_pts": yard_run["polyline_pts"],
+            "coordinate_space": "pdf_points",
+            "basis": CHANNEL_PROPOSAL_BASIS,
+            "confidence": "medium" if scale_verified else "low",
+            "confidence_reasons": [
+                "selected the longest boundary-vertex chord whose complete straight line is "
+                "covered by the calculated Yard polygon",
+                f"tested {yard_run['tested_chords']} vertex pairs; no bounding box used",
+                f"outline repair area change {yard_run['repair_delta_pct']:.3f}% and largest "
+                f"component {yard_run['largest_component_pct']:.3f}%",
+                scale_reason,
+                "placement is geometric; channel existence is an explicit client assumption",
+            ],
+            "assumed": True,
+            "requires_assessor_confirmation": True,
+        })
+    flags = [
+        "CHANNEL PROPOSAL (ASSUMED, NOT MEASURED OR PRICED): assessor must accept, edit or "
+        "remove every proposed run before approval"
+    ]
+    if refusal:
+        flags.append(f"CHANNEL PROPOSAL Yard run refused: {refusal}; Dock run retained")
+    return proposals, flags
 
 
 def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
@@ -462,14 +664,24 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
     # pixels → m²: area = px * (1/S)² * k²  → px_per_m2 = S²/k²
     order = list(np.argsort(sizes)[::-1])   # indices sorted largest-first
     best_idx = order[0]                      # fallback: absolute largest
+    no_plausible_component = False
     if k is not None:
         px_per_m2 = (S * S) / (k * k)
         _MIN_M2, _MAX_M2 = PLAUSIBLE_MIN_M2, PLAUSIBLE_MAX_M2   # plausible single service-yard range
+        no_plausible_component = True
         for idx in order:
             cand_m2 = sizes[idx] / px_per_m2
             if _MIN_M2 <= cand_m2 <= _MAX_M2:
                 best_idx = idx
+                no_plausible_component = False
                 break
+    if _diag is not None:
+        # Surfaced so takeoff() can REFUSE rather than emit the absolute-largest guess.
+        # Found on real client tender packs (31 Jul): an External Kerbing & Surfacing layout
+        # whose legend swatch read black, so segmentation chased white background scraps,
+        # found nothing in the 200-50,000 m² band, fell back to the largest blob and emitted
+        # 8 m² for a site-wide external works drawing. A number that small is not a yard.
+        _diag["no_plausible_component"] = no_plausible_component
     comp = lab == best_idx + 1              # NOT hole-filled yet
 
     # ── Drop satellite components (legend swatches, stray chips) ─────────────
@@ -881,6 +1093,26 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                      f"chip(s)) — not part of the measured yard region")
 
     yard_area = round(px * (1.0 / S) ** 2 * k * k, 0)
+
+    # --- refuse the absolute-largest guess (invariant 5) --------------------------------
+    # If NO connected component fell inside the plausible service-yard band, segment_hatch
+    # fell back to "largest blob on the page", which is a guess, not a measurement. Real
+    # client tender packs (31 Jul: External Kerbing & Surfacing Layout, Proposed External
+    # Works Plan) hit exactly this and produced 8 m² and 7 m² for site-wide drawings — a
+    # confidently wrong small number is the same failure class as a confidently wrong large
+    # one. Emit NO area and send it to the assessor instead.
+    if _seg_diag.get("no_plausible_component") and not (PLAUSIBLE_MIN_M2 <= yard_area <= PLAUSIBLE_MAX_M2):
+        return {"pdf": os.path.basename(pdf), "area_m2": None,
+                "scale_k": round(k, 5), "scale_verified": verified,
+                "scale_src": note, "scale_sources": scale_sources,
+                "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
+                "flags": flags + [
+                    f"REFUSED — no region fell inside the plausible service-yard band "
+                    f"({PLAUSIBLE_MIN_M2:,.0f}-{PLAUSIBLE_MAX_M2:,.0f} m²); the largest candidate was "
+                    f"only {yard_area:,.0f} m², i.e. the colour segmentation did not find a yard on "
+                    f"this sheet (wrong legend swatch, or this is not a slab drawing). Assessor must "
+                    f"confirm the region and scale — no area issued."]}
+
     zones = [{
         "zone_key": "external_yard",
         "category": "external_yard",
@@ -922,8 +1154,9 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             f"Dock {dock_zone['area_m2']:.1f} m²; Dock remains an unpriced assessor-rate line"
         )
         flags.append(
-            "raw Channel/Transition lengths NOT ATTEMPTED — line identity is not reliable "
-            "without marked subjects; assessor must measure/classify these Lm quantities"
+            "raw Channel MEASUREMENT not attempted — any channel_proposals are separate "
+            "assumptions requiring assessor review; Transition length NOT ATTEMPTED because "
+            "line identity is not reliable without marked subjects"
         )
     else:
         if dock_detection.get("evidence_seen"):
@@ -1007,6 +1240,17 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # the overlay and mis-place the polygon on capped wide sheets.
     polygon_pts = _hatch_contour(yard_comp, S)
 
+    # --- unpriced channel ASSUMPTIONS -------------------------------------------------------
+    # Kept deliberately outside zones[] and every measured/costed total.  The Dock loading-face
+    # placement and Yard chord are geometric; the existence of two channels is Inderjit's
+    # supplied assumption and must be reviewed in the portal before approval.
+    channel_proposals, channel_proposal_flags = propose_channels(
+        polygon_pts, dock_zone, k,
+        scale_verified=verified,
+        explicit_channel_linework=_has_explicit_channel_linework(pdf),
+    )
+    flags += channel_proposal_flags
+
     # --- manhole count ESTIMATE (unmarked path — conservative, never authoritative) ---
     manhole_count_estimate, _mh_centres = detect_manholes(im, yard_comp, k, S=S)
     if manhole_count_estimate > 0:
@@ -1048,6 +1292,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "polygon_pts": polygon_pts, "flags": flags,
             "zones": zones,
             "zones_total_area_m2": zones_total_area,
+            "channel_proposals": channel_proposals,
             "manhole_count_estimate": manhole_count_estimate,
             "manhole_count_assumed": manhole_count_assumed,
             "legend_found": legend_found,

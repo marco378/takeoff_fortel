@@ -442,6 +442,9 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                         "polygon_pts":    tu.get("polygon_pts"),
                         "zones":          tu.get("zones", []),
                         "zones_total_area_m2": tu.get("zones_total_area_m2"),
+                        # Assumed channel runs are tracing/review aids only. They stay outside
+                        # measured zones and every costing/quotation total.
+                        "channel_proposals": tu.get("channel_proposals", []),
                     })
                     r["flags"] = r["flags"] + tu.get("flags", []) + ["assessor: confirm extent + scale"]
                     # A region measured WITHOUT a legend label is a generic grey-hatch guess — its
@@ -527,6 +530,7 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     "polygon_pts":    tu.get("polygon_pts"),
                     "zones":          tu.get("zones", []),
                     "zones_total_area_m2": tu.get("zones_total_area_m2"),
+                    "channel_proposals": tu.get("channel_proposals", []),
                 })
                 r["flags"] = r["flags"] + tu.get("flags", []) + [
                     "flattened/raster drawing measured from the RENDER (no vector geometry) — "

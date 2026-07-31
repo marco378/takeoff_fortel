@@ -118,6 +118,15 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .candidate-row.unresolved{background:#fff1f0;color:#9f2d24}
 .candidate-row button{border:1px solid #d6a83e;background:#fff;color:#6a4900;border-radius:4px;padding:2px 5px;font-size:10px;cursor:pointer}
 .candidate-row button:hover{background:#fff1c9}
+.channel-proposal-panel{margin-top:8px;padding:8px;background:#f7f1ff;border:1px solid #bea3df;border-radius:6px}
+.channel-proposal-note{font-size:10px;color:#58377f;line-height:1.35;margin-bottom:6px}
+.channel-proposal-row{padding:6px 0;border-top:1px solid #ddcfee;font-size:10px;color:#402263}
+.channel-proposal-row:first-of-type{border-top:0}
+.channel-proposal-actions{display:flex;gap:4px;align-items:center;margin-top:4px;flex-wrap:wrap}
+.channel-proposal-actions input{width:78px;padding:3px 5px;border:1px solid #bba4d4;border-radius:4px;font-size:11px}
+.channel-proposal-actions button{border:1px solid #8062a5;background:#fff;color:#4d2b73;border-radius:4px;padding:3px 6px;font-size:10px;cursor:pointer}
+.channel-proposal-actions button.remove{border-color:#b54b4b;color:#922b21}
+.channel-proposal-status{font-weight:700;text-transform:uppercase;font-size:9px;letter-spacing:.3px}
 
 /* Calibration row */
 .cal-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
@@ -496,6 +505,7 @@ let poly = [];            // [{x,y}]
 let traceRegions = [];    // completed assessor regions: [{points:[{x,y}], candidateId:?}]
 let activeCandidateId = null;
 let candidatePolygons = []; // assisted candidates in CANVAS pixels; never authoritative by themselves
+let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never measured/priced
 let cal  = [];            // [{x,y}] calibration line endpoints
 let mpp  = null;          // metres per CANVAS pixel
 let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapshot-Scale header).
@@ -813,7 +823,7 @@ async function selectJob(jobId) {
   // the new one loads. Clearing img/poly/cal/aiPoly + the visible canvas, and
   // resetting snapScale/mpp, guarantees the canvas reloads fresh for each job.
   img = null;
-  poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = [];
+  poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = []; channelProposals = [];
   cal = []; aiPoly = null; dragIdx = -1;
   mpp = null; snapScale = 0.5;
   if (ctx && canvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1030,6 +1040,21 @@ function effectiveCandidatePolygons(job) {
   return Array.isArray(nested) ? nested : [];
 }
 
+function effectiveChannelProposals(job) {
+  if (job && Array.isArray(job.channel_proposals) && job.channel_proposals.length) {
+    return job.channel_proposals;
+  }
+  const nested = job && job.result && job.result.channel_proposals;
+  return Array.isArray(nested) ? nested : [];
+}
+
+function effectiveChannelProposalDecisions(job) {
+  const direct = job && job.channel_proposal_decisions;
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+  const nested = job && job.result && job.result.channel_proposal_decisions;
+  return nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : {};
+}
+
 function initialiseTraceState(job, res) {
   candidatePolygons = effectiveCandidatePolygons(job).map(candidate => ({
     ...candidate,
@@ -1047,6 +1072,14 @@ function initialiseTraceState(job, res) {
     // level/core outlines in regions and are loaded together by loadTraceCandidate().
     points: candidate.regions[0] || []
   })).filter(candidate => candidate.regions.length);
+
+  channelProposals = effectiveChannelProposals(job).map(proposal => ({
+    ...proposal,
+    points: (proposal.polyline_pts || []).map(point => ({
+      x: Number(point[0]) * snapScale,
+      y: Number(point[1]) * snapScale
+    }))
+  })).filter(proposal => proposal.points.length === 2);
 
   const adjusted = job.adjusted || {};
   let storedRegions = Array.isArray(adjusted.regions) ? adjusted.regions : [];
@@ -1227,6 +1260,67 @@ function renderCandidateSummary(job) {
   </div>`;
 }
 
+function renderChannelProposalSummary(job) {
+  const proposals = effectiveChannelProposals(job);
+  if (!proposals.length) return '';
+  const decisions = effectiveChannelProposalDecisions(job);
+  const rows = proposals.map(proposal => {
+    const id = String(proposal.proposal_id || '');
+    const decision = decisions[id] || {};
+    const displayedLength = decision.decision === 'accepted' && decision.length_lm != null
+      ? Number(decision.length_lm) : Number(proposal.proposed_length_lm);
+    const status = decision.decision || 'pending review';
+    const why = (proposal.confidence_reasons || []).join(' · ');
+    const label = proposal.component === 'dock_retaining_wall'
+      ? 'Dock retaining-wall/loading face' : 'Longest straight run inside Yard';
+    return `<div class="channel-proposal-row">
+      <div><strong>${esc(label)}</strong> · ${esc(proposal.confidence || 'low')} confidence
+        · <span class="channel-proposal-status">${esc(status)}</span></div>
+      <div style="margin-top:2px">${esc(proposal.basis || '')}</div>
+      <div style="font-size:9px;color:#6e518f;margin-top:2px">${esc(why || 'Assessor review required')}</div>
+      <div class="channel-proposal-actions">
+        <label>Proposed/edited Lm
+          <input id="channelLength-${esc(id)}" type="number" min="0.01" step="0.01"
+                 value="${Number.isFinite(displayedLength) ? displayedLength.toFixed(2) : ''}">
+        </label>
+        <button type="button" data-proposal-id="${esc(id)}"
+                onclick="reviewChannelProposal(this.dataset.proposalId,'accept')">Accept / save edit</button>
+        <button type="button" class="remove" data-proposal-id="${esc(id)}"
+                onclick="reviewChannelProposal(this.dataset.proposalId,'remove')">Remove</button>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="channel-proposal-panel">
+    <div style="font-size:11px;font-weight:800;color:#4d2b73;margin-bottom:3px">ASSUMED CHANNEL PROPOSALS - NOT MEASURED OR PRICED</div>
+    <div class="channel-proposal-note">Purple dashed lines are editable assumptions under Inderjit's two-channel rule. They are outside measured zones and all totals. Review every row before approval.</div>
+    ${rows}
+  </div>`;
+}
+
+async function reviewChannelProposal(proposalId, action) {
+  if (!currentJob) return;
+  const input = document.getElementById(`channelLength-${proposalId}`);
+  const length = input ? Number(input.value) : null;
+  if (action === 'accept' && (!Number.isFinite(length) || length <= 0)) {
+    toast('Enter a positive channel length first', 'error');
+    return;
+  }
+  try {
+    const response = await fetch(`${BASE}/channel-proposals/${currentJob.id}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({decisions:[{
+        proposal_id:proposalId, action, length_lm:action === 'accept' ? length : null
+      }]})
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    toast(action === 'remove' ? 'Channel proposal removed' : 'Channel proposal accepted/edited');
+    await selectJob(currentJob.id);
+  } catch (error) {
+    toast(`Channel review failed: ${error.message}`, 'error');
+  }
+}
+
 function renderJobDetails(job) {
   const res = job.result || {};
   const perimeter = effectiveStoredPerimeter(job);
@@ -1242,6 +1336,7 @@ function renderJobDetails(job) {
     </div>` : '';
   const zoneSummary = renderZoneSummary(job);
   const candidateSummary = renderCandidateSummary(job);
+  const channelProposalSummary = renderChannelProposalSummary(job);
   document.getElementById('jobDetails').innerHTML = `
     ${projRow}
     ${mstateRow}
@@ -1252,6 +1347,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
     <div class="kv"><span class="k">Slab perimeter</span><span class="v">${perimeter!=null?perimeter.toLocaleString()+' m':'—'}</span></div>
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
+    ${channelProposalSummary}
     ${candidateSummary}
     ${zoneSummary}
   `;
@@ -1783,6 +1879,25 @@ function draw() {
     ctx.stroke();
     ctx.restore();
   }
+
+  // Assumed Channel proposals (purple/dashed, open two-point lines). Drawing these is
+  // presentation-only: they never enter traceRegions, measured zones, area or costing.
+  channelProposals.forEach(proposal => {
+    if (!proposal.points || proposal.points.length !== 2) return;
+    ctx.save();
+    ctx.setLineDash([8,5]);
+    ctx.beginPath();
+    ctx.moveTo(proposal.points[0].x, proposal.points[0].y);
+    ctx.lineTo(proposal.points[1].x, proposal.points[1].y);
+    ctx.strokeStyle = 'rgba(111,66,193,0.9)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    proposal.points.forEach(point => {
+      ctx.fillStyle = 'rgba(111,66,193,0.95)';
+      ctx.beginPath(); ctx.arc(point.x, point.y, 4, 0, Math.PI*2); ctx.fill();
+    });
+    ctx.restore();
+  });
 
   // Assisted Office GA candidates (amber/dashed). Merely drawing these never changes area,
   // state or costing; the assessor must explicitly add/edit them and submit an adjustment.
