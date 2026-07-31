@@ -15,6 +15,7 @@ Breaks found by adversarial testing and how they're handled:
 """
 import fitz, math, re
 from collections import OrderedDict
+from pathlib import Path
 from shapely.geometry import Polygon
 from markup import parse_area_m2
 
@@ -26,17 +27,90 @@ _LENGTH_RX = re.compile(
 
 # Subject is the reliable discriminator in the client-supplied Castle Donington markups.
 # Colour is retained as evidence in each annotation record, but it is deliberately NOT used
-# to classify: every office slab subject has the same yellow fill. Unknown subjects remain
-# unclassified so a future markup convention can never silently turn into yard quantity.
+# to classify: every office slab subject has the same yellow fill. A generic Unit-N subject
+# can use independently strong drawing context below; every other unknown remains unclassified
+# so a future markup convention can never silently turn into yard quantity.
 _SUBJECT_CATEGORIES = {
     "yard": "external_yard",
+    "yards": "external_yard",
+    "yard slab": "external_yard",
+    "yard slabs": "external_yard",
+    "external yard": "external_yard",
+    "external yards": "external_yard",
+    "external yard slab": "external_yard",
+    "external yard slabs": "external_yard",
+    "service yard": "external_yard",
+    "service yards": "external_yard",
+    "concrete service yard": "external_yard",
+    "concrete service yards": "external_yard",
     "dock": "dock",
+    "docks": "dock",
+    "dock slab": "dock",
+    "dock slabs": "dock",
+    "loading dock": "dock",
+    "loading docks": "dock",
+    "loading dock slab": "dock",
+    "loading dock slabs": "dock",
+    "ground floor": "ground_floor",
+    "ground floor slab": "ground_floor",
+    "ground floor slabs": "ground_floor",
+    "ground floor core": "ground_floor",
+    "ground floor cores": "ground_floor",
+    "gf": "ground_floor",
+    "gf slab": "ground_floor",
+    "gf slabs": "ground_floor",
     "gf core": "ground_floor",
     "gf cores": "ground_floor",
+    "upper floor": "upper_floor",
+    "upper floors": "upper_floor",
+    "first floor": "upper_floor",
+    "first floor slab": "upper_floor",
+    "first floor slabs": "upper_floor",
     "channel": "channel",
+    "channels": "channel",
     "transition": "transition",
+    "transitions": "transition",
 }
-_UPPER_FLOOR_SUBJECT_RX = re.compile(r"^\d+(?:st|nd|rd|th)\s+floor$", re.I)
+_UPPER_FLOOR_SUBJECT_RX = re.compile(
+    r"^(?:\d+(?:st|nd|rd|th)|second|third|fourth|fifth)\s+floors?(?:\s+slabs?)?$",
+    re.I,
+)
+_UNIT_SUBJECT_RX = re.compile(
+    r"^units?\s*[-:#]?\s*[a-z0-9]+(?:\s*(?:&|and|,|/|\+|-)\s*[a-z0-9]+)*$",
+    re.I,
+)
+
+# Context is only allowed to classify a *unit-like* subject. A drawing-context word never
+# overrides a meaningful, unknown subject, and a legend phrase on its own is intentionally
+# insufficient: site plans commonly contain several surface legends. Filename or explicit
+# drawing-title evidence is required, with conflicting evidence causing a safe unclassified
+# result.
+_CONTEXT_FILENAME_PATTERNS = (
+    (re.compile(r"\b(?:external|service|concrete service)?\s*yards?\b", re.I), "external_yard"),
+    (re.compile(r"\b(?:loading\s+)?docks?(?:\s+slabs?)?\b", re.I), "dock"),
+    (re.compile(r"\b(?:ground\s+floor|gf)(?:\s+(?:slabs?|cores?))?\b", re.I), "ground_floor"),
+    (re.compile(
+        r"\b(?:upper|first|second|third|fourth|fifth|\d+(?:st|nd|rd|th))\s+floors?\b",
+        re.I,
+    ), "upper_floor"),
+)
+_CONTEXT_TITLE_PATTERNS = (
+    (re.compile(r"\b(?:proposed\s+)?external\s+yard\s+slab(?:\s+joint)?\s+(?:plan|layout)\b", re.I),
+     "external_yard"),
+    (re.compile(r"\b(?:loading\s+)?dock\s+slab(?:\s+joint)?\s+(?:plan|layout)\b", re.I),
+     "dock"),
+    (re.compile(r"\bground\s+floor\s+(?:slab|core)(?:\s+joint)?\s+(?:plan|layout)\b", re.I),
+     "ground_floor"),
+    (re.compile(
+        r"\b(?:upper|first|second|third|fourth|fifth|\d+(?:st|nd|rd|th))\s+floor\s+"
+        r"(?:steelwork|slab|core|ga)?\s*(?:plan|layout)\b",
+        re.I,
+    ), "upper_floor"),
+)
+_CONTEXT_LEGEND_PATTERNS = (
+    (re.compile(r"\b(?:concrete\s+)?service\s+yards?\b", re.I), "external_yard"),
+    (re.compile(r"\b(?:loading\s+)?dock\s+slabs?\b", re.I), "dock"),
+)
 
 
 def _normalise_subject(value):
@@ -50,6 +124,80 @@ def _subject_category(subject):
     if _UPPER_FLOOR_SUBJECT_RX.fullmatch(probe):
         return "upper_floor"
     return "unclassified"
+
+
+def _context_hits(text, patterns):
+    """Return category/evidence pairs, de-duplicated without losing source wording."""
+    hits = []
+    for pattern, category in patterns:
+        match = pattern.search(text or "")
+        if match:
+            evidence = " ".join(match.group(0).split())
+            item = (category, evidence)
+            if item not in hits:
+                hits.append(item)
+    return hits
+
+
+def _drawing_zone_context(pdf, page, metadata=None):
+    """Return strong drawing-level zone context without guessing from a legend alone.
+
+    The filename is deliberate user context (for example ``Yard Markup.pdf``). Explicit
+    drawing-title phrases are independently strong. Legend text is retained as corroborating
+    evidence, but it cannot classify by itself because one site sheet may show many swatches.
+    """
+    filename = Path(pdf).stem
+    filename_probe = re.sub(r"[_-]+", " ", filename)
+    filename_hits = _context_hits(filename_probe, _CONTEXT_FILENAME_PATTERNS)
+
+    try:
+        page_text = " ".join((page.get_text() or "").split())
+    except (RuntimeError, ValueError):
+        page_text = ""
+    metadata = metadata or {}
+    metadata_text = " ".join(str(metadata.get(key) or "") for key in ("title", "subject"))
+    title_hits = _context_hits(f"{metadata_text} {page_text}", _CONTEXT_TITLE_PATTERNS)
+    legend_hits = _context_hits(page_text, _CONTEXT_LEGEND_PATTERNS)
+
+    strong_hits = [(category, f"filename '{Path(pdf).name}' ({evidence})")
+                   for category, evidence in filename_hits]
+    strong_hits.extend((category, f"drawing title text '{evidence}'")
+                       for category, evidence in title_hits)
+    strong_categories = {category for category, _ in strong_hits}
+    legend_categories = {category for category, _ in legend_hits}
+
+    if len(strong_categories) != 1:
+        reason = "no supported filename/drawing-title zone evidence"
+        if len(strong_categories) > 1:
+            reason = "conflicting filename/drawing-title zone evidence"
+        elif legend_hits:
+            reason = "legend-only zone evidence is insufficient"
+        return {"category": None, "source": reason, "evidence": []}
+
+    category = next(iter(strong_categories))
+    # A legend for another slab type is common on combined drawings. It is not a conflict by
+    # itself, but a matching legend strengthens and documents the classification.
+    evidence = [description for hit_category, description in strong_hits
+                if hit_category == category]
+    evidence.extend(f"legend text '{label}'" for hit_category, label in legend_hits
+                    if hit_category == category)
+    source = "unit-like subject corroborated by " + "; ".join(evidence)
+    return {"category": category, "source": source, "evidence": evidence,
+            "other_legend_categories": sorted(legend_categories - {category})}
+
+
+def _classify_subject(subject, drawing_context):
+    """Classify from the subject, or from strong context only for a unit label."""
+    category = _subject_category(subject)
+    if category != "unclassified":
+        return category, "subject"
+    if not _UNIT_SUBJECT_RX.fullmatch(_normalise_subject(subject)):
+        return "unclassified", "subject"
+    context_category = (drawing_context or {}).get("category")
+    if context_category:
+        return context_category, drawing_context["source"]
+    reason = (drawing_context or {}).get("source") or "no strong drawing context"
+    return "unclassified", f"unit-like subject; {reason}"
 
 
 def _parse_length_lm(content):
@@ -186,6 +334,7 @@ def read_marked_zones(pdf):
     """
     doc = fitz.open(pdf)
     page = doc[0]
+    drawing_context = _drawing_zone_context(pdf, page, doc.metadata)
     records = []
     grouped = OrderedDict()
     flags = []
@@ -218,12 +367,20 @@ def read_marked_zones(pdf):
             except (RuntimeError, TypeError, ValueError, IndexError):
                 perimeter_lm, cutout_count = None, 0
 
-        category = "other" if ignored else _subject_category(subject)
+        if ignored:
+            category, classification_source = "other", "ignored legend metadata"
+        else:
+            category, classification_source = _classify_subject(subject, drawing_context)
         measurable_shape = annot_type in ("Polygon", "PolyLine", "Line")
         if ignored:
             zone_key = None
         elif category == "unclassified":
             zone_key = f"unclassified:{subject_key or annot_type.casefold()}"
+        elif classification_source != "subject" and _UNIT_SUBJECT_RX.fullmatch(subject_key):
+            # A Unit label carries allocation information beyond its inferred slab category.
+            # Keep each unit-labelled region visible rather than collapsing Unit-1 and Unit-2
+            # into one category total. Downstream category sums remain unchanged.
+            zone_key = f"{category}:unit:{subject_key}"
         else:
             zone_key = category
 
@@ -241,7 +398,7 @@ def read_marked_zones(pdf):
             "fill_color": _json_color(colors.get("fill")),
             "category": category,
             "zone_key": zone_key,
-            "classification_source": "subject" if not ignored else "ignored legend metadata",
+            "classification_source": classification_source,
             "measurement_kind": _measurement_kind(area_m2, length_lm, perimeter_lm),
             "area_m2": round(area_m2, 6) if area_m2 is not None else None,
             "length_lm": round(length_lm, 6) if length_lm is not None else None,
@@ -259,6 +416,10 @@ def read_marked_zones(pdf):
             flag = f"assessor: classify zone '{label}'"
             if flag not in flags:
                 flags.append(flag)
+        elif classification_source != "subject":
+            flag = f"zone classification: '{subject}' -> {category} ({classification_source})"
+            if flag not in flags:
+                flags.append(flag)
 
         zone = grouped.setdefault(zone_key, {
             "zone_key": zone_key,
@@ -270,9 +431,17 @@ def read_marked_zones(pdf):
             "perimeter_lm": None,
             "annotation_count": 0,
             "cutout_count": 0,
-            "classification_source": "subject",
+            "classification_source": classification_source,
             "needs_assessor": category == "unclassified",
         })
+        if classification_source != "subject":
+            zone["unit_label"] = subject
+        if classification_source != zone["classification_source"]:
+            sources = [part.strip() for part in
+                       str(zone["classification_source"]).removeprefix("mixed: ").split(" | ")]
+            if classification_source not in sources:
+                sources.append(classification_source)
+            zone["classification_source"] = "mixed: " + " | ".join(sources)
         if subject and subject not in zone["subjects"]:
             zone["subjects"].append(subject)
         zone["annotation_count"] += 1

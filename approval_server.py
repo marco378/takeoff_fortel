@@ -940,7 +940,13 @@ def classify_zones(job_id):
 
 @app.route("/channel-proposals/<job_id>", methods=["POST"])
 def review_channel_proposals(job_id):
-    """Record assessor accept/edit/remove decisions without creating measured quantities."""
+    """Record assessor accept/edit/remove decisions without creating measured quantities.
+
+    Backward-compatible request items may contain only ``length_lm``. New portal clients can
+    additionally send ``polyline_pts`` as two PDF-point coordinates; edited geometry must remain
+    a straight horizontal/vertical segment and its accepted length is derived from the stored
+    job scale rather than trusting a contradictory number from the browser.
+    """
     data = request.get_json(silent=True) or {}
     submitted = data.get("decisions")
     if not isinstance(submitted, list) or not submitted:
@@ -955,15 +961,39 @@ def review_channel_proposals(job_id):
         if not proposal_id or action not in {"accept", "remove"}:
             return jsonify({"error": "proposal_id and action accept/remove are required"}), 400
         length_lm = item.get("length_lm")
+        polyline_pts = item.get("polyline_pts")
         if action == "accept":
             if (not isinstance(length_lm, (int, float)) or isinstance(length_lm, bool)
                     or not math.isfinite(length_lm) or not 0 < length_lm <= 100_000):
                 return jsonify({"error": "accepted length_lm must be a positive number"}), 400
             length_lm = round(float(length_lm), 2)
+            if polyline_pts is not None:
+                if (not isinstance(polyline_pts, list) or len(polyline_pts) != 2
+                        or any(not isinstance(point, list) or len(point) != 2
+                               for point in polyline_pts)):
+                    return jsonify({"error": "polyline_pts must contain exactly two [x,y] points"}), 400
+                try:
+                    polyline_pts = [
+                        [float(point[0]), float(point[1])] for point in polyline_pts
+                    ]
+                except (TypeError, ValueError):
+                    return jsonify({"error": "polyline_pts coordinates must be numeric"}), 400
+                if any(not math.isfinite(value) or abs(value) > 10_000_000
+                       for point in polyline_pts for value in point):
+                    return jsonify({"error": "polyline_pts coordinates must be finite"}), 400
+                dx = abs(polyline_pts[1][0] - polyline_pts[0][0])
+                dy = abs(polyline_pts[1][1] - polyline_pts[0][1])
+                if dx <= 1e-6 and dy <= 1e-6:
+                    return jsonify({"error": "polyline_pts must have positive length"}), 400
+                if dx > 1e-6 and dy > 1e-6:
+                    return jsonify({
+                        "error": "channel proposal geometry must be straight and non-diagonal"
+                    }), 400
         else:
             length_lm = None
-        normalised.append((proposal_id, action, length_lm))
-    if len({proposal_id for proposal_id, _, _ in normalised}) != len(normalised):
+            polyline_pts = None
+        normalised.append((proposal_id, action, length_lm, polyline_pts))
+    if len({proposal_id for proposal_id, _, _, _ in normalised}) != len(normalised):
         return jsonify({"error": "proposal_id decisions must be unique"}), 400
 
     with _jobs_lock:
@@ -981,7 +1011,7 @@ def review_channel_proposals(job_id):
             for proposal in proposals
             if isinstance(proposal, dict) and proposal.get("proposal_id")
         }
-        unknown = [proposal_id for proposal_id, _, _ in normalised
+        unknown = [proposal_id for proposal_id, _, _, _ in normalised
                    if proposal_id not in known]
         if unknown:
             return jsonify({"error": "unknown channel proposal_id(s): "
@@ -990,8 +1020,17 @@ def review_channel_proposals(job_id):
         decisions = dict(job.get("channel_proposal_decisions")
                          or result.get("channel_proposal_decisions") or {})
         decided_at = now_iso()
-        for proposal_id, action, length_lm in normalised:
+        scale_k = job.get("scale_k") or result.get("scale_k")
+        scale_k = float(scale_k) if isinstance(scale_k, (int, float)) and scale_k > 0 else None
+        for proposal_id, action, length_lm, polyline_pts in normalised:
             proposal = known[proposal_id]
+            accepted_polyline = polyline_pts or proposal.get("polyline_pts", [])
+            if action == "accept" and polyline_pts is not None:
+                if scale_k is None:
+                    return jsonify({
+                        "error": "job scale_k is required to accept edited channel geometry"
+                    }), 409
+                length_lm = round(math.dist(polyline_pts[0], polyline_pts[1]) * scale_k, 2)
             decisions[proposal_id] = {
                 "proposal_id": proposal_id,
                 "decision": "accepted" if action == "accept" else "removed",
@@ -999,12 +1038,17 @@ def review_channel_proposals(job_id):
                 "original_proposed_length_lm": proposal.get("proposed_length_lm"),
                 "edited": bool(
                     action == "accept"
-                    and length_lm != proposal.get("proposed_length_lm")
+                    and (length_lm != proposal.get("proposed_length_lm")
+                         or accepted_polyline != proposal.get("polyline_pts", []))
+                ),
+                "geometry_edited": bool(
+                    action == "accept"
+                    and accepted_polyline != proposal.get("polyline_pts", [])
                 ),
                 "decided_at": decided_at,
-                # Retain the proposed geometry as audit/display evidence. A numeric edit does
-                # not pretend that the original two-point line has also been re-measured.
-                "polyline_pts": proposal.get("polyline_pts", []),
+                # Both remain assumptions: editing the geometry does not turn it into a measured
+                # zone or costing quantity. Original geometry remains on the proposal record.
+                "polyline_pts": accepted_polyline,
             }
         reviewed = bool(known) and all(
             decisions.get(proposal_id, {}).get("decision") in {"accepted", "removed"}
@@ -1025,7 +1069,7 @@ def review_channel_proposals(job_id):
     log_training({
         "event": "channel_proposals_reviewed",
         "job_id": job_id,
-        "proposal_ids": [proposal_id for proposal_id, _, _ in normalised],
+        "proposal_ids": [proposal_id for proposal_id, _, _, _ in normalised],
         "review_complete": reviewed,
         "timestamp": decided_at,
     })

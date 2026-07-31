@@ -733,6 +733,38 @@ ck("zone reader retains per-annotation subject/author/colour evidence",
    all("subject" in record and "author" in record and "stroke_color" in record
        for record in _zone_read["markup_annotations"]))
 
+_unit_zone_pdf = "/tmp/Yard Markup Unit Labels.pdf"
+_unit_zone_doc = _fitz_zones.open()
+_unit_zone_page = _unit_zone_doc.new_page(width=600, height=600)
+for _subject, _value, _x in (("Unit-1&2", 235.37, 20), ("Unit-3", 133.79, 300)):
+    _annot = _unit_zone_page.add_polygon_annot([
+        (_x, 20), (_x + 200, 20), (_x + 200, 220), (_x, 220),
+    ])
+    _annot.set_info(title="Fortel QA", subject=_subject,
+                    content=f"Area\n{_value:.2f} sq m")
+    _annot.update()
+_unit_zone_doc.save(_unit_zone_pdf)
+_unit_zone_doc.close()
+_unit_zone_read = _read_marked_zones(_unit_zone_pdf)
+_unit_yard_zones = [zone for zone in _unit_zone_read["zones"]
+                    if zone["category"] == "external_yard"]
+ck("unit-labelled regions inherit a strong Yard filename context and preserve each area",
+   len(_unit_yard_zones) == 2 and
+   sorted(zone["area_m2"] for zone in _unit_yard_zones) == [133.79, 235.37] and
+   sorted(zone["unit_label"] for zone in _unit_yard_zones) == ["Unit-1&2", "Unit-3"] and
+   _unit_zone_read["area_m2"] == 369.2,
+   _unit_zone_read)
+_weak_unit_zone_pdf = "/tmp/General Markup Unit Labels.pdf"
+shutil.copyfile(_unit_zone_pdf, _weak_unit_zone_pdf)
+_weak_unit_read = _read_marked_zones(_weak_unit_zone_pdf)
+ck("unit labels with weak context stay unclassified while every measured area is preserved",
+   all(zone["category"] == "unclassified" and zone["needs_assessor"]
+       for zone in _weak_unit_read["zones"]) and
+   abs(sum(zone["area_m2"] for zone in _weak_unit_read["zones"]) - 369.16) < 0.001 and
+   _weak_unit_read["area_m2"] == 369.2 and
+   len(_weak_unit_read["flags"]) == 2,
+   _weak_unit_read)
+
 _zone_quote_results = []
 for _unit_n in range(1, 5):
     _unit = _quotation_unit(f"Castle Unit-{_unit_n}.pdf", "External yard slabs", 1)
@@ -898,6 +930,10 @@ try:
            and all(proposal.get("assumed") is True
                    and proposal.get("requires_assessor_confirmation") is True
                    and len(proposal.get("polyline_pts", [])) == 2
+                   and (abs(proposal["polyline_pts"][0][0] -
+                            proposal["polyline_pts"][1][0]) <= 0.01
+                        or abs(proposal["polyline_pts"][0][1] -
+                               proposal["polyline_pts"][1][1]) <= 0.01)
                    for proposal in result["channel_proposals"])
            and any("Channel MEASUREMENT not attempted" in flag
                    for flag in result.get("flags", []))
@@ -987,6 +1023,60 @@ try:
             pass
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
+
+print("channel proposal geometry — retaining-wall adjacent and never diagonal")
+from takeoff_unmarked import (
+    _longest_contained_yard_run as _channel_yard_run,
+    propose_channels as _propose_channels_axis,
+)
+_channel_rect = [[0,0],[1000,0],[1000,600],[0,600]]
+_horizontal_wall = [
+    {"polyline_pts":[[0,1],[1000,1]], "grey_wall_evidence":False},
+    {"polyline_pts":[[0,1],[1000,1]], "grey_wall_evidence":False},
+]
+_horizontal_run, _horizontal_refusal = _channel_yard_run(
+    _channel_rect, 0.1, wall_segments=_horizontal_wall)
+ck("corroborated horizontal retaining-wall run is emitted exactly axis-aligned",
+   _horizontal_run is not None and _horizontal_refusal is None and
+   _horizontal_run["length_lm"] == 100.0 and
+   _horizontal_run["polyline_pts"][0][1] == _horizontal_run["polyline_pts"][1][1],
+   (_horizontal_run, _horizontal_refusal))
+_vertical_wall = [
+    {"polyline_pts":[[1,0],[1,600]], "grey_wall_evidence":True},
+]
+_vertical_run, _vertical_refusal = _channel_yard_run(
+    _channel_rect, 0.1, wall_segments=_vertical_wall)
+ck("corroborated vertical retaining-wall run is emitted exactly axis-aligned",
+   _vertical_run is not None and _vertical_refusal is None and
+   _vertical_run["length_lm"] == 60.0 and
+   _vertical_run["polyline_pts"][0][0] == _vertical_run["polyline_pts"][1][0],
+   (_vertical_run, _vertical_refusal))
+_diagonal_run, _diagonal_refusal = _channel_yard_run(
+    _channel_rect, 0.1, wall_segments=[
+        {"polyline_pts":[[0,0],[1000,600]], "grey_wall_evidence":True},
+        {"polyline_pts":[[0,0],[1000,600]], "grey_wall_evidence":True},
+    ])
+ck("diagonal-only evidence refuses the Yard component instead of falling back",
+   _diagonal_run is None and "non-diagonal" in _diagonal_refusal,
+   _diagonal_refusal)
+_diagonal_dock_proposals, _diagonal_dock_flags = _propose_channels_axis(
+    _channel_rect,
+    {"loading_face_lm":100.0, "loading_face_pts":[[0,0],[1000,600]]},
+    0.1, wall_segments=_horizontal_wall)
+ck("diagonal Dock loading-face evidence refuses the whole assumption, not just the Yard run",
+   not _diagonal_dock_proposals and
+   any("not a straight non-diagonal" in flag for flag in _diagonal_dock_flags),
+   _diagonal_dock_flags)
+_ambiguous_wall_run, _ambiguous_wall_refusal = _channel_yard_run(
+    _channel_rect, 0.1, wall_segments=[
+        {"polyline_pts":[[0,1],[1000,1]], "grey_wall_evidence":False},
+        {"polyline_pts":[[0,1],[1000,1]], "grey_wall_evidence":False},
+        {"polyline_pts":[[0,599],[970,599]], "grey_wall_evidence":False},
+        {"polyline_pts":[[0,599],[970,599]], "grey_wall_evidence":False},
+    ])
+ck("near-equal competing retaining-wall runs refuse rather than guessing an edge",
+   _ambiguous_wall_run is None and "within 5%" in _ambiguous_wall_refusal,
+   _ambiguous_wall_refusal)
 
 try:
     _office_marked_paths = [
@@ -1838,6 +1928,7 @@ try:
             "channel_proposals":_copy.deepcopy(_channel_proposals),
             "channel_proposal_decisions":{}, "costing":_copy.deepcopy(_channel_costing),
             "result":{"file":"Raw External.pdf", "area_m2":120.0,
+                      "scale_k":0.1,
                       "measurement_state":"MEASURED_VERIFIED",
                       "zones":_copy.deepcopy(_channel_zones),
                       "channel_proposals":_copy.deepcopy(_channel_proposals),
@@ -1862,6 +1953,35 @@ try:
                "channel-dock-loading-face"]["edited"] is True)
         ck("one pending channel proposal continues to block approval",
            _AS._approve_block_reason(_channel_first_job) is not None)
+        _channel_geometry_resp = _client_up.post(
+            f"/channel-proposals/{_channel_job_id}", json={"decisions":[{
+                "proposal_id":"channel-dock-loading-face", "action":"accept",
+                # Deliberately contradictory browser length: server must derive 35m from
+                # the two PDF-point endpoints and stored 0.1m/pt scale.
+                "length_lm":1.0, "polyline_pts":[[10,10],[360,10]],
+            }]})
+        _channel_geometry_job = _AS.load_jobs()[_channel_job_id]
+        _channel_geometry_decision = _channel_geometry_job["channel_proposal_decisions"][
+            "channel-dock-loading-face"]
+        ck("assessor can drag a channel endpoint; server persists axis-aligned geometry",
+           _channel_geometry_resp.status_code == 200 and
+           _channel_geometry_decision["polyline_pts"] == [[10.0,10.0],[360.0,10.0]] and
+           _channel_geometry_decision["geometry_edited"] is True,
+           _channel_geometry_decision)
+        ck("edited channel length is derived from geometry and scale, not browser arithmetic",
+           _channel_geometry_decision["length_lm"] == 35.0,
+           _channel_geometry_decision)
+        _channel_diagonal_resp = _client_up.post(
+            f"/channel-proposals/{_channel_job_id}", json={"decisions":[{
+                "proposal_id":"channel-yard-longest-contained-run", "action":"accept",
+                "length_lm":90.0, "polyline_pts":[[20,20],[920,120]],
+            }]})
+        ck("channel edit API refuses diagonal geometry rather than storing it",
+           _channel_diagonal_resp.status_code == 400 and
+           "non-diagonal" in _channel_diagonal_resp.get_json()["error"] and
+           "channel-yard-longest-contained-run" not in
+               _AS.load_jobs()[_channel_job_id]["channel_proposal_decisions"],
+           _channel_diagonal_resp.get_json())
         _channel_second_resp = _client_up.post(
             f"/channel-proposals/{_channel_job_id}", json={"decisions":[{
                 "proposal_id":"channel-yard-longest-contained-run", "action":"remove",
@@ -2233,6 +2353,23 @@ try:
                "ASSUMED CHANNEL PROPOSALS - NOT MEASURED OR PRICED",
                "channel_proposals", "reviewChannelProposal(",
                "/channel-proposals/", "Accept / save edit", "Remove")))
+        ck("portal supports axis-locked endpoint drag plus numeric channel geometry edits",
+           all(marker in _portal_html_up for marker in (
+               "channelDrag", "function editChannelLength", "syncChannelLengthInput",
+               "line remains straight/non-diagonal", "polyline_pts:polylinePts")))
+        ck("portal gives assumed/proposed/provisional values one unmissable provenance style",
+           all(marker in _portal_html_up for marker in (
+               'class="assumption-badge" data-provenance="assumed"',
+               "assumption-item", "assumption-legend", "assumption-basis",
+               "assumptionBadge('PROPOSED'", "assumptionBadge('PROVISIONAL'",
+               "assumptionBadge('ASSUMED'", "assumptionBadge('ESTIMATED'")))
+        _zone_assumption_fn = _portal_html_up.split("function zoneAssumption", 1)[1].split(
+            "function provenanceFlag", 1)[0]
+        ck("measured zone quantities never gain an assumption badge without explicit provenance",
+           all(marker in _zone_assumption_fn for marker in (
+               "zone.assumed", "zone.proposed", "zone.provisional", "zone.estimate")) and
+           all(marker not in _zone_assumption_fn for marker in (
+               "measurement_state", "measurement_kind", "area_m2", "length_lm")))
         _candidate_fn = _portal_html_up.split("function loadTraceCandidate", 1)[1].split(
             "function calcArea", 1)[0]
         ck("one-click candidate load is non-mutating until Submit Adjustment",

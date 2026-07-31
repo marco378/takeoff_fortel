@@ -29,16 +29,17 @@ ASSUMED = dict(depth_mm=190, conc_rate=128, mesh="A252", layers=1, steel_rate_t=
 CONCRETE_LABELS = ("concrete service yard", "service yard", "external yard",
                    "yard construction", "type c", "gv areas")
 
-# Inderjit has supplied the assumption rule, but has not yet confirmed that Fortel wants the
-# portal to offer it.  This is the single kill-switch: set CHANNEL_PROPOSALS_ENABLED=0 in the
-# environment (or change this default to "0") to suppress every proposal without touching
-# measurement, zones, costing or portal approval behaviour.
+# Inderjit confirmed on 31 Jul that Fortel wants these assumptions offered.  This remains the
+# single kill-switch: set CHANNEL_PROPOSALS_ENABLED=0 in the environment (or change this default
+# to "0") to suppress every proposal without touching measurement, zones, costing or portal
+# approval behaviour.
 CHANNEL_PROPOSALS_ENABLED = os.getenv("CHANNEL_PROPOSALS_ENABLED", "1").strip().lower() \
     not in {"0", "false", "no", "off"}
 CHANNEL_PROPOSAL_BASIS = (
-    "ASSUMED per Inderjit's rule when channels are not drawn: two proposed runs - one "
-    "between the dock retaining walls/loading face and one along the longest straight run "
-    "inside the calculated yard area. Assessor must accept, edit or remove each proposal."
+    "ASSUMED per Inderjit's confirmed rule when channels are not drawn: two straight, "
+    "non-diagonal runs adjacent to retaining walls - one between the dock retaining walls/"
+    "loading face and one following the longest resolved retaining-wall/yard edge. Assessor "
+    "must accept, edit or remove each proposal."
 )
 
 
@@ -541,19 +542,61 @@ def _has_explicit_channel_linework(pdf):
     return False
 
 
-def _longest_contained_yard_run(polygon_pts, k):
-    """Farthest boundary-vertex chord whose complete line lies inside the Yard polygon.
+def _rendered_axis_wall_segments(pdf):
+    """Return native straight CAD lines in the portal's rendered PDF-point space.
 
-    This is a geometry construction, not a fitted correction.  For a simple polygon the
-    longest visibility chord has boundary endpoints; the raster contour already supplies
-    those ordered boundary vertices.  Slight contour self-crossings may be repaired only
-    when the repair changes area by <=1% and one component retains >=99.5% of the area.
-    Otherwise no run is returned.
+    The segment identity is intentionally generic: ``_axis_segments`` accepts horizontal /
+    vertical native CAD strokes, and this helper only applies the page rotation.  Whether a
+    stroke is usable as a retaining-wall edge is decided geometrically against the measured
+    Yard boundary below -- no architect, filename, colour table or target length is involved.
+    """
+    try:
+        with fitz.open(pdf) as doc:
+            page = doc[0]
+            rotation_matrix = page.rotation_matrix
+            rendered = []
+            for segment in _axis_segments(page):
+                if segment["orientation"] == "H":
+                    start = fitz.Point(segment["a0"], segment["p0"])
+                    end = fitz.Point(segment["a1"], segment["p0"])
+                else:
+                    start = fitz.Point(segment["p0"], segment["a0"])
+                    end = fitz.Point(segment["p0"], segment["a1"])
+                start, end = start * rotation_matrix, end * rotation_matrix
+                # Snap the sub-point floating noise introduced by the rotation matrix.  A
+                # proposed line must be literally horizontal or vertical in portal space.
+                if abs(end.x - start.x) <= abs(end.y - start.y):
+                    x = (start.x + end.x) / 2
+                    points = [[x, start.y], [x, end.y]]
+                else:
+                    y = (start.y + end.y) / 2
+                    points = [[start.x, y], [end.x, y]]
+                rendered.append({
+                    "polyline_pts": points,
+                    "grey_wall_evidence": bool(segment.get("grey")),
+                })
+            return rendered
+    except Exception:
+        return []
+
+
+def _longest_contained_yard_run(polygon_pts, k, wall_segments=None):
+    """Longest unique, non-diagonal native CAD wall beside the measured Yard boundary.
+
+    This replaces the old maximum boundary-vertex chord: that chord could cut diagonally
+    across the Yard and was therefore not a defensible channel placement.  Candidates must
+    now be actual horizontal/vertical CAD lines whose complete sampled length remains within
+    1 m of the measured Yard edge.  Coincident strokes and the two faces of one wall are
+    collapsed by geometric overlap; competing near-equal walls are refused, not guessed.
+
+    ``wall_segments`` is explicit so the geometry can be regression-tested without a PDF.
+    The returned length always comes from the native line itself, never a fitted constant.
     """
     if not k or k <= 0 or not isinstance(polygon_pts, list) or len(polygon_pts) < 3:
         return None, "Yard outline or scale is missing"
+    if not wall_segments:
+        return None, "No native straight CAD wall lines were available beside the Yard"
     try:
-        from itertools import combinations
         from shapely.geometry import LineString, Polygon
 
         raw = Polygon(polygon_pts)
@@ -574,31 +617,116 @@ def _longest_contained_yard_run(polygon_pts, k):
                 f"{dominance * 100:.2f}%)"
             )
 
-        vertices = list(yard.exterior.coords)[:-1]
-        if len(vertices) < 3 or len(vertices) > 180:
-            return None, f"Yard outline has an unsupported {len(vertices)} vertices"
         candidates = []
         tested = 0
-        for start, end in combinations(vertices, 2):
+        adjacency_limit_m = 1.0
+        for evidence in wall_segments:
+            points = evidence.get("polyline_pts") if isinstance(evidence, dict) else evidence
+            if not isinstance(points, (list, tuple)) or len(points) != 2:
+                continue
+            try:
+                start = (float(points[0][0]), float(points[0][1]))
+                end = (float(points[1][0]), float(points[1][1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            dx, dy = abs(end[0] - start[0]), abs(end[1] - start[1])
             tested += 1
-            line = LineString([start, end])
-            # Exact covers(): boundary is allowed, but no part of the proposed run may
-            # cross a notch or leave the calculated Yard polygon.
-            if yard.covers(line):
-                candidates.append((line.length, start, end))
+            # Literal non-diagonal constraint.  The source reader snaps rotation-matrix
+            # noise; callers supplying evidence directly get the same strict contract.
+            if min(dx, dy) > 0.05 or max(dx, dy) <= 0.05:
+                continue
+            orientation = "H" if dx > dy else "V"
+            if orientation == "H":
+                fixed = (start[1] + end[1]) / 2
+                a0, a1 = sorted((start[0], end[0]))
+                line = LineString([(a0, fixed), (a1, fixed)])
+            else:
+                fixed = (start[0] + end[0]) / 2
+                a0, a1 = sorted((start[1], end[1]))
+                line = LineString([(fixed, a0), (fixed, a1)])
+            length_m = line.length * k
+            if length_m < 20:
+                continue
+            samples = [line.interpolate(index / 8, normalized=True) for index in range(9)]
+            boundary_distances_m = [yard.boundary.distance(point) * k for point in samples]
+            if max(boundary_distances_m) > adjacency_limit_m:
+                continue
+            candidates.append({
+                "line": line,
+                "orientation": orientation,
+                "fixed": fixed,
+                "a0": a0,
+                "a1": a1,
+                "length_m": length_m,
+                "max_boundary_distance_m": max(boundary_distances_m),
+                "mean_boundary_distance_m": sum(boundary_distances_m) / len(boundary_distances_m),
+                "grey_wall_evidence": bool(
+                    isinstance(evidence, dict) and evidence.get("grey_wall_evidence")),
+            })
         if not candidates:
-            return None, "No boundary-to-boundary straight run is fully contained in Yard"
-        length_pt, start, end = max(candidates, key=lambda candidate: candidate[0])
-        length_lm = length_pt * k
-        if length_lm < 20:
-            return None, f"Longest contained Yard run is only {length_lm:.2f} Lm"
+            return None, (
+                "No native non-diagonal CAD wall remained within 1.00 m of the complete "
+                "Yard-edge run"
+            )
+
+        # Collapse repeated stroke/fill paths and nearby parallel faces describing one wall.
+        # A cluster is evidence-backed if it contains a light wall stroke OR repeated CAD
+        # paths; a lone anonymous black line is not enough to call a retaining wall.
+        clusters = []
+        for candidate in sorted(candidates, key=lambda item: item["length_m"], reverse=True):
+            matched = None
+            for cluster in clusters:
+                representative = cluster["representative"]
+                if candidate["orientation"] != representative["orientation"]:
+                    continue
+                overlap = max(0.0, min(candidate["a1"], representative["a1"])
+                              - max(candidate["a0"], representative["a0"]))
+                shorter = min(candidate["a1"] - candidate["a0"],
+                              representative["a1"] - representative["a0"])
+                separation_m = abs(candidate["fixed"] - representative["fixed"]) * k
+                if shorter > 0 and overlap / shorter >= 0.9 and separation_m <= 1.0:
+                    matched = cluster
+                    break
+            if matched is None:
+                clusters.append({"representative": candidate, "members": [candidate]})
+            else:
+                matched["members"].append(candidate)
+                if candidate["length_m"] > matched["representative"]["length_m"]:
+                    matched["representative"] = candidate
+
+        supported = [
+            cluster for cluster in clusters
+            if any(member["grey_wall_evidence"] for member in cluster["members"])
+            or len(cluster["members"]) >= 2
+        ]
+        if not supported:
+            return None, (
+                "Yard-edge lines were found, but none had a light wall stroke or repeated "
+                "native CAD paths to corroborate retaining-wall identity"
+            )
+        supported.sort(key=lambda cluster: cluster["representative"]["length_m"], reverse=True)
+        if (len(supported) > 1
+                and supported[1]["representative"]["length_m"]
+                >= 0.95 * supported[0]["representative"]["length_m"]):
+            return None, (
+                "Competing non-diagonal retaining-wall/yard-edge runs are within 5% length "
+                "of one another; assessor must choose the channel edge"
+            )
+
+        chosen_cluster = supported[0]
+        chosen = chosen_cluster["representative"]
+        start, end = list(chosen["line"].coords)
         return {
-            "length_lm": round(length_lm, 2),
+            "length_lm": round(chosen["length_m"], 2),
             "polyline_pts": [
                 [round(start[0], 2), round(start[1], 2)],
                 [round(end[0], 2), round(end[1], 2)],
             ],
-            "tested_chords": tested,
+            "orientation": chosen["orientation"],
+            "tested_wall_segments": tested,
+            "wall_evidence_count": len(chosen_cluster["members"]),
+            "max_boundary_distance_m": round(chosen["max_boundary_distance_m"], 3),
+            "mean_boundary_distance_m": round(chosen["mean_boundary_distance_m"], 3),
             "repair_delta_pct": round(repair_delta * 100, 3),
             "largest_component_pct": round(dominance * 100, 3),
         }, None
@@ -607,7 +735,7 @@ def _longest_contained_yard_run(polygon_pts, k):
 
 
 def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
-                     explicit_channel_linework=False):
+                     explicit_channel_linework=False, wall_segments=None):
     """Return separate, non-measured channel assumptions plus visible refusal reasons."""
     if not CHANNEL_PROPOSALS_ENABLED:
         return [], ["CHANNEL PROPOSALS disabled by CHANNEL_PROPOSALS_ENABLED"]
@@ -629,6 +757,18 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
         return [], [
             "CHANNEL PROPOSAL refused: Dock exists but its loading-face line evidence is missing"
         ]
+    try:
+        loading_dx = abs(float(loading_face_pts[1][0]) - float(loading_face_pts[0][0]))
+        loading_dy = abs(float(loading_face_pts[1][1]) - float(loading_face_pts[0][1]))
+    except (TypeError, ValueError, IndexError):
+        return [], [
+            "CHANNEL PROPOSAL refused: Dock loading-face geometry is malformed"
+        ]
+    if min(loading_dx, loading_dy) > 0.05 or max(loading_dx, loading_dy) <= 0.05:
+        return [], [
+            "CHANNEL PROPOSAL refused: Dock loading face is not a straight non-diagonal line"
+        ]
+    loading_orientation = "horizontal" if loading_dx > loading_dy else "vertical"
 
     scale_reason = ("drawing scale independently verified" if scale_verified
                     else "drawing scale unverified; assessor must confirm proposed Lm")
@@ -637,6 +777,7 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
         "component": "dock_retaining_wall",
         "proposed_length_lm": round(float(loading_face_lm), 2),
         "polyline_pts": loading_face_pts,
+        "orientation": loading_orientation,
         "coordinate_space": "pdf_points",
         "basis": CHANNEL_PROPOSAL_BASIS,
         "confidence": "medium" if scale_verified else "low",
@@ -650,20 +791,25 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
         "requires_assessor_confirmation": True,
     }]
 
-    yard_run, refusal = _longest_contained_yard_run(yard_polygon_pts, k)
+    yard_run, refusal = _longest_contained_yard_run(
+        yard_polygon_pts, k, wall_segments=wall_segments)
     if yard_run:
         proposals.append({
             "proposal_id": "channel-yard-longest-contained-run",
             "component": "yard_longest_contained_run",
             "proposed_length_lm": yard_run["length_lm"],
             "polyline_pts": yard_run["polyline_pts"],
+            "orientation": "horizontal" if yard_run["orientation"] == "H" else "vertical",
             "coordinate_space": "pdf_points",
             "basis": CHANNEL_PROPOSAL_BASIS,
             "confidence": "medium" if scale_verified else "low",
             "confidence_reasons": [
-                "selected the longest boundary-vertex chord whose complete straight line is "
-                "covered by the calculated Yard polygon",
-                f"tested {yard_run['tested_chords']} vertex pairs; no bounding box used",
+                f"selected a native {yard_run['orientation']}-axis CAD retaining-wall/yard-edge "
+                "line; diagonal chords are forbidden",
+                f"tested {yard_run['tested_wall_segments']} native CAD wall segments; chosen "
+                f"wall had {yard_run['wall_evidence_count']} corroborating stroke/path records",
+                f"complete run stays within {yard_run['max_boundary_distance_m']:.3f} m of the "
+                f"calculated Yard boundary (mean {yard_run['mean_boundary_distance_m']:.3f} m)",
                 f"outline repair area change {yard_run['repair_delta_pct']:.3f}% and largest "
                 f"component {yard_run['largest_component_pct']:.3f}%",
                 scale_reason,
@@ -1489,12 +1635,13 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
 
     # --- unpriced channel ASSUMPTIONS -------------------------------------------------------
     # Kept deliberately outside zones[] and every measured/costed total.  The Dock loading-face
-    # placement and Yard chord are geometric; the existence of two channels is Inderjit's
+    # placement and Yard wall-edge run are geometric; the existence of two channels is Inderjit's
     # supplied assumption and must be reviewed in the portal before approval.
     channel_proposals, channel_proposal_flags = propose_channels(
         polygon_pts, dock_zone, k,
         scale_verified=verified,
         explicit_channel_linework=_has_explicit_channel_linework(pdf),
+        wall_segments=_rendered_axis_wall_segments(pdf),
     )
     flags += channel_proposal_flags
 

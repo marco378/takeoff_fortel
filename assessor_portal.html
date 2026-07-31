@@ -63,6 +63,15 @@ header span{opacity:.7;font-size:12px}
 .badge.mstate.MEASURED_UNVERIFIED{background:#e67e22;color:#fff}
 .badge.mstate.UNMEASURED{background:#8e44ad;color:#fff}
 .badge.mstate.REJECTED{background:#c0392b;color:#fff}
+.assumption-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:10px;
+  background:#8a3f00;color:#fff;font-size:9px;font-weight:900;letter-spacing:.45px;
+  line-height:1.35;text-transform:uppercase;vertical-align:middle;box-shadow:0 0 0 2px #ffd88a}
+.assumption-badge::before{content:"!";display:inline-grid;place-items:center;width:12px;height:12px;
+  border-radius:50%;background:#fff;color:#8a3f00;font-size:9px;line-height:1}
+.assumption-item{background:#fff3cd!important;border-left:4px solid #d97706!important}
+.assumption-legend{margin:7px 0;padding:8px 9px;background:#fff3cd;border:2px solid #d97706;
+  border-radius:6px;color:#6f3500;font-size:11px;font-weight:700;line-height:1.35}
+.assumption-basis{display:block;margin-top:2px;color:#765000;font-size:9px;font-weight:500;line-height:1.3}
 .no-jobs{padding:24px 16px;opacity:.5;font-size:13px;text-align:center}
 
 /* ── Main panel ──────────────────────────── */
@@ -111,16 +120,17 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .flag.ok{background:#eafaf1;color:#1e8449;border-left:3px solid #27ae60}
 .candidate-panel{margin-top:8px;padding:8px;background:#fff8e8;border:1px solid #f1cf83;border-radius:6px}
 .candidate-panel .candidate-note{font-size:10px;color:#7a5200;line-height:1.35;margin-bottom:6px}
-.candidate-row{display:flex;align-items:center;gap:5px;padding:4px 0;border-top:1px solid #f3dfb0;font-size:11px}
+.candidate-row{display:flex;align-items:center;gap:5px;padding:5px 5px;border-top:1px solid #f3dfb0;font-size:11px}
 .candidate-row:first-of-type{border-top:0}
 .candidate-row .candidate-label{min-width:0;flex:1;color:#5d4300;font-weight:600}
 .candidate-row .candidate-why{display:block;font-weight:400;font-size:9px;line-height:1.3;color:#7a5b17;margin-top:2px}
 .candidate-row.unresolved{background:#fff1f0;color:#9f2d24}
+.candidate-row.unresolved.assumption-item{background:#fff1f0!important;border-left-color:#c0392b!important}
 .candidate-row button{border:1px solid #d6a83e;background:#fff;color:#6a4900;border-radius:4px;padding:2px 5px;font-size:10px;cursor:pointer}
 .candidate-row button:hover{background:#fff1c9}
 .channel-proposal-panel{margin-top:8px;padding:8px;background:#f7f1ff;border:1px solid #bea3df;border-radius:6px}
 .channel-proposal-note{font-size:10px;color:#58377f;line-height:1.35;margin-bottom:6px}
-.channel-proposal-row{padding:6px 0;border-top:1px solid #ddcfee;font-size:10px;color:#402263}
+.channel-proposal-row{padding:6px 5px;border-top:1px solid #ddcfee;font-size:10px;color:#402263}
 .channel-proposal-row:first-of-type{border-top:0}
 .channel-proposal-actions{display:flex;gap:4px;align-items:center;margin-top:4px;flex-wrap:wrap}
 .channel-proposal-actions input{width:78px;padding:3px 5px;border:1px solid #bba4d4;border-radius:4px;font-size:11px}
@@ -506,6 +516,7 @@ let traceRegions = [];    // completed assessor regions: [{points:[{x,y}], candi
 let activeCandidateId = null;
 let candidatePolygons = []; // assisted candidates in CANVAS pixels; never authoritative by themselves
 let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never measured/priced
+let channelDrag = null;     // {proposalIndex, pointIndex, axis}; edits stay axis-aligned
 let cal  = [];            // [{x,y}] calibration line endpoints
 let mpp  = null;          // metres per CANVAS pixel
 let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapshot-Scale header).
@@ -535,7 +546,10 @@ window.addEventListener('DOMContentLoaded', () => {
   if (p.get('job')) selectJob(p.get('job'));
   setupButtons();
   // Global listeners (added once, not per-canvas)
-  window.addEventListener('mouseup', () => { dragIdx = -1; isPanning = false; });
+  window.addEventListener('mouseup', () => {
+    dragIdx = -1; channelDrag = null; isPanning = false;
+    if (canvas) canvas.style.cursor = getCursorForMode();
+  });
   document.addEventListener('keydown', onKeyDown);
   document.addEventListener('keyup', onKeyUp);
 });
@@ -824,7 +838,7 @@ async function selectJob(jobId) {
   // resetting snapScale/mpp, guarantees the canvas reloads fresh for each job.
   img = null;
   poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = []; channelProposals = [];
-  cal = []; aiPoly = null; dragIdx = -1;
+  cal = []; aiPoly = null; dragIdx = -1; channelDrag = null;
   mpp = null; snapScale = 0.5;
   if (ctx && canvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -1080,13 +1094,22 @@ function initialiseTraceState(job, res) {
     points: candidate.regions[0] || []
   })).filter(candidate => candidate.regions.length);
 
-  channelProposals = effectiveChannelProposals(job).map(proposal => ({
-    ...proposal,
-    points: (proposal.polyline_pts || []).map(point => ({
-      x: Number(point[0]) * snapScale,
-      y: Number(point[1]) * snapScale
-    }))
-  })).filter(proposal => proposal.points.length === 2);
+  const channelDecisions = effectiveChannelProposalDecisions(job);
+  channelProposals = effectiveChannelProposals(job).filter(proposal => {
+    const decision = channelDecisions[String(proposal.proposal_id || '')] || {};
+    return decision.decision !== 'removed';
+  }).map(proposal => {
+    const decision = channelDecisions[String(proposal.proposal_id || '')] || {};
+    const storedPoints = decision.decision === 'accepted' && Array.isArray(decision.polyline_pts)
+      ? decision.polyline_pts : proposal.polyline_pts;
+    return {
+      ...proposal,
+      points: (storedPoints || []).map(point => ({
+        x: Number(point[0]) * snapScale,
+        y: Number(point[1]) * snapScale
+      }))
+    };
+  }).filter(proposal => proposal.points.length === 2);
 
   const adjusted = job.adjusted || {};
   let storedRegions = Array.isArray(adjusted.regions) ? adjusted.regions : [];
@@ -1125,6 +1148,53 @@ function zoneQuantity(value, unit) {
   return `${number.toLocaleString(undefined, {maximumFractionDigits:2})} ${unit}`;
 }
 
+// One presentation contract for every non-measured value.  Callers must opt in from an
+// explicit provenance field/collection; measurement state or low confidence alone is not an
+// assumption and therefore never earns this badge.
+function assumptionBadge(label, basis) {
+  const safeLabel = label || 'ASSUMED';
+  const safeBasis = basis || 'No provenance detail supplied — assessor confirmation required';
+  return `<span class="assumption-badge" data-provenance="assumed"
+                title="${esc(safeBasis)}" aria-label="${esc(`${safeLabel}: ${safeBasis}`)}">${esc(safeLabel)}</span>`;
+}
+
+function zoneAssumption(zone) {
+  const assumed = !!(zone && (
+    zone.assumed === true || zone.provisional === true ||
+    zone.proposed === true || zone.estimate === true
+  ));
+  if (!assumed) return null;
+  return {
+    label: zone.proposed === true ? 'PROPOSED' : (zone.estimate === true ? 'ESTIMATED' : 'ASSUMED'),
+    basis: zone.basis || zone.assumption_basis || zone.provisional_reason || zone.provenance || ''
+  };
+}
+
+function provenanceFlag(job, fieldName) {
+  const res = (job && job.result) || {};
+  const flags = [...(Array.isArray(job && job.flags) ? job.flags : []),
+                 ...(Array.isArray(res.flags) ? res.flags : [])];
+  return flags.find(flag => String(flag).includes(`${fieldName}=`)) || '';
+}
+
+function jobHasAssumptions(job) {
+  const res = (job && job.result) || {};
+  const costing = (job && job.costing) || res.costing || {};
+  const specs = effectiveBriefSpecs(job);
+  const storedBrief = (job && job.brief_spec) || res.brief_spec;
+  const provisionalBrief = brief => !!(brief && brief.fields &&
+    Object.values(brief.fields).some(field => field && field.provisional === true));
+  return !!(
+    (job && (job.manhole_count_estimate != null || job.manhole_count_assumed != null)) ||
+    res.manhole_count_estimate != null || res.manhole_count_assumed != null ||
+    effectiveCandidatePolygons(job).length || effectiveChannelProposals(job).length ||
+    effectiveZones(job).some(zone => zoneAssumption(zone)) ||
+    costing.assumed === true ||
+    (Array.isArray(costing.extras) && costing.extras.some(extra => extra && extra.estimate === true)) ||
+    provisionalBrief(storedBrief) || Object.values(specs).some(provisionalBrief)
+  );
+}
+
 function renderZoneSummary(job) {
   const res = (job && job.result) || {};
   const zones = effectiveZones(job);
@@ -1154,6 +1224,7 @@ function renderZoneSummary(job) {
   };
   const rows = zones.map((zone, zoneIndex) => {
     zone = zone || {};
+    const assumption = zoneAssumption(zone);
     const category = String(zone.category || 'unclassified').trim().toLowerCase();
     const subjects = Array.isArray(zone.subjects)
       ? zone.subjects : (zone.subject ? [zone.subject] : []);
@@ -1179,10 +1250,13 @@ function renderZoneSummary(job) {
         <button type="button" onclick="classifyZone(${zoneIndex})" style="font-size:9px;padding:2px 5px;cursor:pointer">Save</button>
       </div>`;
     }
-    return `<tr style="background:${category.toLowerCase()==='unclassified'?'#fff0ee':'#fff'}">
+    const provenance = assumption
+      ? `${assumptionBadge(assumption.label, assumption.basis)}${assumption.basis ? `<span class="assumption-basis">${esc(assumption.basis)}</span>` : ''}`
+      : '';
+    return `<tr class="${assumption?'assumption-item':''}" style="background:${category.toLowerCase()==='unclassified'?'#fff0ee':'#fff'}">
       <td style="padding:5px;border-bottom:1px solid #d9e0e8;font-weight:700;color:${category.toLowerCase()==='unclassified'?'#c0392b':'#13294b'}">${esc(labels[category]||category)}</td>
       <td style="padding:5px;border-bottom:1px solid #d9e0e8">${esc(subjects.length?subjects.join(', '):'—')}</td>
-      <td style="padding:5px;border-bottom:1px solid #d9e0e8">${esc(zone.measurement_kind||'—')}</td>
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8">${esc(zone.measurement_kind||'—')}${provenance}</td>
       <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right;font-variant-numeric:tabular-nums">${esc(quantities.length?quantities.join(' · '):'—')}</td>
       <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right">${count != null && Number.isFinite(count)?count:'—'}</td>
       <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right">${classifyControl}</td>
@@ -1277,12 +1351,14 @@ function renderCandidateSummary(job) {
     const confidence = `${candidate.confidence || 'low'}${
       candidate.confidence_score == null ? '' : ` (${candidate.confidence_score}/100)`}`;
     const why = (candidate.confidence_reasons || candidate.flags || []).join(' · ');
+    const basis = why || candidate.basis || 'No detector basis supplied — inspect the suggested outline';
     return `
-      <div class="candidate-row ${resolved ? '' : 'unresolved'}">
+      <div class="candidate-row assumption-item ${resolved ? '' : 'unresolved'}">
         <span class="candidate-label">
+          ${assumptionBadge('PROPOSED', basis)}
           ${esc(candidate.level_label || 'Candidate')} · ${esc((candidate.category||'').replace('_',' '))}
           · ${esc(confidence)}
-          <span class="candidate-why">${esc(why || 'Inspect the suggested outline before use')}</span>
+          <span class="candidate-why">Basis: ${esc(basis)}</span>
         </span>
         ${resolved ? `<button type="button" data-candidate-id="${esc(candidate.candidate_id)}"
                     onclick="loadTraceCandidate(this.dataset.candidateId)">Add to trace</button>`
@@ -1308,15 +1384,17 @@ function renderChannelProposalSummary(job) {
     const status = decision.decision || 'pending review';
     const why = (proposal.confidence_reasons || []).join(' · ');
     const label = proposal.component === 'dock_retaining_wall'
-      ? 'Dock retaining-wall/loading face' : 'Longest straight run inside Yard';
-    return `<div class="channel-proposal-row">
-      <div><strong>${esc(label)}</strong> · ${esc(proposal.confidence || 'low')} confidence
+      ? 'Dock retaining-wall/loading face' : 'Yard retaining-wall-adjacent run';
+    const basis = proposal.basis || why || 'No proposal basis supplied — assessor review required';
+    return `<div class="channel-proposal-row assumption-item">
+      <div>${assumptionBadge('PROPOSED', basis)} <strong>${esc(label)}</strong> · ${esc(proposal.confidence || 'low')} confidence
         · <span class="channel-proposal-status">${esc(status)}</span></div>
-      <div style="margin-top:2px">${esc(proposal.basis || '')}</div>
+      <div style="margin-top:2px"><strong>Basis:</strong> ${esc(basis)}</div>
       <div style="font-size:9px;color:#6e518f;margin-top:2px">${esc(why || 'Assessor review required')}</div>
       <div class="channel-proposal-actions">
         <label>Proposed/edited Lm
           <input id="channelLength-${esc(id)}" type="number" min="0.01" step="0.01"
+                 data-proposal-id="${esc(id)}" oninput="editChannelLength(this.dataset.proposalId)"
                  value="${Number.isFinite(displayedLength) ? displayedLength.toFixed(2) : ''}">
         </label>
         <button type="button" data-proposal-id="${esc(id)}"
@@ -1328,9 +1406,54 @@ function renderChannelProposalSummary(job) {
   }).join('');
   return `<div class="channel-proposal-panel">
     <div style="font-size:11px;font-weight:800;color:#4d2b73;margin-bottom:3px">ASSUMED CHANNEL PROPOSALS - NOT MEASURED OR PRICED</div>
-    <div class="channel-proposal-note">Purple dashed lines are editable assumptions under Inderjit's two-channel rule. They are outside measured zones and all totals. Review every row before approval.</div>
+    <div class="channel-proposal-note">Purple dashed lines are editable assumptions under Inderjit's two-channel rule. Drag either endpoint (the line remains straight/non-diagonal), or type a length to redraw it. They are outside measured zones and all totals. Review every row before approval.</div>
     ${rows}
   </div>`;
+}
+
+function channelProposalForId(proposalId) {
+  return channelProposals.find(proposal => String(proposal.proposal_id || '') === String(proposalId));
+}
+
+function channelProposalAxis(proposal) {
+  if (proposal && ['horizontal','vertical'].includes(proposal.orientation)) {
+    return proposal.orientation;
+  }
+  const points = proposal && proposal.points;
+  if (!points || points.length !== 2) return null;
+  return Math.abs(points[1].x - points[0].x) >= Math.abs(points[1].y - points[0].y)
+    ? 'horizontal' : 'vertical';
+}
+
+function syncChannelLengthInput(proposal) {
+  if (!proposal || !proposal.points || proposal.points.length !== 2 || !mpp) return;
+  const length = Math.hypot(
+    proposal.points[1].x - proposal.points[0].x,
+    proposal.points[1].y - proposal.points[0].y
+  ) * mpp;
+  const input = document.getElementById(`channelLength-${proposal.proposal_id}`);
+  if (input && Number.isFinite(length)) input.value = length.toFixed(2);
+}
+
+function editChannelLength(proposalId) {
+  const proposal = channelProposalForId(proposalId);
+  const input = document.getElementById(`channelLength-${proposalId}`);
+  const length = input ? Number(input.value) : NaN;
+  if (!proposal || !proposal.points || proposal.points.length !== 2 || !mpp ||
+      !Number.isFinite(length) || length <= 0) return;
+  const axis = channelProposalAxis(proposal);
+  const start = proposal.points[0], end = proposal.points[1];
+  const pixels = length / mpp;
+  if (axis === 'horizontal') {
+    const direction = end.x < start.x ? -1 : 1;
+    end.x = start.x + direction * pixels;
+    end.y = start.y;
+  } else if (axis === 'vertical') {
+    const direction = end.y < start.y ? -1 : 1;
+    end.x = start.x;
+    end.y = start.y + direction * pixels;
+  }
+  draw();
 }
 
 async function reviewChannelProposal(proposalId, action) {
@@ -1342,10 +1465,14 @@ async function reviewChannelProposal(proposalId, action) {
     return;
   }
   try {
+    const proposal = channelProposalForId(proposalId);
+    const polylinePts = action === 'accept' && proposal && proposal.points.length === 2
+      ? proposal.points.map(point => [point.x / snapScale, point.y / snapScale]) : null;
     const response = await fetch(`${BASE}/channel-proposals/${currentJob.id}`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({decisions:[{
-        proposal_id:proposalId, action, length_lm:action === 'accept' ? length : null
+        proposal_id:proposalId, action, length_lm:action === 'accept' ? length : null,
+        polyline_pts:polylinePts
       }]})
     });
     const payload = await response.json();
@@ -1360,6 +1487,25 @@ async function reviewChannelProposal(proposalId, action) {
 function renderJobDetails(job) {
   const res = job.result || {};
   const perimeter = effectiveStoredPerimeter(job);
+  const manholeCount = job.manhole_count ?? res.manhole_count;
+  const manholeEstimate = job.manhole_count_estimate ?? res.manhole_count_estimate;
+  const manholeAssumed = job.manhole_count_assumed ?? res.manhole_count_assumed;
+  const manholeRows = manholeCount != null
+    ? `<div class="kv"><span class="k">Marked manholes</span><span class="v">${esc(manholeCount)} Nr</span></div>`
+    : manholeEstimate != null
+      ? `<div class="kv assumption-item" style="padding:5px 6px"><span class="k">Detected manholes</span><span class="v">
+           ${esc(manholeEstimate)} Nr ${assumptionBadge('ESTIMATED', provenanceFlag(job,'manhole_count_estimate'))}
+           <span class="assumption-basis">${esc(provenanceFlag(job,'manhole_count_estimate'))}</span>
+         </span></div>`
+      : manholeAssumed != null
+        ? `<div class="kv assumption-item" style="padding:5px 6px"><span class="k">Manhole fallback</span><span class="v">
+             ${esc(manholeAssumed)} Nr ${assumptionBadge('ASSUMED', provenanceFlag(job,'manhole_count_assumed'))}
+             <span class="assumption-basis">${esc(provenanceFlag(job,'manhole_count_assumed'))}</span>
+           </span></div>`
+        : '';
+  const assumptionLegend = jobHasAssumptions(job)
+    ? `<div class="assumption-legend">${assumptionBadge('ASSUMED / PROPOSED', 'Amber values are not measured facts and require assessor confirmation')} Amber values are assumption-based, proposed or provisional. Confirm, edit or remove them before issue.</div>`
+    : '';
   const projRow = (job.project_ref || job.project_name) ? `
     <div class="kv" style="background:#eef3fa;border-radius:5px;padding:5px 8px;margin-bottom:4px">
       ${job.project_ref ? `<span class="k" style="color:#13294b;font-weight:700">#${esc(job.project_ref)}</span>` : ''}
@@ -1376,6 +1522,7 @@ function renderJobDetails(job) {
   const channelProposalSummary = renderChannelProposalSummary(job);
   document.getElementById('jobDetails').innerHTML = `
     ${projRow}
+    ${assumptionLegend}
     ${mstateRow}
     <div class="kv"><span class="k">File</span><span class="v">${esc(res.file)}</span></div>
     <div class="kv"><span class="k">Type</span><span class="v">${esc(res.type)}</span></div>
@@ -1383,6 +1530,7 @@ function renderJobDetails(job) {
     <div class="kv"><span class="k">Confidence</span><span class="v">${esc(res.confidence)}</span></div>
     <div class="kv"><span class="k">AI area</span><span class="v">${res.area_m2?(+res.area_m2).toLocaleString()+' m²':'—'}</span></div>
     <div class="kv"><span class="k">Slab perimeter</span><span class="v">${perimeter!=null?perimeter.toLocaleString()+' m':'—'}</span></div>
+    ${manholeRows}
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
     ${channelProposalSummary}
     ${candidateSummary}
@@ -1457,9 +1605,10 @@ function renderBriefSpecSummary(brief) {
     <div style="font-size:11px;color:#aec3e0;font-weight:700;margin-bottom:5px">${esc(schema.label)}</div>
     ${schema.fields.map(([key,label]) => {
       const field = (brief.fields||{})[key] || {value:null,provisional:true};
+      const basis = field.source || 'not_provided';
       return `<div class="kv" style="gap:8px"><span class="k" style="font-size:10px">${esc(label)}</span>
-        <span class="v" style="font-size:10px;color:${field.provisional?'#f4c56a':'#b8e1c3'}">
-          ${esc(specValueText(key,field))} · ${field.provisional?'PROVISIONAL':'CONFIRMED'}
+        <span class="v ${field.provisional?'assumption-item':''}" style="font-size:10px;color:${field.provisional?'#6f3500':'#b8e1c3'};padding:${field.provisional?'3px 5px':'0'}">
+          ${esc(specValueText(key,field))} ${field.provisional?assumptionBadge('PROVISIONAL',basis):'· CONFIRMED'}
         </span></div>`;
     }).join('')}
   </div>`;
@@ -1478,7 +1627,9 @@ function renderSpecFieldInputs(slabType, brief) {
       : 'No details provided — remains provisional';
     const inputType = (key === 'depth_mm' || key === 'layers') ? 'number' : 'text';
     return `<label style="font-size:11px;color:#8fa8cc;display:block">
-      ${esc(label)} <span style="color:${field.provisional?'#f4c56a':'#7fd394'}">${field.provisional?'PROVISIONAL':'CONFIRMED'}</span>
+      ${esc(label)} ${field.provisional
+        ? assumptionBadge('PROVISIONAL', field.source || 'not_provided')
+        : '<span style="color:#7fd394">CONFIRMED</span>'}
       <input data-spec-key="${key}" type="${inputType}" ${inputType==='number'?'min="1" step="1"':''}
              value="${esc(confirmedValue)}" placeholder="${esc(assumedHint)}"
              style="width:100%;margin-top:3px;padding:5px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
@@ -1514,13 +1665,25 @@ function renderCosting(c, jobStatus, job={}) {
   const rateDisplay = Number.isFinite(numericRate)
     ? numericRate.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})
     : '—';
+  const costingBasis = c.note || (Array.isArray(c.flags) ? c.flags[0] : '') || 'Build-up uses provisional specification fields';
   const rows = ['concrete','steel','dpm','curing','labour','trim'].map(k =>
     bdwn[k] != null
-      ? `<div class="kv"><span class="k" style="padding-left:8px">${k.charAt(0).toUpperCase()+k.slice(1)}</span><span class="v">£${(+bdwn[k]).toFixed(2)}/m²</span></div>`
+      ? `<div class="kv ${assumed?'assumption-item':''}" style="${assumed?'padding:3px 5px':''}"><span class="k" style="padding-left:8px">${k.charAt(0).toUpperCase()+k.slice(1)}</span><span class="v">£${(+bdwn[k]).toFixed(2)}/m² ${assumed?assumptionBadge('ASSUMED',costingBasis):''}</span></div>`
       : ''
   ).join('');
+  const extrasRows = (Array.isArray(c.extras) ? c.extras : []).map(extra => {
+    const estimated = extra && extra.estimate === true;
+    const basis = (Array.isArray(c.flags) ? c.flags.find(flag =>
+      String(flag).includes(String(extra.description||'').split(' (')[0])) : '') ||
+      (estimated ? 'Costing extra is explicitly marked estimate' : '');
+    return `<div class="kv ${estimated?'assumption-item':''}" style="${estimated?'padding:4px 5px':''}">
+      <span class="k">${esc(extra.description||'Extra')}</span>
+      <span class="v">${esc(extra.qty)} ${esc(extra.unit||'')} · £${Number(extra.value||0).toFixed(2)}
+        ${estimated?assumptionBadge('ESTIMATED',basis):''}</span>
+    </div>`;
+  }).join('');
   const assumedBanner = assumed
-    ? `<div class="flag warn" style="margin-top:6px;font-size:11px">⚠ Build-up assumed — no engineer spec</div>` : '';
+    ? `<div class="flag warn assumption-item" style="margin-top:6px;font-size:11px">${assumptionBadge('ASSUMED',costingBasis)} Build-up assumed — no engineer spec<span class="assumption-basis">${esc(costingBasis)}</span></div>` : '';
 
   const escalationBanner = (assumed && c.total_gbp > 200000)
     ? `<div style="background:#fdecea;border:1px solid #e74c3c;border-radius:5px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:#c0392b;line-height:1.4">
@@ -1563,10 +1726,10 @@ function renderCosting(c, jobStatus, job={}) {
     </details>` : '';
 
   const costingCard = hasCosting ? `
-    <div style="background:#13294b;border-radius:6px;padding:10px 12px;margin-bottom:8px;text-align:center">
-      <div style="color:#aec3e0;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT)</div>
+    <div style="background:${assumed?'#6f3500':'#13294b'};border:${assumed?'3px solid #ffd88a':'0'};border-radius:6px;padding:10px 12px;margin-bottom:8px;text-align:center">
+      <div style="color:#fff;font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total (net, excl. VAT) ${assumed?assumptionBadge('ASSUMED',costingBasis):''}</div>
       <div style="color:#fff;font-size:26px;font-weight:800">£${(+c.total_gbp).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
-      <div style="color:#8fa8cc;font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${rateDisplay}/m²</div>
+      <div style="color:${assumed?'#ffe5b5':'#8fa8cc'};font-size:12px">${(+c.area_m2).toLocaleString()} m² @ £${rateDisplay}/m²</div>
     </div>
     <div class="kv" style="align-items:baseline">
       <span class="k" style="font-size:11px">Rate breakdown (per m²)</span>
@@ -1580,7 +1743,8 @@ function renderCosting(c, jobStatus, job={}) {
       Derived from the rate inputs — not editable here. Use “Edit rates” to change concrete,
       steel, labour, margin etc.
     </div>
-    ${rows}` : '<div style="color:var(--muted);font-size:12px">No priced measurement yet.</div>';
+    ${rows}
+    ${extrasRows}` : '<div style="color:var(--muted);font-size:12px">No priced measurement yet.</div>';
 
   el.innerHTML = `
     ${specPricingBanner}
@@ -1932,7 +2096,7 @@ function draw() {
     ctx.stroke();
     proposal.points.forEach(point => {
       ctx.fillStyle = 'rgba(111,66,193,0.95)';
-      ctx.beginPath(); ctx.arc(point.x, point.y, 4, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(point.x, point.y, 6, 0, Math.PI*2); ctx.fill();
     });
     ctx.restore();
   });
@@ -2225,6 +2389,30 @@ function onDown(e) {
     draw(); return;
   }
 
+  // Channel assumptions have their own geometry contract. Dragging an endpoint is kept on
+  // the proposal's original horizontal/vertical axis and never creates a measured trace.
+  if (e.button === 0) {
+    let nearest = null;
+    channelProposals.forEach((proposal, proposalIndex) => {
+      (proposal.points || []).forEach((point, pointIndex) => {
+        const distance = Math.hypot(point.x - p.x, point.y - p.y);
+        if (distance < 12 && (!nearest || distance < nearest.distance)) {
+          nearest = {proposalIndex, pointIndex, distance};
+        }
+      });
+    });
+    if (nearest) {
+      const proposal = channelProposals[nearest.proposalIndex];
+      channelDrag = {
+        proposalIndex: nearest.proposalIndex,
+        pointIndex: nearest.pointIndex,
+        axis: channelProposalAxis(proposal)
+      };
+      if (canvas) canvas.style.cursor = 'ew-resize';
+      return;
+    }
+  }
+
   // Trace: grab nearest vertex to drag, else add new
   dragIdx = poly.findIndex(q => Math.hypot(q.x-p.x, q.y-p.y) < 10);
   if (dragIdx < 0) {
@@ -2243,6 +2431,19 @@ function onMove(e) {
     panX = e.clientX - panStartX;
     panY = e.clientY - panStartY;
     applyCanvasTransform();
+    return;
+  }
+  if (channelDrag) {
+    const proposal = channelProposals[channelDrag.proposalIndex];
+    if (!proposal || !proposal.points || proposal.points.length !== 2) return;
+    const next = pos(e);
+    const other = proposal.points[channelDrag.pointIndex === 0 ? 1 : 0];
+    proposal.points[channelDrag.pointIndex] = channelDrag.axis === 'vertical'
+      ? {x: other.x, y: next.y}
+      : {x: next.x, y: other.y};
+    syncChannelLengthInput(proposal);
+    if (canvas) canvas.style.cursor = channelDrag.axis === 'vertical' ? 'ns-resize' : 'ew-resize';
+    draw();
     return;
   }
   if (dragIdx >= 0) { poly[dragIdx] = pos(e); draw(); }
@@ -2515,9 +2716,9 @@ async function loadLineItems(job) {
 function renderQuotationMeasurements(measurements) {
   if (!Array.isArray(measurements) || !measurements.length) return '';
   return `<div class="li-measurements"><strong>Informational · not priced</strong>${measurements.map(m => `
-    <div style="margin-top:3px">${esc(m.section)} — ${esc(m.description)}:
+    <div class="${m.provisional?'assumption-item':''}" style="margin-top:3px;${m.provisional?'padding:4px 5px':''}">${esc(m.section)} — ${esc(m.description)}:
       <strong>${(+m.qty).toLocaleString(undefined,{maximumFractionDigits:1})} ${esc(m.unit)}</strong>
-      ${m.provisional?'<span class="li-provisional">PROVISIONAL — NO DETAILS PROVIDED</span>':''}
+      ${m.provisional?assumptionBadge('PROVISIONAL',m.provisional_reason||m.basis||'No details provided'):''}
     </div>`).join('')}</div>`;
 }
 
@@ -2558,8 +2759,8 @@ function renderLineItemsTable(items) {
     for (const it of rows) {
       const val = typeof it.value === 'number' ? it.value : 0;
       subtotal += val;
-      html += `<tr>
-        <td>${esc(it.description)}${it.provisional?'<br><span class="li-provisional">PROVISIONAL — NO DETAILS PROVIDED</span>':''}</td>
+      html += `<tr class="${it.provisional?'assumption-item':''}">
+        <td>${esc(it.description)}${it.provisional?`<br>${assumptionBadge('PROVISIONAL',it.provisional_reason||it.basis||'No details provided')}`:''}</td>
         <td class="num">${fmtQty(it.qty)}</td>
         <td>${esc(it.unit)}</td>
         <td class="num">${fmt(it.rate)}</td>
