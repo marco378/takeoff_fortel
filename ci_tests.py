@@ -866,6 +866,22 @@ try:
        and any("Yard run refused" in flag for flag in _dock_only_flags),
        {"proposals": _dock_only_proposals, "flags": _dock_only_flags})
 
+    _channel_enabled_before = _takeoff_unmarked_external.CHANNEL_PROPOSALS_ENABLED
+    try:
+        _takeoff_unmarked_external.CHANNEL_PROPOSALS_ENABLED = False
+        _disabled_proposals, _disabled_flags = _takeoff_unmarked_external.propose_channels(
+            [[0,0],[100,0],[100,100],[0,100]], {
+                "loading_face_lm": 42.0,
+                "loading_face_pts": [[10.0,20.0],[10.0,62.0]],
+            }, 1.0, scale_verified=True)
+    finally:
+        _takeoff_unmarked_external.CHANNEL_PROPOSALS_ENABLED = _channel_enabled_before
+    ck("one gate disables every channel proposal without touching measurement",
+       not _disabled_proposals
+       and _disabled_flags == [
+           "CHANNEL PROPOSALS disabled by CHANNEL_PROPOSALS_ENABLED"],
+       {"proposals": _disabled_proposals, "flags": _disabled_flags})
+
     # Direct takeoff proves the state cap is caused by the non-grey swatch fallback,
     # independently of Unit 3's downstream portal/job handling.
     _unit3_raw = Path("/tmp/ci_external_unit_3_state_cap.pdf")
