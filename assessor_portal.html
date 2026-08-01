@@ -1087,6 +1087,13 @@ function effectiveSegmentationComponents(job) {
   return nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : {};
 }
 
+function effectiveYardRegions(job) {
+  const direct = job && job.yard_regions;
+  if (Array.isArray(direct)) return direct;
+  const nested = job && job.result && job.result.yard_regions;
+  return Array.isArray(nested) ? nested : [];
+}
+
 function initialiseTraceState(job, res) {
   candidatePolygons = effectiveCandidatePolygons(job).map(candidate => ({
     ...candidate,
@@ -1151,6 +1158,7 @@ function zoneReviewRequired(job) {
     job.zone_classification_required || res.zone_classification_required ||
     job.zone_allocation_stale || res.zone_allocation_stale ||
     job.zone_reference_mismatch || res.zone_reference_mismatch ||
+    job.yard_region_review_required || res.yard_region_review_required ||
     effectiveZones(job).some(z => z && String(z.category||'').trim().toLowerCase() === 'unclassified')
   ));
 }
@@ -1329,11 +1337,12 @@ async function acknowledgeZoneReferenceMismatch() {
 
 function renderSegmentationComponentSummary(job) {
   const evidence = effectiveSegmentationComponents(job);
+  const yardRegions = effectiveYardRegions(job);
   const components = Array.isArray(evidence.component_candidates)
-    ? evidence.component_candidates.filter(component => component.plausible) : [];
+    ? evidence.component_candidates.filter(component => component.retained || component.plausible) : [];
   const rawComponents = Array.isArray(evidence.raw_component_candidates)
     ? evidence.raw_component_candidates.filter(component => component.plausible) : [];
-  if (!components.length) return '';
+  if (!components.length && !yardRegions.length) return '';
   const rowHtml = (component, status) => {
     const bbox = Array.isArray(component.bbox_pdf_pts)
       ? component.bbox_pdf_pts.map(value => Number(value).toFixed(1)).join(', ') : '—';
@@ -1343,17 +1352,60 @@ function renderSegmentationComponentSummary(job) {
       <td style="padding:4px;border-top:1px solid #e0d8c6;font-family:monospace;font-size:9px">${esc(bbox)}</td>
     </tr>`;
   };
-  const rows = components.map(component => rowHtml(
-    component, component.chosen ? 'CHOSEN AFTER LINE-GAP CLOSING' : 'CO-COMPONENT (NOT SUMMED)'
+  const reviewRequired = !!(job.yard_region_review_required ||
+    (job.result && job.result.yard_region_review_required));
+  const rows = yardRegions.length ? yardRegions.map(region => {
+    const bbox = Array.isArray(region.bbox_pdf_pts)
+      ? region.bbox_pdf_pts.map(value => Number(value).toFixed(1)).join(', ') : '—';
+    const checked = region.included !== false ? 'checked' : '';
+    return `<tr style="background:${region.included!==false?'#eef7ed':'#f4f4f4'}">
+      <td style="padding:4px;border-top:1px solid #e0d8c6;font-weight:700">
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+          <input class="yard-region-toggle" type="checkbox" data-region-id="${esc(region.region_id)}" ${checked}>
+          ${region.chosen_primary?'PRIMARY REGION':'SAME-TINT REGION'}
+        </label>
+      </td>
+      <td style="padding:4px;border-top:1px solid #e0d8c6;text-align:right">${Number(region.area_m2).toLocaleString()} m²</td>
+      <td style="padding:4px;border-top:1px solid #e0d8c6;font-family:monospace;font-size:9px">${esc(bbox)}</td>
+    </tr>`;
+  }).join('') : components.map(component => rowHtml(
+    component, component.chosen ? 'CHOSEN AFTER LINE-GAP CLOSING' : 'CO-COMPONENT'
   )).join('');
   const rawRows = rawComponents.map(component => rowHtml(
     component, component.chosen ? 'RAW LARGEST COMPONENT' : 'RAW CO-COMPONENT (NOT SUMMED)'
   )).join('');
   return `<div style="margin:8px 0;border:1px solid #d8b96d;border-radius:6px;overflow:hidden;background:#fffdf6">
     <div style="padding:6px 8px;background:#fff1c9;color:#664700;font-size:11px;font-weight:800">SURFACE-TINT COMPONENT REVIEW</div>
-    <div style="padding:6px 8px;font-size:10px;color:#6b5730">Only the chosen component feeds the displayed area. Co-components are matching-colour evidence and are never silently summed. Raw largest: ${esc(evidence.raw_largest_component_m2 ?? '—')} m² · all matching-tint pixels: ${esc(evidence.raw_tint_union_m2 ?? '—')} m².</div>
+    <div style="padding:6px 8px;font-size:10px;color:#6b5730">Every retained same-tint region is shown separately with its measured area and bbox. Checked rows feed the candidate Yard total; uncheck neighbouring buildings or out-of-scope regions, then save. ${reviewRequired?'<strong>Approval is blocked until this review is saved.</strong>':''} Raw largest: ${esc(evidence.raw_largest_component_m2 ?? '—')} m² · all matching-tint pixels: ${esc(evidence.raw_tint_union_m2 ?? '—')} m².</div>
     <table style="width:100%;border-collapse:collapse;font-size:10px"><thead><tr><th style="text-align:left;padding:4px">Status</th><th style="text-align:right;padding:4px">Area</th><th style="text-align:left;padding:4px">BBox (PDF pt)</th></tr></thead><tbody>${rows}${rawRows}</tbody></table>
+    ${yardRegions.length ? '<div style="padding:6px 8px;text-align:right"><button type="button" onclick="saveYardRegionReview()">Save kept/excluded regions</button></div>' : ''}
   </div>`;
+}
+
+async function saveYardRegionReview() {
+  if (!currentJob) return;
+  const toggles = Array.from(document.querySelectorAll('.yard-region-toggle'));
+  if (!toggles.length) return;
+  if (!toggles.some(toggle => toggle.checked)) {
+    toast('Keep at least one Yard region; use Adjust to replace the measurement', 'error');
+    return;
+  }
+  const decisions = toggles.map(toggle => ({
+    region_id: toggle.dataset.regionId,
+    action: toggle.checked ? 'keep' : 'exclude'
+  }));
+  try {
+    const response = await fetch(`${BASE}/yard-regions/${currentJob.id}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({decisions})
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    toast(`Yard regions saved: ${payload.kept} kept, ${payload.excluded} excluded`);
+    await selectJob(currentJob.id);
+  } catch (error) {
+    toast(`Yard region review failed: ${error.message}`, 'error');
+  }
 }
 
 function renderCandidateSummary(job) {

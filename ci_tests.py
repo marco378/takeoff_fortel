@@ -897,6 +897,26 @@ except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
 
 print("raw external zone measurement — Yard/Dock split + low-confidence state cap")
+import numpy as _np_multi_yard
+from takeoff_unmarked import segment_hatch as _segment_hatch_multi_yard
+_multi_yard_image = _np_multi_yard.full((100, 100, 3), 255, dtype=_np_multi_yard.uint8)
+_multi_yard_image[10:25, 10:30] = (180, 180, 180)   # 300 m2 primary
+_multi_yard_image[45:55, 10:22] = (180, 180, 180)   # 120 m2 second unit (<200)
+_multi_yard_image[70:72, 80:84] = (180, 180, 180)   # 8 m2 legend chip
+_multi_yard_diag = {}
+_multi_yard_mask = _segment_hatch_multi_yard(
+    _multi_yard_image, (180, 180, 180), tol=0, close=1, k=1.0, S=1.0,
+    exclude_border=False, legend_exclusion_bbox=[79, 69, 85, 73],
+    full_rgb=True, _diag=_multi_yard_diag)
+ck("same-tint segmentation retains a real second unit below the single-yard 200 m2 floor",
+   int(_multi_yard_mask.sum()) == 420 and
+   len(_multi_yard_diag.get("_retained_component_masks", [])) == 2,
+   {"pixels": int(_multi_yard_mask.sum()),
+    "components": _multi_yard_diag.get("component_candidates")})
+ck("matched legend chip is geometrically excluded, never promoted as another Yard",
+   not _multi_yard_mask[70:72, 80:84].any(),
+   {"excluded_legend_m2": _multi_yard_diag.get("excluded_legend_m2"),
+    "components": _multi_yard_diag.get("component_candidates")})
 try:
     _external_marked_paths = [
         _castle_dir / f"External Markup Unit-{number}.pdf" for number in range(1, 5)
@@ -1069,6 +1089,99 @@ try:
             pass
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
+
+print("raw multi-region Yard fixture + assessor keep/exclude loop")
+try:
+    _tanro_marked = Path(
+        "drawings/inderjit_markups_31jul/2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf")
+    _require_fixture(_tanro_marked, "Tanro multi-region Yard validation")
+    from accuracy_report import strip_annotations as _strip_tanro_annotations
+    from takeoff_pipeline import takeoff as _takeoff_tanro_multi
+    _tanro_raw = Path("/tmp/ci_tanro_multi_region_stripped.pdf")
+    try:
+        _strip_tanro_annotations(_tanro_marked, _tanro_raw)
+        _tanro_result = _takeoff_tanro_multi(
+            str(_tanro_raw), send_approval=False, auto_extract_spec=False)
+        _tanro_regions = _tanro_result.get("yard_regions", [])
+        ck("Tanro raw drawing retains both distant unit Yards as separate visible regions",
+           len(_tanro_regions) == 2 and all(region.get("bbox_pdf_pts")
+                                            for region in _tanro_regions),
+           [{"area_m2":region.get("area_m2"), "bbox":region.get("bbox_pdf_pts")}
+            for region in _tanro_regions])
+        ck("Tanro candidate total sums both retained regions within 5% of client truth",
+           abs(_tanro_result.get("area_m2", 0) - 369.2) / 369.2 * 100 <= 5 and
+           _tanro_result.get("yard_region_review_required") is True,
+           {"measured": _tanro_result.get("area_m2"), "truth": 369.2})
+    finally:
+        try:
+            _tanro_raw.unlink()
+        except FileNotFoundError:
+            pass
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
+
+print("assessor Yard-region exclusion endpoint")
+import tempfile as _tempfile_yard_review
+import approval_server as _AS_yard_review
+_yard_review_tmp = Path(_tempfile_yard_review.mkdtemp(prefix="ci_yard_regions_"))
+_yard_review_jobs_before = _AS_yard_review.JOBS_FILE
+_yard_review_rates_before = _AS_yard_review.CLIENT_RATES_FILE
+try:
+    _AS_yard_review.JOBS_FILE = _yard_review_tmp / "jobs.json"
+    _AS_yard_review.CLIENT_RATES_FILE = _yard_review_tmp / "client_rates.json"
+    _yard_review_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    _yard_review_regions = [
+        {"region_id":"yard-region-1", "area_m2":234.2, "included":True,
+         "bbox_pdf_pts":[10,10,30,25], "polygon_pts":[[10,10],[30,10],[30,25],[10,25]]},
+        {"region_id":"yard-region-2", "area_m2":132.0, "included":True,
+         "bbox_pdf_pts":[60,45,72,55], "polygon_pts":[[60,45],[72,45],[72,55],[60,55]]},
+    ]
+    _yard_review_zones = [{
+        "zone_key":"external_yard", "category":"external_yard", "area_m2":366.0,
+        "measurement_kind":"area", "needs_assessor":True,
+    }]
+    _AS_yard_review.save_jobs({_yard_review_id: {
+        "id":_yard_review_id, "status":"pending", "decision":None,
+        "area_m2":366.0, "measurement_state":"MEASURED_UNVERIFIED",
+        "scale_k":0.1, "yard_regions":_yard_review_regions,
+        "yard_region_review_required":True, "zones":_yard_review_zones,
+        "flags":["YARD REGION REVIEW REQUIRED: synthetic"],
+        "result":{"file":"Multi Yard.pdf", "area_m2":366.0, "scale_k":0.1,
+                  "measurement_state":"MEASURED_UNVERIFIED",
+                  "yard_regions":_yard_review_regions,
+                  "yard_region_review_required":True, "zones":_yard_review_zones,
+                  "flags":["YARD REGION REVIEW REQUIRED: synthetic"]},
+    }})
+    _yard_review_client = _AS_yard_review.app.test_client()
+    _partial_yard_review = _yard_review_client.post(
+        f"/yard-regions/{_yard_review_id}",
+        json={"decisions":[{"region_id":"yard-region-1", "action":"keep"}]})
+    ck("Yard-region review must cover every retained component, never silently omit one",
+       _partial_yard_review.status_code == 409, _partial_yard_review.get_json())
+    _complete_yard_review = _yard_review_client.post(
+        f"/yard-regions/{_yard_review_id}", json={"decisions":[
+            {"region_id":"yard-region-1", "action":"keep"},
+            {"region_id":"yard-region-2", "action":"exclude"},
+        ]})
+    _reviewed_yard_job = _AS_yard_review.load_jobs()[_yard_review_id]
+    ck("assessor exclusion removes exactly that component from Yard and its BOQ zone",
+       _complete_yard_review.status_code == 200 and
+       _complete_yard_review.get_json().get("area_m2") == 234.2 and
+       _reviewed_yard_job["area_m2"] == 234.2 and
+       _reviewed_yard_job["zones"][0]["area_m2"] == 234.2 and
+       _reviewed_yard_job["yard_regions"][1]["included"] is False,
+       {"response":_complete_yard_review.get_json(),
+        "regions":_reviewed_yard_job.get("yard_regions")})
+    ck("completed Yard-region review clears only its gate and preserves four-state review",
+       not _reviewed_yard_job.get("yard_region_review_required") and
+       "same-tint Yard regions" not in
+       (_AS_yard_review._approve_block_reason(_reviewed_yard_job) or "") and
+       _reviewed_yard_job.get("measurement_state") == "MEASURED_UNVERIFIED",
+       _AS_yard_review._approve_block_reason(_reviewed_yard_job))
+finally:
+    _AS_yard_review.JOBS_FILE = _yard_review_jobs_before
+    _AS_yard_review.CLIENT_RATES_FILE = _yard_review_rates_before
+    shutil.rmtree(_yard_review_tmp, ignore_errors=True)
 
 print("channel proposal geometry — retaining-wall adjacent and never diagonal")
 from takeoff_unmarked import (
@@ -2516,6 +2629,10 @@ try:
            all(marker in _portal_html_up for marker in (
                "channelDrag", "function editChannelLength", "syncChannelLengthInput",
                "line remains straight/non-diagonal", "polyline_pts:polylinePts")))
+        ck("portal surfaces every retained Yard region and posts explicit keep/exclude decisions",
+           all(marker in _portal_html_up for marker in (
+               "effectiveYardRegions", "yard-region-toggle", "saveYardRegionReview",
+               "/yard-regions/", "Save kept/excluded regions", "bbox_pdf_pts")))
         ck("portal gives assumed/proposed/provisional values one unmissable provenance style",
            all(marker in _portal_html_up for marker in (
                'class="assumption-badge" data-provenance="assumed"',

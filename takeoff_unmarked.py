@@ -202,6 +202,29 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
     return None, text
 
 
+def _legend_sample_bbox(pdf, page=0):
+    """Rendered-PDF-point bbox covering the matched legend label and its left-hand swatch.
+
+    A real second Yard can be smaller than the historic 200 m2 single-yard plausibility
+    floor.  Multi-region selection therefore uses the relative satellite rule instead, so
+    the legend chip itself must be excluded geometrically rather than by its area.  The bbox
+    is transformed through the page rotation matrix for the same reason as raster swatch
+    sampling: segmentation coordinates describe the rendered page, not unrotated text space.
+    """
+    found = _label_bbox(pdf, page)
+    if not found:
+        return None
+    raw_bbox, _ = found
+    with fitz.open(pdf) as doc:
+        rendered = fitz.Rect(raw_bbox) * doc[page].rotation_matrix
+    return [
+        max(0.0, float(rendered.x0) - 180.0),
+        max(0.0, float(rendered.y0) - 10.0),
+        float(rendered.x1) + 5.0,
+        float(rendered.y1) + 10.0,
+    ]
+
+
 # ---------------------------------------------------------------- segmentation
 # Fraction of the rendered page treated as "outer margin" — a sheet-frame border strip
 # or ruled border line living out here is never part of the priced yard hatch. Kept small
@@ -828,8 +851,9 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
 
 
 def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
-                  title_block_frac=0.0, exclude_border=True, full_rgb=False, _diag=None):
-    """Best-plausible connected region of the concrete-yard hatch.
+                  title_block_frac=0.0, exclude_border=True, full_rgb=False,
+                  legend_exclusion_bbox=None, _diag=None):
+    """All retained same-tint regions of the concrete-yard hatch.
 
     Changes vs original:
     - Best-plausible selection: components are sorted largest-first; the first one whose
@@ -857,9 +881,11 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
            otherwise fuse into the same connected component via binary_closing and inflate
            its area directly rather than appearing as a separate small blob.
         2. SATELLITE COMPONENTS: after labeling, any component whose area is <SATELLITE_FRAC
-           of the chosen (best-plausible) component's area is dropped — legend swatches and
-           stray title-block chips are a tiny fraction of the yard; a genuine multi-part yard
-           is not (kept deliberately generous so multi-region yards survive).
+           of the chosen (best-plausible) component's area is dropped — stray title-block
+           chips are a tiny fraction of the yard; every surviving component is retained as a
+           separately reviewable Yard region.  The matched legend row is masked explicitly,
+           because a small real unit Yard can otherwise be indistinguishable from a large
+           legend chip by area alone.
       Excluded pixels are reported via `_diag['excluded_components']` / `_diag['excluded_m2']`
       so the caller can flag what was dropped for the assessor.
     """
@@ -886,6 +912,17 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
         border_band[:, -mx:] = True
         margin_excluded_px = int((mask & border_band).sum())
         mask = mask & ~border_band
+
+    legend_excluded_px = 0
+    if legend_exclusion_bbox:
+        lx0, ly0, lx1, ly1 = legend_exclusion_bbox
+        x0 = max(0, min(mask.shape[1], int(math.floor(lx0 * S))))
+        y0 = max(0, min(mask.shape[0], int(math.floor(ly0 * S))))
+        x1 = max(0, min(mask.shape[1], int(math.ceil(lx1 * S))))
+        y1 = max(0, min(mask.shape[0], int(math.ceil(ly1 * S))))
+        if x1 > x0 and y1 > y0:
+            legend_excluded_px = int(mask[y0:y1, x0:x1].sum())
+            mask[y0:y1, x0:x1] = False
 
     # ── Exclude title block / legend panel (bottom of drawing) ───────────────
     # Closing is applied only to the active (non-title-block) rows so the kernel
@@ -923,6 +960,17 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
                 best_idx = idx
                 no_plausible_component = False
                 break
+    best_size = sizes[best_idx]
+    retained_indices = [best_idx]
+    if not no_plausible_component:
+        retained_indices.extend(
+            idx for idx in order
+            if idx != best_idx
+            and sizes[idx] >= SATELLITE_FRAC * best_size
+            and (k is None or float(sizes[idx]) / px_per_m2 <= PLAUSIBLE_MAX_M2)
+        )
+    retained_set = set(retained_indices)
+
     if _diag is not None:
         # Surfaced so takeoff() can REFUSE rather than emit the absolute-largest guess.
         # Found on real client tender packs (31 Jul): an External Kerbing & Surfacing layout
@@ -933,7 +981,8 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
         if k is not None:
             px_per_m2 = (S * S) / (k * k)
 
-            def _records(component_labels, component_sizes, component_order, chosen=None):
+            def _records(component_labels, component_sizes, component_order, chosen=None,
+                         retained=None):
                 slices = ndi.find_objects(component_labels)
                 records = []
                 for idx in component_order[:20]:
@@ -952,10 +1001,12 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
                         "plausible": bool(
                             PLAUSIBLE_MIN_M2 <= area_m2 <= PLAUSIBLE_MAX_M2),
                         "chosen": bool(idx == chosen),
+                        "retained": bool(retained is not None and idx in retained),
                     })
                 return records
 
-            _diag["component_candidates"] = _records(lab, sizes, order, best_idx)
+            _diag["component_candidates"] = _records(
+                lab, sizes, order, best_idx, retained_set)
             _diag["selected_component_m2"] = round(float(sizes[best_idx]) / px_per_m2, 1)
             _diag["plausible_component_union_m2"] = round(sum(
                 float(sizes[idx]) / px_per_m2 for idx in order
@@ -974,45 +1025,67 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
                 _diag["raw_largest_component_m2"] = round(
                     float(raw_sizes[raw_order[0]]) / px_per_m2, 1)
                 _diag["raw_tint_union_m2"] = round(int(raw_mask.sum()) / px_per_m2, 1)
-    comp = lab == best_idx + 1              # NOT hole-filled yet
+    # The old path returned only ``best_idx``.  Retain every non-satellite same-tint
+    # component so one Yard per unit is not silently dropped.  Keep the masks separately in
+    # the private diagnostics payload; takeoff() subtracts Dock overlap per region and turns
+    # them into serialisable area/bbox/polygon records for the portal.
+    region_masks = [(idx, lab == idx + 1) for idx in retained_indices]
+    comp = np.zeros_like(mask, dtype=bool)
 
     # ── Drop satellite components (legend swatches, stray chips) ─────────────
     # Keep the chosen component plus any OTHER component that is a meaningful fraction
     # of its area (a real multi-part yard); drop the rest. Report what was excluded.
     if exclude_border and n > 1:
-        best_size = sizes[best_idx]
         satellite_ids = [i + 1 for i in range(n)
-                         if i != best_idx and sizes[i] < SATELLITE_FRAC * best_size]
+                         if i not in retained_set]
         excluded_satellite_px = int(sum(sizes[i - 1] for i in satellite_ids))
     else:
         excluded_satellite_px = 0
 
     if _diag is not None:
-        total_excluded_px = margin_excluded_px + excluded_satellite_px
+        total_excluded_px = margin_excluded_px + legend_excluded_px + excluded_satellite_px
         n_excluded = (1 if margin_excluded_px > 0 else 0) + \
+                     (1 if legend_excluded_px > 0 else 0) + \
                      (len(satellite_ids) if exclude_border and n > 1 else 0)
         if k is not None and total_excluded_px > 0:
             px_per_m2 = (S * S) / (k * k)
             _diag['excluded_components'] = n_excluded
             _diag['excluded_m2'] = round(total_excluded_px / px_per_m2, 1)
             _diag['excluded_margin_m2'] = round(margin_excluded_px / px_per_m2, 1)
+            _diag['excluded_legend_m2'] = round(legend_excluded_px / px_per_m2, 1)
             _diag['excluded_satellite_m2'] = round(excluded_satellite_px / px_per_m2, 1)
 
     # ── Size-limited fill: paint/text holes filled; dock bays / islands kept ─
     if k:
         px_per_m2 = (S * S) / (k * k)
         if _diag is not None:
-            _diag['raw_hatch_m2'] = round(int(comp.sum()) / px_per_m2, 1)
-        filled = ndi.binary_fill_holes(comp)
-        hl, hn = ndi.label(filled & ~comp)
-        if hn:
-            hsz = ndi.sum(np.ones_like(hl), hl, range(1, hn + 1))
-            small_ids = [i + 1 for i in range(hn) if hsz[i] < max_void_m2 * px_per_m2]
-            small = np.isin(hl, small_ids)
-            if _diag is not None:
-                _diag['void_fill_m2'] = round(int(small.sum()) / px_per_m2, 1)
-                _diag['void_count'] = len(small_ids)
-            comp = comp | small
+            _diag['raw_hatch_m2'] = round(
+                sum(int(region.sum()) for _, region in region_masks) / px_per_m2, 1)
+        filled_region_masks = []
+        void_fill_px = 0
+        void_count = 0
+        for idx, region in region_masks:
+            filled = ndi.binary_fill_holes(region)
+            hl, hn = ndi.label(filled & ~region)
+            if hn:
+                hsz = ndi.sum(np.ones_like(hl), hl, range(1, hn + 1))
+                small_ids = [i + 1 for i in range(hn)
+                             if hsz[i] < max_void_m2 * px_per_m2]
+                small = np.isin(hl, small_ids)
+                region = region | small
+                void_fill_px += int(small.sum())
+                void_count += len(small_ids)
+            comp |= region
+            filled_region_masks.append((idx, region))
+        region_masks = filled_region_masks
+        if _diag is not None and void_fill_px:
+            _diag['void_fill_m2'] = round(void_fill_px / px_per_m2, 1)
+            _diag['void_count'] = void_count
+    else:
+        for _, region in region_masks:
+            comp |= region
+    if _diag is not None:
+        _diag['_retained_component_masks'] = region_masks
     return comp
 
 
@@ -1349,9 +1422,11 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "flags": flags + ["no scale — cannot measure"]}
 
+    legend_exclusion_bbox = _legend_sample_bbox(pdf) if legend_found else None
     _seg_diag = {}
     comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S,
-                         full_rgb=swatch_locked, _diag=_seg_diag)
+                         full_rgb=swatch_locked,
+                         legend_exclusion_bbox=legend_exclusion_bbox, _diag=_seg_diag)
 
     # --- swatch-lock plausibility gate: fall back to the validated generic grey band if the
     # locked swatch band produced nothing plausible (closes the Demo-4 regression class — a
@@ -1360,7 +1435,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     if swatch_locked:
         px_per_m2 = (S * S) / (k * k)
         cand_m2 = (int(comp.sum()) / px_per_m2) if comp is not None else 0.0
-        if comp is None or comp.sum() == 0 or not (PLAUSIBLE_MIN_M2 <= cand_m2 <= PLAUSIBLE_MAX_M2):
+        if comp is None or comp.sum() == 0 or _seg_diag.get("no_plausible_component"):
             flags.append(f"swatch-locked band {swatch}±{GREY_TOL} produced no plausible yard region "
                          f"(candidate {cand_m2:.0f} m²) — FELL BACK to validated SGP grey band "
                          f"{GREY_FALLBACK}±{GREY_TOL}; assessor confirm region colour")
@@ -1368,7 +1443,9 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             rgb = GREY_FALLBACK
             swatch_locked = False
             _seg_diag = {}
-            comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S, _diag=_seg_diag)
+            comp = segment_hatch(
+                im, rgb, tol=GREY_TOL, k=k, S=S,
+                legend_exclusion_bbox=legend_exclusion_bbox, _diag=_seg_diag)
 
     # The legend proposes a colour; the measured body must independently confirm it. The
     # segmentation band is intentionally wider than this agreement gate to tolerate rendering,
@@ -1388,7 +1465,9 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             rgb = GREY_FALLBACK
             swatch_locked = False
             _seg_diag = {}
-            comp = segment_hatch(im, rgb, tol=GREY_TOL, k=k, S=S, _diag=_seg_diag)
+            comp = segment_hatch(
+                im, rgb, tol=GREY_TOL, k=k, S=S,
+                legend_exclusion_bbox=legend_exclusion_bbox, _diag=_seg_diag)
         else:
             flags.append(
                 f"legend/body colour cross-check PASSED: swatch {swatch}, selected component "
@@ -1406,17 +1485,51 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # loading-face CAD geometry passes detect_raw_dock_zone's three-signal gate.
     dock_detection = detect_raw_dock_zone(pdf, k, S=S, target_rgb=rgb)
     dock_zone = dock_detection.get("zone")
-    yard_comp = comp
+    retained_component_masks = list(_seg_diag.pop("_retained_component_masks", []))
+    yard_comp = np.zeros_like(comp, dtype=bool)
     overlap_m2 = 0.0
+    dock_mask_bool = None
     if dock_zone:
         dock_mask = np.zeros_like(comp, dtype=np.uint8)
         dock_points = np.asarray(dock_zone["polygon_pts"], dtype=float)
         dock_points = np.rint(dock_points * S).astype(np.int32)
         cv2.fillPoly(dock_mask, [dock_points], 1)
-        overlap_px = int((comp & dock_mask.astype(bool)).sum())
+        dock_mask_bool = dock_mask.astype(bool)
+        overlap_px = int((comp & dock_mask_bool).sum())
         if overlap_px:
-            yard_comp = comp & ~dock_mask.astype(bool)
             overlap_m2 = overlap_px * (1.0 / S) ** 2 * k * k
+    adjusted_component_masks = []
+    for component_idx, region_mask in retained_component_masks:
+        adjusted = region_mask & ~dock_mask_bool if dock_mask_bool is not None else region_mask
+        if adjusted.any():
+            adjusted_component_masks.append((component_idx, adjusted))
+    included_positions = {0}
+    bbox_overlap_ambiguous = False
+    # Defensive compatibility for direct/mocked segment_hatch callers that do not populate
+    # the private per-region masks.
+    if not adjusted_component_masks:
+        yard_comp = comp & ~dock_mask_bool if dock_mask_bool is not None else comp
+        adjusted_component_masks = [(None, yard_comp)]
+    else:
+        # If retained bboxes overlap, the tint occurs in interleaved surface classes on the
+        # same viewport (AEW's Yard/building/road case).  That set is semantically ambiguous:
+        # keep the primary region as the backward-compatible candidate total and surface all
+        # co-components unchecked.  Distinct non-overlapping extents (Tanro's separate unit
+        # Yards) can safely form the candidate total, still with mandatory human review.
+        component_bboxes = []
+        for _, region_mask in adjusted_component_masks:
+            ys, xs = np.where(region_mask)
+            component_bboxes.append((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+        bbox_overlap_ambiguous = any(
+            min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+            for pos, a in enumerate(component_bboxes)
+            for b in component_bboxes[pos + 1:]
+        )
+        included_positions = ({0} if bbox_overlap_ambiguous
+                              else set(range(len(adjusted_component_masks))))
+        for position, (_, adjusted) in enumerate(adjusted_component_masks):
+            if position in included_positions:
+                yard_comp |= adjusted
     px = int(yard_comp.sum())
 
     body_rgb = _dominant_rgb(im, comp)
@@ -1434,7 +1547,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     component_records = component_evidence.get("component_candidates") or []
     selected_record = next((record for record in component_records if record.get("chosen")), None)
     co_components = [record for record in component_records
-                     if not record.get("chosen") and record.get("plausible")]
+                     if not record.get("chosen") and record.get("retained")]
     if selected_record:
         flags.append(
             "surface-tint component chosen (pre-void-fill): "
@@ -1446,8 +1559,11 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             for record in co_components[:10]
         )
         flags.append(
-            "assessor: co-components matching the legend tint were NOT summed into the measured "
-            f"total — {component_text}"
+            "assessor: multiple retained regions match the legend tint; "
+            + ("overlapping bboxes make the set ambiguous, so only the primary feeds the "
+               "candidate total; " if bbox_overlap_ambiguous else
+               "their disjoint extents feed the candidate total; ")
+            + f"keep or exclude every region before approval — {component_text}"
         )
         region_confidence = "low"
 
@@ -1482,10 +1598,50 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     if _seg_diag.get('excluded_m2', 0) > 0:
         flags.append(f"excluded {_seg_diag['excluded_components']} border/legend component(s) "
                      f"({_seg_diag['excluded_m2']} m² equivalent: {_seg_diag.get('excluded_margin_m2', 0)} m² "
-                     f"sheet-frame/border strip + {_seg_diag.get('excluded_satellite_m2', 0)} m² legend/satellite "
+                     f"sheet-frame/border strip + {_seg_diag.get('excluded_legend_m2', 0)} m² matched legend row + "
+                     f"{_seg_diag.get('excluded_satellite_m2', 0)} m² satellite "
                      f"chip(s)) — not part of the measured yard region")
 
     yard_area = round(px * (1.0 / S) ** 2 * k * k, 0)
+
+    # Individually surfaced retained regions are the assessor's extent decision contract.
+    # They are measured same-tint geometry, not assumptions; all feed the initial candidate
+    # total, while a multi-region set is approve-blocked until every row is kept/excluded.
+    yard_regions = []
+    chosen_component_id = next(
+        (record.get("component_id") for record in component_records if record.get("chosen")),
+        None,
+    )
+    for rank, (component_idx, region_mask) in enumerate(adjusted_component_masks, 1):
+        ys, xs = np.where(region_mask)
+        if not len(xs):
+            continue
+        component_id = int(component_idx + 1) if component_idx is not None else rank
+        yard_regions.append({
+            "region_id": f"yard-region-{rank}",
+            "component_id": component_id,
+            "area_m2": round(int(region_mask.sum()) * (1.0 / S) ** 2 * k * k, 1),
+            "bbox_pdf_pts": [
+                round(float(xs.min()) / S, 1), round(float(ys.min()) / S, 1),
+                round(float(xs.max() + 1) / S, 1), round(float(ys.max() + 1) / S, 1),
+            ],
+            "polygon_pts": _hatch_contour(region_mask, S),
+            "included": rank - 1 in included_positions,
+            "chosen_primary": component_id == chosen_component_id,
+            "classification_source": "retained same-tint connected component",
+        })
+    yard_region_review_required = len(yard_regions) > 1
+    component_evidence["yard_regions"] = yard_regions
+    component_evidence["review_required"] = yard_region_review_required
+    if yard_region_review_required:
+        held = len([region for region in yard_regions if not region["included"]])
+        flags.append(
+            f"YARD REGION REVIEW REQUIRED: {len(yard_regions)} retained same-tint regions "
+            f"are visible; candidate Yard total {yard_area:,.0f} m² includes "
+            f"{len(yard_regions) - held} region(s) and holds {held} geometrically ambiguous "
+            "region(s) out. Assessor must keep/exclude every row before approval"
+        )
+        region_confidence = "low"
 
     # --- refuse the absolute-largest guess (invariant 5) --------------------------------
     # If NO connected component fell inside the plausible service-yard band, segment_hatch
@@ -1687,6 +1843,8 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "zones": zones,
             "zones_total_area_m2": zones_total_area,
             "segmentation_components": component_evidence,
+            "yard_regions": yard_regions,
+            "yard_region_review_required": yard_region_review_required,
             "channel_proposals": channel_proposals,
             "manhole_count_estimate": manhole_count_estimate,
             "manhole_count_assumed": manhole_count_assumed,

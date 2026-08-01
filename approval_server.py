@@ -508,6 +508,18 @@ def _channel_proposal_block_reason(job: dict) -> str | None:
     return None
 
 
+def _yard_region_block_reason(job: dict) -> str | None:
+    """A multi-component tint result is a candidate total until every extent is reviewed."""
+    result = job.get("result") or {}
+    if job.get("yard_region_review_required") or result.get("yard_region_review_required"):
+        regions = job.get("yard_regions")
+        if not isinstance(regions, list):
+            regions = result.get("yard_regions") if isinstance(result.get("yard_regions"), list) else []
+        return (f"{len(regions)} retained same-tint Yard regions require assessor "
+                "keep/exclude review before approval")
+    return None
+
+
 def _approve_block_reason(job: dict) -> str | None:
     """
     Server-side hard-block mirroring the escalation-guard mechanism (fb5b92b, >£200k
@@ -519,6 +531,9 @@ def _approve_block_reason(job: dict) -> str | None:
     zone_reason = _zone_block_reason(job)
     if zone_reason:
         return zone_reason
+    yard_reason = _yard_region_block_reason(job)
+    if yard_reason:
+        return yard_reason
     channel_reason = _channel_proposal_block_reason(job)
     if channel_reason:
         return channel_reason
@@ -1299,6 +1314,123 @@ def review_channel_proposals(job_id):
     })
 
 
+@app.route("/yard-regions/<job_id>", methods=["POST"])
+def review_yard_regions(job_id):
+    """Keep/exclude every retained same-tint component and recalculate its Yard quantity.
+
+    These are measured raster components, not assumed quantities.  A multi-region result is
+    deliberately approval-blocked until this endpoint receives one explicit decision per
+    region; that is what lets the same generic mechanism include a second unit Yard while an
+    assessor excludes a neighbouring building carrying the same surface tint.
+    """
+    data = request.get_json(silent=True) or {}
+    submitted = data.get("decisions")
+    if not isinstance(submitted, list) or not submitted:
+        return jsonify({"error": "decisions must be a non-empty list"}), 400
+    normalised = []
+    for item in submitted:
+        if not isinstance(item, dict):
+            return jsonify({"error": "each decision must be an object"}), 400
+        region_id = str(item.get("region_id") or "").strip()
+        action = str(item.get("action") or "").strip().lower()
+        if not region_id or action not in {"keep", "exclude"}:
+            return jsonify({"error": "region_id and action keep/exclude are required"}), 400
+        normalised.append((region_id, action))
+    if len({region_id for region_id, _ in normalised}) != len(normalised):
+        return jsonify({"error": "region_id decisions must be unique"}), 400
+
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        if job.get("status") == "processing":
+            return jsonify({"error": "job is still processing"}), 409
+        result = dict(job.get("result") or {})
+        regions = job.get("yard_regions")
+        if not isinstance(regions, list):
+            regions = result.get("yard_regions") if isinstance(result.get("yard_regions"), list) else []
+        known = {str(region.get("region_id")): dict(region)
+                 for region in regions if isinstance(region, dict) and region.get("region_id")}
+        submitted_ids = {region_id for region_id, _ in normalised}
+        if submitted_ids != set(known):
+            return jsonify({
+                "error": "decisions must cover every current yard region exactly once"
+            }), 409
+        decisions = {}
+        decided_at = now_iso()
+        for region_id, action in normalised:
+            known[region_id]["included"] = action == "keep"
+            decisions[region_id] = {
+                "region_id": region_id,
+                "decision": "kept" if action == "keep" else "excluded",
+                "decided_at": decided_at,
+            }
+        ordered_regions = [known[str(region["region_id"])] for region in regions]
+        kept = [region for region in ordered_regions if region.get("included")]
+        if not kept:
+            return jsonify({"error": "at least one Yard region must be kept; use Adjust to replace it"}), 400
+        area_m2 = round(sum(float(region.get("area_m2") or 0) for region in kept), 1)
+
+        zones = job.get("zones") if isinstance(job.get("zones"), list) else result.get("zones")
+        zones = [dict(zone) for zone in (zones or [])]
+        for zone in zones:
+            if str(zone.get("category") or "").strip().lower() == "external_yard":
+                zone["area_m2"] = area_m2
+                zone["needs_assessor"] = False
+                zone["region_count"] = len(kept)
+        zones_total = round(sum(float(zone.get("area_m2") or 0) for zone in zones), 1)
+        old_flags = [flag for flag in (result.get("flags") or [])
+                     if not str(flag).startswith("YARD REGION REVIEW REQUIRED:")]
+        summary = (f"assessor Yard-region review: kept {len(kept)} of {len(ordered_regions)} "
+                   f"same-tint regions; final Yard {area_m2:,.1f} m²")
+        old_flags.append(summary)
+        result.update({
+            "area_m2": area_m2,
+            "zones": zones,
+            "zones_total_area_m2": zones_total,
+            "yard_regions": ordered_regions,
+            "yard_region_decisions": decisions,
+            "yard_region_review_required": False,
+            "flags": old_flags,
+            "polygon_pts": kept[0].get("polygon_pts"),
+        })
+        costing_result = _run_costing(area_m2, result)
+        if costing_result:
+            result["costing"] = costing_result
+        job_flags = [flag for flag in (job.get("flags") or [])
+                     if not str(flag).startswith("YARD REGION REVIEW REQUIRED:")]
+        job_flags.append(summary)
+        job.update({
+            "area_m2": area_m2,
+            "zones": zones,
+            "yard_regions": ordered_regions,
+            "yard_region_decisions": decisions,
+            "yard_region_review_required": False,
+            "yard_regions_reviewed_at": decided_at,
+            "polygon_pts": kept[0].get("polygon_pts"),
+            "costing": costing_result,
+            "flags": job_flags,
+            "result": result,
+        })
+        jobs[job_id] = job
+        save_jobs(jobs)
+
+    log_training({
+        "event": "yard_regions_reviewed", "job_id": job_id,
+        "kept_region_ids": [region["region_id"] for region in kept],
+        "excluded_region_ids": [region["region_id"] for region in ordered_regions
+                                if not region.get("included")],
+        "area_m2": area_m2, "timestamp": decided_at,
+    })
+    return jsonify({
+        "status": "yard_regions_reviewed", "job_id": job_id,
+        "area_m2": area_m2, "kept": len(kept),
+        "excluded": len(ordered_regions) - len(kept),
+        "review_complete": True,
+    })
+
+
 @app.route("/spec-override/<job_id>", methods=["POST"])
 def spec_override(job_id):
     """Capture Fortel's slab checklist and re-price only its supplied pricing fields.
@@ -1603,6 +1735,12 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["channel_proposals"] = list(job["channel_proposals"])
     if isinstance(job.get("channel_proposal_decisions"), dict):
         result["channel_proposal_decisions"] = dict(job["channel_proposal_decisions"])
+    if isinstance(job.get("yard_regions"), list):
+        result["yard_regions"] = list(job["yard_regions"])
+    if isinstance(job.get("yard_region_decisions"), dict):
+        result["yard_region_decisions"] = dict(job["yard_region_decisions"])
+    if "yard_region_review_required" in job:
+        result["yard_region_review_required"] = bool(job["yard_region_review_required"])
     if "zone_classification_required" in job:
         result["zone_classification_required"] = bool(job["zone_classification_required"])
     if job.get("zone_reference_mismatch"):
@@ -2102,6 +2240,10 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "candidate_polygons": result.get("candidate_polygons", []),
                 "channel_proposals": result.get("channel_proposals", []),
                 "channel_proposal_decisions": {},
+                "yard_regions":      result.get("yard_regions", []),
+                "yard_region_decisions": {},
+                "yard_region_review_required": bool(
+                    result.get("yard_region_review_required", False)),
                 "perimeter_lm":     result.get("perimeter_lm"),
                 # Mirror zone-aware marked-PDF evidence at job level for the portal while
                 # retaining the canonical nested pipeline result for backward compatibility.

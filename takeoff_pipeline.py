@@ -443,6 +443,9 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                         "zones":          tu.get("zones", []),
                         "zones_total_area_m2": tu.get("zones_total_area_m2"),
                         "segmentation_components": tu.get("segmentation_components", {}),
+                        "yard_regions": tu.get("yard_regions", []),
+                        "yard_region_review_required": bool(
+                            tu.get("yard_region_review_required", False)),
                         # Assumed channel runs are tracing/review aids only. They stay outside
                         # measured zones and every costing/quotation total.
                         "channel_proposals": tu.get("channel_proposals", []),
@@ -532,6 +535,9 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     "zones":          tu.get("zones", []),
                     "zones_total_area_m2": tu.get("zones_total_area_m2"),
                     "segmentation_components": tu.get("segmentation_components", {}),
+                    "yard_regions": tu.get("yard_regions", []),
+                    "yard_region_review_required": bool(
+                        tu.get("yard_region_review_required", False)),
                     "channel_proposals": tu.get("channel_proposals", []),
                 })
                 r["flags"] = r["flags"] + tu.get("flags", []) + [
