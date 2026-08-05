@@ -35,7 +35,7 @@ Environment:
   CLIENT_RATES_FILE optional override path; otherwise client_rates.json is stored beside
                     JOBS_FILE (including on the same Railway volume).
 """
-import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib, math
+import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib, math, html
 from email import policy
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
@@ -43,14 +43,14 @@ from flask import Flask, request, jsonify, send_file, redirect, Response
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
 
-# Railway's container filesystem is EPHEMERAL — every deploy wiped approval_jobs.json
-# (observed live: job_count 2 -> 0 across the 16 Jul deploy). When a Railway volume is
-# attached, Railway sets RAILWAY_VOLUME_MOUNT_PATH; store the job state there so pending
-# client jobs survive deploys. Explicit JOBS_FILE env still wins; local dev unchanged.
-_VOLUME_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
-JOBS_FILE    = Path(os.getenv("JOBS_FILE") or
-                    ((Path(_VOLUME_DIR) / "approval_jobs.json") if _VOLUME_DIR
-                     else (Path(__file__).parent / "approval_jobs.json")))
+# Railway's container filesystem is EPHEMERAL.  Resolve every resumable assessment artifact
+# from one volume-aware source so a deploy cannot preserve a job record while orphaning its
+# uploaded PDF or generated quotation.  Explicit per-path env overrides still win.
+from storage_paths import resolve_storage_paths
+_STORAGE_PATHS = resolve_storage_paths()
+JOBS_FILE = _STORAGE_PATHS.jobs_file
+DRAWINGS_DIR = _STORAGE_PATHS.drawings_dir
+QUOTATIONS_DIR = _STORAGE_PATHS.quotations_dir
 from client_rates import rates_path_for_jobs
 CLIENT_RATES_FILE = Path(os.getenv("CLIENT_RATES_FILE") or rates_path_for_jobs(JOBS_FILE))
 # JOBS_ARCHIVE_FILE / BACKUP_DIR used to derive from JOBS_FILE.parent only — so a QA instance
@@ -60,13 +60,10 @@ CLIENT_RATES_FILE = Path(os.getenv("CLIENT_RATES_FILE") or rates_path_for_jobs(J
 # approval_jobs.qa_archive.json and backups_approval_jobs.qa/ — never colliding with the live
 # instance's approval_jobs_archive.json / backups/. Dedicated env overrides win if set
 # (e.g. a QA setup that wants archive/backups somewhere else entirely).
-JOBS_ARCHIVE_FILE = Path(os.getenv("JOBS_ARCHIVE_FILE") or
-                         (JOBS_FILE.parent / f"{JOBS_FILE.stem}_archive.json"))
+JOBS_ARCHIVE_FILE = _STORAGE_PATHS.jobs_archive_file
 TRAINING_LOG = Path(__file__).parent / "training_log.jsonl"
 PORTAL_HTML  = Path(__file__).parent / "assessor_portal.html"
-BACKUP_DIR   = Path(os.getenv("BACKUP_DIR") or
-                    (JOBS_FILE.parent / ("backups" if JOBS_FILE.stem == "approval_jobs"
-                                         else f"backups_{JOBS_FILE.stem}")))
+BACKUP_DIR   = _STORAGE_PATHS.backup_dir
 BACKUP_KEEP  = 14   # keep the newest N daily backups
 
 _jobs_lock = threading.Lock()
@@ -602,10 +599,24 @@ def approve(job_id):
         costing_result = _run_costing(res.get("area_m2"), res)
     # Auto-generate and save quotation
     quotation_paths = _save_quotation(job_id, res, costing_result)
+    quotation_error = quotation_paths.get("error") if isinstance(quotation_paths, dict) else None
     with _jobs_lock:
         jobs = load_jobs()
         jobs[job_id]["costing"] = costing_result
         jobs[job_id]["quotation_paths"] = quotation_paths
+        if quotation_error:
+            flag = f"QUOTATION GENERATION ERROR: {quotation_error}"
+            flags = [f for f in (jobs[job_id].get("flags") or [])
+                     if not str(f).startswith("QUOTATION GENERATION ERROR:")]
+            flags.append(flag)
+            jobs[job_id].update({
+                "quotation_status": "error",
+                "quotation_error": quotation_error,
+                "flags": flags,
+            })
+        else:
+            jobs[job_id].update({"quotation_status": "ready"})
+            jobs[job_id].pop("quotation_error", None)
         save_jobs(jobs)
 
     log_training({
@@ -616,6 +627,18 @@ def approve(job_id):
         "flags":      res.get("flags", []),
         "timestamp":  now_iso(),
     })
+
+    if quotation_error:
+        message = ("approval was recorded, but quotation generation failed; the job has been "
+                   f"flagged for review: {quotation_error}")
+        if not request.is_json:
+            return Response(
+                f"<!doctype html><meta charset='utf-8'><title>Quotation failed</title>"
+                f"<h2>Quotation generation failed</h2><p>{html.escape(message)}</p>"
+                f"<p><a href='/portal?job={job_id}'>Open the flagged job in the portal</a></p>",
+                status=500, mimetype="text/html")
+        return jsonify({"status": "quotation_error", "job_id": job_id,
+                        "error": message, "costing": costing_result}), 500
 
     # The confirm page's <form> does a plain (non-JSON) POST and wants the human-readable
     # result page back; the portal's own JS POSTs JSON and wants JSON back (unchanged).
@@ -1864,10 +1887,9 @@ def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:
     try:
         from quotation import save_quotation
         q = _quotation_for_job(job_id, result_override=result, costing_override=costing)
-        out_dir = Path(__file__).parent / "quotations"
-        return save_quotation(q, out_dir=str(out_dir))
+        return save_quotation(q, out_dir=str(QUOTATIONS_DIR))
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def _run_costing(area_m2, result: dict) -> dict | None:
@@ -2071,7 +2093,7 @@ def n8n_webhook():
     # rendered/exfiltrated back as a base64 PNG. Only allow paths that resolve inside this
     # server's own drawings/ directory (same pattern already used at /upload).
     if pdf_path:
-        drawings_dir = (Path(__file__).parent / "drawings").resolve()
+        drawings_dir = DRAWINGS_DIR.resolve()
         try:
             resolved = Path(pdf_path).resolve()
             resolved.relative_to(drawings_dir)
@@ -2162,6 +2184,54 @@ def _mark_job_unmeasured(job_id: str, flag: str, extra: dict = None, watchdog_fi
         save_jobs(jobs)
 
 
+def _notify_saved_review_job(job_id: str, pdf_path: str, result: dict,
+                             project_name: str, project_ref: str) -> dict:
+    """Notify against the canonical, already-saved portal job and persist the outcome."""
+    if os.getenv("SEND_APPROVAL_EMAILS", "0") != "1":
+        return {"job_id": job_id, "sent": False, "status": "disabled", "reason": ""}
+    try:
+        from approval_email import send_job_approval_email
+        outcome = send_job_approval_email(
+            job_id, pdf_path, result,
+            project_name=project_name, project_ref=project_ref)
+    except Exception as exc:
+        outcome = {
+            "job_id": job_id, "sent": False, "status": "internal_error",
+            "reason": f"approval email notifier failed: {type(exc).__name__}: {exc}",
+        }
+
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return outcome
+        status = str(outcome.get("status") or "send_failed")
+        reason = str(outcome.get("reason") or "")
+        job.update({
+            "approval_email_status": status,
+            "approval_email_attempted_at": now_iso(),
+        })
+        if outcome.get("sent"):
+            job["approval_email_sent_at"] = now_iso()
+            job.pop("approval_email_error", None)
+        else:
+            job["approval_email_error"] = reason or "approval email was not sent"
+            flag = f"APPROVAL EMAIL NOT SENT: {job['approval_email_error']}"
+            flags = [f for f in (job.get("flags") or [])
+                     if not str(f).startswith("APPROVAL EMAIL NOT SENT:")]
+            flags.append(flag)
+            job["flags"] = flags
+            stored_result = dict(job.get("result") or {})
+            result_flags = [f for f in (stored_result.get("flags") or [])
+                            if not str(f).startswith("APPROVAL EMAIL NOT SENT:")]
+            result_flags.append(flag)
+            stored_result["flags"] = result_flags
+            job["result"] = stored_result
+        jobs[job_id] = job
+        save_jobs(jobs)
+    return outcome
+
+
 def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str):
     """
     Background thread: run takeoff pipeline and update job record when done.
@@ -2197,8 +2267,15 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
         # A few integrations/tests provide a narrow takeoff-compatible callable. Preserve
         # that interface while the real pipeline receives the explicit isolated rates path.
         import inspect
-        if "client_rates_path" in inspect.signature(takeoff_pipeline.takeoff).parameters:
+        _takeoff_params = inspect.signature(takeoff_pipeline.takeoff).parameters
+        if "client_rates_path" in _takeoff_params:
             takeoff_kwargs["client_rates_path"] = CLIENT_RATES_FILE
+        # The portal already owns this job record. If approval emails are ever enabled
+        # (SEND_APPROVAL_EMAILS=1), the pipeline must attach to THIS id — otherwise it creates
+        # a duplicate job and emails the assessor a link to the ghost, leaving the real case
+        # pending forever.
+        if "approval_job_id" in _takeoff_params:
+            takeoff_kwargs["approval_job_id"] = job_id
         result = takeoff_pipeline.takeoff(pdf_path, **takeoff_kwargs)
         watchdog.cancel()
         with _jobs_lock:
@@ -2220,6 +2297,10 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                       f"{TAKEOFF_TIMEOUT_S}s watchdog already marked it UNMEASURED; "
                       f"overwriting with the completed result (state={result.get('measurement_state')}).")
             job.pop("_watchdog_fired", None)
+            result_flags = [f for f in (result.get("flags") or [])
+                            if not str(f).startswith("APPROVAL EMAIL DEFERRED:")]
+            result = dict(result)
+            result["flags"] = result_flags
             job.update({
                 "project_name":     result.get("project_name", project_name),
                 "project_ref":      result.get("project_ref",  project_ref),
@@ -2235,7 +2316,7 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "scale_src":        result.get("scale_src"),
                 "scale_sources":    result.get("scale_sources"),
                 "costing":          result.get("costing"),
-                "flags":            pre_flags + result.get("flags", []),
+                "flags":            pre_flags + result_flags,
                 "polygon_pts":      result.get("polygon_pts"),
                 "candidate_polygons": result.get("candidate_polygons", []),
                 "channel_proposals": result.get("channel_proposals", []),
@@ -2261,6 +2342,12 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
             })
             jobs[job_id] = job
             save_jobs(jobs)
+        if result.get("measurement_state") != "REJECTED":
+            _notify_saved_review_job(
+                job_id, pdf_path, result,
+                result.get("project_name", project_name),
+                result.get("project_ref", project_ref),
+            )
     except Exception as e:
         watchdog.cancel()
         _mark_job_unmeasured(
@@ -2500,8 +2587,8 @@ def upload():
     if not up_files:
         return jsonify({"error": "file is required"}), 400
 
-    drawings_dir = Path(__file__).parent / "drawings"
-    drawings_dir.mkdir(exist_ok=True)
+    drawings_dir = DRAWINGS_DIR
+    drawings_dir.mkdir(parents=True, exist_ok=True)
     upload_items = []
 
     for up_file in up_files:
@@ -2702,6 +2789,8 @@ if __name__ == "__main__":
     print(f"  client rates  = {CLIENT_RATES_FILE}")
     print(f"  jobs archive  = {JOBS_ARCHIVE_FILE}")
     print(f"  backups dir   = {BACKUP_DIR}")
+    print(f"  drawings dir  = {DRAWINGS_DIR}")
+    print(f"  quotations dir= {QUOTATIONS_DIR}")
     print(f"  base url      = {os.getenv('APPROVAL_BASE_URL', 'http://localhost:5001')}")
     print(f"  token set     = {'yes (' + _mask_token(APPROVAL_TOKEN) + ')' if APPROVAL_TOKEN else 'no'}")
     print(f"  cors origin   = {_CORS_ORIGIN or '(none — same-origin only)'}")

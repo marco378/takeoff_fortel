@@ -600,6 +600,38 @@ ck("quotation surfaces perimeter as informational, unpriced quantity",
        for m in _q_perimeter["measurements"]) and
    all("perimeter" not in li["description"].lower() for li in _q_perimeter["line_items"]))
 
+# A real case can mix pipeline-measured siblings (top-level perimeter_lm) with an
+# assessor-traced sibling whose perimeter lives on a zone.  Both sources intentionally
+# share the same measurement key and must aggregate without either provenance path assuming
+# it was the one that created the record.
+_mixed_top_perimeter = _quotation_unit(
+    "Yard Unit-1.pdf", "External yard slabs", 100)
+_mixed_top_perimeter["perimeter_lm"] = 40.0
+_mixed_zone_perimeter = _quotation_unit(
+    "Yard Unit-2.pdf", "External yard slabs", 120)
+_mixed_zone_perimeter["zones"] = [{
+    "category": "external_yard", "area_m2": 120.0, "perimeter_lm": 50.0,
+}]
+_q_mixed_perimeter = generate_quotation(
+    [_mixed_top_perimeter, _mixed_zone_perimeter],
+    project="Mixed perimeter case", ref="TST-MIXED-PERIMETER")
+_mixed_outputs = (
+    quotation_text(_q_mixed_perimeter), quotation_html(_q_mixed_perimeter),
+    quotation_json(_q_mixed_perimeter), quotation_xlsx(_q_mixed_perimeter),
+)
+_mixed_ws = _load_workbook(
+    _BytesIO(_mixed_outputs[3]), data_only=False)["REV_01"]
+_mixed_measurement = next(
+    measurement for measurement in _q_mixed_perimeter["measurements"]
+    if measurement["section"] == "External yard slabs"
+    and measurement["description"] == "Slab perimeter")
+ck("case quotation renders txt/html/json/xlsx with mixed perimeter provenance",
+   _mixed_measurement["qty"] == 90.0 and
+   len(_mixed_measurement["quantity_rows"]) == 2 and
+   all(output for output in _mixed_outputs[:3]) and
+   _mixed_ws.max_row > 7,
+   _mixed_measurement)
+
 _q_text = quotation_text(_q)
 _q_html = quotation_html(_q)
 _q_json = quotation_json(_q)
@@ -1953,6 +1985,7 @@ try:
     _orig_jobs_file_up = _AS.JOBS_FILE
     _orig_jobs_archive_file_up = _AS.JOBS_ARCHIVE_FILE
     _orig_backup_dir_up = _AS.BACKUP_DIR
+    _orig_drawings_dir_up = _AS.DRAWINGS_DIR
     _orig_server_file_up = _AS.__file__
     _orig_thread_up = _AS.threading.Thread
     _started_up = []
@@ -1967,6 +2000,7 @@ try:
         _AS.JOBS_FILE = _tmpdir / "multi_upload_jobs.json"
         _AS.JOBS_ARCHIVE_FILE = _tmpdir / "multi_upload_jobs_archive.json"
         _AS.BACKUP_DIR = _tmpdir / "multi_upload_backups"
+        _AS.DRAWINGS_DIR = _tmpdir / "drawings"
         _AS.__file__ = str(_tmpdir / "approval_server.py")
         _AS.threading.Thread = _NoStartThread
         _client_up = _AS.app.test_client()
@@ -2656,6 +2690,7 @@ try:
         _AS.JOBS_FILE = _orig_jobs_file_up
         _AS.JOBS_ARCHIVE_FILE = _orig_jobs_archive_file_up
         _AS.BACKUP_DIR = _orig_backup_dir_up
+        _AS.DRAWINGS_DIR = _orig_drawings_dir_up
 
     # approve hard-block mirrors the >£200k escalation guard mechanism (fb5b92b)
     ck("UNMEASURED job blocks approve",
@@ -3269,6 +3304,225 @@ try:
 except ImportError as _e:
     print(f"  [SKIP] approval_server /portal login-form tests — missing dependency: {_e}")
 
+print("persistent storage: one volume-aware resolver keeps jobs, drawings and quotations together")
+try:
+    import tempfile as _tempfile_storage
+    import shutil as _shutil_storage
+    import json as _json_storage
+    import fitz as _fitz_storage
+    import approval_server as _AS_storage
+    from storage_paths import resolve_storage_paths as _resolve_storage_paths
+    from quotation import save_quotation as _save_quote_storage
+
+    _storage_root = Path(_tempfile_storage.mkdtemp(prefix="ci_volume_"))
+    _app_root = _storage_root / "ephemeral-app"
+    _volume_root = _storage_root / "railway-volume"
+    _local_paths = _resolve_storage_paths({}, app_dir=_app_root)
+    _volume_paths = _resolve_storage_paths(
+        {"RAILWAY_VOLUME_MOUNT_PATH": str(_volume_root)}, app_dir=_app_root)
+    ck("storage paths stay repository-local without a Railway volume",
+       _local_paths.jobs_file == _app_root / "approval_jobs.json" and
+       _local_paths.drawings_dir == _app_root / "drawings" and
+       _local_paths.quotations_dir == _app_root / "quotations", _local_paths)
+    ck("Railway volume places job store, drawings and quotations under one persistent base",
+       _volume_paths.jobs_file == _volume_root / "approval_jobs.json" and
+       _volume_paths.drawings_dir == _volume_root / "drawings" and
+       _volume_paths.quotations_dir == _volume_root / "quotations" and
+       _volume_paths.jobs_archive_file.parent == _volume_root and
+       _volume_paths.backup_dir.parent == _volume_root, _volume_paths)
+    _override_paths = _resolve_storage_paths({
+        "RAILWAY_VOLUME_MOUNT_PATH": str(_volume_root),
+        "JOBS_FILE": str(_storage_root / "custom" / "jobs.qa.json"),
+        "DRAWINGS_DIR": str(_storage_root / "custom-drawings"),
+        "QUOTATIONS_DIR": str(_storage_root / "custom-quotes"),
+    }, app_dir=_app_root)
+    ck("explicit jobs/drawings/quotations path overrides still win over the volume default",
+       _override_paths.jobs_file == _storage_root / "custom" / "jobs.qa.json" and
+       _override_paths.drawings_dir == _storage_root / "custom-drawings" and
+       _override_paths.quotations_dir == _storage_root / "custom-quotes", _override_paths)
+
+    _orig_storage_jobs = _AS_storage.JOBS_FILE
+    _orig_storage_backups = _AS_storage.BACKUP_DIR
+    try:
+        _AS_storage.JOBS_FILE = _volume_paths.jobs_file
+        _AS_storage.BACKUP_DIR = _volume_paths.backup_dir
+        _volume_paths.drawings_dir.mkdir(parents=True, exist_ok=True)
+        _persistent_pdf = _volume_paths.drawings_dir / "PERSIST-001_plan.pdf"
+        _persistent_doc = _fitz_storage.open()
+        _persistent_doc.new_page(width=100, height=100)
+        _persistent_doc.save(_persistent_pdf)
+        _persistent_doc.close()
+        _persistent_quote_paths = _save_quote_storage(
+            _q, out_dir=str(_volume_paths.quotations_dir))
+        _AS_storage.save_jobs({"persist-1": {
+            "id": "persist-1", "status": "approved",
+            "pdf_path": str(_persistent_pdf),
+            "quotation_paths": _persistent_quote_paths,
+        }})
+
+        # Re-run the pure resolver exactly as a fresh process does after a deploy.  Nothing
+        # from the ephemeral application directory is consulted.
+        _fresh_paths = _resolve_storage_paths(
+            {"RAILWAY_VOLUME_MOUNT_PATH": str(_volume_root)}, app_dir=_app_root)
+        _fresh_jobs = _json_storage.loads(_fresh_paths.jobs_file.read_text())
+        _fresh_job = _fresh_jobs["persist-1"]
+        ck("deploy-cycle re-resolution preserves job record, uploaded PDF and quotation",
+           Path(_fresh_job["pdf_path"]).is_file() and
+           Path(_fresh_job["quotation_paths"]["xlsx"]).is_file() and
+           Path(_fresh_job["quotation_paths"]["json"]).is_file() and
+           Path(_fresh_job["pdf_path"]).is_relative_to(_fresh_paths.drawings_dir) and
+           Path(_fresh_job["quotation_paths"]["xlsx"]).is_relative_to(
+               _fresh_paths.quotations_dir), _fresh_job)
+    finally:
+        _AS_storage.JOBS_FILE = _orig_storage_jobs
+        _AS_storage.BACKUP_DIR = _orig_storage_backups
+        _shutil_storage.rmtree(_storage_root, ignore_errors=True)
+except (ImportError, OSError, ValueError) as _e:
+    ck("persistent storage deploy-cycle test imports and runs", False, _e)
+
+print("critical approval safeguards: quotation errors visible; email uses canonical saved job")
+try:
+    import tempfile as _tempfile_critical
+    import shutil as _shutil_critical
+    import os as _os_critical
+    from unittest import mock as _mock_critical
+    import approval_server as _AS_critical
+    import approval_email as _AE_critical
+    import takeoff_pipeline as _TP_critical
+
+    _critical_root = Path(_tempfile_critical.mkdtemp(prefix="ci_critical_"))
+    _critical_jobs = _critical_root / "jobs.json"
+    _orig_critical_jobs = _AS_critical.JOBS_FILE
+    _orig_critical_backups = _AS_critical.BACKUP_DIR
+    _orig_critical_quotes = _AS_critical.QUOTATIONS_DIR
+    _orig_critical_token = _AS_critical.APPROVAL_TOKEN
+    _orig_smtp_pass = _AE_critical.SMTP_PASS
+    _AS_critical.JOBS_FILE = _critical_jobs
+    _AS_critical.BACKUP_DIR = _critical_root / "backups"
+    _AS_critical.QUOTATIONS_DIR = _critical_root / "quotations"
+    _AS_critical.APPROVAL_TOKEN = ""
+    try:
+        _app_critical = _AS_critical.app
+        _app_critical.testing = True
+        _client_critical = _app_critical.test_client()
+
+        _quotation_failure_id = "quotation-failure-visible"
+        _AS_critical.save_jobs({_quotation_failure_id: {
+            "id": _quotation_failure_id, "status": "pending", "decision": None,
+            "measurement_state": "MEASURED_VERIFIED", "scale_confirmed": False,
+            "flags": [], "result": {
+                "file": "Mixed perimeter case.pdf", "area_m2": 100.0,
+                "measurement_state": "MEASURED_VERIFIED", "flags": [],
+            },
+        }})
+        with _mock_critical.patch.object(
+                _AS_critical, "_run_costing", return_value={"area_m2":100.0}), \
+                _mock_critical.patch.object(
+                    _AS_critical, "_save_quotation",
+                    return_value={"error":"KeyError: quantity_rows"}):
+            _quotation_failure_response = _client_critical.post(
+                f"/approve/{_quotation_failure_id}", json={"note":"reviewed"})
+        _quotation_failure_job = _AS_critical.load_jobs()[_quotation_failure_id]
+        ck("quotation generation failure returns HTTP 500 and is persisted on the approved job",
+           _quotation_failure_response.status_code == 500 and
+           _quotation_failure_response.get_json()["status"] == "quotation_error" and
+           _quotation_failure_job["decision"] == "approved" and
+           _quotation_failure_job["quotation_status"] == "error" and
+           _quotation_failure_job["quotation_error"] == "KeyError: quantity_rows" and
+           any(flag.startswith("QUOTATION GENERATION ERROR:")
+               for flag in _quotation_failure_job["flags"]),
+           _quotation_failure_response.get_json())
+        ck("portal source renders a specific quotation-error banner and hides broken links",
+           "job.quotation_error" in Path("assessor_portal.html").read_text() and
+           "Quotation generation failed" in Path("assessor_portal.html").read_text())
+
+        # SEND_APPROVAL_EMAILS can no longer make the pipeline create a second job.  Direct
+        # pipeline use has no authoritative persisted context, so it only emits a loud defer
+        # flag; the approval-server worker owns delivery after its atomic save.
+        _deferred_result = {"file":"direct.pdf", "flags":[]}
+        with _mock_critical.patch.object(_AE_critical, "create_job") as _create_job_mock:
+            _TP_critical._trigger_approval(
+                "direct.pdf", _deferred_result, approval_job_id="real-job",
+                send_requested=True)
+        ck("direct pipeline approval trigger never creates a duplicate job",
+           _create_job_mock.call_count == 0 and
+           any(flag.startswith("APPROVAL EMAIL DEFERRED:")
+               for flag in _deferred_result["flags"]), _deferred_result)
+
+        _real_job_id = "portal-real-job-id"
+        _AS_critical.save_jobs({_real_job_id: {
+            "id":_real_job_id, "status":"processing", "decision":None,
+            "project_name":"Email case", "project_ref":"EMAIL-001", "flags":[],
+            "result":{"file":"EMAIL-001_plan.pdf"},
+        }})
+        _email_targets = []
+        _pipeline_context = []
+
+        def _fake_takeoff_critical(pdf, project_name=None, project_ref=None,
+                                   client_rates_path=None, approval_job_id=None):
+            _pipeline_context.append(approval_job_id)
+            return {
+                "file":"EMAIL-001_plan.pdf", "area_m2":100.0,
+                "measurement_state":"MEASURED_UNVERIFIED", "needs_assessor":True,
+                "project_name":project_name, "project_ref":project_ref,
+                "flags":[], "zones":[],
+            }
+
+        def _fake_email_critical(job_id, pdf_path, result,
+                                 project_name=None, project_ref=None, to=None):
+            # This assertion happens inside the notifier: delivery must not start until the
+            # completed result is visible in the canonical store.
+            saved = _AS_critical.load_jobs()[job_id]
+            _email_targets.append((job_id, saved["status"], saved["result"]["file"]))
+            return {"job_id":job_id, "sent":True, "status":"sent", "reason":""}
+
+        with _mock_critical.patch.object(
+                _TP_critical, "takeoff", new=_fake_takeoff_critical), \
+                _mock_critical.patch.object(
+                    _AE_critical, "send_job_approval_email",
+                    side_effect=_fake_email_critical), \
+                _mock_critical.patch.dict(
+                    _os_critical.environ, {"SEND_APPROVAL_EMAILS":"1"}):
+            _AS_critical._run_takeoff(
+                _real_job_id, str(_critical_root / "EMAIL-001_plan.pdf"),
+                "Email case", "EMAIL-001")
+        _email_jobs = _AS_critical.load_jobs()
+        ck("worker email targets the portal's real saved job_id and creates no duplicate",
+           list(_email_jobs) == [_real_job_id] and
+           _pipeline_context == [_real_job_id] and
+           _email_targets == [(_real_job_id, "pending", "EMAIL-001_plan.pdf")] and
+           _email_jobs[_real_job_id]["approval_email_status"] == "sent",
+           {"jobs":list(_email_jobs), "targets":_email_targets,
+            "pipeline_context":_pipeline_context})
+
+        # Missing credentials are checked before snapshot rendering and stored on the job;
+        # there is no automatic approval_emails/*.html fallback on this production path.
+        _AE_critical.SMTP_PASS = ""
+        with _mock_critical.patch.dict(
+                _os_critical.environ, {"SEND_APPROVAL_EMAILS":"1"}):
+            _missing_smtp = _AS_critical._notify_saved_review_job(
+                _real_job_id, str(_critical_root / "missing.pdf"),
+                _email_jobs[_real_job_id]["result"], "Email case", "EMAIL-001")
+        _missing_smtp_job = _AS_critical.load_jobs()[_real_job_id]
+        ck("missing SMTP configuration is recorded visibly and never treated as sent",
+           _missing_smtp["status"] == "not_configured" and
+           _missing_smtp["sent"] is False and
+           _missing_smtp_job["approval_email_status"] == "not_configured" and
+           "SMTP_PASS" in _missing_smtp_job["approval_email_error"] and
+           any(flag.startswith("APPROVAL EMAIL NOT SENT:")
+               for flag in _missing_smtp_job["flags"]) and
+           not (_critical_root / "approval_emails" / f"{_real_job_id}.html").exists(),
+           _missing_smtp)
+    finally:
+        _AS_critical.JOBS_FILE = _orig_critical_jobs
+        _AS_critical.BACKUP_DIR = _orig_critical_backups
+        _AS_critical.QUOTATIONS_DIR = _orig_critical_quotes
+        _AS_critical.APPROVAL_TOKEN = _orig_critical_token
+        _AE_critical.SMTP_PASS = _orig_smtp_pass
+        _shutil_critical.rmtree(_critical_root, ignore_errors=True)
+except (ImportError, OSError, ValueError, KeyError) as _e:
+    ck("critical approval safeguard tests import and run", False, _e)
+
 print("approval_server: jobs-file backup rotation + corrupt-file preservation (prod-audit MUST)")
 try:
     import approval_server as _AS7
@@ -3732,6 +3986,131 @@ try:
         print(f"  [SKIP] tender-pack scale verification for {_tp_site_plan} — fixture not present")
 except ImportError as _e:
     print(f"  [SKIP] scale.py real-sheet regression tests — missing dependency: {_e}")
+
+
+
+# ── Deploy survival, ghost-job neutralisation, case-level quotation ───────────
+# Railway's container filesystem is EPHEMERAL and this has already destroyed real assessor
+# work once.  These tests pin the three properties that keep a case resumable across a deploy:
+# artifacts resolve onto the mounted volume, the approval email never mints a duplicate job,
+# and a case whose documents carry perimeters from DIFFERENT sources still exports.
+print("\n[deploy survival / job identity / case export]")
+import os as _os_ds
+from pathlib import Path as _Path_ds
+from storage_paths import resolve_storage_paths as _rsp
+
+_vol = "/mnt/fortel-data"
+_paths_vol = _rsp({"RAILWAY_VOLUME_MOUNT_PATH": _vol}, app_dir="/app")
+ck("volume mounted: jobs file lands on the volume, not the ephemeral app dir",
+   str(_paths_vol.jobs_file) == f"{_vol}/approval_jobs.json", _paths_vol.jobs_file)
+ck("volume mounted: uploaded drawings survive a deploy (on the volume)",
+   str(_paths_vol.drawings_dir) == f"{_vol}/drawings", _paths_vol.drawings_dir)
+ck("volume mounted: generated quotations survive a deploy (on the volume)",
+   str(_paths_vol.quotations_dir) == f"{_vol}/quotations", _paths_vol.quotations_dir)
+ck("volume mounted: archive + backups survive a deploy too",
+   str(_paths_vol.jobs_archive_file).startswith(_vol)
+   and str(_paths_vol.backup_dir).startswith(_vol),
+   (_paths_vol.jobs_archive_file, _paths_vol.backup_dir))
+
+# The real failure mode: a deploy replaces the container (new app dir, same volume). Every
+# artifact a half-finished assessment needs must resolve to the SAME location afterwards.
+_before = _rsp({"RAILWAY_VOLUME_MOUNT_PATH": _vol}, app_dir="/app")
+_after = _rsp({"RAILWAY_VOLUME_MOUNT_PATH": _vol}, app_dir="/app-redeploy-2")
+ck("deploy cycle: a new container resolves the SAME jobs/drawings/quotations paths — an "
+   "in-flight assessment is still resumable after a redeploy",
+   (_before.jobs_file, _before.drawings_dir, _before.quotations_dir)
+   == (_after.jobs_file, _after.drawings_dir, _after.quotations_dir),
+   (_after.jobs_file, _after.drawings_dir, _after.quotations_dir))
+_no_vol = _rsp({}, app_dir="/app")
+_no_vol_after = _rsp({}, app_dir="/app-redeploy-2")
+ck("no volume: paths follow the app dir and therefore do NOT survive a deploy — the "
+   "difference between the two states must stay visible, not silently equal",
+   _no_vol.jobs_file != _no_vol_after.jobs_file, (_no_vol.jobs_file, _no_vol_after.jobs_file))
+ck("local dev without a volume keeps repo-local paths",
+   str(_no_vol.jobs_file) == "/app/approval_jobs.json", _no_vol.jobs_file)
+ck("explicit env overrides still win over the volume default",
+   str(_rsp({"RAILWAY_VOLUME_MOUNT_PATH": _vol,
+             "DRAWINGS_DIR": "/elsewhere/d"}, app_dir="/app").drawings_dir) == "/elsewhere/d")
+
+# Ghost jobs: the portal creates a job at upload. If the approval email creates a SECOND one,
+# the assessor's emailed link points at a record the portal never shows, and approving it
+# leaves the real case pending forever.  request_approval must attach to the caller's job.
+import tempfile as _tf_ds, json as _json_ds
+import approval_email as _ae_ds
+_ae_orig = (_ae_ds.JOBS_FILE, _ae_ds.render_snapshot, _ae_ds.send_email,
+            _ae_ds._send_email_result)
+try:
+    _tmp_jobs = _Path_ds(_tf_ds.mkdtemp()) / "approval_jobs.json"
+    _ae_ds.JOBS_FILE = _tmp_jobs
+    _ae_ds.render_snapshot = lambda *a, **k: b"\x89PNG\r\n\x1a\n"
+    _ae_ds.send_email = lambda *a, **k: True
+    _ae_ds._send_email_result = lambda *a, **k: {
+        "sent": True, "status": "sent", "reason": ""}
+    _portal_job = _ae_ds.create_job("/x/site.pdf", {"file": "site.pdf", "area_m2": 1.0})
+    _returned = _ae_ds.request_approval("/x/site.pdf", {"file": "site.pdf", "area_m2": 2.0},
+                                        job_id=_portal_job)
+    _jobs_after = _json_ds.loads(_tmp_jobs.read_text())
+    ck("approval email attaches to the portal's existing job — no duplicate ghost record",
+       len(_jobs_after) == 1, sorted(_jobs_after))
+    ck("...and the emailed link carries the portal's OWN job id",
+       _returned == _portal_job, (_returned, _portal_job))
+    ck("...and the job record is refreshed with the new measurement, not left stale",
+       _jobs_after[_portal_job]["result"]["area_m2"] == 2.0, _jobs_after[_portal_job]["result"])
+    # A standalone/CLI caller with no job of its own must still get one created.
+    _standalone = _ae_ds.request_approval("/x/other.pdf", {"file": "other.pdf", "area_m2": 3.0})
+    ck("standalone caller (no job_id) still gets a job created — behaviour unchanged",
+       _standalone != _portal_job and len(_json_ds.loads(_tmp_jobs.read_text())) == 2)
+    # A stale/unknown id means the caller's real job is gone. Creating one here would be the
+    # ghost bug by another route, so it must refuse loudly and leave the store untouched.
+    _before_stale = len(_json_ds.loads(_tmp_jobs.read_text()))
+    try:
+        _ae_ds.request_approval("/x/z.pdf", {"file": "z.pdf", "area_m2": 4.0},
+                                job_id="deadbeef")
+        _refused, _why = False, "no error raised"
+    except ValueError as _e_stale:
+        _refused, _why = True, str(_e_stale)
+    ck("unknown job_id is refused loudly rather than silently creating a ghost", _refused, _why)
+    ck("...and the refusal leaves the job store untouched",
+       len(_json_ds.loads(_tmp_jobs.read_text())) == _before_stale)
+finally:
+    (_ae_ds.JOBS_FILE, _ae_ds.render_snapshot, _ae_ds.send_email,
+     _ae_ds._send_email_result) = _ae_orig
+
+# The pipeline must expose the parameter the portal now passes; a silent signature drift here
+# would reinstate the ghost-job bug without any test failing.
+import inspect as _insp_ds, takeoff_pipeline as _tp_ds
+ck("takeoff() accepts approval_job_id so the portal can own the job identity",
+   "approval_job_id" in _insp_ds.signature(_tp_ds.takeoff).parameters)
+
+# One case, two documents, perimeters arriving by DIFFERENT routes (a top-level perimeter_lm
+# and a zone-carried one). These share a measurement key, so any future divergence in how the
+# two rows are seeded breaks the whole case's export — not just one document's.
+from quotation import generate_quotation as _gq_ds, quotation_xlsx as _qx_ds
+_doc_top = {"file": "top.pdf", "area_m2": 100.0, "perimeter_lm": 40.0,
+            "costing": {"area_m2": 100.0, "rate": 50.0,
+                        "spec": {"depth_mm": 150, "mesh": "A393"}, "assumed": False}}
+_doc_zone = {"file": "zone.pdf", "area_m2": 200.0,
+             "costing": {"area_m2": 200.0, "rate": 50.0,
+                         "spec": {"depth_mm": 150, "mesh": "A393"}, "assumed": False},
+             "zones": [{"category": "external_yard", "perimeter_lm": 80.0, "area_m2": 200.0}]}
+for _label, _case in (("top-level only", [_doc_top]), ("zone-carried only", [_doc_zone]),
+                      ("mixed", [_doc_top, _doc_zone]),
+                      ("mixed, reversed order", [_doc_zone, _doc_top])):
+    try:
+        _q_ds = _gq_ds(_case, project="P", client="C")
+        _xl_ds = _qx_ds(_q_ds)
+        _ok_ds, _g_ds = bool(_xl_ds), f"{len(_xl_ds)} bytes"
+    except Exception as _e_ds:
+        _ok_ds, _g_ds = False, f"{type(_e_ds).__name__}: {_e_ds}"
+    ck(f"case export survives perimeters from mixed sources ({_label})", _ok_ds, _g_ds)
+
+_q_mixed = _gq_ds([_doc_top, _doc_zone], project="P", client="C")
+_perims = [m for m in _q_mixed["measurements"] if m["description"] == "Slab perimeter"]
+ck("both documents' perimeters reach the take-off, aggregated not dropped",
+   len(_perims) == 1 and abs(_perims[0]["qty"] - 120.0) < 0.01, _perims)
+ck("...and each document keeps its own provenance row",
+   len(_perims[0].get("quantity_rows") or []) == 2, _perims[0].get("quantity_rows"))
+
 
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)

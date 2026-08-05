@@ -324,8 +324,13 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             measurement = measurements_by_key.setdefault(mkey, {
                 "section": section, "description": "Slab perimeter", "qty": 0.0,
                 "unit": "Lm", "provisional": False, "drawings": [],
+                "quantity_rows": [], "assessor_rate_required": True,
             })
             measurement["qty"] += float(perimeter)
+            measurement["quantity_rows"].append({
+                "description": _unit_name(unit), "qty": float(perimeter), "unit": "Lm",
+                "drawing": drawing,
+            })
             if drawing and drawing not in measurement["drawings"]:
                 measurement["drawings"].append(drawing)
 

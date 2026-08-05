@@ -14,10 +14,10 @@ Measured area -> price_zone (deterministic, validated) -> GBP.
 
 MANUAL APPROVAL FLOW:
   When the result needs human sign-off (scale unverified, architect drawing, raster, etc.)
-  the pipeline calls request_approval() which:
-    1. Creates a job record in approval_jobs.json
-    2. Emails Inderjit a snapshot + YES / NO / ADJUST buttons
-    3. Starts the approval_server.py portal if not already running
+  approval_server.py first persists the canonical portal job, then emails Inderjit a
+  snapshot + APPROVE / REJECT / ADJUST controls for that exact job id.  The pipeline itself
+  is deliberately unable to create approval jobs: alongside /upload that produced a ghost
+  job whose emailed controls did not affect the portal's real case.
 
   Set SEND_APPROVAL_EMAILS=1 to enable; defaults to off for dev runs.
 """
@@ -143,24 +143,28 @@ def _zone_reference_flags(pdf: str, zones: list[dict]) -> list[str]:
 
 
 def _trigger_approval(pdf: str, result: dict, vision: dict = None,
-                      project_name: str = None, project_ref: str = None):
-    """Fire-and-forget: email Inderjit, create job record.  Never blocks the pipeline."""
-    if not SEND_APPROVALS:
+                      project_name: str = None, project_ref: str = None,
+                      approval_job_id: str = None, send_requested: bool = None):
+    """Log/defer review notification; never create a second approval job.
+
+    ``approval_job_id`` is accepted for API compatibility, but delivery belongs to the
+    approval-server worker after its completed result is atomically saved.  A direct pipeline
+    caller has no authoritative persisted job context and is therefore refused rather than
+    allowed to mint a duplicate.
+    """
+    enabled = SEND_APPROVALS if send_requested is None else bool(send_requested)
+    if not enabled:
         ref_s  = f" [#{project_ref}]" if project_ref else ""
         name_s = f" {project_name}"   if project_name else ""
         print(f"[pipeline] Approval needed{ref_s}{name_s} — {result.get('file')} — "
               f"set SEND_APPROVAL_EMAILS=1 to email.  Portal: http://localhost:5001/portal")
         return
-    try:
-        from approval_email import request_approval
-        poly = None
-        if vision and vision.get("regions") and vision["regions"]:
-            poly = vision["regions"][0]   # first region as the proposed polygon
-        jid = request_approval(pdf, result, polygon_pts=poly,
-                               project_name=project_name, project_ref=project_ref)
-        print(f"[pipeline] Approval email sent. Job: {jid}")
-    except Exception as e:
-        print(f"[pipeline] Approval email failed (non-fatal): {e}")
+    flag = ("APPROVAL EMAIL DEFERRED: direct pipeline job creation is disabled; "
+            "approval_server notifies only after the canonical portal job is saved")
+    flags = result.setdefault("flags", [])
+    if flag not in flags:
+        flags.append(flag)
+    print(f"[pipeline] {flag} — {result.get('file')}")
 
 
 # ── Costing with defaults ─────────────────────────────────────────────────────
@@ -279,7 +283,8 @@ def price_with_defaults(area_m2: float, engineer_spec: dict = None,
 # ── Main takeoff ──────────────────────────────────────────────────────────────
 
 def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extract_spec=True,
-            project_name: str = None, project_ref: str = None, client_rates_path=None):
+            project_name: str = None, project_ref: str = None, client_rates_path=None,
+            approval_job_id: str = None):
     """
     vision (optional) = {'regions':[[...]], 'voids':{i:[...]}, 'scale_ref':[[x1,y1],[x2,y2],metres]}
     engineer_spec (optional) = dict from construction-detail drawing (depth_mm, mesh, etc.)
@@ -289,6 +294,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     project_name (optional) = human-readable project name e.g. "TSL Agratas Battery Facility"
     project_ref  (optional) = Fortel sequential reference number e.g. "2131"
     client_rates_path       = optional explicit client_rates.json store (server/test isolation)
+    approval_job_id         = job record the caller already owns; the approval email attaches
+                              to it instead of minting a duplicate ghost job
     """
     # ── Multi-page tender pack: never assume page 0. Classify every page, rank candidates
     # by router.drawing_priority (external-works/hard-landscaping/construction-thickness
@@ -655,7 +662,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     do_send = send_approval if send_approval is not None else SEND_APPROVALS
     if _needs_approval(r) and (do_send or not os.getenv("SKIP_APPROVAL_LOG")):
         _trigger_approval(pdf, r, vision,
-                          project_name=project_name, project_ref=project_ref)
+                          project_name=project_name, project_ref=project_ref,
+                          approval_job_id=approval_job_id, send_requested=do_send)
 
     return r
 

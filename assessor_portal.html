@@ -1911,6 +1911,14 @@ function renderDecision(job) {
   el.innerHTML = `<div class="decision-banner ${esc(job.decision)}">
     ${esc(job.decision).toUpperCase()} · ${(job.decided_at||'').substring(0,16).replace('T',' ')}
   </div>`;
+  if (job.quotation_error) {
+    el.innerHTML += `<div class="flag err" style="margin-top:8px">
+      ❌ <strong>Quotation generation failed.</strong> ${esc(job.quotation_error)}
+      <br><span style="font-size:11px">The approval is recorded, but no client quotation is ready. Resolve this error and regenerate before issue.</span>
+    </div>`;
+    ql.style.display = 'none';
+    return;
+  }
   // Quotation links (shown after approval / adjustment)
   if ((job.decision === 'approved' || job.decision === 'adjusted') &&
       !projectPricingBlocked) {
@@ -2788,6 +2796,11 @@ function toggleLineItems() {
 async function loadLineItems(job) {
   const el = document.getElementById('lineItemsBlock');
   const status = job.decision;
+
+  if (job.quotation_error) {
+    el.innerHTML = `<span class="li-none" style="color:#c0392b">Quotation failed: ${esc(job.quotation_error)}</span>`;
+    return;
+  }
 
   // Only fetch after a decision that produces a quotation
   if (status !== 'approved' && status !== 'adjusted') {

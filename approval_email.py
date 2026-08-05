@@ -48,14 +48,11 @@ SMTP_PASS         = os.getenv("SMTP_PASS",     "")
 # ?token=<token> or clicking them from the email just hits a 401 page. See build_html_email.
 APPROVAL_TOKEN    = os.getenv("PORTAL_TOKEN") or os.getenv("APPROVAL_TOKEN", "")
 
-# Stored pending-review jobs (simple JSON file; replace with DB in production).
-# Same JOBS_FILE env override as approval_server.py so a caller (a test, a QA instance,
-# n8n pointed at a scratch file) can redirect writes away from the live jobs file instead
-# of hard-writing it. _load_jobs()/_save_jobs() below read this module attribute at call
-# time (not a cached copy), so tests that monkeypatch approval_email.JOBS_FILE after
-# import (the established pattern already used for approval_server.JOBS_FILE in
-# ci_tests.py) take effect immediately.
-JOBS_FILE = Path(os.getenv("JOBS_FILE") or (Path(__file__).parent / "approval_jobs.json"))
+# Stored pending-review jobs (simple JSON file; replace with DB in production).  Resolve it
+# through the same volume-aware source as approval_server; tests may still monkeypatch this
+# module attribute at call time for isolation.
+from storage_paths import resolve_storage_paths
+JOBS_FILE = resolve_storage_paths().jobs_file
 
 
 # ---------------------------------------------------------------------------
@@ -480,11 +477,16 @@ def build_html_email(job_id: str, result: dict, png_b64: str,
 # ---------------------------------------------------------------------------
 # Send / output
 # ---------------------------------------------------------------------------
-def send_email(to: str, subject: str, html: str) -> bool:
-    """Send via SMTP.  Returns True on success."""
-    if not SMTP_PASS:
-        print(f"[approval_email] SMTP_PASS not set — saving email to disk instead")
-        return False
+def _send_email_result(to: str, subject: str, html: str) -> dict:
+    """Attempt an SMTP delivery and return a non-secret, auditable result."""
+    missing = [name for name, value in (
+        ("SMTP_HOST", SMTP_HOST), ("SMTP_USER", SMTP_USER), ("SMTP_PASS", SMTP_PASS),
+    ) if not str(value or "").strip()]
+    if missing:
+        return {
+            "sent": False, "status": "not_configured",
+            "reason": f"SMTP credentials missing: {', '.join(missing)}",
+        }
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = SMTP_USER
@@ -494,10 +496,63 @@ def send_email(to: str, subject: str, html: str) -> bool:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
             s.ehlo(); s.starttls(); s.login(SMTP_USER, SMTP_PASS)
             s.sendmail(SMTP_USER, [to], msg.as_string())
-        return True
+        return {"sent": True, "status": "sent", "reason": ""}
     except Exception as e:
-        print(f"[approval_email] SMTP error: {e}")
-        return False
+        return {
+            "sent": False, "status": "send_failed",
+            "reason": f"SMTP delivery failed: {type(e).__name__}: {e}",
+        }
+
+
+def send_email(to: str, subject: str, html: str) -> bool:
+    """Compatibility wrapper returning only success/failure."""
+    outcome = _send_email_result(to, subject, html)
+    if not outcome["sent"]:
+        print(f"[approval_email] {outcome['reason']}")
+    return bool(outcome["sent"])
+
+
+def send_job_approval_email(job_id: str, pdf_path: str, result: dict,
+                            project_name: str = None, project_ref: str = None,
+                            to: str = None) -> dict:
+    """Email review controls for an ALREADY-PERSISTED portal job.
+
+    This function deliberately has no call to ``create_job``.  Its caller owns the canonical
+    job id and must save that job before invoking this notifier.  Missing SMTP configuration
+    returns a visible structured failure; it never pretends that writing HTML to ephemeral
+    container storage delivered an email.
+    """
+    missing = [name for name, value in (
+        ("SMTP_HOST", SMTP_HOST), ("SMTP_USER", SMTP_USER), ("SMTP_PASS", SMTP_PASS),
+    ) if not str(value or "").strip()]
+    if missing:
+        return {
+            "job_id": job_id, "sent": False, "status": "not_configured",
+            "reason": f"SMTP credentials missing: {', '.join(missing)}",
+        }
+
+    try:
+        png_b64 = ""
+        if pdf_path and Path(pdf_path).is_file():
+            png_b64 = png_to_b64(render_snapshot(
+                pdf_path, polygon_pts=result.get("polygon_pts")))
+        html_body = build_html_email(
+            job_id, result, png_b64,
+            project_name=project_name, project_ref=project_ref)
+        ref_part = f"[#{project_ref}] " if project_ref else ""
+        name_part = (f"{project_name} — " if project_name
+                     else f"{result.get('file', job_id)} — ")
+        delivery = _send_email_result(
+            to or APPROVAL_TO,
+            f"Fortel AI — {ref_part}{name_part}Review Required",
+            html_body,
+        )
+        return {"job_id": job_id, **delivery}
+    except Exception as exc:
+        return {
+            "job_id": job_id, "sent": False, "status": "build_failed",
+            "reason": f"approval email build failed: {type(exc).__name__}: {exc}",
+        }
 
 
 def save_email_file(job_id: str, html: str) -> str:
@@ -535,19 +590,34 @@ def n8n_webhook_payload(job_id: str, result: dict, html: str,
 def request_approval(pdf_path: str, result: dict,
                      polygon_pts: list = None, page: int = 0,
                      to: str = None,
-                     project_name: str = None, project_ref: str = None) -> str:
+                     project_name: str = None, project_ref: str = None,
+                     job_id: str = None) -> str:
     """
     Full flow:
-      1. Create job record
+      1. Attach to the caller's existing job record, or create one
       2. Render snapshot
       3. Build + send email  (subject = "Fortel AI — [#REF] Project Name — Review Required")
     Returns job_id.
+
+    ``job_id`` exists because the portal already creates a job record the moment a drawing is
+    uploaded.  Creating a second one here would email the assessor a link to a GHOST job:
+    approving it would leave the portal's real job untouched and the case would silently stay
+    pending.  Callers that own a job pass its id; only standalone/CLI callers create one.
     """
     to = to or APPROVAL_TO
     proj_name = project_name or result.get("project_name", "")
     proj_ref  = project_ref  or result.get("project_ref",  "")
 
-    job_id = create_job(pdf_path, result, project_name=proj_name, project_ref=proj_ref)
+    if job_id:
+        if job_id not in _load_jobs():
+            raise ValueError(
+                f"existing approval job {job_id!r} was not found; refusing to create a duplicate")
+        # Refresh the caller's own record rather than duplicating it.
+        update_job(job_id, result=result,
+                   project_name=proj_name or result.get("project_name", ""),
+                   project_ref=proj_ref or result.get("project_ref", ""))
+    else:
+        job_id = create_job(pdf_path, result, project_name=proj_name, project_ref=proj_ref)
     png    = render_snapshot(pdf_path, page=page, polygon_pts=polygon_pts)
     b64    = png_to_b64(png)
     html   = build_html_email(job_id, result, b64,
@@ -558,11 +628,16 @@ def request_approval(pdf_path: str, result: dict,
     name_part = f"{proj_name} — " if proj_name else f"{result.get('file', job_id)} — "
     subject   = f"Fortel AI — {ref_part}{name_part}Review Required"
 
-    sent = send_email(to, subject, html)
-    if not sent:
-        path = save_email_file(job_id, html)
-        print(f"[approval_email] Email saved: {path}")
-        print(f"[approval_email] Portal:      {APPROVAL_BASE_URL}/review/{job_id}")
+    delivery = _send_email_result(to, subject, html)
+    update_job(
+        job_id,
+        approval_email_status=delivery["status"],
+        approval_email_error=delivery.get("reason") or None,
+        approval_email_attempted_at=datetime.datetime.utcnow().isoformat(),
+    )
+    if not delivery["sent"]:
+        print(f"[approval_email] NOT SENT: {delivery['reason']}")
+        print(f"[approval_email] Portal:   {APPROVAL_BASE_URL}/review/{job_id}")
     else:
         print(f"[approval_email] Email sent to {to}. Job: {job_id}")
 
