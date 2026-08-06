@@ -2464,7 +2464,7 @@ function setupCanvasEvents() {
   canvas.addEventListener('mousedown', onDown);
   canvas.addEventListener('mousemove', onMove);
   canvas.addEventListener('wheel', onWheel, { passive: false });
-  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('contextmenu', onContextMenu);
   // Wire up zoom control buttons
   const zIn  = document.getElementById('btnZoomIn');
   const zOut = document.getElementById('btnZoomOut');
@@ -2531,6 +2531,81 @@ function getCursorForMode() {
   return 'crosshair';
 }
 
+// ─────────────────────────────────────────────────
+// Right-click delete (contextmenu fires reliably on all platforms)
+// ─────────────────────────────────────────────────
+function onContextMenu(e) {
+  e.preventDefault();
+  const p = pos(e);
+  const hitDist = Math.max(14, 14 / zoom);
+
+  // Check cut-out regions
+  for (let ci = cutoutPolygons.length - 1; ci >= 0; ci--) {
+    const region = cutoutPolygons[ci];
+    if (!region.points || region.points.length < 3) continue;
+    const inPoly = region.points.some(q => Math.hypot(q.x - p.x, q.y - p.y) < hitDist);
+    let inside = false;
+    for (let i = 0, j = region.points.length - 1; i < region.points.length; j = i++) {
+      const xi = region.points[i].x, yi = region.points[i].y;
+      const xj = region.points[j].x, yj = region.points[j].y;
+      if ((yi > p.y) !== (yj > p.y) && p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    if (inPoly || inside) {
+      cutoutPolygons.splice(ci, 1);
+      toast(`Cut-out region ${ci + 1} deleted`);
+      draw(); return;
+    }
+  }
+
+  // Check user channels
+  for (let ci = userChannels.length - 1; ci >= 0; ci--) {
+    const ch = userChannels[ci];
+    if (!ch.points || ch.points.length !== 2) continue;
+    const [a, b] = ch.points;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const lenSq = dx * dx + dy * dy;
+    let t = lenSq > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq)) : 0;
+    const projX = a.x + t * dx, projY = a.y + t * dy;
+    if (Math.hypot(p.x - projX, p.y - projY) < hitDist) {
+      userChannels.splice(ci, 1);
+      toast(`Channel ${ci + 1} deleted`);
+      draw(); return;
+    }
+  }
+
+  // Check trace regions (green filled)
+  for (let ci = traceRegions.length - 1; ci >= 0; ci--) {
+    const region = traceRegions[ci];
+    if (!region.points || region.points.length < 3) continue;
+    let inside = false;
+    for (let i = 0, j = region.points.length - 1; i < region.points.length; j = i++) {
+      const xi = region.points[i].x, yi = region.points[i].y;
+      const xj = region.points[j].x, yj = region.points[j].y;
+      if ((yi > p.y) !== (yj > p.y) && p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    if (inside) {
+      traceRegions.splice(ci, 1);
+      toast(`Trace region ${ci + 1} deleted`);
+      draw(); return;
+    }
+  }
+
+  // Check active trace polygon
+  if (poly.length >= 3) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x, yi = poly[i].y;
+      const xj = poly[j].x, yj = poly[j].y;
+      if ((yi > p.y) !== (yj > p.y) && p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    if (inside) {
+      poly = [];
+      toast('Active trace polygon cleared');
+      draw(); return;
+    }
+  }
+}
+
 function onDown(e) {
   // Middle-click or space+left-click = start panning
   if (e.button === 1 || (e.button === 0 && spaceHeld)) {
@@ -2543,44 +2618,6 @@ function onDown(e) {
   }
 
   const p = pos(e);
-
-  // Right-click: delete nearest cut-out region or user channel
-  if (e.button === 2) {
-    e.preventDefault();
-    // Check cut-out regions
-    for (let ci = cutoutPolygons.length - 1; ci >= 0; ci--) {
-      const region = cutoutPolygons[ci];
-      if (!region.points || region.points.length < 3) continue;
-      const inPoly = region.points.some(q => Math.hypot(q.x - p.x, q.y - p.y) < 14);
-      let inside = false;
-      for (let i = 0, j = region.points.length - 1; i < region.points.length; j = i++) {
-        const xi = region.points[i].x, yi = region.points[i].y;
-        const xj = region.points[j].x, yj = region.points[j].y;
-        if ((yi > p.y) !== (yj > p.y) && p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi) inside = !inside;
-      }
-      if (inPoly || inside) {
-        cutoutPolygons.splice(ci, 1);
-        toast(`Cut-out region ${ci + 1} deleted`);
-        draw(); return;
-      }
-    }
-    // Check user channels
-    for (let ci = userChannels.length - 1; ci >= 0; ci--) {
-      const ch = userChannels[ci];
-      if (!ch.points || ch.points.length !== 2) continue;
-      const [a, b] = ch.points;
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const lenSq = dx * dx + dy * dy;
-      let t = lenSq > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq)) : 0;
-      const projX = a.x + t * dx, projY = a.y + t * dy;
-      if (Math.hypot(p.x - projX, p.y - projY) < 14) {
-        userChannels.splice(ci, 1);
-        toast(`Channel ${ci + 1} deleted`);
-        draw(); return;
-      }
-    }
-    return;
-  }
 
   // ── Vertex drag checks (MUST come before mode-specific drawing) ──
   if (e.button === 0) {
