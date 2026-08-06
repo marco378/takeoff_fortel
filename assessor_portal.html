@@ -2036,6 +2036,8 @@ function loadImage(url, forJobId) {
     </div>`);
     canvas = document.createElement('canvas');
     ctx    = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     wrap.appendChild(canvas);
     // Reset zoom/pan for new image
     zoom = 1; panX = 0; panY = 0;
@@ -2127,7 +2129,7 @@ function zoomAtPoint(factor, clientPt) {
   const cy = clientPt ? (clientPt.y - wrapRect.top) : wrapRect.height / 2;
 
   const oldZoom = zoom;
-  zoom = Math.max(0.1, Math.min(10, zoom * factor));
+  zoom = Math.max(0.05, Math.min(30, zoom * factor));
 
   // Adjust pan so the point under the cursor stays fixed
   panX = cx - (cx - panX) * (zoom / oldZoom);
@@ -2167,6 +2169,11 @@ function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (img) ctx.drawImage(img, 0, 0);
 
+  // Scale-independent line widths: stay visible at any zoom
+  const lw = Math.max(1, 2 / zoom);
+  const lwThin = Math.max(0.5, 1.5 / zoom);
+  const dotR = Math.max(3, 5 / zoom);
+
   // AI proposal (lighter, dashed)
   if (aiPoly && aiPoly.length >= 3) {
     ctx.save();
@@ -2177,13 +2184,12 @@ function draw() {
     ctx.fillStyle   = 'rgba(224,0,122,0.10)';
     ctx.fill();
     ctx.strokeStyle = 'rgba(224,0,122,0.55)';
-    ctx.lineWidth   = 1.5;
+    ctx.lineWidth   = lw;
     ctx.stroke();
     ctx.restore();
   }
 
-  // Assumed Channel proposals (purple/dashed, open two-point lines). Drawing these is
-  // presentation-only: they never enter traceRegions, measured zones, area or costing.
+  // Assumed Channel proposals (purple/dashed, open two-point lines)
   channelProposals.forEach(proposal => {
     if (!proposal.points || proposal.points.length !== 2) return;
     ctx.save();
@@ -2192,11 +2198,11 @@ function draw() {
     ctx.moveTo(proposal.points[0].x, proposal.points[0].y);
     ctx.lineTo(proposal.points[1].x, proposal.points[1].y);
     ctx.strokeStyle = 'rgba(111,66,193,0.9)';
-    ctx.lineWidth = 3;
+    ctx.lineWidth = lw * 1.5;
     ctx.stroke();
     proposal.points.forEach(point => {
       ctx.fillStyle = 'rgba(111,66,193,0.95)';
-      ctx.beginPath(); ctx.arc(point.x, point.y, 6, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(point.x, point.y, dotR, 0, Math.PI*2); ctx.fill();
     });
     ctx.restore();
   });
@@ -2210,11 +2216,11 @@ function draw() {
     ctx.moveTo(ch.points[0].x, ch.points[0].y);
     ctx.lineTo(ch.points[1].x, ch.points[1].y);
     ctx.strokeStyle = 'rgba(192,57,43,0.9)';
-    ctx.lineWidth = 3;
+    ctx.lineWidth = lw * 1.5;
     ctx.stroke();
     ch.points.forEach(point => {
       ctx.fillStyle = 'rgba(192,57,43,0.95)';
-      ctx.beginPath(); ctx.arc(point.x, point.y, 5, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(point.x, point.y, dotR, 0, Math.PI*2); ctx.fill();
     });
     ctx.restore();
   });
@@ -2231,7 +2237,7 @@ function draw() {
     ctx.fillStyle = 'rgba(211,84,0,0.15)';
     ctx.fill();
     ctx.strokeStyle = 'rgba(211,84,0,0.85)';
-    ctx.lineWidth = 2;
+    ctx.lineWidth = lw;
     ctx.stroke();
     // Draw X pattern to indicate subtraction
     const bbox = region.points.reduce((acc, p) => ({
@@ -2242,18 +2248,17 @@ function draw() {
     ctx.moveTo(bbox.minX, bbox.minY); ctx.lineTo(bbox.maxX, bbox.maxY);
     ctx.moveTo(bbox.maxX, bbox.minY); ctx.lineTo(bbox.minX, bbox.maxY);
     ctx.strokeStyle = 'rgba(211,84,0,0.5)';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = lwThin;
     ctx.stroke();
     // Draw editable vertex dots
     region.points.forEach(point => {
       ctx.fillStyle = 'rgba(211,84,0,0.95)';
-      ctx.beginPath(); ctx.arc(point.x, point.y, 4, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(point.x, point.y, dotR * 0.8, 0, Math.PI*2); ctx.fill();
     });
     ctx.restore();
   });
 
-  // Assisted Office GA candidates (amber/dashed). Merely drawing these never changes area,
-  // state or costing; the assessor must explicitly add/edit them and submit an adjustment.
+  // Assisted Office GA candidates (amber/dashed)
   candidatePolygons.forEach(candidate => {
     if (!candidate.points || candidate.points.length < 3) return;
     ctx.save();
@@ -2265,7 +2270,7 @@ function draw() {
     ctx.fillStyle = 'rgba(230,126,34,0.05)';
     ctx.fill();
     ctx.strokeStyle = 'rgba(230,126,34,0.75)';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = lwThin;
     ctx.stroke();
     ctx.restore();
   });
@@ -2282,7 +2287,7 @@ function draw() {
     ctx.fillStyle = 'rgba(39,174,96,0.13)';
     ctx.fill();
     ctx.strokeStyle = 'rgba(30,132,73,0.8)';
-    ctx.lineWidth = 2;
+    ctx.lineWidth = lw;
     ctx.stroke();
     ctx.restore();
   });
@@ -2295,13 +2300,13 @@ function draw() {
     ctx.fillStyle   = 'rgba(0,150,80,0.18)';
     ctx.fill();
     ctx.strokeStyle = '#008000';
-    ctx.lineWidth   = 2.5;
+    ctx.lineWidth   = lw * 1.2;
     ctx.setLineDash([]);
     ctx.stroke();
     poly.forEach(p => {
       ctx.fillStyle = '#008000';
       ctx.beginPath();
-      ctx.arc(p.x, p.y, 5, 0, Math.PI*2);
+      ctx.arc(p.x, p.y, dotR, 0, Math.PI*2);
       ctx.fill();
     });
   }
@@ -2312,12 +2317,12 @@ function draw() {
     ctx.moveTo(cal[0].x, cal[0].y);
     if (cal[1]) ctx.lineTo(cal[1].x, cal[1].y);
     ctx.strokeStyle = '#0066ff';
-    ctx.lineWidth = 3;
+    ctx.lineWidth = lw * 1.5;
     ctx.setLineDash([]);
     ctx.stroke();
     cal.forEach(p => {
       ctx.fillStyle = '#0066ff';
-      ctx.beginPath(); ctx.arc(p.x,p.y,5,0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x,p.y,dotR,0,Math.PI*2); ctx.fill();
     });
   }
 
