@@ -807,6 +807,8 @@ def adjust(job_id):
     scale_k    = data.get("scale_k")         # m/px
     area_m2    = data.get("assessed_area_m2")
     note       = data.get("note", "")
+    cutout_regions_in = data.get("cutout_regions") or []  # [[[x,y], ...], ...]
+    user_channels_in = data.get("user_channels") or []    # [[[x,y], [x,y]], ...]
 
     def _valid_region(region):
         return (
@@ -855,6 +857,32 @@ def adjust(job_id):
     else:
         region_categories = []
 
+    # Validate cut-out regions (polygons to subtract from the measured area)
+    cutout_regions = []
+    if cutout_regions_in:
+        if (not isinstance(cutout_regions_in, list) or len(cutout_regions_in) > 50
+                or not all(_valid_region(region) for region in cutout_regions_in)):
+            return jsonify({"error": "cutout_regions must contain 0-50 valid polygons"}), 400
+        cutout_regions = cutout_regions_in
+
+    # Validate user-drawn channels (two-point lines)
+    user_channels = []
+    if user_channels_in:
+        if not isinstance(user_channels_in, list) or len(user_channels_in) > 20:
+            return jsonify({"error": "user_channels must contain 0-20 channel lines"}), 400
+        for ch in user_channels_in:
+            if (not isinstance(ch, list) or len(ch) != 2
+                    or any(not isinstance(point, (list, tuple)) or len(point) != 2
+                           or any(not isinstance(value, (int, float)) or not math.isfinite(value)
+                                  for value in point)
+                           for point in ch)):
+                return jsonify({"error": "each user_channel must contain exactly two [x,y] points"}), 400
+            dx = abs(ch[1][0] - ch[0][0])
+            dy = abs(ch[1][1] - ch[0][1])
+            if dx <= 1e-6 and dy <= 1e-6:
+                return jsonify({"error": "user_channels must have positive length"}), 400
+        user_channels = user_channels_in
+
     # If assessor traced one or more polygons + scale, re-measure (heavy I/O — outside lock).
     # Legacy `vertices` remains exactly one region; Office GA candidates can now be combined.
     if regions and scale_k:
@@ -864,6 +892,12 @@ def adjust(job_id):
             region_areas = [measure_regions([region], scale_k)[0] for region in regions]
             perimeters = [polygon_perimeter_lm(region, scale_k) for region in regions]
             perimeter_lm = round(sum(value for value in perimeters if value is not None), 2)
+            # Subtract cut-out areas from the measured area
+            if cutout_regions:
+                cutout_area, cutout_flags = measure_regions(cutout_regions, scale_k)
+                if cutout_area > 0:
+                    area_m2 = round(max(0, area_m2 - cutout_area), 1)
+                    gflags = gflags + [f"cut-out: {cutout_area:,.1f} m² subtracted"] + cutout_flags
         except Exception as e:
             area_m2, perimeter_lm, region_areas, perimeters, gflags = (
                 None, None, [], [], [f"geometry error: {e}"])
@@ -1023,6 +1057,8 @@ def adjust(job_id):
                 "perimeter_lm": perimeter_lm,
                 "flags":    gflags,
                 "note":     note,
+                "cutout_regions": cutout_regions,
+                "user_channels": user_channels,
             },
             "costing": costing_result,
         })
@@ -1762,6 +1798,8 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["yard_regions"] = list(job["yard_regions"])
     if isinstance(job.get("yard_region_decisions"), dict):
         result["yard_region_decisions"] = dict(job["yard_region_decisions"])
+    if isinstance(job.get("user_channels"), list):
+        result["user_channels"] = list(job["user_channels"])
     if "yard_region_review_required" in job:
         result["yard_region_review_required"] = bool(job["yard_region_review_required"])
     if "zone_classification_required" in job:
@@ -1787,6 +1825,10 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
             # the superseded AI outline's perimeter as if it described the adjusted area.
             result.pop("perimeter_lm", None)
             result.pop("polygon_pts", None)
+    if isinstance(adjusted.get("user_channels"), list):
+        result["user_channels"] = list(adjusted["user_channels"])
+    if isinstance(adjusted.get("cutout_regions"), list):
+        result["cutout_regions"] = list(adjusted["cutout_regions"])
     return result
 
 

@@ -454,6 +454,54 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                     "price is included."
                 )
 
+    # User-drawn channels (red dotted lines added by the assessor)
+    for unit in source_results:
+        drawing = unit.get("file") or Path(str(unit.get("pdf_path") or "")).name
+        user_channels = unit.get("user_channels") or []
+        if not isinstance(user_channels, list):
+            continue
+        for idx, ch in enumerate(user_channels, 1):
+            if not isinstance(ch, list) or len(ch) != 2:
+                continue
+            # Calculate channel length from the two points (in PDF-point space)
+            try:
+                dx = float(ch[1][0]) - float(ch[0][0])
+                dy = float(ch[1][1]) - float(ch[0][1])
+                length_pts = (dx**2 + dy**2) ** 0.5
+            except (TypeError, ValueError, IndexError):
+                continue
+            # Convert to metres using the job's scale
+            scale_k = unit.get("scale_k") or (unit.get("result") or {}).get("scale_k")
+            if not scale_k or scale_k <= 0:
+                continue
+            length_lm = round(length_pts * scale_k, 2)
+            if length_lm <= 0:
+                continue
+            extra_rows.append({
+                "section": "External yard slabs",
+                "description": f"Channel — assessor-drawn run #{idx}",
+                "qty": length_lm, "unit": "Lm",
+                "rate": None, "value": None, "assessor_rate_required": True,
+                "provisional": True, "provisional_reason": PROVISIONAL_LABEL,
+                "assumption_basis": "assessor-drawn channel on portal",
+                "drawings": [drawing] if drawing else [],
+            })
+            declarations.append(
+                f"{PROVISIONAL_LABEL}: assessor-drawn channel #{idx} — {length_lm:g} Lm "
+                f"included with rate left blank; basis: assessor-drawn on portal."
+            )
+
+    # Cut-out regions (subtracted from measured area)
+    for unit in source_results:
+        drawing = unit.get("file") or Path(str(unit.get("pdf_path") or "")).name
+        cutout_regions = unit.get("cutout_regions") or []
+        if not isinstance(cutout_regions, list) or not cutout_regions:
+            continue
+        declarations.append(
+            f"NOTE: {len(cutout_regions)} cut-out region(s) subtracted from measured area "
+            f"on {drawing or 'drawing'} by assessor."
+        )
+
     line_items = []
     specifications = []
     for group_number, group in enumerate(

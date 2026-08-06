@@ -90,6 +90,10 @@ header span{opacity:.7;font-size:12px}
 .toolbar button.delete{background:#fff;color:#8e44ad;border-color:#8e44ad}
 .toolbar button.delete:hover{background:#8e44ad;color:#fff}
 .toolbar button.on{background:var(--blue);color:#fff;border-color:var(--blue)}
+.toolbar button.cutout{background:#fff;color:#d35400;border-color:#d35400}
+.toolbar button.cutout:hover{background:#d35400;color:#fff}
+.toolbar button.channel{background:#fff;color:#c0392b;border-color:#c0392b}
+.toolbar button.channel:hover{background:#c0392b;color:#fff}
 #readout{margin-left:auto;font-size:13px;font-weight:700;color:var(--blue)}
 .divider{width:1px;background:var(--border);height:24px;margin:0 4px}
 
@@ -326,6 +330,8 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <button id="btnUndo">↩ Undo</button>
       <button id="btnClear">🗑 Clear</button>
       <button id="btnNewRegion" title="Finish this outline and start another slab/core region">＋ Region</button>
+      <button id="btnCutout" class="cutout" title="Draw a polygon over unwanted area to subtract it">✂️ Cut-out</button>
+      <button id="btnChannel" class="channel" title="Draw a channel line (red dotted)">📏 Channel</button>
       <div class="divider"></div>
       <button id="btnLoad" title="Load AI's proposed polygon">🤖 Load AI polygon</button>
       <button id="btnClearAi" title="Clear AI polygon overlay">❌ Clear AI</button>
@@ -519,6 +525,8 @@ let activeCandidateId = null;
 let candidatePolygons = []; // assisted candidates in CANVAS pixels; never authoritative by themselves
 let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never measured/priced
 let channelDrag = null;     // {proposalIndex, pointIndex, axis}; edits stay axis-aligned
+let cutoutPolygons = [];    // completed cut-out regions: [{points:[{x,y}]}]
+let userChannels = [];      // user-drawn channel lines: [{points:[{x,y},{x,y}]}]
 let cal  = [];            // [{x,y}] calibration line endpoints
 let mpp  = null;          // metres per CANVAS pixel
 let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapshot-Scale header).
@@ -840,6 +848,7 @@ async function selectJob(jobId) {
   // resetting snapScale/mpp, guarantees the canvas reloads fresh for each job.
   img = null;
   poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = []; channelProposals = [];
+  cutoutPolygons = []; userChannels = [];
   cal = []; aiPoly = null; dragIdx = -1; channelDrag = null;
   mpp = null; snapScale = 0.5;
   if (ctx && canvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -881,8 +890,10 @@ async function renderJobUI(job, gen) {
   document.getElementById('emptyState').style.display = 'none';
   document.getElementById('canvasWrap').style.display = 'flex';
 
-  // BUG 2: Hide approve/reject/adjust for processing/error jobs; show status message instead
-  const isActionable = job.status !== 'processing' && job.status !== 'error';
+  // BUG 2: Hide approve/reject/adjust for processing jobs; show status message instead.
+  // Error jobs ARE actionable — the assessor may want to approve with existing measurement
+  // or adjust manually after a takeoff failure.
+  const isActionable = job.status !== 'processing';
   document.getElementById('btnApprove').style.display = isActionable ? '' : 'none';
   document.getElementById('btnReject') .style.display = isActionable ? '' : 'none';
   document.getElementById('btnAdjust') .style.display = isActionable ? '' : 'none';
@@ -1148,6 +1159,18 @@ function initialiseTraceState(job, res) {
   poly = [];
   activeCandidateId = null;
   cal = [];
+
+  // Restore cut-out regions from stored state
+  const storedCutouts = Array.isArray(adjusted.cutout_regions) ? adjusted.cutout_regions : [];
+  cutoutPolygons = storedCutouts.map(region => ({
+    points: region.map(point => ({x:Number(point[0]), y:Number(point[1])}))
+  })).filter(region => region.points.length >= 3);
+
+  // Restore user-drawn channels from stored state
+  const storedChannels = Array.isArray(adjusted.user_channels) ? adjusted.user_channels : [];
+  userChannels = storedChannels.map(ch => ({
+    points: ch.map(point => ({x:Number(point[0]), y:Number(point[1])}))
+  })).filter(ch => ch.points.length === 2);
   // An adjusted scale is already metres/canvas-pixel. Pipeline scale_k is metres/PDF-point.
   mpp = Number(adjusted.scale_k) || (res.scale_k ? res.scale_k / snapScale : null);
 }
@@ -2175,6 +2198,52 @@ function draw() {
     ctx.restore();
   });
 
+  // User-drawn channels (red dotted lines)
+  userChannels.forEach(ch => {
+    if (!ch.points || ch.points.length !== 2) return;
+    ctx.save();
+    ctx.setLineDash([6,4]);
+    ctx.beginPath();
+    ctx.moveTo(ch.points[0].x, ch.points[0].y);
+    ctx.lineTo(ch.points[1].x, ch.points[1].y);
+    ctx.strokeStyle = 'rgba(192,57,43,0.9)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ch.points.forEach(point => {
+      ctx.fillStyle = 'rgba(192,57,43,0.95)';
+      ctx.beginPath(); ctx.arc(point.x, point.y, 5, 0, Math.PI*2); ctx.fill();
+    });
+    ctx.restore();
+  });
+
+  // Cut-out regions (orange/red dashed, subtracted from measured area)
+  cutoutPolygons.forEach(region => {
+    if (!region.points || region.points.length < 3) return;
+    ctx.save();
+    ctx.setLineDash([6,4]);
+    ctx.beginPath();
+    region.points.forEach((point,index) => index
+      ? ctx.lineTo(point.x,point.y) : ctx.moveTo(point.x,point.y));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(211,84,0,0.15)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(211,84,0,0.85)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // Draw X pattern to indicate subtraction
+    const bbox = region.points.reduce((acc, p) => ({
+      minX: Math.min(acc.minX, p.x), maxX: Math.max(acc.maxX, p.x),
+      minY: Math.min(acc.minY, p.y), maxY: Math.max(acc.maxY, p.y)
+    }), {minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity});
+    ctx.beginPath();
+    ctx.moveTo(bbox.minX, bbox.minY); ctx.lineTo(bbox.maxX, bbox.maxY);
+    ctx.moveTo(bbox.maxX, bbox.minY); ctx.lineTo(bbox.minX, bbox.maxY);
+    ctx.strokeStyle = 'rgba(211,84,0,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+  });
+
   // Assisted Office GA candidates (amber/dashed). Merely drawing these never changes area,
   // state or costing; the assessor must explicitly add/edit them and submit an adjustment.
   candidatePolygons.forEach(candidate => {
@@ -2324,7 +2393,9 @@ function loadTraceCandidate(candidateId) {
 function calcArea() {
   const regions = traceRegionEntries();
   if (!mpp || !regions.length) return null;
-  return regions.reduce((total,region) => total + shoelace(region.points), 0) * mpp * mpp;
+  const grossArea = regions.reduce((total,region) => total + shoelace(region.points), 0) * mpp * mpp;
+  const cutoutArea = cutoutPolygons.reduce((total,region) => total + shoelace(region.points), 0) * mpp * mpp;
+  return Math.max(0, grossArea - cutoutArea);
 }
 
 function calcPerimeter() {
@@ -2370,7 +2441,7 @@ function updateAreaDisplay() {
     document.getElementById('areaSource').textContent = 'No polygon traced yet';
   }
   document.getElementById('readout').textContent =
-    `area: ${aStr}  ·  ${traceRegionEntries().length} region(s)  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
+    `area: ${aStr}  ·  ${traceRegionEntries().length} region(s)  ·  ${cutoutPolygons.length} cut-out(s)  ·  ${userChannels.length} channel(s)  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
 }
 
 // ─────────────────────────────────────────────────
@@ -2474,6 +2545,39 @@ function onDown(e) {
     draw(); return;
   }
 
+  // Cut-out mode: draw polygon over unwanted area
+  if (mode === 'cutout') {
+    if (cutoutPolygons.length > 0 && cutoutPolygons[cutoutPolygons.length-1].points.length >= 3) {
+      // Check if clicking near the first point to close the polygon
+      const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
+      if (Math.hypot(lastRegion.points[0].x-p.x, lastRegion.points[0].y-p.y) < 14) {
+        toast(`Cut-out region ${cutoutPolygons.length} closed — click Submit Adjustment to apply`);
+        draw(); return;
+      }
+    }
+    // Start or continue cut-out polygon
+    if (cutoutPolygons.length === 0 || cutoutPolygons[cutoutPolygons.length-1].closed) {
+      cutoutPolygons.push({points: [p], closed: false});
+    } else {
+      cutoutPolygons[cutoutPolygons.length-1].points.push(p);
+    }
+    draw(); return;
+  }
+
+  // Channel mode: draw two-point line
+  if (mode === 'channel') {
+    if (userChannels.length > 0 && userChannels[userChannels.length-1].points.length === 2) {
+      // Channel already complete, start a new one
+      userChannels.push({points: [p]});
+    } else if (userChannels.length === 0) {
+      userChannels.push({points: [p]});
+    } else {
+      userChannels[userChannels.length-1].points.push(p);
+      toast(`Channel ${userChannels.length} placed — click Submit Adjustment to save`);
+    }
+    draw(); return;
+  }
+
   // Channel assumptions have their own geometry contract. Dragging an endpoint is kept on
   // the proposal's original horizontal/vertical axis and never creates a measured trace.
   if (e.button === 0) {
@@ -2532,6 +2636,18 @@ function onMove(e) {
     return;
   }
   if (dragIdx >= 0) { poly[dragIdx] = pos(e); draw(); }
+
+  // Cut-out mode: drag nearest cut-out vertex
+  if (mode === 'cutout' && cutoutPolygons.length > 0) {
+    const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
+    if (!lastRegion.closed) {
+      const cutDragIdx = lastRegion.points.findIndex(q => Math.hypot(q.x-p.x, q.y-p.y) < 10);
+      if (cutDragIdx >= 0) {
+        lastRegion.points[cutDragIdx] = pos(e);
+        draw();
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────
@@ -2542,17 +2658,35 @@ function setupButtons() {
     mode = 'cal';
     document.getElementById('btnCal').classList.add('on');
     document.getElementById('btnTrace').classList.remove('on');
+    document.getElementById('btnCutout').classList.remove('on');
+    document.getElementById('btnChannel').classList.remove('on');
   });
   document.getElementById('btnTrace').addEventListener('click', () => {
     mode = 'trace';
     document.getElementById('btnTrace').classList.add('on');
     document.getElementById('btnCal').classList.remove('on');
+    document.getElementById('btnCutout').classList.remove('on');
+    document.getElementById('btnChannel').classList.remove('on');
   });
   document.getElementById('btnUndo').addEventListener('click', () => { poly.pop(); draw(); });
   document.getElementById('btnClear').addEventListener('click', () => {
-    poly=[]; traceRegions=[]; activeCandidateId=null; cal=[]; draw();
+    poly=[]; traceRegions=[]; activeCandidateId=null; cal=[]; cutoutPolygons=[]; userChannels=[]; draw();
   });
   document.getElementById('btnNewRegion').addEventListener('click', startNewTraceRegion);
+  document.getElementById('btnCutout').addEventListener('click', () => {
+    mode = 'cutout';
+    document.getElementById('btnCutout').classList.add('on');
+    document.getElementById('btnTrace').classList.remove('on');
+    document.getElementById('btnCal').classList.remove('on');
+    document.getElementById('btnChannel').classList.remove('on');
+  });
+  document.getElementById('btnChannel').addEventListener('click', () => {
+    mode = 'channel';
+    document.getElementById('btnChannel').classList.add('on');
+    document.getElementById('btnTrace').classList.remove('on');
+    document.getElementById('btnCal').classList.remove('on');
+    document.getElementById('btnCutout').classList.remove('on');
+  });
   document.getElementById('btnLoad').addEventListener('click', () => {
     if (!aiPoly) { toast('No AI polygon for this job', 'warn'); return; }
     traceRegions = [];
@@ -2667,6 +2801,12 @@ async function submitDecision(action) {
     // Every traced region carries an explicit BOQ category. Suggested Office levels inherit
     // the detector's ground/upper category; a manual region remains visibly unclassified.
     region_categories: regionEntries.map(entry => entry.category || 'unclassified'),
+    // Cut-out regions to subtract from the measured area
+    cutout_regions: cutoutPolygons.filter(r => r.points && r.points.length >= 3)
+      .map(r => r.points.map(point => [Math.round(point.x), Math.round(point.y)])),
+    // User-drawn channel lines (red dotted)
+    user_channels: userChannels.filter(ch => ch.points && ch.points.length === 2)
+      .map(ch => ch.points.map(point => [Math.round(point.x), Math.round(point.y)])),
     note: ''
   };
   try {
