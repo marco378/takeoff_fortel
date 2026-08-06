@@ -99,7 +99,7 @@ header span{opacity:.7;font-size:12px}
 
 /* ── Canvas area ─────────────────────────── */
 .canvas-wrap{flex:1;overflow:hidden;position:relative;padding:16px;background:var(--bg)}
-canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.08);cursor:crosshair;position:absolute;transform-origin:0 0}
+canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.08);cursor:crosshair;position:absolute;transform-origin:0 0;image-rendering:crisp-edges}
 
 /* ── Zoom controls ─────────────────────────── */
 .zoom-controls{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:4px;background:#fff;border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:10}
@@ -2036,8 +2036,6 @@ function loadImage(url, forJobId) {
     </div>`);
     canvas = document.createElement('canvas');
     ctx    = canvas.getContext('2d');
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
     wrap.appendChild(canvas);
     // Reset zoom/pan for new image
     zoom = 1; panX = 0; panY = 0;
