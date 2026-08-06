@@ -527,6 +527,8 @@ let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never m
 let channelDrag = null;     // {proposalIndex, pointIndex, axis}; edits stay axis-aligned
 let cutoutPolygons = [];    // completed cut-out regions: [{points:[{x,y}]}]
 let userChannels = [];      // user-drawn channel lines: [{points:[{x,y},{x,y}]}]
+let cutoutDrag = null;      // {polygonIndex, pointIndex} — dragging a cut-out vertex
+let userChannelDrag = null; // {channelIndex, pointIndex} — dragging a channel endpoint
 let cal  = [];            // [{x,y}] calibration line endpoints
 let mpp  = null;          // metres per CANVAS pixel
 let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapshot-Scale header).
@@ -557,7 +559,7 @@ window.addEventListener('DOMContentLoaded', () => {
   setupButtons();
   // Global listeners (added once, not per-canvas)
   window.addEventListener('mouseup', () => {
-    dragIdx = -1; channelDrag = null; isPanning = false;
+    dragIdx = -1; channelDrag = null; cutoutDrag = null; userChannelDrag = null; isPanning = false;
     if (canvas) canvas.style.cursor = getCursorForMode();
   });
   document.addEventListener('keydown', onKeyDown);
@@ -849,6 +851,7 @@ async function selectJob(jobId) {
   img = null;
   poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = []; channelProposals = [];
   cutoutPolygons = []; userChannels = [];
+  cutoutDrag = null; userChannelDrag = null;
   cal = []; aiPoly = null; dragIdx = -1; channelDrag = null;
   mpp = null; snapScale = 0.5;
   if (ctx && canvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -2241,6 +2244,11 @@ function draw() {
     ctx.strokeStyle = 'rgba(211,84,0,0.5)';
     ctx.lineWidth = 1.5;
     ctx.stroke();
+    // Draw editable vertex dots
+    region.points.forEach(point => {
+      ctx.fillStyle = 'rgba(211,84,0,0.95)';
+      ctx.beginPath(); ctx.arc(point.x, point.y, 4, 0, Math.PI*2); ctx.fill();
+    });
     ctx.restore();
   });
 
@@ -2531,6 +2539,46 @@ function onDown(e) {
 
   const p = pos(e);
 
+  // Right-click: delete nearest cut-out region or user channel
+  if (e.button === 2) {
+    e.preventDefault();
+    // Check cut-out regions
+    for (let ci = cutoutPolygons.length - 1; ci >= 0; ci--) {
+      const region = cutoutPolygons[ci];
+      if (!region.points || region.points.length < 3) continue;
+      const inPoly = region.points.some(q => Math.hypot(q.x - p.x, q.y - p.y) < 14);
+      // Also check if click is inside the polygon
+      let inside = false;
+      for (let i = 0, j = region.points.length - 1; i < region.points.length; j = i++) {
+        const xi = region.points[i].x, yi = region.points[i].y;
+        const xj = region.points[j].x, yj = region.points[j].y;
+        if ((yi > p.y) !== (yj > p.y) && p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi) inside = !inside;
+      }
+      if (inPoly || inside) {
+        cutoutPolygons.splice(ci, 1);
+        toast(`Cut-out region ${ci + 1} deleted`);
+        draw(); return;
+      }
+    }
+    // Check user channels
+    for (let ci = userChannels.length - 1; ci >= 0; ci--) {
+      const ch = userChannels[ci];
+      if (!ch.points || ch.points.length !== 2) continue;
+      // Check proximity to the line segment
+      const [a, b] = ch.points;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const lenSq = dx * dx + dy * dy;
+      let t = lenSq > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq)) : 0;
+      const projX = a.x + t * dx, projY = a.y + t * dy;
+      if (Math.hypot(p.x - projX, p.y - projY) < 14) {
+        userChannels.splice(ci, 1);
+        toast(`Channel ${ci + 1} deleted`);
+        draw(); return;
+      }
+    }
+    return;
+  }
+
   if (mode === 'cal') {
     if (cal.length >= 2) cal = [];
     cal.push(p);
@@ -2576,6 +2624,33 @@ function onDown(e) {
       toast(`Channel ${userChannels.length} placed — click Submit Adjustment to save`);
     }
     draw(); return;
+  }
+
+  // Check for cut-out vertex drag (any mode)
+  if (e.button === 0) {
+    for (let ci = 0; ci < cutoutPolygons.length; ci++) {
+      const region = cutoutPolygons[ci];
+      if (!region.points) continue;
+      for (let pi = 0; pi < region.points.length; pi++) {
+        if (Math.hypot(region.points[pi].x - p.x, region.points[pi].y - p.y) < 10) {
+          cutoutDrag = {polygonIndex: ci, pointIndex: pi};
+          if (canvas) canvas.style.cursor = 'move';
+          return;
+        }
+      }
+    }
+    // Check for user channel endpoint drag (any mode)
+    for (let ci = 0; ci < userChannels.length; ci++) {
+      const ch = userChannels[ci];
+      if (!ch.points || ch.points.length !== 2) continue;
+      for (let pi = 0; pi < ch.points.length; pi++) {
+        if (Math.hypot(ch.points[pi].x - p.x, ch.points[pi].y - p.y) < 10) {
+          userChannelDrag = {channelIndex: ci, pointIndex: pi};
+          if (canvas) canvas.style.cursor = 'move';
+          return;
+        }
+      }
+    }
   }
 
   // Channel assumptions have their own geometry contract. Dragging an endpoint is kept on
@@ -2637,16 +2712,26 @@ function onMove(e) {
   }
   if (dragIdx >= 0) { poly[dragIdx] = pos(e); draw(); }
 
-  // Cut-out mode: drag nearest cut-out vertex
-  if (mode === 'cutout' && cutoutPolygons.length > 0) {
-    const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
-    if (!lastRegion.closed) {
-      const cutDragIdx = lastRegion.points.findIndex(q => Math.hypot(q.x-p.x, q.y-p.y) < 10);
-      if (cutDragIdx >= 0) {
-        lastRegion.points[cutDragIdx] = pos(e);
-        draw();
-      }
+  // Drag cut-out vertex
+  if (cutoutDrag) {
+    const region = cutoutPolygons[cutoutDrag.polygonIndex];
+    if (region && region.points) {
+      region.points[cutoutDrag.pointIndex] = pos(e);
+      if (canvas) canvas.style.cursor = 'move';
+      draw();
     }
+    return;
+  }
+
+  // Drag user channel endpoint
+  if (userChannelDrag) {
+    const ch = userChannels[userChannelDrag.channelIndex];
+    if (ch && ch.points && ch.points.length === 2) {
+      ch.points[userChannelDrag.pointIndex] = pos(e);
+      if (canvas) canvas.style.cursor = 'move';
+      draw();
+    }
+    return;
   }
 }
 
