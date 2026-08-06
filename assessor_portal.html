@@ -2547,7 +2547,6 @@ function onDown(e) {
       const region = cutoutPolygons[ci];
       if (!region.points || region.points.length < 3) continue;
       const inPoly = region.points.some(q => Math.hypot(q.x - p.x, q.y - p.y) < 14);
-      // Also check if click is inside the polygon
       let inside = false;
       for (let i = 0, j = region.points.length - 1; i < region.points.length; j = i++) {
         const xi = region.points[i].x, yi = region.points[i].y;
@@ -2564,7 +2563,6 @@ function onDown(e) {
     for (let ci = userChannels.length - 1; ci >= 0; ci--) {
       const ch = userChannels[ci];
       if (!ch.points || ch.points.length !== 2) continue;
-      // Check proximity to the line segment
       const [a, b] = ch.points;
       const dx = b.x - a.x, dy = b.y - a.y;
       const lenSq = dx * dx + dy * dy;
@@ -2579,55 +2577,9 @@ function onDown(e) {
     return;
   }
 
-  if (mode === 'cal') {
-    if (cal.length >= 2) cal = [];
-    cal.push(p);
-    if (cal.length === 2) {
-      // Auto-apply if cal metres is set
-      const m = parseFloat(document.getElementById('calMetres').value);
-      if (m > 0) {
-        const dist = Math.hypot(cal[1].x-cal[0].x, cal[1].y-cal[0].y);
-        if (dist > 0) { mpp = m / dist; toast(`Scale set: 1 px = ${mpp.toFixed(4)} m`); }
-      }
-    }
-    draw(); return;
-  }
-
-  // Cut-out mode: draw polygon over unwanted area
-  if (mode === 'cutout') {
-    if (cutoutPolygons.length > 0 && cutoutPolygons[cutoutPolygons.length-1].points.length >= 3) {
-      // Check if clicking near the first point to close the polygon
-      const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
-      if (Math.hypot(lastRegion.points[0].x-p.x, lastRegion.points[0].y-p.y) < 14) {
-        toast(`Cut-out region ${cutoutPolygons.length} closed — click Submit Adjustment to apply`);
-        draw(); return;
-      }
-    }
-    // Start or continue cut-out polygon
-    if (cutoutPolygons.length === 0 || cutoutPolygons[cutoutPolygons.length-1].closed) {
-      cutoutPolygons.push({points: [p], closed: false});
-    } else {
-      cutoutPolygons[cutoutPolygons.length-1].points.push(p);
-    }
-    draw(); return;
-  }
-
-  // Channel mode: draw two-point line
-  if (mode === 'channel') {
-    if (userChannels.length > 0 && userChannels[userChannels.length-1].points.length === 2) {
-      // Channel already complete, start a new one
-      userChannels.push({points: [p]});
-    } else if (userChannels.length === 0) {
-      userChannels.push({points: [p]});
-    } else {
-      userChannels[userChannels.length-1].points.push(p);
-      toast(`Channel ${userChannels.length} placed — click Submit Adjustment to save`);
-    }
-    draw(); return;
-  }
-
-  // Check for cut-out vertex drag (any mode)
+  // ── Vertex drag checks (MUST come before mode-specific drawing) ──
   if (e.button === 0) {
+    // Cut-out vertex drag
     for (let ci = 0; ci < cutoutPolygons.length; ci++) {
       const region = cutoutPolygons[ci];
       if (!region.points) continue;
@@ -2639,7 +2591,7 @@ function onDown(e) {
         }
       }
     }
-    // Check for user channel endpoint drag (any mode)
+    // User channel endpoint drag
     for (let ci = 0; ci < userChannels.length; ci++) {
       const ch = userChannels[ci];
       if (!ch.points || ch.points.length !== 2) continue;
@@ -2651,11 +2603,7 @@ function onDown(e) {
         }
       }
     }
-  }
-
-  // Channel assumptions have their own geometry contract. Dragging an endpoint is kept on
-  // the proposal's original horizontal/vertical axis and never creates a measured trace.
-  if (e.button === 0) {
+    // AI channel proposal endpoint drag
     let nearest = null;
     channelProposals.forEach((proposal, proposalIndex) => {
       (proposal.points || []).forEach((point, pointIndex) => {
@@ -2675,17 +2623,66 @@ function onDown(e) {
       if (canvas) canvas.style.cursor = 'ew-resize';
       return;
     }
+    // Active trace polygon vertex drag
+    dragIdx = poly.findIndex(q => Math.hypot(q.x - p.x, q.y - p.y) < 10);
   }
 
-  // Trace: grab nearest vertex to drag, else add new
-  dragIdx = poly.findIndex(q => Math.hypot(q.x-p.x, q.y-p.y) < 10);
-  if (dragIdx < 0) {
-    // Snap to start if within 14px
-    if (poly.length >= 3 && Math.hypot(poly[0].x-p.x, poly[0].y-p.y) < 14) {
-      // Already closed — do nothing
-    } else {
-      poly.push(p);
+  // ── Mode-specific drawing (only if no vertex was grabbed) ──
+  if (dragIdx >= 0) {
+    // Vertex already grabbed above — onMove handles the drag
+    draw(); return;
+  }
+
+  if (mode === 'cal') {
+    if (cal.length >= 2) cal = [];
+    cal.push(p);
+    if (cal.length === 2) {
+      const m = parseFloat(document.getElementById('calMetres').value);
+      if (m > 0) {
+        const dist = Math.hypot(cal[1].x-cal[0].x, cal[1].y-cal[0].y);
+        if (dist > 0) { mpp = m / dist; toast(`Scale set: 1 px = ${mpp.toFixed(4)} m`); }
+      }
     }
+    draw(); return;
+  }
+
+  // Cut-out mode: draw polygon over unwanted area
+  if (mode === 'cutout') {
+    if (cutoutPolygons.length > 0 && !cutoutPolygons[cutoutPolygons.length-1].closed
+        && cutoutPolygons[cutoutPolygons.length-1].points.length >= 3) {
+      const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
+      if (Math.hypot(lastRegion.points[0].x-p.x, lastRegion.points[0].y-p.y) < 14) {
+        lastRegion.closed = true;
+        toast(`Cut-out region ${cutoutPolygons.length} closed — click Submit Adjustment to apply`);
+        draw(); return;
+      }
+    }
+    if (cutoutPolygons.length === 0 || cutoutPolygons[cutoutPolygons.length-1].closed) {
+      cutoutPolygons.push({points: [p], closed: false});
+    } else {
+      cutoutPolygons[cutoutPolygons.length-1].points.push(p);
+    }
+    draw(); return;
+  }
+
+  // Channel mode: draw two-point line
+  if (mode === 'channel') {
+    if (userChannels.length > 0 && userChannels[userChannels.length-1].points.length === 2) {
+      userChannels.push({points: [p]});
+    } else if (userChannels.length === 0) {
+      userChannels.push({points: [p]});
+    } else {
+      userChannels[userChannels.length-1].points.push(p);
+      toast(`Channel ${userChannels.length} placed — click Submit Adjustment to save`);
+    }
+    draw(); return;
+  }
+
+  // Trace mode: snap to start or add new vertex
+  if (poly.length >= 3 && Math.hypot(poly[0].x - p.x, poly[0].y - p.y) < 14) {
+    // Already closed — do nothing
+  } else {
+    poly.push(p);
   }
   draw();
 }
@@ -2697,6 +2694,27 @@ function onMove(e) {
     applyCanvasTransform();
     return;
   }
+  // Cut-out vertex drag
+  if (cutoutDrag) {
+    const region = cutoutPolygons[cutoutDrag.polygonIndex];
+    if (region && region.points) {
+      region.points[cutoutDrag.pointIndex] = pos(e);
+      if (canvas) canvas.style.cursor = 'move';
+      draw();
+    }
+    return;
+  }
+  // User channel endpoint drag
+  if (userChannelDrag) {
+    const ch = userChannels[userChannelDrag.channelIndex];
+    if (ch && ch.points && ch.points.length === 2) {
+      ch.points[userChannelDrag.pointIndex] = pos(e);
+      if (canvas) canvas.style.cursor = 'move';
+      draw();
+    }
+    return;
+  }
+  // AI channel proposal endpoint drag
   if (channelDrag) {
     const proposal = channelProposals[channelDrag.proposalIndex];
     if (!proposal || !proposal.points || proposal.points.length !== 2) return;
@@ -2710,29 +2728,8 @@ function onMove(e) {
     draw();
     return;
   }
+  // Active trace vertex drag
   if (dragIdx >= 0) { poly[dragIdx] = pos(e); draw(); }
-
-  // Drag cut-out vertex
-  if (cutoutDrag) {
-    const region = cutoutPolygons[cutoutDrag.polygonIndex];
-    if (region && region.points) {
-      region.points[cutoutDrag.pointIndex] = pos(e);
-      if (canvas) canvas.style.cursor = 'move';
-      draw();
-    }
-    return;
-  }
-
-  // Drag user channel endpoint
-  if (userChannelDrag) {
-    const ch = userChannels[userChannelDrag.channelIndex];
-    if (ch && ch.points && ch.points.length === 2) {
-      ch.points[userChannelDrag.pointIndex] = pos(e);
-      if (canvas) canvas.style.cursor = 'move';
-      draw();
-    }
-    return;
-  }
 }
 
 // ─────────────────────────────────────────────────
