@@ -36,10 +36,10 @@ CONCRETE_LABELS = ("concrete service yard", "service yard", "external yard",
 CHANNEL_PROPOSALS_ENABLED = os.getenv("CHANNEL_PROPOSALS_ENABLED", "1").strip().lower() \
     not in {"0", "false", "no", "off"}
 CHANNEL_PROPOSAL_BASIS = (
-    "ASSUMED per Inderjit's confirmed rule when channels are not drawn: two straight, "
-    "non-diagonal runs adjacent to retaining walls - one between the dock retaining walls/"
-    "loading face and one following the longest resolved retaining-wall/yard edge. Assessor "
-    "must accept, edit or remove each proposal."
+    "ASSUMED per Inderjit's confirmed rule when channels are not drawn: use straight, "
+    "non-diagonal retaining-wall-adjacent runs; a unit with a dock level has one dock-level "
+    "run plus one full-Yard-width run, while a unit with no dock level has only the full-"
+    "Yard-width run. Assessor must accept, edit or remove each proposal."
 )
 
 
@@ -565,6 +565,146 @@ def _has_explicit_channel_linework(pdf):
     return False
 
 
+CONSTRUCTION_JOINT_DETAIL = (
+    "square dowel plates at 600 centres; sleeve one side; mid-depth; 60 mm embedment; "
+    "150x150x8 mm plates"
+)
+
+
+def detect_raw_construction_joint(pdf, k, page=0):
+    """Measure native CJ linework only when an on-sheet legend proves its stroke colour.
+
+    The colour is read from the drawing itself; there is no architect-specific RGB table.
+    A labelled legend with competing colours or no matching body line refuses cleanly.
+    """
+    if not isinstance(k, (int, float)) or isinstance(k, bool) or k <= 0:
+        return {"zone": None, "evidence_seen": False,
+                "reason": "verified/display scale is unavailable"}
+    try:
+        from shapely.geometry import LineString
+        from shapely.ops import unary_union
+
+        with fitz.open(pdf) as doc:
+            pg = doc[page]
+            text_lines = []
+            for block in pg.get_text("dict").get("blocks", []):
+                for line in block.get("lines", []):
+                    text = "".join(span.get("text", "") for span in line.get("spans", []))
+                    if (re.search(r"\bconstruction\s+joint\b", text, re.I)
+                            and re.search(r"\bCJ\b", text, re.I)):
+                        text_lines.append((text, fitz.Rect(line["bbox"])))
+            if not text_lines:
+                return {"zone": None, "evidence_seen": False,
+                        "reason": "no CJ/construction-joint legend text"}
+
+            segments = []
+            for drawing in pg.get_drawings():
+                colour = drawing.get("color")
+                if colour is None or len(colour) < 3:
+                    continue
+                rgb = tuple(float(value) for value in colour[:3])
+                for item in drawing.get("items") or []:
+                    if item[0] != "l":
+                        continue
+                    start, end = item[1], item[2]
+                    length = math.dist(start, end)
+                    if length <= 0:
+                        continue
+                    segments.append({
+                        "start": start, "end": end, "length": length, "colour": rgb,
+                        "rect": fitz.Rect(min(start.x, end.x), min(start.y, end.y),
+                                          max(start.x, end.x), max(start.y, end.y)),
+                    })
+
+            legend_candidates = []
+            for _, label_rect in text_lines:
+                for segment in segments:
+                    r, g, b = segment["colour"]
+                    # The client legend explicitly defines a green line. This hue test is
+                    # generic; its exact RGB still comes from the on-sheet legend swatch.
+                    if not (g >= r + 0.12 and g >= b + 0.12):
+                        continue
+                    cy = (segment["start"].y + segment["end"].y) / 2
+                    if (label_rect.y0 - 18 <= cy <= label_rect.y1 + 18
+                            and label_rect.x0 - 140 <= segment["rect"].x1 <= label_rect.x0 + 10
+                            and 5 <= segment["length"] <= 140):
+                        legend_candidates.append((segment["colour"], label_rect, segment))
+            colours = []
+            for colour, _, _ in legend_candidates:
+                if not any(max(abs(colour[i] - other[i]) for i in range(3)) <= 0.03
+                           for other in colours):
+                    colours.append(colour)
+            if len(colours) != 1:
+                return {
+                    "zone": None, "evidence_seen": True,
+                    "reason": ("CJ legend colour is ambiguous" if colours
+                               else "CJ legend text found but no unique green line swatch resolved"),
+                }
+
+            target = colours[0]
+            legend_segment_ids = {
+                id(segment) for colour, _, segment in legend_candidates
+                if max(abs(colour[i] - target[i]) for i in range(3)) <= 0.03
+            }
+            legend_exclusions = [
+                fitz.Rect(rect.x0 - 150, rect.y0 - 25, rect.x1 + 20, rect.y1 + 25)
+                for _, rect in text_lines
+            ]
+            body_segments = []
+            body_records = []
+            displayed_segment_keys = set()
+            for segment in segments:
+                if max(abs(segment["colour"][i] - target[i]) for i in range(3)) > 0.03:
+                    continue
+                if id(segment) in legend_segment_ids:
+                    continue
+                if any(segment["rect"].intersects(exclusion)
+                       for exclusion in legend_exclusions):
+                    continue
+                line = LineString([(segment["start"].x, segment["start"].y),
+                                   (segment["end"].x, segment["end"].y)])
+                body_segments.append(line)
+                start = segment["start"] * pg.rotation_matrix
+                end = segment["end"] * pg.rotation_matrix
+                record = [[round(start.x, 2), round(start.y, 2)],
+                          [round(end.x, 2), round(end.y, 2)]]
+                record_key = tuple(sorted((tuple(record[0]), tuple(record[1]))))
+                if record_key not in displayed_segment_keys:
+                    displayed_segment_keys.add(record_key)
+                    body_records.append(record)
+            if not body_segments:
+                return {"zone": None, "evidence_seen": True,
+                        "reason": "CJ legend resolved but no matching body linework found"}
+            merged = unary_union(body_segments)
+            length_lm = round(float(merged.length) * float(k), 2)
+            if length_lm <= 0:
+                return {"zone": None, "evidence_seen": True,
+                        "reason": "matching CJ linework is degenerate"}
+            return {
+                "zone": {
+                    "zone_key": "construction_joint",
+                    "category": "construction_joint",
+                    "subjects": ["CJ internal construction joint"],
+                    "measurement_kind": "length",
+                    "area_m2": None,
+                    "length_lm": length_lm,
+                    "perimeter_lm": None,
+                    "annotation_count": 0,
+                    "classification_source": "on-sheet CJ legend stroke colour + native vectors",
+                    "basis": "green legend line = internal construction joint",
+                    "joint_detail": CONSTRUCTION_JOINT_DETAIL,
+                    "polyline_segments": body_records,
+                    "needs_assessor": False,
+                },
+                "evidence_seen": True,
+                "reason": None,
+                "legend_rgb": [round(value, 4) for value in target],
+            }
+    except Exception as exc:
+        return {"zone": None, "evidence_seen": False,
+                "reason": f"CJ vector detection failed ({type(exc).__name__}: {exc})"}
+
+
 def _rendered_axis_wall_segments(pdf):
     """Return native straight CAD lines in the portal's rendered PDF-point space.
 
@@ -758,7 +898,8 @@ def _longest_contained_yard_run(polygon_pts, k, wall_segments=None):
 
 
 def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
-                     explicit_channel_linework=False, wall_segments=None):
+                     explicit_channel_linework=False, wall_segments=None,
+                     dock_presence=None, access_road_interruption=False):
     """Return separate, non-measured channel assumptions plus visible refusal reasons."""
     if not CHANNEL_PROPOSALS_ENABLED:
         return [], ["CHANNEL PROPOSALS disabled by CHANNEL_PROPOSALS_ENABLED"]
@@ -767,52 +908,58 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
             "CHANNEL PROPOSAL not created: explicit Channel linework exists; the real marked "
             "measurement takes precedence over an assumption"
         ]
-    if not isinstance(dock_zone, dict):
+    dock_case = dock_presence or ("present" if isinstance(dock_zone, dict) else "absent")
+    if dock_case not in {"present", "absent", "ambiguous"}:
+        return [], [f"CHANNEL PROPOSAL refused: unknown dock-presence state {dock_case!r}"]
+    if dock_case == "ambiguous":
         return [], [
-            "CHANNEL PROPOSAL refused: no unique Dock loading face was resolved; neither of "
-            "Inderjit's two assumed runs is emitted"
+            "CHANNEL PROPOSAL refused: Dock presence is ambiguous, so the one-channel versus "
+            "two-channel client rule cannot be selected safely"
         ]
-
-    loading_face_lm = dock_zone.get("loading_face_lm")
-    loading_face_pts = dock_zone.get("loading_face_pts")
-    if (not isinstance(loading_face_lm, (int, float)) or loading_face_lm <= 0
-            or not isinstance(loading_face_pts, list) or len(loading_face_pts) != 2):
-        return [], [
-            "CHANNEL PROPOSAL refused: Dock exists but its loading-face line evidence is missing"
-        ]
-    try:
-        loading_dx = abs(float(loading_face_pts[1][0]) - float(loading_face_pts[0][0]))
-        loading_dy = abs(float(loading_face_pts[1][1]) - float(loading_face_pts[0][1]))
-    except (TypeError, ValueError, IndexError):
-        return [], [
-            "CHANNEL PROPOSAL refused: Dock loading-face geometry is malformed"
-        ]
-    if min(loading_dx, loading_dy) > 0.05 or max(loading_dx, loading_dy) <= 0.05:
-        return [], [
-            "CHANNEL PROPOSAL refused: Dock loading face is not a straight non-diagonal line"
-        ]
-    loading_orientation = "horizontal" if loading_dx > loading_dy else "vertical"
 
     scale_reason = ("drawing scale independently verified" if scale_verified
                     else "drawing scale unverified; assessor must confirm proposed Lm")
-    proposals = [{
-        "proposal_id": "channel-dock-loading-face",
-        "component": "dock_retaining_wall",
-        "proposed_length_lm": round(float(loading_face_lm), 2),
-        "polyline_pts": loading_face_pts,
-        "orientation": loading_orientation,
-        "coordinate_space": "pdf_points",
-        "basis": CHANNEL_PROPOSAL_BASIS,
-        "confidence": "medium" if scale_verified else "low",
-        "confidence_reasons": [
-            "unique loading face reconstructed from repeated dock-door/reveal vectors, "
-            "adjacent Yard hatch and continuous retaining-wall CAD line",
-            scale_reason,
-            "placement is geometric; channel existence is an explicit client assumption",
-        ],
-        "assumed": True,
-        "requires_assessor_confirmation": True,
-    }]
+    proposals = []
+    if dock_case == "present":
+        if not isinstance(dock_zone, dict):
+            return [], ["CHANNEL PROPOSAL refused: Dock is present but its zone is missing"]
+        loading_face_lm = dock_zone.get("loading_face_lm")
+        loading_face_pts = dock_zone.get("loading_face_pts")
+        if (not isinstance(loading_face_lm, (int, float)) or loading_face_lm <= 0
+                or not isinstance(loading_face_pts, list) or len(loading_face_pts) != 2):
+            return [], [
+                "CHANNEL PROPOSAL refused: Dock exists but its loading-face line evidence is missing"
+            ]
+        try:
+            loading_dx = abs(float(loading_face_pts[1][0]) - float(loading_face_pts[0][0]))
+            loading_dy = abs(float(loading_face_pts[1][1]) - float(loading_face_pts[0][1]))
+        except (TypeError, ValueError, IndexError):
+            return [], ["CHANNEL PROPOSAL refused: Dock loading-face geometry is malformed"]
+        if min(loading_dx, loading_dy) > 0.05 or max(loading_dx, loading_dy) <= 0.05:
+            return [], [
+                "CHANNEL PROPOSAL refused: Dock loading face is not a straight non-diagonal line"
+            ]
+        loading_orientation = "horizontal" if loading_dx > loading_dy else "vertical"
+        proposals.append({
+            "proposal_id": "channel-dock-loading-face",
+            "component": "dock_retaining_wall",
+            "channel_case": "with_dock_level_two_runs",
+            "proposed_length_lm": round(float(loading_face_lm), 2),
+            "polyline_pts": loading_face_pts,
+            "orientation": loading_orientation,
+            "coordinate_space": "pdf_points",
+            "basis": CHANNEL_PROPOSAL_BASIS,
+            "confidence": "medium" if scale_verified else "low",
+            "confidence_reasons": [
+                "client-rule case: Dock level present, so this is the first of two runs",
+                "unique loading face reconstructed from repeated dock-door/reveal vectors, "
+                "adjacent Yard hatch and continuous retaining-wall CAD line",
+                scale_reason,
+                "placement is geometric; channel existence is an explicit client assumption",
+            ],
+            "assumed": True,
+            "requires_assessor_confirmation": True,
+        })
 
     yard_run, refusal = _longest_contained_yard_run(
         yard_polygon_pts, k, wall_segments=wall_segments)
@@ -820,6 +967,8 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
         proposals.append({
             "proposal_id": "channel-yard-longest-contained-run",
             "component": "yard_longest_contained_run",
+            "channel_case": ("with_dock_level_two_runs" if dock_case == "present"
+                             else "no_dock_level_one_run"),
             "proposed_length_lm": yard_run["length_lm"],
             "polyline_pts": yard_run["polyline_pts"],
             "orientation": "horizontal" if yard_run["orientation"] == "H" else "vertical",
@@ -837,13 +986,19 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
                 f"component {yard_run['largest_component_pct']:.3f}%",
                 scale_reason,
                 "placement is geometric; channel existence is an explicit client assumption",
+                ("access-road interruption indicated; assessor must split/edit this assumed "
+                 "run around the road" if access_road_interruption else
+                 "assessor must check whether an access road interrupts the full-width run"),
             ],
+            "access_road_interruption": bool(access_road_interruption),
             "assumed": True,
             "requires_assessor_confirmation": True,
         })
+    case_label = ("Dock level present: two proposed runs" if dock_case == "present"
+                  else "No Dock level resolved: one full-Yard-width proposed run")
     flags = [
-        "CHANNEL PROPOSAL (ASSUMED, NOT MEASURED OR PRICED): assessor must accept, edit or "
-        "remove every proposed run before approval"
+        f"CHANNEL PROPOSAL (ASSUMED, NOT MEASURED OR PRICED): {case_label}; assessor must "
+        "accept, edit or remove every proposed run before approval"
     ]
     if refusal:
         flags.append(f"CHANNEL PROPOSAL Yard run refused: {refusal}; Dock run retained")
@@ -1212,6 +1367,23 @@ SCALE_BAR_AGREE_TOL = 0.03   # ±3 % — bar and title-block must agree within t
 # and must be rejected as a false anchor rather than trusted over the title block.
 PLAUSIBLE_SCALE_RATIO_MIN = 20
 PLAUSIBLE_SCALE_RATIO_MAX = 5000
+# This is a review-risk trigger, not a scale/area tolerance. Inderjit specifically identified
+# 1:1500 and 1:2000 sheets as unusually sensitive to small boundary-click errors.
+LARGE_SCALE_PRECISION_DENOMINATOR = 1500
+
+
+def boundary_precision_risk(scale_sources):
+    """Visible assessor flag for large-denominator sensitivity; never adjusts area."""
+    title = (scale_sources or {}).get("title_block") or {}
+    denom = title.get("denom")
+    if (isinstance(denom, (int, float)) and not isinstance(denom, bool)
+            and denom >= LARGE_SCALE_PRECISION_DENOMINATOR):
+        return (
+            f"BOUNDARY PRECISION RISK: title scale 1:{int(denom)} — a small corner/click "
+            "offset materially inflates area at this denominator; assessor must zoom in and "
+            "confirm every measured boundary vertex (no numeric adjustment applied)"
+        )
+    return None
 
 
 def _implausible_scale_ratio(k_m_per_pt):
@@ -1417,6 +1589,10 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # --- scale FIRST (segmentation needs k for scale-aware dock-bay/void handling) ---
     k, verified, note, scale_sources = scale_for(pdf)
     flags.append(note)
+    precision_risk = boundary_precision_risk(scale_sources)
+    if precision_risk:
+        flags.append(precision_risk)
+        region_confidence = "low"
     if k is None:
         return {"pdf": pdf, "area_m2": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
@@ -1704,8 +1880,9 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         )
         flags.append(
             "raw Channel MEASUREMENT not attempted — any channel_proposals are separate "
-            "assumptions requiring assessor review; Transition length NOT ATTEMPTED because "
-            "line identity is not reliable without marked subjects"
+            "assumptions requiring assessor review; Yard-entrance Transition length NOT "
+            "ATTEMPTED because the tarmac-to-concrete boundary is not reliably identifiable "
+            "without a marked subject — assessor must trace one run per unit entrance"
         )
     else:
         if dock_detection.get("evidence_seen"):
@@ -1727,6 +1904,47 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 f"assessor: classify/trace Dock zone — {dock_detection['reason']}; "
                 "Yard retained, no Dock area guessed"
             )
+
+    # Client exclusion checklist. Text can prove that a Gatehouse/Hub office is labelled,
+    # but colour segmentation cannot prove its footprint. Keep the measured candidate visible
+    # and force assessor confirmation rather than silently pretending the full tint is net.
+    from measurement_rules import exclusion_review_prompts, unresolved_exclusion_detected
+    try:
+        with fitz.open(pdf) as exclusion_doc:
+            exclusion_text = exclusion_doc[0].get_text() or ""
+    except Exception:
+        exclusion_text = ""
+    exclusion_prompts = exclusion_review_prompts(
+        [zone.get("category") for zone in zones], exclusion_text)
+    exclusion_review_required = unresolved_exclusion_detected(exclusion_prompts)
+    for prompt in exclusion_prompts:
+        if prompt["status"] == "outline_unresolved":
+            flags.append(
+                f"EXCLUSION REVIEW REQUIRED: {prompt['label']} is labelled on the drawing "
+                f"but its outline was not resolved — {prompt['rule']}; assessor confirm/edit "
+                "the measured extent"
+            )
+    if exclusion_review_required:
+        region_confidence = "low"
+
+    # Internal office-slab Construction Joint: quantity only. The detector requires the
+    # sheet's own CJ legend colour and matching native body vectors; anything weaker is a
+    # visible not-attempted flag, never a guessed length.
+    construction_joint_detection = detect_raw_construction_joint(pdf, k)
+    construction_joint_zone = construction_joint_detection.get("zone")
+    if construction_joint_zone:
+        zones.append(construction_joint_zone)
+        flags.append(
+            "raw CJ quantity measured from on-sheet construction-joint legend colour and "
+            f"native vector linework: {construction_joint_zone['length_lm']:.2f} Lm; rate "
+            "left blank for assessor; " + CONSTRUCTION_JOINT_DETAIL
+        )
+    elif construction_joint_detection.get("evidence_seen"):
+        flags.append(
+            "CONSTRUCTION JOINT NOT ATTEMPTED: "
+            + str(construction_joint_detection.get("reason") or "line identity unresolved")
+            + "; assessor must measure CJ Lm manually — no quantity or rate emitted"
+        )
 
     # --- refuse instead of guess (invariant 5) ------------------------------------------------
     # No concrete-yard legend label AND no verified scale means BOTH the region identity and the
@@ -1798,6 +2016,9 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         scale_verified=verified,
         explicit_channel_linework=_has_explicit_channel_linework(pdf),
         wall_segments=_rendered_axis_wall_segments(pdf),
+        dock_presence=("present" if dock_zone else
+                       "ambiguous" if dock_detection.get("evidence_seen") else "absent"),
+        access_road_interruption=bool(re.search(r"\baccess\s+road\b", exclusion_text, re.I)),
     )
     flags += channel_proposal_flags
 
@@ -1846,6 +2067,10 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "yard_regions": yard_regions,
             "yard_region_review_required": yard_region_review_required,
             "channel_proposals": channel_proposals,
+            "exclusion_prompts": exclusion_prompts,
+            "exclusion_review_required": exclusion_review_required,
+            "boundary_precision_risk": precision_risk,
+            "construction_joint_detection": construction_joint_detection,
             "manhole_count_estimate": manhole_count_estimate,
             "manhole_count_assumed": manhole_count_assumed,
             "legend_found": legend_found,

@@ -525,6 +525,12 @@ def _approve_block_reason(job: dict) -> str | None:
     Returns a reason string to block, or None to allow.
     """
     result = job.get("result") or {}
+    if job.get("exclusion_review_required") or result.get("exclusion_review_required"):
+        return ("drawing-labelled slab exclusion(s) have no resolved outline; assessor must "
+                "confirm the measured extent/exclusions before approval")
+    if job.get("unit_group_review_required") or result.get("unit_group_review_required"):
+        return ("Unit-4 subunit set is incomplete; assessor must confirm the combined 4A-4D "
+                "slab extent before approval")
     zone_reason = _zone_block_reason(job)
     if zone_reason:
         return zone_reason
@@ -749,6 +755,8 @@ def confirm_measurement(job_id):
             "extent_confirmed": True,
             "zone_allocation_stale": False,
             "flags": _without_zone_stale_flags(result.get("flags")),
+            "exclusion_review_required": False,
+            "unit_group_review_required": False,
         })
         job.update({
             "measurement_state": "MEASURED_VERIFIED",
@@ -758,8 +766,16 @@ def confirm_measurement(job_id):
             "measurement_confirmed_at": confirmed_at,
             "measurement_confirmation_note": str(data.get("note") or ""),
             "flags": _without_zone_stale_flags(job.get("flags")),
+            "exclusion_review_required": False,
+            "unit_group_review_required": False,
+            "exclusion_prompts": [
+                {**prompt, "status": "assessor_confirmed"}
+                for prompt in (job.get("exclusion_prompts")
+                               or result.get("exclusion_prompts") or [])
+            ],
             "result": result,
         })
+        result["exclusion_prompts"] = list(job["exclusion_prompts"])
         jobs[job_id] = job
         save_jobs(jobs)
 
@@ -804,6 +820,7 @@ def adjust(job_id):
     regions_in = data.get("regions")         # new multi-region [[[x,y], ...], ...]
     candidate_ids = data.get("candidate_ids") or []
     region_categories_in = data.get("region_categories")
+    region_scopes_in = data.get("region_scopes")
     scale_k    = data.get("scale_k")         # m/px
     area_m2    = data.get("assessed_area_m2")
     note       = data.get("note", "")
@@ -856,6 +873,20 @@ def adjust(job_id):
         region_categories = [category.strip().lower() for category in region_categories_in]
     else:
         region_categories = []
+    allowed_region_scopes = {"main", "ground_floor_core", "main_upper_floor",
+                             "plant_deck", "pod_first_floor"}
+    if region_scopes_in is not None:
+        if (not isinstance(region_scopes_in, list)
+                or len(region_scopes_in) != len(regions)
+                or any(not isinstance(scope, str)
+                       or scope.strip().lower() not in allowed_region_scopes
+                       for scope in region_scopes_in)):
+            return jsonify({
+                "error": "region_scopes must assign every region a valid BOQ scope"
+            }), 400
+        region_scopes = [scope.strip().lower() for scope in region_scopes_in]
+    else:
+        region_scopes = []
 
     # Validate cut-out regions (polygons to subtract from the measured area)
     cutout_regions = []
@@ -936,6 +967,7 @@ def adjust(job_id):
         # that flow by taking the detector's explicit category.  New clients send a category
         # for every region, including ``unclassified`` for a manual outline.
         effective_region_categories = list(region_categories)
+        effective_region_scopes = list(region_scopes)
         if (not effective_region_categories and regions
                 and len(candidate_ids) == len(regions)):
             effective_region_categories = [
@@ -945,8 +977,24 @@ def adjust(job_id):
             ]
             if any(category not in area_categories for category in effective_region_categories):
                 effective_region_categories = []
+        if (not effective_region_scopes and regions
+                and len(candidate_ids) == len(regions)):
+            effective_region_scopes = [
+                str(stored_candidate_records[candidate_id].get("boq_scope")
+                    or "main").strip().lower()
+                for candidate_id in candidate_ids
+            ]
+            if any(scope not in allowed_region_scopes for scope in effective_region_scopes):
+                effective_region_scopes = []
+        if not effective_region_scopes and regions:
+            effective_region_scopes = [
+                ("ground_floor_core" if category == "ground_floor"
+                 else "main_upper_floor" if category == "upper_floor" else "main")
+                for category in effective_region_categories
+            ]
         categorized_remeasure = bool(
             confirmed and regions and len(effective_region_categories) == len(regions)
+            and len(effective_region_scopes) == len(regions)
             and len(region_areas) == len(regions)
         )
         had_zone_allocation = bool(area_m2 and area_m2 > 0) and bool(
@@ -982,11 +1030,21 @@ def adjust(job_id):
         brief_specs = dict(job.get("brief_specs") or stored_result.get("brief_specs") or {})
         if categorized_remeasure:
             grouped = {}
-            for index, (category, region_area, region_perimeter) in enumerate(zip(
-                    effective_region_categories, region_areas, perimeters), 1):
-                zone = grouped.setdefault(category, {
-                    "zone_key": f"assessor-trace:{category}",
+            for index, (category, scope, region_area, region_perimeter) in enumerate(zip(
+                    effective_region_categories, effective_region_scopes,
+                    region_areas, perimeters), 1):
+                group_key = (category, scope)
+                scope_labels = {
+                    "plant_deck": "Plant deck",
+                    "pod_first_floor": "POD first floor",
+                    "main_upper_floor": "Main upper floor",
+                    "ground_floor_core": "Ground floor core",
+                }
+                zone = grouped.setdefault(group_key, {
+                    "zone_key": f"assessor-trace:{category}:{scope}",
                     "category": category,
+                    "boq_scope": scope,
+                    "scope_label": scope_labels.get(scope),
                     "subjects": [],
                     "measurement_kind": "area",
                     "area_m2": 0.0,
@@ -1052,6 +1110,7 @@ def adjust(job_id):
                 "regions":  regions,
                 "candidate_ids": candidate_ids,
                 "region_categories": effective_region_categories,
+                "region_scopes": effective_region_scopes,
                 "scale_k":  scale_k,
                 "area_m2":  area_m2,
                 "perimeter_lm": perimeter_lm,
@@ -1111,6 +1170,7 @@ def adjust(job_id):
         "assessed_regions": regions,
         "candidate_ids":    candidate_ids,
         "region_categories": effective_region_categories,
+        "region_scopes": effective_region_scopes,
         "scale_k":        scale_k,
         "flags":          res.get("flags", []),
         "timestamp":      now_iso(),
@@ -1141,7 +1201,7 @@ def classify_zones(job_id):
         for item in classifications if isinstance(item, dict)
     }
     allowed = {"external_yard", "dock", "ground_floor", "upper_floor",
-               "channel", "transition", "other"}
+               "channel", "transition", "construction_joint", "other"}
     if any(not key or category not in allowed for key, category in requested.items()):
         return jsonify({"error": "invalid zone_key/category"}), 400
 
@@ -1164,7 +1224,8 @@ def classify_zones(job_id):
             if is_area and category not in {"external_yard", "dock", "ground_floor",
                                             "upper_floor", "other"}:
                 return jsonify({"error": f"area zone {zone_key!r} cannot be {category}"}), 400
-            if is_length and category not in {"channel", "transition", "other"}:
+            if is_length and category not in {
+                    "channel", "transition", "construction_joint", "other"}:
                 return jsonify({"error": f"length zone {zone_key!r} cannot be {category}"}), 400
             if not is_area and not is_length and category != "other":
                 return jsonify({"error": f"unparsed zone {zone_key!r} can only be other"}), 400
@@ -2362,6 +2423,13 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "polygon_pts":      result.get("polygon_pts"),
                 "candidate_polygons": result.get("candidate_polygons", []),
                 "channel_proposals": result.get("channel_proposals", []),
+                "exclusions":        result.get("exclusions", []),
+                "exclusion_prompts": result.get("exclusion_prompts", []),
+                "exclusion_review_required": bool(
+                    result.get("exclusion_review_required", False)),
+                "unit_group_review_required": bool(
+                    result.get("unit_group_review_required", False)),
+                "boundary_precision_risk": result.get("boundary_precision_risk"),
                 "channel_proposal_decisions": {},
                 "yard_regions":      result.get("yard_regions", []),
                 "yard_region_decisions": {},

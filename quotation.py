@@ -110,6 +110,11 @@ def _expand_zone_results(results: list[dict]) -> list[dict]:
             virtual["quotation_section"] = ZONE_SECTION[category]
             virtual["unit_name"] = _unit_name(parent)
             virtual["zone_category"] = category
+            virtual["boq_scope"] = zone.get("boq_scope") or "main"
+            virtual["scope_label"] = zone.get("scope_label")
+            virtual["area_label"] = (zone.get("scope_label")
+                                     or zone.get("unit_label")
+                                     or ", ".join(zone.get("subjects") or []))
             virtual["brief_spec"] = per_zone_specs.get(category) or build_brief_spec(category)
 
             explicit_costing = per_zone_costing.get(category)
@@ -278,12 +283,16 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 for field in (brief_spec.get("fields") or {}).values()
                 if isinstance(field, dict)
             )
-            key = (section, _spec_key(costing, brief_spec), rate, group_provisional)
+            boq_scope = str(unit.get("boq_scope") or "main")
+            key = (section, _spec_key(costing, brief_spec), rate,
+                   group_provisional, boq_scope)
             group = groups.setdefault(key, {
                 "section": section, "spec": spec, "brief_spec": brief_spec,
                 "rate": rate, "assumed": group_provisional,
                 "area": 0.0, "drawings": [], "area_rows": [],
                 "breakdown": costing.get("breakdown") or {},
+                "boq_scope": boq_scope,
+                "scope_label": unit.get("scope_label"),
             })
             group["area"] += float(area)
             if drawing and drawing not in group["drawings"]:
@@ -314,6 +323,20 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             )
         declarations.extend(f for f in flags if (
             "ASSUMED" in f or "architect" in f.lower() or "tolerance" in f.lower()))
+        for exclusion in unit.get("exclusions") or []:
+            quantity = (f" ({float(exclusion['area_m2']):g} m²)"
+                        if isinstance(exclusion.get("area_m2"), (int, float)) else "")
+            declarations.append(
+                f"EXCLUDED FROM SLAB: {exclusion.get('label', 'recorded exclusion')}{quantity} "
+                f"— {exclusion.get('rule', 'outside slab scope')}."
+            )
+        for prompt in unit.get("exclusion_prompts") or []:
+            if prompt.get("status") != "assessor_confirmed":
+                declarations.append(
+                    f"{PROVISIONAL_LABEL}: EXCLUSION CHECK — "
+                    f"{prompt.get('label', 'slab exclusion')}: "
+                    f"{prompt.get('rule', 'assessor to confirm measured extent')}."
+                )
 
         perimeter = unit.get("perimeter_lm")
         if perimeter is None and unit.get("polygon_pts") and unit.get("scale_k"):
@@ -374,16 +397,25 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
     # provenance so the workbook can expose editable source rows just like its area take-off.
     for unit in source_results:
         drawing = unit.get("file") or Path(str(unit.get("pdf_path") or "")).name
-        unit_label = _unit_name(unit)
         for zone in unit.get("zones") or []:
+            unit_label = zone.get("unit_label") or _unit_name(unit)
             category = zone.get("category")
             quantities = []
-            if category in ("channel", "transition") and zone.get("length_lm") is not None:
+            if category in ("channel", "transition", "construction_joint") and zone.get("length_lm") is not None:
                 quantities.append((
-                    "External yard slabs",
-                    "Channel length" if category == "channel" else "Transition length",
+                    (ZONE_SECTION.get(zone.get("slab_category"), quotation_section(unit))
+                     if category == "construction_joint" else "External yard slabs"),
+                    ("Channel length" if category == "channel" else
+                     "Transition length" if category == "transition" else
+                     "Internal construction joint (CJ)"),
                     float(zone["length_lm"]),
                 ))
+                if category == "construction_joint":
+                    declarations.append(
+                        "CONSTRUCTION JOINT (CJ) — quantity only; rate left blank for assessor. "
+                        + str(zone.get("joint_detail") or
+                              "Detail requirements must be confirmed from the engineer drawing.")
+                    )
             if category in ZONE_SECTION and zone.get("perimeter_lm") is not None:
                 quantities.append((ZONE_SECTION[category], "Slab perimeter",
                                    float(zone["perimeter_lm"])))
@@ -534,7 +566,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         if mix: known_parts.append(str(mix))
         known_parts.append("slab")
         if layers is not None and mesh: known_parts.append(f"{layers}× {mesh} mesh")
-        slab_desc = " ".join(known_parts) + " (supply & lay)"
+        scope_prefix = {
+            "plant_deck": "Plant deck — ",
+            "pod_first_floor": "POD first floor — ",
+        }.get(group.get("boq_scope"), "")
+        slab_desc = scope_prefix + " ".join(known_parts) + " (supply & lay)"
         line_items.append({
             **common, "description": slab_desc, "rate": group["rate"],
             "value": (round(area * group["rate"], 2)

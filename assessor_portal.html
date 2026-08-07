@@ -332,6 +332,13 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <button id="btnNewRegion" title="Finish this outline and start another slab/core region">＋ Region</button>
       <button id="btnCutout" class="cutout" title="Draw a polygon over unwanted area to subtract it">✂️ Cut-out</button>
       <button id="btnChannel" class="channel" title="Draw a channel line (red dotted)">📏 Channel</button>
+      <select id="traceScope" title="BOQ scope for the active trace" style="max-width:150px">
+        <option value="main">Main slab</option>
+        <option value="ground_floor_core">Ground-floor core</option>
+        <option value="main_upper_floor">Main upper floor</option>
+        <option value="plant_deck">Plant deck</option>
+        <option value="pod_first_floor">POD first floor</option>
+      </select>
       <div class="divider"></div>
       <button id="btnLoad" title="Load AI's proposed polygon">🤖 Load AI polygon</button>
       <button id="btnClearAi" title="Clear AI polygon overlay">❌ Clear AI</button>
@@ -1151,13 +1158,16 @@ function initialiseTraceState(job, res) {
   const storedIds = Array.isArray(adjusted.candidate_ids) ? adjusted.candidate_ids : [];
   const storedCategories = Array.isArray(adjusted.region_categories)
     ? adjusted.region_categories : [];
+  const storedScopes = Array.isArray(adjusted.region_scopes)
+    ? adjusted.region_scopes : [];
   // candidate_ids is an audit list and can be shorter when manual and suggested
   // regions were mixed. Only align IDs to regions when the cardinality matches.
   const alignedStoredIds = storedIds.length === storedRegions.length ? storedIds : [];
   traceRegions = storedRegions.map((region, index) => ({
     points: region.map(point => ({x:Number(point[0]), y:Number(point[1])})),
     candidateId: alignedStoredIds[index] || null,
-    category: storedCategories[index] || candidateCategory(alignedStoredIds[index])
+    category: storedCategories[index] || candidateCategory(alignedStoredIds[index]),
+    boqScope: storedScopes[index] || candidateScope(alignedStoredIds[index])
   }));
   poly = [];
   activeCandidateId = null;
@@ -1268,6 +1278,7 @@ function renderZoneSummary(job) {
   const labels = {
     external_yard:'External yard', dock:'Dock', ground_floor:'Ground floor',
     upper_floor:'Upper floor', channel:'Channel', transition:'Transition',
+    construction_joint:'Construction joint (CJ)',
     other:'Other', unclassified:'Unclassified'
   };
   const rows = zones.map((zone, zoneIndex) => {
@@ -1288,7 +1299,8 @@ function renderZoneSummary(job) {
       const allowed = zone.area_m2 != null
         ? [['external_yard','External yard'],['dock','Dock'],['ground_floor','Ground floor'],['upper_floor','Upper floor'],['other','Other / out of scope']]
         : zone.length_lm != null
-          ? [['channel','Channel'],['transition','Transition'],['other','Other / out of scope']]
+          ? [['channel','Channel'],['transition','Transition'],
+             ['construction_joint','Construction joint (CJ)'],['other','Other / out of scope']]
           : [['other','Other / out of scope']];
       classifyControl = `<div style="display:flex;gap:3px;justify-content:flex-end">
         <select id="zoneClass-${zoneIndex}" style="max-width:112px;font-size:9px;padding:2px">
@@ -1476,7 +1488,9 @@ function renderChannelProposalSummary(job) {
     const status = decision.decision || 'pending review';
     const why = (proposal.confidence_reasons || []).join(' · ');
     const label = proposal.component === 'dock_retaining_wall'
-      ? 'Dock retaining-wall/loading face' : 'Yard retaining-wall-adjacent run';
+      ? 'Dock-level retaining-wall/loading face'
+      : (proposal.channel_case === 'no_dock_level_one_run'
+        ? 'Full Yard width (no Dock level)' : 'Full Yard width (second run)');
     const basis = proposal.basis || why || 'No proposal basis supplied — assessor review required';
     return `<div class="channel-proposal-row assumption-item">
       <div>${assumptionBadge('PROPOSED', basis)} <strong>${esc(label)}</strong> · ${esc(proposal.confidence || 'low')} confidence
@@ -1576,6 +1590,31 @@ async function reviewChannelProposal(proposalId, action) {
   }
 }
 
+function effectiveExclusions(job) {
+  const res = (job && job.result) || {};
+  return {
+    recorded: (job && Array.isArray(job.exclusions) ? job.exclusions : res.exclusions) || [],
+    prompts: (job && Array.isArray(job.exclusion_prompts) ? job.exclusion_prompts : res.exclusion_prompts) || []
+  };
+}
+
+function renderExclusionSummary(job) {
+  const data = effectiveExclusions(job);
+  if (!data.recorded.length && !data.prompts.length) return '';
+  const recorded = data.recorded.map(item => `<div class="candidate-row">
+    <strong>EXCLUDED · ${esc(item.label)}</strong>${item.area_m2==null?'':` · ${Number(item.area_m2).toLocaleString()} m²`}
+    <span class="candidate-why">${esc(item.rule || '')} · explicit markup evidence</span>
+  </div>`).join('');
+  const prompts = data.prompts.map(item => {
+    const confirmed = item.status === 'assessor_confirmed';
+    const badge = confirmed ? '<strong>ASSESSOR CONFIRMED</strong>' : assumptionBadge('CHECK EXCLUSION', item.basis);
+    return `<div class="candidate-row ${confirmed?'':'assumption-item'}">${badge} · <strong>${esc(item.label)}</strong>
+      <span class="candidate-why">${esc(item.rule || '')} · ${esc(item.basis || '')}</span></div>`;
+  }).join('');
+  return `<div class="candidate-panel"><div style="font-size:11px;font-weight:800;color:#6a4900;margin-bottom:3px">SLAB EXCLUSIONS</div>
+    <div class="candidate-note">Recorded exclusions stay outside slab quantities. Checklist rows with no reliable outline require the assessor to verify the traced/measured extent.</div>${recorded}${prompts}</div>`;
+}
+
 function renderJobDetails(job) {
   const res = job.result || {};
   const perimeter = effectiveStoredPerimeter(job);
@@ -1612,6 +1651,7 @@ function renderJobDetails(job) {
   const segmentationComponentSummary = renderSegmentationComponentSummary(job);
   const candidateSummary = renderCandidateSummary(job);
   const channelProposalSummary = renderChannelProposalSummary(job);
+  const exclusionSummary = renderExclusionSummary(job);
   document.getElementById('jobDetails').innerHTML = `
     ${projRow}
     ${assumptionLegend}
@@ -1625,6 +1665,7 @@ function renderJobDetails(job) {
     ${manholeRows}
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
     ${channelProposalSummary}
+    ${exclusionSummary}
     ${candidateSummary}
     ${segmentationComponentSummary}
     ${zoneSummary}
@@ -2342,7 +2383,8 @@ function shoelace(pts) {
 function traceRegionEntries() {
   const entries = traceRegions.filter(region => region.points && region.points.length >= 3);
   if (poly.length >= 3) entries.push({
-    points:poly, candidateId:activeCandidateId, category:candidateCategory(activeCandidateId)
+    points:poly, candidateId:activeCandidateId, category:candidateCategory(activeCandidateId),
+    boqScope:document.getElementById('traceScope').value || candidateScope(activeCandidateId)
   });
   return entries;
 }
@@ -2354,13 +2396,19 @@ function candidateCategory(candidateId) {
     ? category : 'unclassified';
 }
 
+function candidateScope(candidateId) {
+  const candidate = candidatePolygons.find(item => item.candidate_id === candidateId);
+  return (candidate && candidate.boq_scope) || 'main';
+}
+
 function stashActiveRegion() {
   if (poly.length >= 3) {
     traceRegions.push({
       points: poly.map(point => ({x:point.x, y:point.y})),
       candidateId: activeCandidateId,
       candidateGroupId: activeCandidateId,
-      category: candidateCategory(activeCandidateId)
+      category: candidateCategory(activeCandidateId),
+      boqScope: document.getElementById('traceScope').value || candidateScope(activeCandidateId)
     });
   }
   poly = [];
@@ -2387,11 +2435,13 @@ function loadTraceCandidate(candidateId) {
     region.candidateGroupId !== candidateId && region.candidateId !== candidateId);
   const regions = candidate.regions || [candidate.points];
   poly = regions[0].map(point => ({x:point.x, y:point.y}));
+  document.getElementById('traceScope').value = candidateScope(candidateId);
   regions.slice(1).forEach(region => traceRegions.push({
     points: region.map(point => ({x:point.x, y:point.y})),
     candidateId: null,
     candidateGroupId: candidateId,
-    category: candidateCategory(candidateId)
+    category: candidateCategory(candidateId),
+    boqScope: candidateScope(candidateId)
   }));
   activeCandidateId = candidateId;
   mode = 'trace';
@@ -2929,6 +2979,7 @@ async function submitDecision(action) {
     // User-drawn channel lines (red dotted)
     user_channels: userChannels.filter(ch => ch.points && ch.points.length === 2)
       .map(ch => ch.points.map(point => [Math.round(point.x), Math.round(point.y)])),
+    region_scopes: regionEntries.map(entry => entry.boqScope || 'main'),
     note: ''
   };
   try {
