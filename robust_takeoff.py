@@ -18,6 +18,7 @@ from collections import OrderedDict
 from pathlib import Path
 from shapely.geometry import Polygon
 from markup import parse_area_m2
+from measurement_rules import classify_exclusion, exclusion_review_prompts
 
 
 _LENGTH_RX = re.compile(
@@ -70,6 +71,12 @@ _SUBJECT_CATEGORIES = {
     "channels": "channel",
     "transition": "transition",
     "transitions": "transition",
+    "cj": "construction_joint",
+    "cj internal": "construction_joint",
+    "construction joint": "construction_joint",
+    "construction joints": "construction_joint",
+    "internal construction joint": "construction_joint",
+    "office slab construction joint": "construction_joint",
 }
 _UPPER_FLOOR_SUBJECT_RX = re.compile(
     r"^(?:\d+(?:st|nd|rd|th)|second|third|fourth|fifth)\s+floors?(?:\s+slabs?)?$",
@@ -79,6 +86,34 @@ _UNIT_SUBJECT_RX = re.compile(
     r"^units?\s*[-:#]?\s*[a-z0-9]+(?:\s*(?:&|and|,|/|\+|-)\s*[a-z0-9]+)*$",
     re.I,
 )
+_UNIT_LINEAR_SUBJECT_RX = re.compile(
+    r"^(?P<unit>units?\s*[-:#]?\s*[a-z0-9]+(?:\s*(?:&|and|,|/|\+|-)\s*[a-z0-9]+)*)"
+    r"\s*[-:]?\s*(?P<kind>channels?|transitions?)$",
+    re.I,
+)
+_UNIT_TOKEN_RX = re.compile(r"\bunits?\s*[-:#]?\s*([0-9]+[a-z]?)\b", re.I)
+_UNIT4_SUBUNIT_RX = re.compile(r"^units?\s*[-:#]?\s*4\s*([a-d])$", re.I)
+
+
+def _upper_scope(subject):
+    """Return a distinct Upper-floor BOQ scope only from explicit subject wording."""
+    probe = _normalise_subject(subject)
+    unit_match = _UNIT_TOKEN_RX.search(probe)
+    unit_label = f"Unit {unit_match.group(1).upper()}" if unit_match else None
+    if re.search(r"\bplant\s+deck\b", probe, re.I):
+        return {"boq_scope": "plant_deck",
+                "scope_label": f"{unit_label + ' ' if unit_label else ''}Plant deck",
+                "unit_label": unit_label}
+    if (re.search(r"\bpod\b", probe, re.I)
+            and re.search(r"\b(?:first|upper)\s+floor\b", probe, re.I)):
+        return {"boq_scope": "pod_first_floor",
+                "scope_label": f"{unit_label + ' ' if unit_label else ''}POD first floor",
+                "unit_label": unit_label}
+    if unit_label and re.search(r"\b(?:first|upper)\s+floor\b", probe, re.I):
+        return {"boq_scope": "main_upper_floor",
+                "scope_label": f"{unit_label} main first floor",
+                "unit_label": unit_label}
+    return None
 
 # Context is only allowed to classify a *unit-like* subject. A drawing-context word never
 # overrides a meaningful, unknown subject, and a legend phrase on its own is intentionally
@@ -119,11 +154,41 @@ def _normalise_subject(value):
 
 def _subject_category(subject):
     probe = _normalise_subject(subject)
+    if re.search(r"\broller\s+shutter\b", probe):
+        return "other"
+    if re.search(r"\binternal\s+warehouse\s+slab\b|\bwarehouse\s+floor\s+slab\b", probe):
+        return "other"
+    if _upper_scope(subject):
+        return "upper_floor"
     if probe in _SUBJECT_CATEGORIES:
         return _SUBJECT_CATEGORIES[probe]
     if _UPPER_FLOOR_SUBJECT_RX.fullmatch(probe):
         return "upper_floor"
+    linear = _UNIT_LINEAR_SUBJECT_RX.fullmatch(probe)
+    if linear:
+        return "channel" if linear.group("kind").startswith("channel") else "transition"
     return "unclassified"
+
+
+def _out_of_scope_exclusion(subject):
+    """Return only explicit client-owned scope exclusions; never infer from geometry."""
+    probe = _normalise_subject(subject)
+    if re.search(r"\binternal\s+warehouse\s+slab\b|\bwarehouse\s+floor\s+slab\b", probe):
+        return {
+            "exclusion_id": "internal_warehouse_scope",
+            "label": "Internal warehouse slab",
+            "rule": (
+                "outside Fortel external-works/office scope; retained as evidence for "
+                "Neil's separate warehouse quotation"
+            ),
+            "provenance": "explicit markup subject",
+        }
+    return None
+
+
+def _linear_unit_label(subject):
+    match = _UNIT_LINEAR_SUBJECT_RX.fullmatch(_normalise_subject(subject))
+    return " ".join(match.group("unit").split()) if match else None
 
 
 def _context_hits(text, patterns):
@@ -339,8 +404,25 @@ def read_marked_zones(pdf):
     grouped = OrderedDict()
     flags = []
     aggregate_areas = []
+    exclusions = []
+    annotations = list(page.annots() or [])
+    unit4_subunits = {
+        match.group(1).casefold()
+        for annot in annotations
+        for match in [_UNIT4_SUBUNIT_RX.fullmatch(_normalise_subject(
+            (annot.info or {}).get("subject") or ""))]
+        if match
+    }
+    combine_unit4 = unit4_subunits == {"a", "b", "c", "d"}
+    if unit4_subunits and not combine_unit4:
+        flags.append(
+            "UNIT-4 SUBUNIT REVIEW REQUIRED: found "
+            + ", ".join(f"4{letter.upper()}" for letter in sorted(unit4_subunits))
+            + " but not the complete 4A-4D set; areas preserved separately, never silently "
+              "treated as the combined Unit-4 slab"
+        )
 
-    for index, annot in enumerate(page.annots() or []):
+    for index, annot in enumerate(annotations):
         info = annot.info or {}
         annot_type = annot.type[1]
         subject = str(info.get("subject") or "").strip()
@@ -348,11 +430,15 @@ def read_marked_zones(pdf):
         content = str(info.get("content") or "")
         author = str(info.get("title") or "")
         ignored = subject_key == "legend"
+        exclusion = None if ignored else (
+            classify_exclusion(subject, content) or _out_of_scope_exclusion(subject)
+        )
+        upper_scope = _upper_scope(subject) if not ignored else None
 
         # Preserve read_marked's exact contract: only a Polygon with an explicit area label
         # contributes to aggregate area / region count.
         area_m2 = parse_area_m2(content) if annot_type == "Polygon" else None
-        if area_m2 is not None:
+        if area_m2 is not None and exclusion is None:
             aggregate_areas.append(area_m2)
 
         length_lm = (_parse_length_lm(content)
@@ -376,6 +462,15 @@ def read_marked_zones(pdf):
             zone_key = None
         elif category == "unclassified":
             zone_key = f"unclassified:{subject_key or annot_type.casefold()}"
+        elif (combine_unit4 and category == "ground_floor"
+              and _UNIT4_SUBUNIT_RX.fullmatch(subject_key)):
+            zone_key = "ground_floor:unit:unit-4-combined"
+        elif upper_scope:
+            zone_key = f"upper_floor:scope:{upper_scope['boq_scope']}:{subject_key}"
+        elif _linear_unit_label(subject):
+            # Inderjit measures one entrance Transition per unit, and Channel runs per unit.
+            # Preserve that allocation even though the quotation later totals like quantities.
+            zone_key = f"{category}:unit:{_normalise_subject(_linear_unit_label(subject))}"
         elif classification_source != "subject" and _UNIT_SUBJECT_RX.fullmatch(subject_key):
             # A Unit label carries allocation information beyond its inferred slab category.
             # Keep each unit-labelled region visible rather than collapsing Unit-1 and Unit-2
@@ -405,10 +500,34 @@ def read_marked_zones(pdf):
             "perimeter_lm": round(perimeter_lm, 6) if perimeter_lm is not None else None,
             "cutout_count": cutout_count,
             "ignored": ignored,
+            "excluded_from_slab": exclusion is not None,
+            "exclusion_id": exclusion.get("exclusion_id") if exclusion else None,
+            "boq_scope": upper_scope.get("boq_scope") if upper_scope else None,
         }
         records.append(record)
 
-        if ignored or not measurable_shape:
+        if exclusion is not None:
+            exclusion_record = {
+                **exclusion,
+                "page": 0,
+                "annotation_index": index,
+                "annotation_type": annot_type,
+                "area_m2": round(area_m2, 6) if area_m2 is not None else None,
+                "bbox_pdf_pts": [round(value, 2) for value in
+                                   (annot.rect.x0, annot.rect.y0,
+                                    annot.rect.x1, annot.rect.y1)],
+                "status": "explicit_markup_exclusion",
+                "assumed": False,
+            }
+            exclusions.append(exclusion_record)
+            quantity = (f" ({area_m2:g} m² exclusion markup)"
+                        if area_m2 is not None else "")
+            flags.append(
+                f"EXCLUSION RECORDED: {exclusion['label']}{quantity} — "
+                f"{exclusion['rule']}; not included in measured slab zones/aggregate"
+            )
+
+        if ignored or exclusion is not None or not measurable_shape:
             continue
 
         if category == "unclassified":
@@ -434,7 +553,39 @@ def read_marked_zones(pdf):
             "classification_source": classification_source,
             "needs_assessor": category == "unclassified",
         })
-        if classification_source != "subject":
+        linear_unit_label = _linear_unit_label(subject)
+        if linear_unit_label:
+            zone["unit_label"] = linear_unit_label
+            if category == "transition":
+                zone["basis"] = (
+                    "tarmac-to-concrete junction at the Yard entrance; one measured run "
+                    "per unit entrance"
+                )
+        if upper_scope:
+            zone.update(upper_scope)
+            zone["boundary_rule"] = "measure to the edge of the metal decking"
+        if category == "construction_joint":
+            if drawing_context.get("category") in {"ground_floor", "upper_floor"}:
+                zone["slab_category"] = drawing_context["category"]
+            zone["basis"] = (
+                "legend/subject CJ: internal office-slab construction joint; quantity only, "
+                "assessor supplies the rate"
+            )
+            zone["joint_detail"] = (
+                "square dowel plates at 600 centres; sleeve one side; mid-depth; 60 mm "
+                "embedment; 150x150x8 mm plates"
+            )
+        if (combine_unit4 and category == "ground_floor"
+                and _UNIT4_SUBUNIT_RX.fullmatch(subject_key)):
+            zone["unit_label"] = "Unit 4 (4A-4D combined)"
+            zone["boq_scope"] = "ground_floor_core"
+            zone["scope_label"] = "Unit 4 combined ground-floor core"
+            zone["classification_source"] = (
+                "complete Unit 4A-4D subject set; client rule combines as one slab"
+            )
+        if (classification_source != "subject"
+                and not (combine_unit4 and category == "ground_floor"
+                         and _UNIT4_SUBUNIT_RX.fullmatch(subject_key))):
             zone["unit_label"] = subject
         if classification_source != zone["classification_source"]:
             sources = [part.strip() for part in
@@ -465,12 +616,25 @@ def read_marked_zones(pdf):
             zone["area_m2"], zone["length_lm"], zone["perimeter_lm"])
         zones.append(zone)
 
+    categories = [zone.get("category") for zone in zones]
+    prompts = exclusion_review_prompts(categories, page.get_text() or "")
+    for zone in zones:
+        if zone.get("cutout_count"):
+            flags.append(
+                f"EXCLUSION REVIEW: {zone['cutout_count']} polygon cutout(s) are already net "
+                f"in the stored Bluebeam {zone.get('category')} area; assessor must verify "
+                "their identity against the gatehouse/lift/riser/stair-foundation checklist"
+            )
+
     result = {
         "area_m2": round(sum(aggregate_areas), 1),
         "regions": len(aggregate_areas),
         "markup_annotations": records,
         "zones": zones,
         "flags": flags,
+        "exclusions": exclusions,
+        "exclusion_prompts": prompts,
+        "unit_group_review_required": bool(unit4_subunits and not combine_unit4),
     }
     doc.close()
     return result

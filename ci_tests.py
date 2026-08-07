@@ -365,8 +365,11 @@ except ImportError as _e:
 
 print("scale_for verification logic (scale bar vs title block)")
 try:
-    from takeoff_unmarked import scale_for as _scale_for, SCALE_BAR_AGREE_TOL as _TOL
+    from takeoff_unmarked import (scale_for as _scale_for, SCALE_BAR_AGREE_TOL as _TOL,
+                                  boundary_precision_risk as _boundary_precision_risk)
     import scale as _SC
+    from sanity import (measurement_state as _precision_measurement_state,
+                        MEASURED_UNVERIFIED as _PRECISION_UNVERIFIED)
     # PT_PER_M = 0.0254/72; k for 1:500 = 500 * PT_PER_M ≈ 0.176389 m/pt
     _PT_PER_M = 0.0254 / 72
     _k500 = 500 * _PT_PER_M   # ≈ 0.176389 m/pt
@@ -445,6 +448,18 @@ try:
     ck("mixed/disagree -> returns title k (no auto-pick of bar)",
        _k5 is not None and abs(_k5 - _k1500) < 1e-5)
     ck("mixed/disagree -> sources still recorded",  "scale_bar" in _src5 and "title_block" in _src5)
+
+    _risk_1500 = _boundary_precision_risk({"title_block":{"denom":1500}})
+    _risk_2000 = _boundary_precision_risk({"title_block":{"denom":2000}})
+    ck("1:1500 and 1:2000 sheets carry a visible boundary-click precision risk",
+       "1:1500" in _risk_1500 and "no numeric adjustment" in _risk_1500 and
+       "1:2000" in _risk_2000)
+    ck("ordinary 1:1000 sheet does not gain the large-denominator precision flag",
+       _boundary_precision_risk({"title_block":{"denom":1000}}) is None)
+    ck("large-denominator risk caps an otherwise verified number at assessor-gated state",
+       _precision_measurement_state(
+           1000, scale_verified=True,
+           confidence="low" if _risk_1500 else None)[0] == _PRECISION_UNVERIFIED)
 
 except ImportError as _e:
     print(f"  [SKIP] scale_for tests — missing dependency: {_e}")
@@ -573,6 +588,28 @@ _q_diff_spec = generate_quotation([
 ], ref="TST-DIFF-SPEC")
 ck("different unit specs remain separate on one quotation",
    len([li for li in _q_diff_spec["line_items"] if "supply & lay" in li["description"]]) == 2)
+_unit1_ground = _quotation_unit(
+    "Unit-1 Ground Floor Core.pdf", "Ground floor slabs", 100)
+_unit5_ground = _quotation_unit(
+    "Unit-5 Ground Floor Core.pdf", "Ground floor slabs", 80)
+for _unit, _depth in ((_unit1_ground, 193), (_unit5_ground, 150)):
+    _unit["costing"]["spec"].update({"depth_mm":_depth, "mesh":"A252", "layers":1})
+    _unit["brief_spec"] = _build_brief_spec(
+        "ground_floor", effective_spec=_unit["costing"]["spec"],
+        confirmed={"depth_mm":_depth, "mesh":"A252", "layers":1},
+        source="engineer_drawing")
+_q_ground_spec_split = generate_quotation(
+    [_unit1_ground, _unit5_ground], ref="TST-GROUND-SPEC-SPLIT")
+_ground_spec_rows = [
+    item for item in _q_ground_spec_split["line_items"]
+    if item["section"] == "Ground floor slabs" and "supply & lay" in item["description"]
+]
+ck("193mm A252 and 150mm A252 ground slabs in one case are never merged",
+   len(_ground_spec_rows) == 2 and
+   {item["qty"] for item in _ground_spec_rows} == {100.0, 80.0} and
+   {spec["fields"]["depth_mm"]["value"]
+    for spec in _q_ground_spec_split["specifications"]} == {193, 150},
+   {"items":_ground_spec_rows, "specs":_q_ground_spec_split["specifications"]})
 _confirmed_unit_a = _quotation_unit("Confirmed-A.pdf", "External yard slabs", 60)
 _confirmed_unit_b = _quotation_unit("Confirmed-B.pdf", "External yard slabs", 40)
 _confirmed_unit_a["brief_spec"] = _confirmed_brief
@@ -810,6 +847,215 @@ ck("zone reader retains per-annotation subject/author/colour evidence",
    len(_zone_read["markup_annotations"]) == 4 and
    all("subject" in record and "author" in record and "stroke_color" in record
        for record in _zone_read["markup_annotations"]))
+
+_exclusion_pdf = "/tmp/ci_marked_slab_exclusions.pdf"
+_exclusion_doc = _fitz_zones.open()
+_exclusion_page = _exclusion_doc.new_page(width=600, height=600)
+for _subject, _value, _x in (
+        ("Ground floor core", 500.0, 20),
+        ("Lift shaft", 12.0, 260),
+        ("Data riser", 4.0, 380),
+        ("Precast staircase foundation", 8.0, 480)):
+    _annot = _exclusion_page.add_polygon_annot([
+        (_x, 20), (_x + 80, 20), (_x + 80, 120), (_x, 120),
+    ])
+    _annot.set_info(title="Fortel QA", subject=_subject,
+                    content=f"Area\n{_value:.2f} sq m")
+    _annot.update()
+_exclusion_doc.save(_exclusion_pdf)
+_exclusion_doc.close()
+_exclusion_read = _read_marked_zones(_exclusion_pdf)
+ck("explicit lift/riser/stair-foundation markups are excluded, recorded and never summed",
+   _exclusion_read["area_m2"] == 500.0 and
+   _exclusion_read["regions"] == 1 and
+   len(_exclusion_read["zones"]) == 1 and
+   {item["exclusion_id"] for item in _exclusion_read["exclusions"]} == {
+       "lift_void", "service_data_riser", "precast_stair_foundation"} and
+   all(record["excluded_from_slab"]
+       for record in _exclusion_read["markup_annotations"][1:]),
+   _exclusion_read)
+from measurement_rules import (
+    classify_exclusion as _classify_client_exclusion,
+    exclusion_review_prompts as _exclusion_review_prompts,
+)
+_yard_exclusion_prompts = _exclusion_review_prompts(
+    ["external_yard"], "Proposed Gatehouse and Hub Office")
+ck("raw labels create visible unresolved Gatehouse/Hub-office prompts, never fake geometry",
+   {prompt["exclusion_id"] for prompt in _yard_exclusion_prompts
+    if prompt["status"] == "outline_unresolved"} == {"gatehouse", "hub_office"} and
+   all(prompt.get("requires_assessor_confirmation")
+       for prompt in _yard_exclusion_prompts), _yard_exclusion_prompts)
+ck("a bare pit is never guessed to be a lift void or precast stair foundation",
+   _classify_client_exclusion("Pit", "300 345 600 mm") is None)
+
+_scope_pdf = "/tmp/ci_internal_warehouse_scope.pdf"
+_scope_doc = _fitz_zones.open()
+_scope_page = _scope_doc.new_page(width=600, height=300)
+for _subject, _value, _x in (("Ground floor core", 120.0, 20),
+                             ("Internal warehouse slab", 900.0, 260)):
+    _annot = _scope_page.add_polygon_annot([
+        (_x, 20), (_x + 180, 20), (_x + 180, 180), (_x, 180),
+    ])
+    _annot.set_info(title="Fortel QA", subject=_subject,
+                    content=f"Area\n{_value:.2f} sq m")
+    _annot.update()
+_scope_doc.save(_scope_pdf)
+_scope_doc.close()
+_scope_read = _read_marked_zones(_scope_pdf)
+ck("explicit internal warehouse slabs stay visible but never enter our area or BOQ zones",
+   _scope_read["area_m2"] == 120.0 and _scope_read["regions"] == 1 and
+   len(_scope_read["zones"]) == 1 and
+   _scope_read["zones"][0]["category"] == "ground_floor" and
+   any(item["exclusion_id"] == "internal_warehouse_scope" and
+       item["area_m2"] == 900.0 for item in _scope_read["exclusions"]) and
+   any("Internal warehouse slab" in flag for flag in _scope_read["flags"]),
+   _scope_read)
+
+_transition_pdf = "/tmp/ci_unit_yard_transitions.pdf"
+_transition_doc = _fitz_zones.open()
+_transition_page = _transition_doc.new_page(width=600, height=300)
+for _subject, _value, _y in (("Unit 1 Transition", 12.5, 50),
+                             ("Unit 2 Transition", 8.25, 150)):
+    _annot = _transition_page.add_polyline_annot([(20, _y), (220, _y)])
+    _annot.set_info(title="Fortel QA", subject=_subject,
+                    content=f"{_value:.2f} m")
+    _annot.update()
+_transition_doc.save(_transition_pdf)
+_transition_doc.close()
+_transition_read = _read_marked_zones(_transition_pdf)
+_transition_zones = [zone for zone in _transition_read["zones"]
+                     if zone["category"] == "transition"]
+ck("yard-entrance transitions remain one measured Lm zone per unit, never one anonymous lump",
+   len(_transition_zones) == 2 and
+   [zone["unit_label"] for zone in _transition_zones] == ["unit 1", "unit 2"] and
+   [zone["length_lm"] for zone in _transition_zones] == [12.5, 8.25] and
+   all("tarmac-to-concrete" in zone["basis"] for zone in _transition_zones),
+   _transition_zones)
+_transition_quote = generate_quotation({
+    "file":"Site yard transitions.pdf", "source_discipline":"engineer",
+    "zones":_transition_zones, "flags":[], "area_m2":None,
+}, project="Transition QA")
+_transition_measurement = next(
+    item for item in _transition_quote["measurements"]
+    if item["description"] == "Transition length")
+ck("measured Yard transitions reach the quotation as blank-rate Lm source rows",
+   _transition_measurement["qty"] == 20.75 and
+   _transition_measurement["assessor_rate_required"] and
+   [row["description"] for row in _transition_measurement["quantity_rows"]] ==
+   ["unit 1", "unit 2"], _transition_measurement)
+
+from takeoff_unmarked import detect_raw_construction_joint as _detect_raw_cj
+_raw_cj_pdf = "/tmp/ci_raw_construction_joint.pdf"
+_raw_cj_doc = _fitz_zones.open()
+_raw_cj_page = _raw_cj_doc.new_page(width=600, height=500)
+_raw_cj_page.insert_text((180, 80), "CJ indicates internal construction joint")
+_raw_cj_legend = _raw_cj_page.new_shape()
+_raw_cj_legend.draw_line((100, 76), (160, 76))
+_raw_cj_legend.finish(color=(0.0, 0.75, 0.0)); _raw_cj_legend.commit()
+_raw_cj_body = _raw_cj_page.new_shape()
+_raw_cj_body.draw_line((50, 200), (150, 200))
+_raw_cj_body.draw_line((200, 300), (300, 300))
+_raw_cj_body.finish(color=(0.0, 0.75, 0.0)); _raw_cj_body.commit()
+_raw_cj_other = _raw_cj_page.new_shape()
+_raw_cj_other.draw_line((50, 400), (350, 400))
+_raw_cj_other.finish(color=(0.0, 0.0, 0.0)); _raw_cj_other.commit()
+_raw_cj_doc.save(_raw_cj_pdf); _raw_cj_doc.close()
+_raw_cj_detected = _detect_raw_cj(_raw_cj_pdf, 0.1)
+ck("raw CJ reads its green legend swatch and measures only matching body vectors",
+   _raw_cj_detected.get("zone", {}).get("category") == "construction_joint" and
+   _raw_cj_detected["zone"]["length_lm"] == 20.0 and
+   len(_raw_cj_detected["zone"]["polyline_segments"]) == 2 and
+   "600 centres" in _raw_cj_detected["zone"]["joint_detail"],
+   _raw_cj_detected)
+
+_marked_cj_pdf = "/tmp/Ground Floor CJ QA.pdf"
+_marked_cj_doc = _fitz_zones.open()
+_marked_cj_page = _marked_cj_doc.new_page(width=500, height=300)
+_marked_cj = _marked_cj_page.add_polyline_annot([(20, 50), (145, 50)])
+_marked_cj.set_info(title="Fortel QA", subject="CJ internal", content="12.50 m")
+_marked_cj.update()
+_roller = _marked_cj_page.add_polyline_annot([(20, 150), (300, 150)])
+_roller.set_info(title="Fortel QA", subject="Roller shutter detail", content="99.00 m")
+_roller.update()
+_marked_cj_doc.save(_marked_cj_pdf); _marked_cj_doc.close()
+_marked_cj_read = _read_marked_zones(_marked_cj_pdf)
+_marked_cj_zone = next(zone for zone in _marked_cj_read["zones"]
+                       if zone["category"] == "construction_joint")
+ck("explicit CJ is a measured Lm zone while roller-shutter detail stays out of scope",
+   _marked_cj_zone["length_lm"] == 12.5 and
+   _marked_cj_zone.get("slab_category") == "ground_floor" and
+   any(zone["category"] == "other" for zone in _marked_cj_read["zones"]),
+   _marked_cj_read["zones"])
+_marked_cj_quote = generate_quotation({
+    "file":"Ground Floor CJ QA.pdf", "source_discipline":"engineer",
+    "zones":_marked_cj_read["zones"], "flags":[], "area_m2":None,
+}, project="CJ QA")
+_cj_measurement = next(item for item in _marked_cj_quote["measurements"]
+                       if item["description"] == "Internal construction joint (CJ)")
+ck("CJ reaches Ground-floor quotation as quantity-only Lm with blank assessor rate",
+   _cj_measurement["section"] == "Ground floor slabs" and
+   _cj_measurement["qty"] == 12.5 and _cj_measurement["assessor_rate_required"] and
+   any("150x150x8 mm" in note for note in _marked_cj_quote["declarations"]),
+   {"measurement":_cj_measurement,
+    "declarations":_marked_cj_quote["declarations"]})
+
+_upper_scope_pdf = "/tmp/ci_upper_floor_scopes.pdf"
+_upper_scope_doc = _fitz_zones.open()
+_upper_scope_page = _upper_scope_doc.new_page(width=700, height=300)
+for _subject, _value, _x in (
+        ("Unit 5 First Floor", 100.0, 20),
+        ("Unit 5 Plant Deck", 30.0, 260),
+        ("Unit 5 POD First Floor", 40.0, 500)):
+    _annot = _upper_scope_page.add_polygon_annot([
+        (_x, 20), (_x + 120, 20), (_x + 120, 150), (_x, 150),
+    ])
+    _annot.set_info(title="Fortel QA", subject=_subject,
+                    content=f"Area\n{_value:.2f} sq m")
+    _annot.update()
+_upper_scope_doc.save(_upper_scope_pdf)
+_upper_scope_doc.close()
+_upper_scope_read = _read_marked_zones(_upper_scope_pdf)
+ck("main upper floor, Plant deck and Unit-5 POD stay three explicit measured scopes",
+   len(_upper_scope_read["zones"]) == 3 and
+   {zone["boq_scope"] for zone in _upper_scope_read["zones"]} == {
+       "main_upper_floor", "plant_deck", "pod_first_floor"} and
+   all(zone["category"] == "upper_floor" and
+       zone["boundary_rule"] == "measure to the edge of the metal decking"
+       for zone in _upper_scope_read["zones"]), _upper_scope_read["zones"])
+_upper_scope_quote = generate_quotation({
+    "file":"Unit-5 Upper Floors.pdf", "source_discipline":"engineer",
+    "zones":_upper_scope_read["zones"], "flags":[], "area_m2":170.0,
+    "costing":{"area_m2":170.0, "rate":None, "total_gbp":None,
+               "assumed":True, "spec":{}, "breakdown":{}, "extras":[]},
+}, project="Upper Scope QA")
+_upper_scope_items = [item for item in _upper_scope_quote["line_items"]
+                      if item["section"] == "Upper floor slabs"]
+ck("Plant deck and POD are separate Upper-floor BOQ rows, never merged with main floor",
+   len(_upper_scope_items) == 3 and
+   any(item["description"].startswith("Plant deck —") for item in _upper_scope_items) and
+   any(item["description"].startswith("POD first floor —") for item in _upper_scope_items),
+   _upper_scope_items)
+
+_unit4_pdf = "/tmp/Ground Floor Unit 4 Subunits.pdf"
+_unit4_doc = _fitz_zones.open()
+_unit4_page = _unit4_doc.new_page(width=700, height=300)
+for _index, _subject in enumerate(("Unit 4A", "Unit 4B", "Unit 4C", "Unit 4D")):
+    _x = 20 + _index * 160
+    _annot = _unit4_page.add_polygon_annot([
+        (_x, 20), (_x + 100, 20), (_x + 100, 120), (_x, 120),
+    ])
+    _annot.set_info(title="Fortel QA", subject=_subject, content="Area\n25.00 sq m")
+    _annot.update()
+_unit4_doc.save(_unit4_pdf)
+_unit4_doc.close()
+_unit4_read = _read_marked_zones(_unit4_pdf)
+ck("complete Unit-4A/4B/4C/4D markup is one combined ground-floor slab zone",
+   len(_unit4_read["zones"]) == 1 and
+   _unit4_read["zones"][0]["category"] == "ground_floor" and
+   _unit4_read["zones"][0]["area_m2"] == 100.0 and
+   _unit4_read["zones"][0]["annotation_count"] == 4 and
+   _unit4_read["zones"][0]["unit_label"] == "Unit 4 (4A-4D combined)" and
+   not _unit4_read["unit_group_review_required"], _unit4_read)
 
 _unit_zone_pdf = "/tmp/Yard Markup Unit Labels.pdf"
 _unit_zone_doc = _fitz_zones.open()
@@ -1268,6 +1514,35 @@ _ambiguous_wall_run, _ambiguous_wall_refusal = _channel_yard_run(
 ck("near-equal competing retaining-wall runs refuse rather than guessing an edge",
    _ambiguous_wall_run is None and "within 5%" in _ambiguous_wall_refusal,
    _ambiguous_wall_refusal)
+_no_dock_proposals, _no_dock_flags = _propose_channels_axis(
+    _channel_rect, None, 0.1, scale_verified=True,
+    dock_presence="absent", wall_segments=_horizontal_wall)
+ck("unit with no Dock level gets exactly one full-Yard-width assumed channel",
+   len(_no_dock_proposals) == 1 and
+   _no_dock_proposals[0]["component"] == "yard_longest_contained_run" and
+   _no_dock_proposals[0]["channel_case"] == "no_dock_level_one_run" and
+   any("one full-Yard-width" in flag for flag in _no_dock_flags),
+   (_no_dock_proposals, _no_dock_flags))
+_with_dock_proposals, _with_dock_flags = _propose_channels_axis(
+    _channel_rect,
+    {"loading_face_lm":60.0, "loading_face_pts":[[1,0],[1,600]]},
+    0.1, scale_verified=True, dock_presence="present",
+    wall_segments=_horizontal_wall, access_road_interruption=True)
+ck("unit with a Dock level gets dock-level + full-width runs and access-road assumption",
+   len(_with_dock_proposals) == 2 and
+   all(proposal["channel_case"] == "with_dock_level_two_runs"
+       for proposal in _with_dock_proposals) and
+   _with_dock_proposals[1]["access_road_interruption"] is True and
+   any("split/edit" in reason
+       for reason in _with_dock_proposals[1]["confidence_reasons"]),
+   (_with_dock_proposals, _with_dock_flags))
+_ambiguous_dock_proposals, _ambiguous_dock_flags = _propose_channels_axis(
+    _channel_rect, None, 0.1, dock_presence="ambiguous",
+    wall_segments=_horizontal_wall)
+ck("ambiguous Dock presence refuses instead of silently choosing one- or two-run rule",
+   not _ambiguous_dock_proposals and
+   any("one-channel versus two-channel" in flag for flag in _ambiguous_dock_flags),
+   _ambiguous_dock_flags)
 
 try:
     _office_marked_paths = [
@@ -2060,9 +2335,11 @@ try:
         _candidate_job_id = "99999999-9999-4999-8999-999999999999"
         _candidate_records = [
             {"candidate_id":"office-p0-level-00-1", "page":0, "level":0,
-             "category":"ground_floor", "polygon_pts":[[0,0],[100,0],[100,100],[0,100]]},
+             "category":"ground_floor", "boq_scope":"ground_floor_core",
+             "polygon_pts":[[0,0],[100,0],[100,100],[0,100]]},
             {"candidate_id":"office-p0-level-01-1", "page":0, "level":1,
-             "category":"upper_floor", "polygon_pts":[[200,0],[300,0],[300,100],[200,100]]},
+             "category":"upper_floor", "boq_scope":"main_upper_floor",
+             "polygon_pts":[[200,0],[300,0],[300,100],[200,100]]},
         ]
         _AS.save_jobs({_candidate_job_id: {
             "id":_candidate_job_id, "status":"pending", "decision":None,
@@ -2084,6 +2361,7 @@ try:
             "scale_k":0.1,
             "candidate_ids":["office-p0-level-00-1", "office-p0-level-01-1"],
             "region_categories":["ground_floor", "upper_floor"],
+            "region_scopes":["ground_floor_core", "main_upper_floor"],
             "note":"assessor accepted two Office GA regions",
         })
         _multi_region_job = _AS.load_jobs()[_candidate_job_id]
@@ -2103,7 +2381,9 @@ try:
            {"ground_floor":100.0, "upper_floor":100.0} and
            not _multi_region_job.get("zone_allocation_stale") and
            _multi_region_job["adjusted"]["region_categories"] ==
-           ["ground_floor", "upper_floor"], _multi_region_job.get("zones"))
+           ["ground_floor", "upper_floor"] and
+           _multi_region_job["adjusted"]["region_scopes"] ==
+           ["ground_floor_core", "main_upper_floor"], _multi_region_job.get("zones"))
         _office_adjust_quote = _AS._quotation_for_job(_candidate_job_id)
         ck("real Office region categories override the filename and reach separate BOQ sections",
            [spec["section"] for spec in _office_adjust_quote["specifications"]] ==
@@ -2642,7 +2922,9 @@ try:
         ck("portal exposes assisted Office candidates without auto-submitting them",
            all(marker in _portal_html_up for marker in (
                "ASSISTED TRACE CANDIDATES", "candidate_polygons", "loadTraceCandidate(",
-               "Add to trace", "btnNewRegion", "traceRegions")) and
+               "Add to trace", "btnNewRegion", "traceRegions", 'id="traceScope"',
+               "ground_floor_core", "main_upper_floor", "plant_deck",
+               "pod_first_floor", "region_scopes: regionEntries.map")) and
            "function loadTraceCandidate" in _portal_html_up and
            "regions: regionPayload" in _portal_html_up and
            "region_categories: regionEntries.map" in _portal_html_up)
@@ -2658,7 +2940,12 @@ try:
            all(marker in _portal_html_up for marker in (
                "ASSUMED CHANNEL PROPOSALS - NOT MEASURED OR PRICED",
                "channel_proposals", "reviewChannelProposal(",
-               "/channel-proposals/", "Accept / save edit", "Remove")))
+               "/channel-proposals/", "Accept / save edit", "Remove",
+               "Dock-level retaining-wall/loading face", "Full Yard width (no Dock level)")))
+        ck("portal visibly carries exclusion checks and construction-joint classification",
+           all(marker in _portal_html_up for marker in (
+               "SLAB EXCLUSIONS", "CHECK EXCLUSION", "EXCLUDED ·",
+               "Construction joint (CJ)", "construction_joint")))
         ck("portal supports axis-locked endpoint drag plus numeric channel geometry edits",
            all(marker in _portal_html_up for marker in (
                "channelDrag", "function editChannelLength", "syncChannelLengthInput",

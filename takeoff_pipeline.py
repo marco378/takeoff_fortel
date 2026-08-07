@@ -392,6 +392,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                 "regions": n,
                 "markup_annotations": marked.get("markup_annotations", []),
                 "zones": marked.get("zones", []),
+                "exclusions": marked.get("exclusions", []),
+                "exclusion_prompts": marked.get("exclusion_prompts", []),
+                "unit_group_review_required": bool(
+                    marked.get("unit_group_review_required", False)),
             })
             if marked.get("flags"):
                 r["flags"] = r["flags"] + marked["flags"]
@@ -400,7 +404,11 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                 # aggregate Bluebeam quantity remains verified, but approval/quotation must
                 # wait for an assessor to classify the unknown subject.
                 r["zone_classification_required"] = True
-            state, sflags2 = measurement_state(area, scale_verified=True, confidence=conf)
+            marked_confidence = (
+                "low" if marked.get("unit_group_review_required") else conf
+            )
+            state, sflags2 = measurement_state(
+                area, scale_verified=True, confidence=marked_confidence)
             r["flags"] = r["flags"] + sflags + sflags2
             r["measurement_state"] = state
             # Manhole markers (Circle annots Fortel placed) — CONFIRMED count, not an estimate.
@@ -456,6 +464,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                         # Assumed channel runs are tracing/review aids only. They stay outside
                         # measured zones and every costing/quotation total.
                         "channel_proposals": tu.get("channel_proposals", []),
+                        "exclusion_prompts": tu.get("exclusion_prompts", []),
+                        "exclusion_review_required": bool(
+                            tu.get("exclusion_review_required", False)),
+                        "boundary_precision_risk": tu.get("boundary_precision_risk"),
                     })
                     r["flags"] = r["flags"] + tu.get("flags", []) + ["assessor: confirm extent + scale"]
                     # A region measured WITHOUT a legend label is a generic grey-hatch guess — its
@@ -506,6 +518,7 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                             r.update({
                                 "method": "assisted office vector trace",
                                 "candidate_polygons": assisted["candidate_polygons"],
+                                "exclusion_prompts": assisted.get("exclusion_prompts", []),
                                 "scale_k": round(office_k, 6) if office_k else None,
                                 "scale_src": office_note,
                                 "scale_verified": office_verified,
@@ -546,6 +559,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     "yard_region_review_required": bool(
                         tu.get("yard_region_review_required", False)),
                     "channel_proposals": tu.get("channel_proposals", []),
+                    "exclusion_prompts": tu.get("exclusion_prompts", []),
+                    "exclusion_review_required": bool(
+                        tu.get("exclusion_review_required", False)),
+                    "boundary_precision_risk": tu.get("boundary_precision_risk"),
                 })
                 r["flags"] = r["flags"] + tu.get("flags", []) + [
                     "flattened/raster drawing measured from the RENDER (no vector geometry) — "

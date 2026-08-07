@@ -324,6 +324,9 @@ def _candidate_record(page, page_number: int, title: dict, records: list[dict],
         "source_label": title["text"],
         "title_bbox": title["bbox"],
         "category": "ground_floor" if level == 0 else "upper_floor",
+        "boq_scope": "ground_floor_core" if level == 0 else "main_upper_floor",
+        "boundary_rule": (None if level == 0 else
+                          "assessor trace must follow the edge of the metal decking"),
         # First region retained for older portal clients; new clients use all regions.
         "polygon_pts": regions[0] if regions else [],
         "regions": regions,
@@ -338,10 +341,13 @@ def _candidate_record(page, page_number: int, title: dict, records: list[dict],
         "flags": [
             "ASSISTED TRACE candidate only — assessor must inspect/edit exterior doors, "
             "partitions and voids before submitting an adjustment"
+        ] + ([] if level == 0 else [
+            "UPPER FLOOR SCOPE CHECK: trace to the edge of the metal decking; Plant deck and "
+            "POD first-floor areas require separate assessor regions/BOQ scopes"
         ] + ([] if resolved else [
             UNRESOLVED_REASON
             + (f" ({unresolved_detail})" if unresolved_detail else "")
-        ]),
+        ])),
     }
 
 
@@ -419,7 +425,29 @@ def detect_office_candidates(pdf: str, page: int = 0, *, scale_k: float | None =
                 "OFFICE ASSISTED TRACE: scale is not independently verified; candidates carry "
                 "geometry only and assessor must calibrate before adjustment"
             )
-        return {"candidate_polygons": candidates, "flags": flags}
+        from measurement_rules import exclusion_review_prompts
+        prompts = exclusion_review_prompts(
+            {candidate["category"] for candidate in candidates}, pg.get_text() or "")
+        for candidate in candidates:
+            candidate["exclusion_prompts"] = [
+                prompt for prompt in prompts
+                if ((candidate["category"] == "ground_floor"
+                     and prompt["exclusion_id"] in {
+                         "lift_void", "service_data_riser", "precast_stair_foundation"})
+                    or (candidate["category"] == "upper_floor"
+                        and prompt["exclusion_id"] in {
+                            "lift_void", "service_data_riser"}))
+            ]
+            candidate["flags"].append(
+                "EXCLUSION CHECK: trace around lift shafts/pits and service/data risers; "
+                "ground-floor stair foundations are separate work, not slab void pricing"
+            )
+        flags.append(
+            "OFFICE EXCLUSION CHECK: candidate outlines do not prove lift/riser/stair-"
+            "foundation voids; assessor must exclude them while tracing"
+        )
+        return {"candidate_polygons": candidates, "flags": flags,
+                "exclusion_prompts": prompts}
     finally:
         doc.close()
 
