@@ -1807,6 +1807,14 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         if not len(xs):
             continue
         component_id = int(component_idx + 1) if component_idx is not None else rank
+        region_polygon = _hatch_contour(region_mask, S)
+        region_perimeter_lm = None
+        if region_polygon:
+            region_perimeter_lm = round(sum(
+                math.dist(start, end)
+                for start, end in zip(
+                    region_polygon, region_polygon[1:] + region_polygon[:1])
+            ) * k, 2)
         yard_regions.append({
             "region_id": f"yard-region-{rank}",
             "component_id": component_id,
@@ -1815,10 +1823,14 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 round(float(xs.min()) / S, 1), round(float(ys.min()) / S, 1),
                 round(float(xs.max() + 1) / S, 1), round(float(ys.max() + 1) / S, 1),
             ],
-            "polygon_pts": _hatch_contour(region_mask, S),
+            "polygon_pts": region_polygon,
+            "perimeter_lm": region_perimeter_lm,
             "included": rank - 1 in included_positions,
             "chosen_primary": component_id == chosen_component_id,
-            "classification_source": "retained same-tint connected component",
+            "classification_source": (
+                "retained same-tint connected component; perimeter follows its rendered "
+                "outer boundary"
+            ),
         })
     yard_region_review_required = len(yard_regions) > 1
     component_evidence["yard_regions"] = yard_regions

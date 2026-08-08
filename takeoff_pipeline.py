@@ -35,6 +35,38 @@ with contextlib.redirect_stdout(io.StringIO()):       # costing self-validates o
 SEND_APPROVALS = os.getenv("SEND_APPROVAL_EMAILS", "0") == "1"
 
 
+_REPORT_CLASS_RX = __import__("re").compile(
+    r"\b(?:das(?:[ _-]+report)?|design[ _-]+(?:and|&)[ _-]+access[ _-]+statement|"
+    r"planning[ _-]+statement)\b",
+    __import__("re").I,
+)
+
+
+def _fast_report_refusal(pdf_path: str, doc) -> str | None:
+    """Identify obvious multi-page planning/report documents without rasterising them.
+
+    This is deliberately a document-class gate, not a measurement heuristic.  It examines
+    only the filename and first page text already available from the PDF catalogue.  A
+    single-sheet drawing is never rejected here, and an uncertain document continues through
+    the normal router.  The gate exists so a large DAS cannot consume the render watchdog.
+    """
+    if doc.page_count < 4:
+        return None
+    filename_evidence = _REPORT_CLASS_RX.search(Path(pdf_path).stem.replace("_", " "))
+    try:
+        first_page_text = " ".join((doc[0].get_text() or "").split())[:12_000]
+    except Exception:
+        first_page_text = ""
+    text_evidence = _REPORT_CLASS_RX.search(first_page_text)
+    evidence = filename_evidence or text_evidence
+    if not evidence:
+        return None
+    return (
+        f"FAST REFUSE: multi-page non-drawing report class matched '{evidence.group(0)}' "
+        f"({doc.page_count} pages); no page was rasterised or measured"
+    )
+
+
 # ── Auto-extract engineer spec from the drawing pack ─────────────────────────
 
 def find_engineer_spec(pdf_path: str) -> dict | None:
@@ -306,7 +338,15 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     # yield a REJECTED result, never an exception out of takeoff().
     page = 0
     page_flags = []
+    fast_report_reason = None
     try:
+        # Read five bytes before asking MuPDF to inspect the container.  Large ZIP/DWG/Office
+        # files can otherwise spend minutes in format probing (or exhaust the child process)
+        # even though direct callers may only supply native PDFs.  This is an intake check,
+        # not a filename guess: oddly named files with a real %PDF header still proceed.
+        with open(pdf, "rb") as _input:
+            if _input.read(5) != b"%PDF-":
+                raise ValueError("not a native PDF (%PDF header absent) — use portal intake")
         _probe = fitz.open(pdf)
         page_count = _probe.page_count
         if page_count == 0:
@@ -317,6 +357,7 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             # PDF before calling takeoff(); direct callers must convert first.
             raise ValueError("not a native PDF (image/other container) — convert to PDF first "
                              "(the portal does this automatically on upload)")
+        fast_report_reason = _fast_report_refusal(pdf, _probe)
         _probe.close()
     except Exception as e:
         return {
@@ -328,6 +369,15 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             "flags": [f"REJECTED: file could not be opened as a PDF ({type(e).__name__}: {e}). "
                       "If this is a ZIP/EML/image, upload it via the portal which extracts/converts; "
                       "if CAD, export a PDF."],
+        }
+    if fast_report_reason:
+        return {
+            "file": Path(pdf).name, "pdf_path": pdf, "page": 0,
+            "type": "NON-DRAWING REPORT", "confidence": "high", "method": "fast-refuse",
+            "area_m2": None, "measurement_state": UNMEASURED, "status": UNMEASURED,
+            "needs_assessor": False,
+            "project_name": project_name or "", "project_ref": project_ref or "",
+            "flags": [fast_report_reason, "REFUSED: document is not a measurable slab drawing"],
         }
     if page_count > 1:
         from router import rank_pages

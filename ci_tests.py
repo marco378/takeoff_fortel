@@ -47,6 +47,37 @@ ck("scale bar uses terminal 10m tick, not intermediate 1m",
    _tick_k is not None and abs(_tick_k - 10 / 283.44) < 1e-5 and "10 m" in _tick_info,
    (_tick_k, _tick_info))
 
+print("fast refusal for obvious multi-page reports")
+_das_pdf = "/tmp/_synthetic_heavy_das_report.pdf"
+_das_canvas = canvas.Canvas(_das_pdf, pagesize=(1400, 900))
+for _das_page in range(12):
+    _das_canvas.setFont("Helvetica-Bold", 22)
+    _das_canvas.drawString(80, 820, "Design and Access Statement")
+    _das_canvas.setFont("Helvetica", 8)
+    for _das_row in range(80):
+        _das_canvas.drawString(80, 790 - _das_row * 9,
+                               f"Planning report narrative row {_das_row} page {_das_page + 1}")
+    _das_canvas.showPage()
+_das_canvas.save()
+from takeoff_pipeline import takeoff as _pipeline_takeoff_fast_report
+_das_result = _pipeline_takeoff_fast_report(_das_pdf, auto_extract_spec=False,
+                                             send_approval=False)
+ck("obvious DAS report refuses before page ranking/raster measurement",
+   _das_result.get("measurement_state") == "UNMEASURED" and
+   _das_result.get("method") == "fast-refuse" and
+   _das_result.get("area_m2") is None and
+   any("no page was rasterised" in flag for flag in _das_result.get("flags", [])),
+   _das_result)
+_fake_large_container = Path("/tmp/_synthetic_large_tender.zip")
+_fake_large_container.write_bytes(b"PK\x03\x04" + b"not-a-pdf" * 1024)
+_container_result = _pipeline_takeoff_fast_report(
+    str(_fake_large_container), auto_extract_spec=False, send_approval=False)
+ck("non-PDF container refuses from magic bytes before MuPDF format probing",
+   _container_result.get("measurement_state") == "REJECTED" and
+   _container_result.get("area_m2") is None and
+   any("%PDF header absent" in flag for flag in _container_result.get("flags", [])),
+   _container_result)
+
 print("Office GA assisted-trace vector candidates")
 from office_candidates import detect_office_candidates as _office_candidates
 _office_pdf = "/tmp/_office_candidates.pdf"
@@ -1250,8 +1281,42 @@ ck("same-tint segmentation retains a real second unit below the single-yard 200 
     "components": _multi_yard_diag.get("component_candidates")})
 ck("matched legend chip is geometrically excluded, never promoted as another Yard",
    not _multi_yard_mask[70:72, 80:84].any(),
-   {"excluded_legend_m2": _multi_yard_diag.get("excluded_legend_m2"),
-    "components": _multi_yard_diag.get("component_candidates")})
+    {"excluded_legend_m2": _multi_yard_diag.get("excluded_legend_m2"),
+     "components": _multi_yard_diag.get("component_candidates")})
+
+# Source: Fortel's Yard Markup.pdf supplied for 2165 Tanro Voltage Business Park:
+# Unit-1&2 = 235.37 m² and Unit-3 = 133.79 m².  Production sees only a temporary
+# annotation-stripped copy; these client answers stay here in the validation assertion.
+try:
+    import glob as _glob_tanro_regions
+    import tempfile as _tempfile_tanro_regions
+    from accuracy_report import strip_annotations as _strip_tanro_regions
+    from pathlib import Path as _Path_tanro_regions
+    import takeoff_unmarked as _takeoff_unmarked_tanro_regions
+    _tanro_matches = _glob_tanro_regions.glob(
+        "drawings/aryan_drive/**/2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf",
+        recursive=True,
+    )
+    if not _tanro_matches:
+        raise _FixtureNotPresent("Tanro Yard Markup.pdf")
+    with _tempfile_tanro_regions.TemporaryDirectory() as _tanro_tmp:
+        _tanro_raw = _Path_tanro_regions(_tanro_tmp) / "Yard raw.pdf"
+        _strip_tanro_regions(_Path_tanro_regions(_tanro_matches[0]), _tanro_raw)
+        _tanro_result = _takeoff_unmarked_tanro_regions.takeoff(str(_tanro_raw))
+        _tanro_regions = _tanro_result.get("yard_regions") or []
+        _tanro_areas = sorted(region.get("area_m2") for region in _tanro_regions)
+        _tanro_truth = sorted([235.37, 133.79])
+        ck("Tanro raw Yard separates both client unit regions within 5%",
+           len(_tanro_areas) == 2 and all(
+               abs(actual - expected) / expected * 100 <= 5
+               for actual, expected in zip(_tanro_areas, _tanro_truth)
+           ), {"actual": _tanro_areas, "truth": _tanro_truth})
+        ck("every retained raw Yard region surfaces its own area, bbox and perimeter",
+           all(region.get("area_m2") and region.get("bbox_pdf_pts")
+               and region.get("perimeter_lm") for region in _tanro_regions),
+           _tanro_regions)
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] {_e} — fixture not present")
 try:
     _external_marked_paths = [
         _castle_dir / f"External Markup Unit-{number}.pdf" for number in range(1, 5)
