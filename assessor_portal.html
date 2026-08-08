@@ -513,6 +513,7 @@ let _jobSearchTerm = '';        // current search filter
 let _archivedJobs = {};         // cache of archived jobs (fetched only when the toggle is on)
 let _showArchived = false;      // "Show archived" sidebar toggle state
 let _collapsedProjects = new Set();
+let _jobRenderInFlight = false;
 // Monotonic generation counter guarding selectJob() against out-of-order completion.
 // selectJob is async (fetch /job/<id> then render); with no guard, rapidly switching
 // jobs (or a poll-triggered re-select racing a user click) can let an OLDER in-flight
@@ -536,6 +537,7 @@ let cutoutPolygons = [];    // completed cut-out regions: [{points:[{x,y}]}]
 let userChannels = [];      // user-drawn channel lines: [{points:[{x,y},{x,y}]}]
 let cutoutDrag = null;      // {polygonIndex, pointIndex} — dragging a cut-out vertex
 let userChannelDrag = null; // {channelIndex, pointIndex} — dragging a channel endpoint
+let cutoutSnapTarget = null; // {polygonIndex} — when hovering near first point of open cutout
 let cal  = [];            // [{x,y}] calibration line endpoints
 let mpp  = null;          // metres per CANVAS pixel
 let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapshot-Scale header).
@@ -676,7 +678,7 @@ async function loadJobList() {
 
     renderJobList(jobs);
     // BUG 5: if a job is open and its status changed, refresh the detail panel
-    if (selectedJobId) {
+    if (selectedJobId && !_jobRenderInFlight) {
       const cur = _jobs.find(j => j.id === selectedJobId);
       if (cur && cur.status !== _lastRenderedStatus) {
         selectJob(selectedJobId);
@@ -839,6 +841,7 @@ function clearJobSearch() {
 // ─────────────────────────────────────────────────
 async function selectJob(jobId) {
   selectedJobId = jobId;  // BUG 5: track open job
+  _jobRenderInFlight = true;
 
   // Claim a generation ticket. If another selectJob() call starts before this one's
   // fetch/render finishes (rapid clicks, or the 15s poll's auto-reselect on status change
@@ -861,7 +864,6 @@ async function selectJob(jobId) {
   cutoutDrag = null; userChannelDrag = null;
   cal = []; aiPoly = null; dragIdx = -1; channelDrag = null;
   mpp = null; snapScale = 0.5;
-  if (ctx && canvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   try {
     const r = await fetch(`${BASE}/job/${jobId}`);
@@ -882,6 +884,8 @@ async function selectJob(jobId) {
     loadJobList();
   } catch(e) {
     if (gen === _selectGen) toast('Failed to load job', 'error');
+  } finally {
+    if (gen === _selectGen) _jobRenderInFlight = false;
   }
 }
 
@@ -1058,10 +1062,12 @@ async function loadSnapshot(job, errorState) {
 // Canvas placeholder for a failed-takeoff job whose drawing also can't be rendered.
 function loadErrorCanvas() {
   const wrap = document.getElementById('canvasWrap');
-  wrap.innerHTML = '<div class="empty"><div class="icon" style="font-size:40px;opacity:.4">❌</div>' +
-    '<div style="font-size:15px;font-weight:600;color:#c0392b">Takeoff failed — drawing unavailable</div>' +
-    '<div style="color:#888;font-size:12px">PDF not on this server. See error details in the panel →</div></div>';
-  canvas = null; ctx = null;
+  if (!canvas || !wrap.contains(canvas)) {
+    wrap.innerHTML = '<div class="empty"><div class="icon" style="font-size:40px;opacity:.4">❌</div>' +
+      '<div style="font-size:15px;font-weight:600;color:#c0392b">Takeoff failed - drawing unavailable</div>' +
+      '<div style="color:#888;font-size:12px">PDF not on this server. See error details in the panel →</div></div>';
+    canvas = null; ctx = null;
+  }
 }
 
 function effectiveStoredPerimeter(job) {
@@ -2060,57 +2066,56 @@ function toggleErrTrace() {
 function loadImage(url, forJobId) {
   return new Promise(res => {
     // Bail BEFORE touching the DOM if a newer selectJob() has already taken over — decoding
-    // happens off-thread, so without this a slow/late-resolving stale call would still tear
-    // down the current job's already-populated canvas (wrap.innerHTML = '') and rebuild an
-    // empty one, even though its own onload below will refuse to draw into it. That
-    // teardown-without-redraw is exactly the "switching projects goes blank" symptom.
+    // happens off-thread, so without this a slow/late-resolving stale call could still tear
+    // down the current job's already-populated canvas. Keep the existing sheet in place until
+    // the replacement image has decoded successfully, then swap the canvas atomically.
     if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
-    const wrap = document.getElementById('canvasWrap');
-    wrap.innerHTML = '';
-    // Re-add zoom controls after innerHTML reset
-    wrap.insertAdjacentHTML('beforeend', `<div class="zoom-controls" id="zoomControls">
-      <button id="btnZoomIn" title="Zoom in (Ctrl++)">+</button>
-      <button id="btnZoomOut" title="Zoom out (Ctrl+-)">−</button>
-      <button id="btnZoomFit" title="Fit to window">⊞</button>
-      <button id="btnZoomReset" title="Reset zoom to 100%">1:1</button>
-      <div class="zoom-level" id="zoomLevel">100%</div>
-    </div>`);
-    canvas = document.createElement('canvas');
-    ctx    = canvas.getContext('2d');
-    wrap.appendChild(canvas);
-    // Reset zoom/pan for new image
-    zoom = 1; panX = 0; panY = 0;
-    updateZoomDisplay();
-    img = new Image();
-    img.onload = () => {
+    const nextImg = new Image();
+    nextImg.onload = () => {
       // forJobId is set by loadSnapshot(); if a newer selectJob() has since taken over
       // (image decode is async — a stale call's onload can fire after a newer call has
-      // already rebuilt the canvas), skip sizing/drawing so we don't stomp the current
+      // already loaded a different job), skip sizing/drawing so we don't stomp the current
       // job's canvas with old pixels sized for a different job's image.
       if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
-      canvas.width  = img.width;
-      canvas.height = img.height;
+      const wrap = document.getElementById('canvasWrap');
+      const nextCanvas = document.createElement('canvas');
+      const nextCtx = nextCanvas.getContext('2d');
+      nextCanvas.width  = nextImg.width;
+      nextCanvas.height = nextImg.height;
+      canvas = nextCanvas;
+      ctx    = nextCtx;
+      img    = nextImg;
+      // Reset zoom/pan for new image only after the image is actually available.
+      zoom = 1; panX = 0; panY = 0;
+      updateZoomDisplay();
+      wrap.replaceChildren(nextCanvas);
       setupCanvasEvents();
       zoomFit();
       draw();
       res();
     };
-    img.src = url;
+    nextImg.onerror = () => {
+      if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
+      res();
+    };
+    nextImg.src = url;
   });
 }
 
 function loadImagePlaceholder() {
   const wrap = document.getElementById('canvasWrap');
-  wrap.innerHTML = '';
-  canvas = document.createElement('canvas');
-  canvas.width  = 900; canvas.height = 600;
-  ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#f7f8fa';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#ccc'; ctx.font = '18px Arial';
-  ctx.fillText('No snapshot available — drawing was not rendered', 100, 300);
-  wrap.appendChild(canvas);
-  setupCanvasEvents();
+  if (!canvas || !wrap.contains(canvas)) {
+    wrap.innerHTML = '';
+    canvas = document.createElement('canvas');
+    wrap.appendChild(canvas);
+    canvas.width  = 900; canvas.height = 600;
+    ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#f7f8fa';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#ccc'; ctx.font = '18px Arial';
+    ctx.fillText('No snapshot available - drawing was not rendered', 100, 300);
+    setupCanvasEvents();
+  }
 }
 
 // ─────────────────────────────────────────────────
@@ -2296,6 +2301,20 @@ function draw() {
     });
     ctx.restore();
   });
+
+  // Draw snap target indicator when hovering near first point
+  if (cutoutSnapTarget && cutoutPolygons[cutoutSnapTarget.polygonIndex]) {
+    const region = cutoutPolygons[cutoutSnapTarget.polygonIndex];
+    const first = region.points[0];
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(first.x, first.y, 12, 0, Math.PI*2);
+    ctx.strokeStyle = '#e67e22';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.restore();
+  }
 
   // Assisted Office GA candidates (amber/dashed)
   candidatePolygons.forEach(candidate => {
@@ -2511,6 +2530,7 @@ function updateAreaDisplay() {
 function setupCanvasEvents() {
   canvas.addEventListener('mousedown', onDown);
   canvas.addEventListener('mousemove', onMove);
+  canvas.addEventListener('dblclick', onDblClick);
   canvas.addEventListener('wheel', onWheel, { passive: false });
   canvas.addEventListener('contextmenu', onContextMenu);
   // Wire up zoom control buttons
@@ -2522,6 +2542,16 @@ function setupCanvasEvents() {
   if (zOut) zOut.addEventListener('click', zoomOut);
   if (zFit) zFit.addEventListener('click', zoomFit);
   if (zRst) zRst.addEventListener('click', zoomReset);
+}
+
+function onDblClick(e) {
+  if (mode !== 'cutout') return;
+  if (cutoutPolygons.length === 0) return;
+  const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
+  if (lastRegion.closed || lastRegion.points.length < 3) return;
+  lastRegion.closed = true;
+  toast(`Cut-out ${cutoutPolygons.length} closed — draw another or click Submit`);
+  draw();
 }
 
 function pos(e) {
@@ -2741,14 +2771,15 @@ function onDown(e) {
     if (cutoutPolygons.length > 0 && !cutoutPolygons[cutoutPolygons.length-1].closed
         && cutoutPolygons[cutoutPolygons.length-1].points.length >= 3) {
       const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
-      if (Math.hypot(lastRegion.points[0].x-p.x, lastRegion.points[0].y-p.y) < 14) {
+      if (Math.hypot(lastRegion.points[0].x-p.x, lastRegion.points[0].y-p.y) < 20) {
         lastRegion.closed = true;
-        toast(`Cut-out region ${cutoutPolygons.length} closed — click Submit Adjustment to apply`);
+        toast(`Cut-out region ${cutoutPolygons.length} closed — draw another or click Submit`);
         draw(); return;
       }
     }
     if (cutoutPolygons.length === 0 || cutoutPolygons[cutoutPolygons.length-1].closed) {
       cutoutPolygons.push({points: [p], closed: false});
+      toast(`Cut-out ${cutoutPolygons.length} started — click points, then close near first point`);
     } else {
       cutoutPolygons[cutoutPolygons.length-1].points.push(p);
     }
@@ -2818,6 +2849,19 @@ function onMove(e) {
     draw();
     return;
   }
+  // Cut-out snap target detection
+  cutoutSnapTarget = null;
+  if (mode === 'cutout' && cutoutPolygons.length > 0) {
+    const last = cutoutPolygons[cutoutPolygons.length-1];
+    if (!last.closed && last.points.length >= 3) {
+      const p = pos(e);
+      if (Math.hypot(last.points[0].x-p.x, last.points[0].y-p.y) < 20) {
+        cutoutSnapTarget = {polygonIndex: cutoutPolygons.length-1};
+        if (canvas) canvas.style.cursor = 'pointer';
+      }
+    }
+  }
+  draw();
   // Active trace vertex drag
   if (dragIdx >= 0) { poly[dragIdx] = pos(e); draw(); }
 }
@@ -2846,11 +2890,20 @@ function setupButtons() {
   });
   document.getElementById('btnNewRegion').addEventListener('click', startNewTraceRegion);
   document.getElementById('btnCutout').addEventListener('click', () => {
+    // Close any open cutout polygon before switching/starting new
+    if (cutoutPolygons.length > 0) {
+      const last = cutoutPolygons[cutoutPolygons.length-1];
+      if (!last.closed && last.points.length >= 3) {
+        last.closed = true;
+        toast(`Cut-out ${cutoutPolygons.length} saved`);
+      }
+    }
     mode = 'cutout';
     document.getElementById('btnCutout').classList.add('on');
     document.getElementById('btnTrace').classList.remove('on');
     document.getElementById('btnCal').classList.remove('on');
     document.getElementById('btnChannel').classList.remove('on');
+    draw();
   });
   document.getElementById('btnChannel').addEventListener('click', () => {
     mode = 'channel';
@@ -2956,7 +3009,8 @@ async function submitDecision(action) {
   }
   const regionEntries = traceRegionEntries();
   const a = calcArea();
-  if (action === 'adjust' && (!regionEntries.length || !a)) {
+  const hasCutouts = cutoutPolygons.some(r => r.points && r.points.length >= 3);
+  if (action === 'adjust' && !regionEntries.length && !a && !hasCutouts) {
     toast('Trace or add at least one polygon, then Submit Adjustment', 'warn'); return;
   }
   const regionPayload = regionEntries.map(entry =>
