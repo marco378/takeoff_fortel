@@ -1062,10 +1062,12 @@ async function loadSnapshot(job, errorState) {
 // Canvas placeholder for a failed-takeoff job whose drawing also can't be rendered.
 function loadErrorCanvas() {
   const wrap = document.getElementById('canvasWrap');
-  wrap.innerHTML = '<div class="empty"><div class="icon" style="font-size:40px;opacity:.4">❌</div>' +
-    '<div style="font-size:15px;font-weight:600;color:#c0392b">Takeoff failed - drawing unavailable</div>' +
-    '<div style="color:#888;font-size:12px">PDF not on this server. See error details in the panel →</div></div>';
-  canvas = null; ctx = null;
+  if (!canvas || !wrap.contains(canvas)) {
+    wrap.innerHTML = '<div class="empty"><div class="icon" style="font-size:40px;opacity:.4">❌</div>' +
+      '<div style="font-size:15px;font-weight:600;color:#c0392b">Takeoff failed - drawing unavailable</div>' +
+      '<div style="color:#888;font-size:12px">PDF not on this server. See error details in the panel →</div></div>';
+    canvas = null; ctx = null;
+  }
 }
 
 function effectiveStoredPerimeter(job) {
@@ -2064,36 +2066,39 @@ function toggleErrTrace() {
 function loadImage(url, forJobId) {
   return new Promise(res => {
     // Bail BEFORE touching the DOM if a newer selectJob() has already taken over — decoding
-    // happens off-thread, so without this a slow/late-resolving stale call would still tear
-    // down the current job's already-populated canvas (wrap.innerHTML = '') and rebuild an
-    // empty one, even though its own onload below will refuse to draw into it. That
-    // teardown-without-redraw is exactly the "switching projects goes blank" symptom.
+    // happens off-thread, so without this a slow/late-resolving stale call could still tear
+    // down the current job's already-populated canvas. Keep the existing sheet in place until
+    // the replacement image has decoded successfully, then swap the canvas atomically.
     if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
-    const wrap = document.getElementById('canvasWrap');
-    if (!canvas || !wrap.contains(canvas)) {
-      wrap.innerHTML = '';
-      canvas = document.createElement('canvas');
-      ctx    = canvas.getContext('2d');
-      wrap.appendChild(canvas);
-    }
-    // Reset zoom/pan for new image
-    zoom = 1; panX = 0; panY = 0;
-    updateZoomDisplay();
-    img = new Image();
-    img.onload = () => {
+    const nextImg = new Image();
+    nextImg.onload = () => {
       // forJobId is set by loadSnapshot(); if a newer selectJob() has since taken over
       // (image decode is async — a stale call's onload can fire after a newer call has
-      // already rebuilt the canvas), skip sizing/drawing so we don't stomp the current
+      // already loaded a different job), skip sizing/drawing so we don't stomp the current
       // job's canvas with old pixels sized for a different job's image.
       if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
-      canvas.width  = img.width;
-      canvas.height = img.height;
+      const wrap = document.getElementById('canvasWrap');
+      const nextCanvas = document.createElement('canvas');
+      const nextCtx = nextCanvas.getContext('2d');
+      nextCanvas.width  = nextImg.width;
+      nextCanvas.height = nextImg.height;
+      canvas = nextCanvas;
+      ctx    = nextCtx;
+      img    = nextImg;
+      // Reset zoom/pan for new image only after the image is actually available.
+      zoom = 1; panX = 0; panY = 0;
+      updateZoomDisplay();
+      wrap.replaceChildren(nextCanvas);
       setupCanvasEvents();
       zoomFit();
       draw();
       res();
     };
-    img.src = url;
+    nextImg.onerror = () => {
+      if (forJobId !== undefined && forJobId !== selectedJobId) { res(); return; }
+      res();
+    };
+    nextImg.src = url;
   });
 }
 
@@ -2103,14 +2108,14 @@ function loadImagePlaceholder() {
     wrap.innerHTML = '';
     canvas = document.createElement('canvas');
     wrap.appendChild(canvas);
+    canvas.width  = 900; canvas.height = 600;
+    ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#f7f8fa';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#ccc'; ctx.font = '18px Arial';
+    ctx.fillText('No snapshot available - drawing was not rendered', 100, 300);
+    setupCanvasEvents();
   }
-  canvas.width  = 900; canvas.height = 600;
-  ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#f7f8fa';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#ccc'; ctx.font = '18px Arial';
-  ctx.fillText('No snapshot available - drawing was not rendered', 100, 300);
-  setupCanvasEvents();
 }
 
 // ─────────────────────────────────────────────────
