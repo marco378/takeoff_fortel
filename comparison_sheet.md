@@ -85,3 +85,89 @@
 Rows with both numbers: **52**
 PASS count: **51**
 REFUSED count: **29**
+
+## 2142 — TSL LG Box Bay
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+
+Verdict: No PDF exists beneath a Markup-named folder in the listed 2.4 GB tender archive, so this project contains no Fortel-marked truth to pair or score; the similarly named “AS-BUILT MARKUP” design records are not Fortel measurements.
+
+## 2148 — GMI Element 4&5 Knowsley
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+
+Verdict: The listed nine-file tender archive contains raw site/external-works drawings but no Markup-named folder, so there is no Fortel-marked truth or defensible marked/raw pair to score.
+
+## 2150 — Magrock Farnborough Aerospace Centre
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+
+Verdict: The listed 511 MB tender archive contains raw external-works and office slab plans, but no PDF beneath a Markup-named folder; no Fortel answer exists here to compare without inventing truth.
+
+## 2154 — Magrock Reform Road Maidenhead (nested 2165 Tanro Voltage Business Park)
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+| `2165 Tanro- Voltage Business Park/Markup/1st Floor.pdf` — total | 570.0 m² | REFUSED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/1st Floor.pdf` — Upper Floor | 570.05 m² | REFUSED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/1st Floor.pdf` — Upper Floor perimeter | 194.24 Lm | REFUSED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/1st Floor.pdf` — unclassified length | 2.24 Lm | REFUSED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/Drainage Markup.pdf` — MH Counts | 1 Nr | REFUSED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — total | 369.2 m² | 366.0 m² | -0.87% | PASS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Unit-1&2 Yard | 235.37 m² | UNMEASURED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Unit-1&2 perimeter | 61.54 Lm | UNMEASURED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Unit-3 Yard | 133.79 m² | UNMEASURED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Unit-3 perimeter | 49.80 Lm | UNMEASURED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Transition | 26.55 Lm | UNMEASURED | — | REFUSED-MISS |
+
+Verdict: Fortel marked 570.05 m² of first-floor slab, 1 manhole, 369.2 m² of Yard across two unit regions, and 26.55 Lm of transition; the AI matched only the aggregate Yard at 366.0 m² (-0.87%), while its biggest gap is refusal/loss of every line-hatch and per-region quantity.
+
+## 2156 — Winvic Mountpark Ferrybridge Unit-3
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+| `7466-SMR-03-ZZ-DR-A-3333-S2-P01-UNIT_3_-_PROPOSED_OFFICE_GA_PLANS_-_SHEET_1.pdf` | SLAB-RELEVANT GA | REFUSED | — | REFUSED-MISS |
+| `7466-SMR-03-ZZ-DR-A-4301-S2-P01-UNIT_3_-_PROPOSED_ELEVATIONS.pdf` | NON-SLAB | REFUSED | — | REFUSED-CORRECT |
+| `7466-SMR-03-ZZ-DR-A-4302-S2-P01-UNIT_3_-_PROPOSED_SECTIONS.pdf` | NON-SLAB | REFUSED | — | REFUSED-CORRECT |
+| `7466-SMR-03-ZZ-DR-A-3300-S2-P01-UNIT_3_SITE_LOCATION_PLAN.pdf` | NON-SLAB | REFUSED | — | REFUSED-CORRECT |
+| `7466-SMR-U3A-XX-MS-A-0001-A3-P10_-_DAS_REPORT_UNIT_3A.pdf` | NON-SLAB | TIMEOUT | — | TIMEOUT |
+
+Verdict: No Fortel markup truth exists in this project; the targeted class check correctly refused the elevation, section, and location plan, but the slab-relevant office GA also refused (the biggest gap) and the DAS report hit the enforced 120-second timeout.
+
+## 2167 — Winvic Prologis DIRFT III DC610
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+
+Verdict: The listed archive and downloaded project tree contain raw design/tender PDFs but no Markup-named folder, so there is no Fortel-side measurement truth to pair or score.
+
+## 2168 — Magrock DPD Farnborough
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+
+Verdict: The 235-entry archive contains raw site, external-works, dock, and ground-floor drawings but no Markup-named folder, so no Fortel-marked answer is available for a scored comparison.
+
+## 2172 — Tanro Prologis Park Luton
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+
+Verdict: The archive contains raw external-works and hard-landscaping drawings but no PDF beneath a Markup-named folder, so no Fortel-marked truth exists for a defensible scored pair.
+
+## Aryan Drive run totals
+
+Rows with both numbers: **1**
+
+PASS ±5%: **1**
+
+REFUSED-CORRECT: **3**
+
+REFUSED-MISS: **11**
+
+NO-RAW-SIBLING: **0**
+
+TIMEOUT: **1**
