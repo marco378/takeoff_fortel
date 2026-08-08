@@ -963,6 +963,21 @@ def adjust(job_id):
         if any(candidate_id not in stored_candidate_records for candidate_id in candidate_ids):
             return jsonify({"error": "one or more candidate_ids are stale or unknown"}), 409
         stored_result = dict(job.get("result") or {})
+        # Cutout-only: subtract from existing measured area when no new trace regions
+        if cutout_regions and scale_k and not regions:
+            existing_area = (job.get("adjusted") or {}).get("assessed_area_m2") or stored_result.get("area_m2")
+            if existing_area and existing_area > 0:
+                try:
+                    from geometry import measure_regions
+                    cutout_area, cutout_flags = measure_regions(cutout_regions, scale_k)
+                    if cutout_area > 0:
+                        area_m2 = round(max(0, existing_area - cutout_area), 1)
+                        gflags = [f"cut-out only: {cutout_area:,.1f} m² subtracted from {existing_area:,.1f} m²"] + cutout_flags
+                    else:
+                        area_m2 = existing_area
+                        gflags = []
+                except Exception as e:
+                    area_m2, gflags = None, [f"geometry error: {e}"]
         # Older clients supplied one candidate id per region but no category list.  Preserve
         # that flow by taking the detector's explicit category.  New clients send a category
         # for every region, including ``unclassified`` for a manual outline.
@@ -1119,6 +1134,7 @@ def adjust(job_id):
                 "cutout_regions": cutout_regions,
                 "user_channels": user_channels,
             },
+            "region_scopes": effective_region_scopes,
             "costing": costing_result,
         })
         if had_zone_allocation:
@@ -1155,6 +1171,7 @@ def adjust(job_id):
                 "needs_assessor": bool(zone_classification_required or zone_geometry_overlap),
                 "result": stored_result,
                 "flags": _without_zone_stale_flags(jobs[job_id].get("flags")) + list(gflags),
+                "region_scopes": effective_region_scopes,
             })
         save_jobs(jobs)
 
