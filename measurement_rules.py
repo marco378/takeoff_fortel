@@ -1,132 +1,153 @@
-"""Measurement rules for slab exclusions and review prompts.
+"""Evidence-gated slab exclusions from Inderjit's 5 August live markup.
 
-Implements Inderjit's live-markup measurement rules from the 5 Aug call.
-Identifies explicit exclusions (lift voids, risers, stair foundations) from
-Bluebeam markups and generates review prompts for unresolved exclusions.
+The functions in this module classify explicit annotation text or create an assessor
+checklist. They never manufacture an exclusion polygon or subtract an unproved area.
 """
+from __future__ import annotations
+
 import re
 
 
-# ---------------------------------------------------------------------------
-# Exclusion classification (Bluebeam markup subject → exclusion record)
-# ---------------------------------------------------------------------------
-
-_EXCLUSION_RULES = [
+EXCLUSION_RULES = (
     {
-        "pattern": re.compile(r"\blift\s*(?:shaft|void|pit)\b", re.I),
-        "exclusion_id": "lift_void",
-        "label": "Lift shaft / void",
-        "rule": "lift void is not slab — separate lift subcontractor",
-        "provenance": "explicit markup subject",
+        "exclusion_id": "gatehouse",
+        "label": "Gatehouse",
+        "categories": {"external_yard"},
+        "patterns": (re.compile(r"\bgate\s*house\b", re.I),),
+        "rule": "exclude from the external/service Yard slab area",
     },
     {
-        "pattern": re.compile(r"\b(?:data|service)\s*riser\b", re.I),
+        "exclusion_id": "hub_office",
+        "label": "Hub office",
+        "categories": {"external_yard"},
+        "patterns": (re.compile(r"\bhub\s+office\b", re.I),),
+        "rule": "exclude from the external/service Yard slab area",
+    },
+    {
+        "exclusion_id": "lift_void",
+        "label": "Lift shaft / lift pit",
+        "categories": {"ground_floor", "upper_floor"},
+        # The transcript repeatedly renders "lift pit" as "lift bit".  Require the feature
+        # noun: a lift lobby is slab circulation space and a bare "Lift" is not enough evidence
+        # to subtract anything.  A bare "Pit" is likewise not enough.
+        "patterns": (
+            re.compile(r"\blift\s+(?:shaft|pit|bit|void)\b", re.I),
+        ),
+        "rule": "exclude from the office slab area",
+    },
+    {
         "exclusion_id": "service_data_riser",
         "label": "Service / data riser",
-        "rule": "riser is not slab — services subcontractor",
-        "provenance": "explicit markup subject",
+        "categories": {"ground_floor", "upper_floor"},
+        "patterns": (
+            re.compile(r"\b(?:service|data)\s+(?:riser|raiser)\b", re.I),
+            re.compile(r"\b(?:riser|raiser)\s+(?:service|data)\b", re.I),
+        ),
+        "rule": "exclude from the office slab area",
     },
     {
-        "pattern": re.compile(r"\bprecast\s*(?:stair(?:case)?)?\s*foundation\b", re.I),
         "exclusion_id": "precast_stair_foundation",
-        "label": "Precast stair foundation",
-        "rule": "stair foundation is separate work, not slab void pricing",
-        "provenance": "explicit markup subject",
+        "label": "Precast staircase foundation",
+        "categories": {"ground_floor"},
+        # A generic Pit or Foundation is deliberately insufficient. The feature must carry
+        # explicit stair/foundation semantics before it can be excluded automatically.
+        "patterns": (
+            re.compile(
+                r"\bpre[- ]?cast\s+(?:concrete\s+)?stair(?:case)?\s+foundation\b",
+                re.I,
+            ),
+            re.compile(r"\bstair(?:case)?\s+foundation\b", re.I),
+        ),
+        "rule": (
+            "exclude from the slab quotation; price separately only if the client asks "
+            "(detail evidence: 300 / 345 / 600 mm)"
+        ),
     },
+)
+
+# Preserve Aryan's module-level API shape for any external diagnostic/import code.
+_EXCLUSION_RULES = [
+    {
+        "pattern": pattern,
+        "exclusion_id": rule["exclusion_id"],
+        "label": rule["label"],
+        "rule": rule["rule"],
+        "provenance": "explicit markup subject/content",
+    }
+    for rule in EXCLUSION_RULES
+    for pattern in rule["patterns"]
 ]
+_CATEGORY_EXCLUSIONS = {
+    category: [
+        (rule["exclusion_id"], rule["label"], rule["rule"])
+        for rule in EXCLUSION_RULES
+        if category in rule["categories"]
+    ]
+    for category in ("external_yard", "ground_floor", "upper_floor")
+}
+
+
+def _normalise(value) -> str:
+    return " ".join(str(value or "").strip().split())
 
 
 def classify_exclusion(subject, content=""):
-    """Return an exclusion record if *subject* matches a known exclusion, else None.
-
-    Only explicit, labelled exclusions are classified.  A bare "Pit" or
-    unlabeled polygon is never guessed to be a lift void or stair foundation.
-    """
-    probe = str(subject or "").strip()
-    if not probe:
+    """Classify only semantically explicit annotation subject/content evidence."""
+    evidence = _normalise(f"{subject or ''} {content or ''}")
+    if not evidence:
         return None
-    for rule in _EXCLUSION_RULES:
-        if rule["pattern"].search(probe):
+    for rule in EXCLUSION_RULES:
+        if any(pattern.search(evidence) for pattern in rule["patterns"]):
             return {
                 "exclusion_id": rule["exclusion_id"],
                 "label": rule["label"],
                 "rule": rule["rule"],
-                "provenance": rule["provenance"],
+                "provenance": "explicit markup subject/content",
+                "evidence": evidence,
+                "categories": sorted(rule["categories"]),
             }
     return None
 
 
-# ---------------------------------------------------------------------------
-# Exclusion review prompts (drawing text → assessor review checklist)
-# ---------------------------------------------------------------------------
-
-# Category → list of (exclusion_id, label, rule) for that zone type
-_CATEGORY_EXCLUSIONS = {
-    "external_yard": [
-        ("gatehouse", "Gatehouse",
-         "colour segmentation cannot prove its footprint; assessor must trace the outline"),
-        ("hub_office", "Hub Office",
-         "colour segmentation cannot prove its footprint; assessor must trace the outline"),
-    ],
-    "ground_floor": [
-        ("lift_void", "Lift shaft / void",
-         "lift void is not slab — assessor must exclude it from the ground-floor trace"),
-        ("service_data_riser", "Service / data riser",
-         "riser is not slab — assessor must exclude it from the ground-floor trace"),
-        ("precast_stair_foundation", "Precast stair foundation",
-         "stair foundation is separate work, not slab void pricing"),
-    ],
-    "upper_floor": [
-        ("lift_void", "Lift shaft / void",
-         "lift void is not slab — assessor must exclude it from the upper-floor trace"),
-        ("service_data_riser", "Service / data riser",
-         "riser is not slab — assessor must exclude it from the upper-floor trace"),
-    ],
-}
-
-
 def exclusion_review_prompts(categories, page_text=""):
-    """Return assessor-review prompts for slab exclusions found or labelled on the drawing.
+    """Return the applicable checklist and identify labels with unresolved outlines.
 
-    *categories* is a list of zone category strings (e.g. ["external_yard", "dock"]).
-    *page_text* is the full extracted text of the drawing page (to detect labelled
-    exclusions whose outline was not resolved).
-
-    Each prompt dict contains:
-        exclusion_id, label, rule, status, requires_assessor_confirmation
+    Absence of searchable text does not prove absence of a lift, riser, foundation,
+    Gatehouse, or Hub office. Such rows remain visible assessor checks, but only an actual
+    text hit creates the approval-blocking ``outline_unresolved`` state.
     """
-    text_lower = str(page_text or "").lower()
-    seen = set()
+    category_set = {str(category or "").strip().lower() for category in categories or []}
+    text = _normalise(page_text)
     prompts = []
-
-    for category in categories or []:
-        for exclusion_id, label, rule in _CATEGORY_EXCLUSIONS.get(category, []):
-            if exclusion_id in seen:
-                continue
-            seen.add(exclusion_id)
-            # Check if the label appears in the drawing text
-            label_words = label.lower().split()
-            label_present = all(word in text_lower for word in label_words)
-            if label_present:
-                status = "outline_unresolved"
-                requires = True
-            else:
-                status = "label_not_found"
-                requires = False
-            prompts.append({
-                "exclusion_id": exclusion_id,
-                "label": label,
-                "rule": rule,
-                "status": status,
-                "requires_assessor_confirmation": requires,
-            })
-
+    for rule in EXCLUSION_RULES:
+        if not (rule["categories"] & category_set):
+            continue
+        match = next((pattern.search(text) for pattern in rule["patterns"]
+                      if pattern.search(text)), None)
+        prompts.append({
+            "exclusion_id": rule["exclusion_id"],
+            "label": rule["label"],
+            "rule": rule["rule"],
+            "status": "outline_unresolved" if match else "assessor_check",
+            "drawing_text_evidence": match.group(0) if match else None,
+            "requires_assessor_confirmation": True,
+            "assumed": True,
+            "basis": (
+                f"drawing text labels '{match.group(0)}', but no reliable exclusion "
+                "outline was resolved"
+                if match else
+                "client exclusion checklist; no reliable automatic feature outline was resolved"
+            ),
+        })
     return prompts
 
 
 def unresolved_exclusion_detected(prompts):
-    """Return True if any prompt has status 'outline_unresolved'."""
-    return any(
-        prompt.get("status") == "outline_unresolved"
-        for prompt in (prompts or [])
-    )
+    """Return whether labelled evidence exists without a resolved exclusion outline."""
+    return any(prompt.get("status") == "outline_unresolved" for prompt in prompts or [])
+
+
+__all__ = [
+    "EXCLUSION_RULES", "classify_exclusion", "exclusion_review_prompts",
+    "unresolved_exclusion_detected",
+]

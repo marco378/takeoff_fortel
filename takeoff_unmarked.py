@@ -1462,6 +1462,20 @@ def scale_for(pdf, page=0):
             k_consensus, cflags = SC.scale_consensus([(kbar, 1), (k_title_full, 1)], tol=SCALE_BAR_AGREE_TOL)
             pct_diff = abs(kbar - k_title_full) / k_title_full
             if k_consensus is not None:
+                if len(denoms) > 1:
+                    # A numerical agreement is not a spatial association.  On a multi-layout
+                    # sheet the detected bar and printed 1:N label may belong to a detail or a
+                    # sibling floor rather than the segmented slab viewport.  Inderjit confirmed
+                    # this failure mode on 7 Aug; until the detector can bind all three extents,
+                    # preserve the candidate k for assessor display but never call it VERIFIED.
+                    candidates = ", ".join(f"1:{value}" for value in denoms)
+                    note = (
+                        f"MULTIPLE VIEWPORT SCALES ({candidates}) — scale bar ({info}) agrees "
+                        f"with printed 1:{denom}, but its spatial association with the measured "
+                        "slab viewport is unresolved; assessor must calibrate/confirm that "
+                        "viewport before sign-off"
+                    )
+                    return kbar, False, note, sources
                 note = (f"scale bar ({info}) AGREES with title 1:{denom} "
                         f"(diff {pct_diff*100:.1f}% ≤ {SCALE_BAR_AGREE_TOL*100:.0f}%) — VERIFIED "
                         f"[{cflags[0]}]")

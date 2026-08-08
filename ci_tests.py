@@ -449,6 +449,30 @@ try:
        _k5 is not None and abs(_k5 - _k1500) < 1e-5)
     ck("mixed/disagree -> sources still recorded",  "scale_bar" in _src5 and "title_block" in _src5)
 
+    # --- CASE 6: multiple viewport scales.  A bar agreeing with one printed denominator
+    # does not prove that denominator belongs to the slab viewport being segmented.  Inderjit
+    # clarified on 7 Aug that each layout can carry its own scale; without a spatial
+    # bar/title/region association the sheet must remain assessor-gated.
+    _c6 = canvas.Canvas("/tmp/_sf_multiple_viewports.pdf", pagesize=(1400, 2200))
+    _c6.drawString(100, 2100, "GROUND FLOOR LAYOUT  Scale 1:500")
+    _c6.drawString(800, 2100, "SECTION DETAIL  Scale 1:100")
+    _c6.drawString(200, 120, "0          88 m")
+    _c6.line(100, 110, 600, 110)
+    _c6.save()
+    _k6, _v6, _n6, _src6 = _scale_for("/tmp/_sf_multiple_viewports.pdf")
+    ck("multiple viewport scales cannot be globally VERIFIED without spatial association",
+       _v6 is False and "MULTIPLE VIEWPORT SCALES" in _n6 and
+       _src6.get("title_block_candidates") == [500, 100],
+       {"verified":_v6, "note":_n6, "sources":_src6})
+
+    _c7 = canvas.Canvas("/tmp/_sf_a0_nts.pdf", pagesize=(1400, 2200))
+    _c7.drawString(100, 2100, "SHEET SIZE A0   SCALE AS INDICATED   NTS")
+    _c7.save()
+    _k7, _v7, _n7, _src7 = _scale_for("/tmp/_sf_a0_nts.pdf")
+    ck("A0 is sheet size and NTS never becomes a numeric scale",
+       _k7 is None and _v7 is False and _src7 == {} and "no scale" in _n7,
+       {"k":_k7, "verified":_v7, "note":_n7, "sources":_src7})
+
     _risk_1500 = _boundary_precision_risk({"title_block":{"denom":1500}})
     _risk_2000 = _boundary_precision_risk({"title_block":{"denom":2000}})
     ck("1:1500 and 1:2000 sheets carry a visible boundary-click precision risk",
@@ -887,6 +911,39 @@ ck("raw labels create visible unresolved Gatehouse/Hub-office prompts, never fak
        for prompt in _yard_exclusion_prompts), _yard_exclusion_prompts)
 ck("a bare pit is never guessed to be a lift void or precast stair foundation",
    _classify_client_exclusion("Pit", "300 345 600 mm") is None)
+ck("a lift lobby is slab circulation space, not guessed to be a lift void",
+   _classify_client_exclusion("Lift lobby", "") is None)
+_explicit_client_exclusions = {
+    subject: _classify_client_exclusion(subject, content)
+    for subject, content in (
+        ("Gatehouse", ""),
+        ("Hub office", ""),
+        ("Area Measurement", "Lift bit"),
+        ("Riser data", ""),
+        ("Pre-cast concrete staircase foundation", ""),
+    )
+}
+ck("5-Aug exclusion wording is recognised from explicit subject/content evidence",
+   {subject: record and record.get("exclusion_id")
+    for subject, record in _explicit_client_exclusions.items()} == {
+       "Gatehouse":"gatehouse", "Hub office":"hub_office",
+       "Area Measurement":"lift_void", "Riser data":"service_data_riser",
+       "Pre-cast concrete staircase foundation":"precast_stair_foundation",
+   }, _explicit_client_exclusions)
+_ground_exclusion_checklist = _exclusion_review_prompts(["ground_floor"], "")
+ck("every ground-floor trace keeps the lift/riser/stair checklist visible without a text hit",
+   {prompt["exclusion_id"] for prompt in _ground_exclusion_checklist} == {
+       "lift_void", "service_data_riser", "precast_stair_foundation"} and
+   all(prompt.get("status") == "assessor_check" and
+       prompt.get("requires_assessor_confirmation") and prompt.get("assumed") and
+       prompt.get("basis") for prompt in _ground_exclusion_checklist),
+   _ground_exclusion_checklist)
+_labelled_ground_exclusions = _exclusion_review_prompts(
+    ["ground_floor"], "Lift pit and data riser")
+ck("drawing-text evidence gates unresolved lift/data outlines instead of missing slash labels",
+   {prompt["exclusion_id"] for prompt in _labelled_ground_exclusions
+    if prompt["status"] == "outline_unresolved"} == {
+       "lift_void", "service_data_riser"}, _labelled_ground_exclusions)
 
 _scope_pdf = "/tmp/ci_internal_warehouse_scope.pdf"
 _scope_doc = _fitz_zones.open()
