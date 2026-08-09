@@ -1870,6 +1870,8 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["zones"] = list(job["zones"])
     if isinstance(job.get("channel_proposals"), list):
         result["channel_proposals"] = list(job["channel_proposals"])
+    if isinstance(job.get("transition_candidates"), list):
+        result["transition_candidates"] = list(job["transition_candidates"])
     if isinstance(job.get("channel_proposal_decisions"), dict):
         result["channel_proposal_decisions"] = dict(job["channel_proposal_decisions"])
     if isinstance(job.get("yard_regions"), list):
@@ -2440,6 +2442,7 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "polygon_pts":      result.get("polygon_pts"),
                 "candidate_polygons": result.get("candidate_polygons", []),
                 "channel_proposals": result.get("channel_proposals", []),
+                "transition_candidates": result.get("transition_candidates", []),
                 "exclusions":        result.get("exclusions", []),
                 "exclusion_prompts": result.get("exclusion_prompts", []),
                 "exclusion_review_required": bool(

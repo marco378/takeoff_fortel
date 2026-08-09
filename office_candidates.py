@@ -17,6 +17,7 @@ import math
 import re
 
 import fitz
+from shapely.affinity import translate
 from shapely.geometry import LineString, Polygon
 from shapely.ops import polygonize, unary_union
 
@@ -38,6 +39,12 @@ def _level_titles(page) -> list[dict]:
             match = re.search(r"Office\s+Plan\s+Level\s*(\d+)", text, re.I)
             if match:
                 level = int(match.group(1))
+            elif re.search(r"\bFirst\s+Floor\s+Steelwork\s+Layout\b", text, re.I):
+                # Engineer composite-deck sheets do not call the viewport an Office Plan,
+                # but this title is direct evidence of an upper-floor review target.  The
+                # title creates an assisted row only; fragmented deck hatch is not promoted
+                # to a measured boundary.
+                level = 1
             elif re.search(r"\bThird\s+Floor\b", text, re.I):
                 # Unit 3 calls the last plan "Third Floor" instead of "Level 03".
                 level = 3
@@ -186,7 +193,8 @@ def _confidence(*, resolved: bool, translated: bool, scale_verified: bool,
     if translated:
         score += 5
         reasons.append(
-            "outline translated from the strongest sibling-level plate; inspect extent manually"
+            "assisted prefill translated from the nearest resolved sibling-level plate; "
+            "inspect and edit extent manually"
         )
     else:
         score += 20
@@ -254,8 +262,9 @@ def _upper_regions(records: list[dict], scale_k: float | None) -> tuple[list[dic
     substantially but are not the same geometry, a dark loop without any retained topology
     is ambiguous and must remain a manual trace.
 
-    Deliberately do not copy a sibling level.  Units 2/3 prove that nominally similar floors
-    have different extents; translating the largest sibling silently manufactured an area.
+    This function deliberately does not copy a sibling level as a resolved boundary.  The
+    caller may separately offer a translated sibling as an explicitly low-confidence assisted
+    prefill, but it remains non-measured geometry until the assessor accepts or edits it.
     """
     dark = [
         record for record in records
@@ -334,14 +343,18 @@ def _candidate_record(page, page_number: int, title: dict, records: list[dict],
         "diagnostic_void_count": void_count,
         "coordinate_space": "rotated_pdf_points",
         "source": "+".join(sources) if sources else "office-level-title-only",
-        "outline_status": "resolved" if resolved else "unresolved",
+        "outline_status": ("prefill" if resolved and translated else
+                           "resolved" if resolved else "unresolved"),
         "confidence": confidence,
         "confidence_score": score,
         "confidence_reasons": reasons,
         "flags": [
             "ASSISTED TRACE candidate only — assessor must inspect/edit exterior doors, "
             "partitions and voids before submitting an adjustment"
-        ] + ([] if level == 0 else [
+        ] + ([
+            "LOW-CONFIDENCE PREFILL: geometry was translated from the nearest resolved "
+            "level on this same sheet; it is not a measurement and must be accepted or edited"
+        ] if translated else []) + ([] if level == 0 else [
             "UPPER FLOOR SCOPE CHECK: trace to the edge of the metal decking; Plant deck and "
             "POD first-floor areas require separate assessor regions/BOQ scopes"
         ] + ([] if resolved else [
@@ -387,31 +400,73 @@ def detect_office_candidates(pdf: str, page: int = 0, *, scale_k: float | None =
             nearest = min(titles, key=lambda title: abs(pos - title[title_axis]))
             grouped[nearest["level"]].append(record)
 
-        candidates = []
-        for title in sorted(titles, key=lambda item: item["level"]):
+        ordered_titles = sorted(titles, key=lambda item: item["level"])
+        local_selection = {}
+        local_reason = {}
+        for title in ordered_titles:
             level = title["level"]
-            translated = False
-            selected = []
-            unresolved_detail = None
             if level == 0:
-                selected = _ground_regions(grouped[level], scale_k, scale_verified)
+                local_selection[level] = _ground_regions(
+                    grouped[level], scale_k, scale_verified)
+                local_reason[level] = None
             else:
-                selected, unresolved_detail = _upper_regions(grouped[level], scale_k)
+                local_selection[level], local_reason[level] = _upper_regions(
+                    grouped[level], scale_k)
+
+        # A repeated level plan with broken local exterior linework can still receive a useful
+        # one-click starting outline.  Translation uses only same-sheet title spacing and a
+        # genuinely resolved sibling polygon.  It never emits area and is visibly low-confidence;
+        # if no sibling resolved, the level remains explicitly unresolved.
+        translated_levels = set()
+        resolved_upper = [
+            title for title in ordered_titles
+            if title["level"] > 0 and local_selection[title["level"]]
+        ]
+        for title in ordered_titles:
+            level = title["level"]
+            if level == 0 or local_selection[level] or not resolved_upper:
+                continue
+            sibling = min(
+                resolved_upper,
+                key=lambda source: abs(title[title_axis] - source[title_axis]),
+            )
+            dx = title["x"] - sibling["x"] if title_axis == "x" else 0.0
+            dy = title["y"] - sibling["y"] if title_axis == "y" else 0.0
+            translated_records = [{
+                "geometry": translate(record["geometry"], xoff=dx, yoff=dy),
+                "source": "office-vector-sibling-level-prefill",
+            } for record in local_selection[sibling["level"]]]
+            page_bounds = Polygon([
+                (pg.mediabox.x0, pg.mediabox.y0), (pg.mediabox.x1, pg.mediabox.y0),
+                (pg.mediabox.x1, pg.mediabox.y1), (pg.mediabox.x0, pg.mediabox.y1),
+            ])
+            if translated_records and all(
+                    page_bounds.covers(record["geometry"]) for record in translated_records):
+                local_selection[level] = translated_records
+                translated_levels.add(level)
+
+        candidates = []
+        for title in ordered_titles:
+            level = title["level"]
             candidates.append(_candidate_record(
-                pg, page, title, selected,
-                translated=translated,
+                pg, page, title, local_selection[level],
+                translated=level in translated_levels,
                 scale_verified=scale_verified,
-                unresolved_detail=unresolved_detail,
+                unresolved_detail=local_reason[level],
             ))
 
         unresolved = [
             candidate["level_label"] for candidate in candidates
             if candidate["outline_status"] == "unresolved"
         ]
-        resolved_count = len(candidates) - len(unresolved)
+        prefill_count = sum(
+            candidate["outline_status"] == "prefill" for candidate in candidates)
+        resolved_count = sum(
+            candidate["outline_status"] == "resolved" for candidate in candidates)
         flags = [
-            f"OFFICE ASSISTED TRACE: {resolved_count}/{len(candidates)} level outline(s) "
-            "resolved; exactly one candidate row per detected level; no area emitted — "
+            f"OFFICE ASSISTED TRACE: {resolved_count} locally resolved, {prefill_count} "
+            f"low-confidence prefill, {len(unresolved)} unresolved across {len(candidates)} "
+            "level(s); exactly one candidate row per detected level; no area emitted — "
             "assessor must inspect/edit and submit required regions"
         ]
         if unresolved:

@@ -28,6 +28,7 @@ with contextlib.redirect_stdout(io.StringIO()):
 ASSUMED = dict(depth_mm=190, conc_rate=128, mesh="A252", layers=1, steel_rate_t=850, margin=0.11)
 CONCRETE_LABELS = ("concrete service yard", "service yard", "external yard",
                    "yard construction", "type c", "gv areas")
+MACADAM_LABELS = ("macadam surfacing", "tarmac surfacing", "asphalt surfacing")
 
 # Inderjit confirmed on 31 Jul that Fortel wants these assumptions offered.  This remains the
 # single kill-switch: set CHANNEL_PROPOSALS_ENABLED=0 in the environment (or change this default
@@ -44,8 +45,8 @@ CHANNEL_PROPOSAL_BASIS = (
 
 
 # ---------------------------------------------------------------- legend -> hatch colour
-def _label_bbox(pdf, page=0):
-    """Find the legend text line naming the priced concrete area; return (bbox_pt, text) or None."""
+def _label_bbox_for(pdf, labels, page=0):
+    """Find a legend line containing one of ``labels``; return (bbox_pt, text) or None."""
     with fitz.open(pdf) as doc:
         pg = doc[page]
         lines = {}
@@ -54,10 +55,15 @@ def _label_bbox(pdf, page=0):
         for ws in lines.values():
             ws = sorted(ws, key=lambda w: w[0])
             text = " ".join(w[4] for w in ws).lower()
-            if any(lbl in text for lbl in CONCRETE_LABELS):
+            if any(lbl in text for lbl in labels):
                 return (min(w[0] for w in ws), min(w[1] for w in ws),
                         max(w[2] for w in ws), max(w[3] for w in ws)), text[:40]
     return None
+
+
+def _label_bbox(pdf, page=0):
+    """Backward-compatible concrete-Yard legend lookup."""
+    return _label_bbox_for(pdf, CONCRETE_LABELS, page)
 
 
 def _is_plausible_surface_tint(rgb):
@@ -144,11 +150,11 @@ def _choose_raster_swatch(patch):
     return min(candidates)[2] if candidates else None
 
 
-def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
-    """Deterministic legend anchor. Locate the 'Concrete Service Yard' label, then read its swatch
+def _find_surface_swatch_rgb(pdf, labels, im=None, S=2.0, page=0):
+    """Deterministic legend anchor. Locate a surface label, then read its swatch
     colour — first from the rendered raster just LEFT of the label (robust), else from a vector fill
     rect. Returns (rgb_0_255, label) or (None, reason)."""
-    found = _label_bbox(pdf, page)
+    found = _label_bbox_for(pdf, labels, page)
     if not found:
         return None, None
     raw_bbox, text = found
@@ -202,6 +208,11 @@ def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
     return None, text
 
 
+def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
+    """Read the on-sheet Concrete/Service Yard legend swatch."""
+    return _find_surface_swatch_rgb(pdf, CONCRETE_LABELS, im=im, S=S, page=page)
+
+
 def _legend_sample_bbox(pdf, page=0):
     """Rendered-PDF-point bbox covering the matched legend label and its left-hand swatch.
 
@@ -212,6 +223,22 @@ def _legend_sample_bbox(pdf, page=0):
     sampling: segmentation coordinates describe the rendered page, not unrotated text space.
     """
     found = _label_bbox(pdf, page)
+    if not found:
+        return None
+    raw_bbox, _ = found
+    with fitz.open(pdf) as doc:
+        rendered = fitz.Rect(raw_bbox) * doc[page].rotation_matrix
+    return [
+        max(0.0, float(rendered.x0) - 180.0),
+        max(0.0, float(rendered.y0) - 10.0),
+        float(rendered.x1) + 5.0,
+        float(rendered.y1) + 10.0,
+    ]
+
+
+def _legend_sample_bbox_for(pdf, labels, page=0):
+    """Rendered swatch/label exclusion box for an arbitrary supported surface legend."""
+    found = _label_bbox_for(pdf, labels, page)
     if not found:
         return None
     raw_bbox, _ = found
@@ -1290,6 +1317,286 @@ def _hatch_contour(comp, S, max_pts=180):
         return None
 
 
+def _drawing_closed_polygon(drawing, rotation_matrix):
+    """Return one native closed CAD path in rotated PDF-point space, if explicit.
+
+    MuPDF exposes quadrilaterals, rectangles and connected line chains differently.  This
+    parser accepts only those explicit closed forms; curves, disconnected fragments and
+    implicitly guessed closures are rejected.  It deliberately knows nothing about drawing
+    names, projects or expected measurements.
+    """
+    items = drawing.get("items") or []
+    raw_points = None
+    if len(items) == 1 and items[0][0] == "qu":
+        quad = items[0][1]
+        raw_points = [quad.ul, quad.ur, quad.lr, quad.ll]
+    elif len(items) == 1 and items[0][0] == "re":
+        rect = items[0][1]
+        raw_points = [rect.tl, rect.tr, rect.br, rect.bl]
+    elif items and all(item[0] == "l" for item in items):
+        first_start, first_end = items[0][1], items[0][2]
+        raw_points = [first_start, first_end]
+        for _, start, end in items[1:]:
+            if math.dist((raw_points[-1].x, raw_points[-1].y),
+                         (start.x, start.y)) > 0.01:
+                return None
+            raw_points.append(end)
+        if math.dist((raw_points[-1].x, raw_points[-1].y),
+                     (raw_points[0].x, raw_points[0].y)) > 0.01:
+            return None
+        raw_points.pop()  # repeated closing vertex
+    if not raw_points or len(raw_points) < 3:
+        return None
+    rotated = [point * rotation_matrix for point in raw_points]
+    return [[float(point.x), float(point.y)] for point in rotated]
+
+
+def _native_boundary_for_mask(page, region_mask, S, k, min_iou=0.90, drawings=None):
+    """Match a segmented surface to an independently encoded closed CAD boundary.
+
+    Raster hatch edges are serrated by text, bay lines and antialiasing, which biases a
+    chain-code perimeter high.  A native vector is used only when its filled polygon has
+    strong IoU with the independently segmented tint.  Competing materially different paths
+    refuse, and callers retain the raster outline for tracing but emit no perimeter.
+    """
+    ys, xs = np.where(region_mask)
+    if not len(xs):
+        return None, "empty segmented region"
+    mask_bbox = fitz.Rect(xs.min() / S, ys.min() / S,
+                          (xs.max() + 1) / S, (ys.max() + 1) / S)
+    candidates = []
+    # ``get_drawings()`` is expensive on dense architectural sheets. The main takeoff may
+    # retain several same-tint regions, so callers can parse the page once and reuse the
+    # immutable drawing records rather than reparsing the full content stream per region.
+    for drawing in drawings if drawings is not None else page.get_drawings():
+        try:
+            drawing_bbox = drawing["rect"] * page.rotation_matrix
+            intersection = drawing_bbox & mask_bbox
+            union_area = drawing_bbox.get_area() + mask_bbox.get_area() - intersection.get_area()
+            bbox_iou = intersection.get_area() / union_area if union_area > 0 else 0.0
+            if bbox_iou < 0.75:
+                continue
+            polygon = _drawing_closed_polygon(drawing, page.rotation_matrix)
+            if not polygon:
+                continue
+            pixels = np.rint(np.asarray(polygon, dtype=float) * S).astype(np.int32)
+            candidate_mask = np.zeros_like(region_mask, dtype=np.uint8)
+            cv2.fillPoly(candidate_mask, [pixels], 1)
+            candidate_bool = candidate_mask.astype(bool)
+            union = int((candidate_bool | region_mask).sum())
+            if not union:
+                continue
+            iou = int((candidate_bool & region_mask).sum()) / union
+            if iou < min_iou:
+                continue
+            perimeter_lm = sum(
+                math.dist(start, end)
+                for start, end in zip(polygon, polygon[1:] + polygon[:1])
+            ) * k
+            candidates.append({
+                "polygon_pts": polygon,
+                "perimeter_lm": perimeter_lm,
+                "iou": iou,
+                "bbox_iou": bbox_iou,
+            })
+        except Exception:
+            continue
+    if not candidates:
+        return None, f"no explicit closed native CAD boundary reached IoU {min_iou:.2f}"
+    candidates.sort(key=lambda item: (item["iou"], item["bbox_iou"]), reverse=True)
+    best = candidates[0]
+    for contender in candidates[1:]:
+        close_score = contender["iou"] >= best["iou"] - 0.01
+        material_difference = abs(contender["perimeter_lm"] - best["perimeter_lm"]) \
+            / best["perimeter_lm"] > 0.02
+        if close_score and material_difference:
+            return None, (
+                "competing closed native CAD boundaries have near-equal IoU but materially "
+                "different perimeters"
+            )
+    best["candidate_count"] = len(candidates)
+    return best, None
+
+
+# Parsing every native vector on dense landscape/boundary sheets can exceed the robustness
+# harness's per-file ceiling merely to obtain an optional perimeter.  This budget is a
+# performance/safety limit on compressed page-content bytes, not a measurement tolerance.
+MAX_NATIVE_BOUNDARY_STREAM_BYTES = 2_000_000
+
+
+def _native_boundary_stream_budget(total_bytes,
+                                   limit=MAX_NATIVE_BOUNDARY_STREAM_BYTES):
+    return isinstance(total_bytes, int) and 0 <= total_bytes <= limit
+
+
+def _native_boundary_drawings(page):
+    """Parse reusable native drawings only when page-content complexity is bounded."""
+    try:
+        xrefs = page.get_contents() or []
+        compressed_bytes = sum(
+            len(page.parent.xref_stream_raw(xref) or b"") for xref in xrefs)
+    except Exception as exc:
+        return None, f"native content complexity could not be read ({type(exc).__name__})"
+    if not _native_boundary_stream_budget(compressed_bytes):
+        return None, (
+            f"native CAD perimeter refused: page content streams total "
+            f"{compressed_bytes / 1_000_000:.2f} MB, above the "
+            f"{MAX_NATIVE_BOUNDARY_STREAM_BYTES / 1_000_000:.2f} MB safe parse budget"
+        )
+    try:
+        return page.get_drawings(), None
+    except Exception as exc:
+        return None, f"native CAD perimeter parse failed ({type(exc).__name__}: {exc})"
+
+
+def _transition_candidates_from_surface_mask(yard_regions, surface_mask, k, S=2.0,
+                                             max_gap_m=0.5, min_coverage=0.80):
+    """Find one contiguous macadam-adjacent boundary run per resolved Yard region.
+
+    This creates tracing prefills, never measured zones.  The Yard boundary must already be
+    independently resolved from native CAD geometry.  A run is accepted only when at least
+    ``min_coverage`` of each constituent edge has the separately legend-identified surface
+    within ``max_gap_m``.  Zero or multiple disjoint runs refuse for that region.
+    """
+    if not k or k <= 0 or surface_mask is None or not surface_mask.any():
+        return [], ["transition prefill refused: no usable scale or adjacent surface mask"]
+    height, width = surface_mask.shape
+    candidates, reasons = [], []
+    for region_index, region in enumerate(yard_regions, 1):
+        points = np.asarray(region.get("polygon_pts") or [], dtype=float)
+        if (len(points) < 3
+                or region.get("perimeter_confidence") != "high"):
+            reasons.append(
+                f"Yard region {region_index}: transition prefill refused because its native "
+                "boundary is unresolved"
+            )
+            continue
+        edge_hits = []
+        for start, end in zip(points, np.roll(points, -1, axis=0)):
+            vector = end - start
+            span_pt = float(np.linalg.norm(vector))
+            if span_pt <= 1e-6:
+                edge_hits.append(False)
+                continue
+            normal = np.asarray([-vector[1], vector[0]], dtype=float) / span_pt
+            sample_count = max(5, int(math.ceil(span_pt / max(5.0, 0.5 / k))))
+            along = np.linspace(0.05, 0.95, sample_count)
+            offset_distances = np.linspace(0.05, max_gap_m, 8) / k
+            best_coverage = 0.0
+            for sign in (-1.0, 1.0):
+                hits = 0
+                for fraction in along:
+                    point = start + vector * fraction
+                    found = False
+                    for offset in offset_distances:
+                        probe = point + sign * normal * offset
+                        px = int(round(float(probe[0]) * S))
+                        py = int(round(float(probe[1]) * S))
+                        if 0 <= px < width and 0 <= py < height and surface_mask[py, px]:
+                            found = True
+                            break
+                    hits += int(found)
+                best_coverage = max(best_coverage, hits / len(along))
+            edge_hits.append(best_coverage >= min_coverage)
+
+        active = [index for index, hit in enumerate(edge_hits) if hit]
+        if not active:
+            reasons.append(
+                f"Yard region {region_index}: no tarmac/macadam-adjacent boundary run resolved"
+            )
+            continue
+        if len(active) == len(points):
+            reasons.append(
+                f"Yard region {region_index}: transition prefill refused because macadam "
+                "surrounds the complete boundary rather than one entrance"
+            )
+            continue
+        groups = [[active[0]]]
+        for index in active[1:]:
+            if index == groups[-1][-1] + 1:
+                groups[-1].append(index)
+            else:
+                groups.append([index])
+        if len(groups) > 1 and groups[0][0] == 0 and groups[-1][-1] == len(points) - 1:
+            groups = [groups[-1] + groups[0]] + groups[1:-1]
+        if len(groups) != 1:
+            reasons.append(
+                f"Yard region {region_index}: transition prefill refused because "
+                f"{len(groups)} disjoint macadam-adjacent runs compete"
+            )
+            continue
+        group = groups[0]
+        polyline = [points[group[0]].tolist()]
+        for edge_index in group:
+            polyline.append(points[(edge_index + 1) % len(points)].tolist())
+        proposed_length = sum(
+            float(np.linalg.norm(points[(edge_index + 1) % len(points)] - points[edge_index]))
+            for edge_index in group
+        ) * k
+        candidates.append({
+            "candidate_id": f"transition-yard-region-{region_index}",
+            "region_id": region.get("region_id") or f"yard-region-{region_index}",
+            "category": "transition",
+            "proposed_length_lm": round(proposed_length, 2),
+            "polyline_pts": [[round(float(x), 4), round(float(y), 4)] for x, y in polyline],
+            "coordinate_space": "rotated_pdf_points",
+            "source": "legend-macadam/Yard-native-boundary-adjacency",
+            "basis": (
+                "ASSISTED PREFILL: contiguous tarmac/macadam-to-concrete boundary at the "
+                "Yard entrance; assessor must inspect/edit and trace one Transition run for "
+                "this unit before it becomes a measured Lm quantity"
+            ),
+            "confidence": "low",
+            "confidence_reasons": [
+                "surface class comes from this sheet's own tarmac/macadam legend swatch",
+                "the proposed run is a contiguous portion of the independently matched native Yard boundary",
+                f"surface adjacency covers at least {min_coverage * 100:.0f}% of every retained edge within {max_gap_m:.2f} m",
+                "prefill is not a measurement and is excluded from zones, totals and pricing",
+            ],
+            "assumed": True,
+            "requires_assessor_confirmation": True,
+        })
+    return candidates, reasons
+
+
+def detect_raw_transition_candidates(pdf, im, yard_regions, k, S=2.0, tol=14):
+    """Return honest Yard-entrance Transition tracing prefills from on-sheet evidence.
+
+    The legend supplies the tarmac/macadam tint and the independently matched native Yard
+    polygon supplies the other side of the junction.  Weak/ambiguous evidence returns no
+    candidates plus visible reasons.  Nothing here enters ``zones[]``.
+    """
+    swatch, label = _find_surface_swatch_rgb(
+        pdf, MACADAM_LABELS, im=im, S=S)
+    if not label:
+        return [], [
+            "raw Yard-entrance Transition NOT ATTEMPTED: no tarmac/macadam/asphalt surface "
+            "legend was found; assessor must trace one run per unit entrance"
+        ]
+    if not swatch or not _is_plausible_surface_tint(swatch):
+        return [], [
+            f"raw Yard-entrance Transition prefill refused: legend '{label}' has no plausible "
+            "surface swatch; assessor must trace manually"
+        ]
+    centre = np.asarray(swatch, dtype=np.int16)
+    surface_mask = np.all(np.abs(im.astype(np.int16) - centre) <= tol, axis=2).astype(np.uint8)
+    surface_mask = cv2.morphologyEx(
+        surface_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    exclusion = _legend_sample_bbox_for(pdf, MACADAM_LABELS)
+    if exclusion:
+        x0, y0, x1, y1 = [int(round(value * S)) for value in exclusion]
+        surface_mask[max(0, y0):min(surface_mask.shape[0], y1),
+                     max(0, x0):min(surface_mask.shape[1], x1)] = 0
+    candidates, reasons = _transition_candidates_from_surface_mask(
+        yard_regions, surface_mask.astype(bool), k, S=S)
+    if candidates:
+        reasons.insert(0,
+            f"TRANSITION ASSISTED PREFILL: legend '{label}' swatch {tuple(int(v) for v in swatch)} "
+            f"corroborates {len(candidates)} Yard-entrance boundary run(s); these remain "
+            "assumptions outside measured zones/totals until assessor trace")
+    return candidates, reasons
+
+
 # ---------------------------------------------------------------- manhole detector (UNMARKED, conservative)
 # Real manhole covers/chambers on a site plan are typically drawn ~0.6-1.5 m diameter.
 MANHOLE_DIAM_M_MIN = 0.5
@@ -1802,19 +2109,33 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         (record.get("component_id") for record in component_records if record.get("chosen")),
         None,
     )
+    native_drawings, native_drawings_reason = _native_boundary_drawings(pg)
     for rank, (component_idx, region_mask) in enumerate(adjusted_component_masks, 1):
         ys, xs = np.where(region_mask)
         if not len(xs):
             continue
         component_id = int(component_idx + 1) if component_idx is not None else rank
-        region_polygon = _hatch_contour(region_mask, S)
-        region_perimeter_lm = None
-        if region_polygon:
-            region_perimeter_lm = round(sum(
-                math.dist(start, end)
-                for start, end in zip(
-                    region_polygon, region_polygon[1:] + region_polygon[:1])
-            ) * k, 2)
+        raster_polygon = _hatch_contour(region_mask, S)
+        if native_drawings is None:
+            native_boundary, perimeter_reason = None, native_drawings_reason
+        else:
+            native_boundary, perimeter_reason = _native_boundary_for_mask(
+                pg, region_mask, S, k, drawings=native_drawings)
+        if native_boundary:
+            region_polygon = native_boundary["polygon_pts"]
+            region_perimeter_lm = round(native_boundary["perimeter_lm"], 2)
+            perimeter_source = (
+                "native closed CAD boundary independently matched to segmented surface "
+                f"(IoU {native_boundary['iou']:.3f})"
+            )
+            perimeter_confidence = "high"
+        else:
+            # The raster outline remains useful as an assessor trace overlay, but its jagged
+            # pixel boundary is not promoted to a commercial Lm quantity.
+            region_polygon = raster_polygon
+            region_perimeter_lm = None
+            perimeter_source = f"unresolved: {perimeter_reason}"
+            perimeter_confidence = "unresolved"
         yard_regions.append({
             "region_id": f"yard-region-{rank}",
             "component_id": component_id,
@@ -1825,13 +2146,22 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             ],
             "polygon_pts": region_polygon,
             "perimeter_lm": region_perimeter_lm,
+            "perimeter_source": perimeter_source,
+            "perimeter_confidence": perimeter_confidence,
             "included": rank - 1 in included_positions,
             "chosen_primary": component_id == chosen_component_id,
-            "classification_source": (
-                "retained same-tint connected component; perimeter follows its rendered "
-                "outer boundary"
-            ),
+            "classification_source": "retained same-tint connected component",
         })
+        if native_boundary:
+            flags.append(
+                f"Yard region {rank}: perimeter {region_perimeter_lm:.2f} Lm from "
+                f"independent native boundary at IoU {native_boundary['iou']:.3f}"
+            )
+        else:
+            flags.append(
+                f"assessor: Yard region {rank} perimeter not measured — {perimeter_reason}; "
+                "raster outline retained for manual trace"
+            )
     yard_region_review_required = len(yard_regions) > 1
     component_evidence["yard_regions"] = yard_regions
     component_evidence["review_required"] = yard_region_review_required
@@ -1844,6 +2174,14 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "region(s) out. Assessor must keep/exclude every row before approval"
         )
         region_confidence = "low"
+
+    # Yard-entrance Transition assistance is deliberately separate from measured zones.
+    # It requires two independent on-sheet signals: a tarmac/macadam legend swatch and a
+    # contiguous shared run on an independently matched native Yard boundary.  The assessor
+    # still traces/edits it before any Lm quantity can enter a quotation.
+    transition_candidates, transition_candidate_flags = detect_raw_transition_candidates(
+        pdf, im, yard_regions, k, S=S)
+    flags += transition_candidate_flags
 
     # --- refuse the absolute-largest guess (invariant 5) --------------------------------
     # If NO connected component fell inside the plausible service-yard band, segment_hatch
@@ -1906,9 +2244,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         )
         flags.append(
             "raw Channel MEASUREMENT not attempted — any channel_proposals are separate "
-            "assumptions requiring assessor review; Yard-entrance Transition length NOT "
-            "ATTEMPTED because the tarmac-to-concrete boundary is not reliably identifiable "
-            "without a marked subject — assessor must trace one run per unit entrance"
+            "assumptions requiring assessor review"
         )
     else:
         if dock_detection.get("evidence_seen"):
@@ -2093,6 +2429,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "yard_regions": yard_regions,
             "yard_region_review_required": yard_region_review_required,
             "channel_proposals": channel_proposals,
+            "transition_candidates": transition_candidates,
             "exclusion_prompts": exclusion_prompts,
             "exclusion_review_required": exclusion_review_required,
             "boundary_precision_risk": precision_risk,

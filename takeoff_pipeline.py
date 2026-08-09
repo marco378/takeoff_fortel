@@ -514,6 +514,9 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                         # Assumed channel runs are tracing/review aids only. They stay outside
                         # measured zones and every costing/quotation total.
                         "channel_proposals": tu.get("channel_proposals", []),
+                        # Yard-entrance boundary prefills are likewise assistance only. They
+                        # become Transition Lm only after an assessor traces/confirms them.
+                        "transition_candidates": tu.get("transition_candidates", []),
                         "exclusion_prompts": tu.get("exclusion_prompts", []),
                         "exclusion_review_required": bool(
                             tu.get("exclusion_review_required", False)),
@@ -609,6 +612,7 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     "yard_region_review_required": bool(
                         tu.get("yard_region_review_required", False)),
                     "channel_proposals": tu.get("channel_proposals", []),
+                    "transition_candidates": tu.get("transition_candidates", []),
                     "exclusion_prompts": tu.get("exclusion_prompts", []),
                     "exclusion_review_required": bool(
                         tu.get("exclusion_review_required", False)),

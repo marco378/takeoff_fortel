@@ -532,6 +532,7 @@ let traceRegions = [];    // completed assessor regions: [{points:[{x,y}], candi
 let activeCandidateId = null;
 let candidatePolygons = []; // assisted candidates in CANVAS pixels; never authoritative by themselves
 let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never measured/priced
+let transitionCandidates = []; // macadam/Yard boundary prefills; never measured/priced
 let channelDrag = null;     // {proposalIndex, pointIndex, axis}; edits stay axis-aligned
 let cutoutPolygons = [];    // completed cut-out regions: [{points:[{x,y}]}]
 let userChannels = [];      // user-drawn channel lines: [{points:[{x,y},{x,y}]}]
@@ -859,7 +860,8 @@ async function selectJob(jobId) {
   // the new one loads. Clearing img/poly/cal/aiPoly + the visible canvas, and
   // resetting snapScale/mpp, guarantees the canvas reloads fresh for each job.
   img = null;
-  poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = []; channelProposals = [];
+  poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = [];
+  channelProposals = []; transitionCandidates = [];
   cutoutPolygons = []; userChannels = [];
   cutoutDrag = null; userChannelDrag = null;
   cal = []; aiPoly = null; dragIdx = -1; channelDrag = null;
@@ -1100,6 +1102,14 @@ function effectiveChannelProposals(job) {
   return Array.isArray(nested) ? nested : [];
 }
 
+function effectiveTransitionCandidates(job) {
+  if (job && Array.isArray(job.transition_candidates) && job.transition_candidates.length) {
+    return job.transition_candidates;
+  }
+  const nested = job && job.result && job.result.transition_candidates;
+  return Array.isArray(nested) ? nested : [];
+}
+
 function effectiveChannelProposalDecisions(job) {
   const direct = job && job.channel_proposal_decisions;
   if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
@@ -1155,6 +1165,14 @@ function initialiseTraceState(job, res) {
       }))
     };
   }).filter(proposal => proposal.points.length === 2);
+
+  transitionCandidates = effectiveTransitionCandidates(job).map(candidate => ({
+    ...candidate,
+    points: (candidate.polyline_pts || []).map(point => ({
+      x: Number(point[0]) * snapScale,
+      y: Number(point[1]) * snapScale
+    }))
+  })).filter(candidate => candidate.points.length >= 2);
 
   const adjusted = job.adjusted || {};
   let storedRegions = Array.isArray(adjusted.regions) ? adjusted.regions : [];
@@ -1252,6 +1270,7 @@ function jobHasAssumptions(job) {
     (job && (job.manhole_count_estimate != null || job.manhole_count_assumed != null)) ||
     res.manhole_count_estimate != null || res.manhole_count_assumed != null ||
     effectiveCandidatePolygons(job).length || effectiveChannelProposals(job).length ||
+    effectiveTransitionCandidates(job).length ||
     effectiveZones(job).some(zone => zoneAssumption(zone)) ||
     costing.assumed === true ||
     (Array.isArray(costing.extras) && costing.extras.some(extra => extra && extra.estimate === true)) ||
@@ -1523,6 +1542,30 @@ function renderChannelProposalSummary(job) {
   </div>`;
 }
 
+function renderTransitionCandidateSummary(job) {
+  const candidates = effectiveTransitionCandidates(job);
+  if (!candidates.length) return '';
+  const rows = candidates.map(candidate => {
+    const why = (candidate.confidence_reasons || []).join(' · ');
+    const basis = candidate.basis || why || 'Assessor must resolve the Yard entrance boundary';
+    const length = Number(candidate.proposed_length_lm);
+    return `<div class="candidate-row assumption-item">
+      <span class="candidate-label">
+        ${assumptionBadge('PROPOSED', basis)}
+        <strong>${esc(candidate.region_id || 'Yard entrance')}</strong>
+        · ${Number.isFinite(length) ? length.toFixed(2) + ' Lm' : 'length unresolved'}
+        · ${esc(candidate.confidence || 'low')} confidence
+        <span class="candidate-why">Basis: ${esc(why || basis)}</span>
+      </span>
+    </div>`;
+  }).join('');
+  return `<div class="candidate-panel">
+    <div style="font-size:11px;font-weight:800;color:#9a4f00;margin-bottom:3px">TRANSITION ASSISTED PREFILLS - NOT MEASURED OR PRICED</div>
+    <div class="candidate-note">Orange dashed runs are on-sheet macadam/Yard boundary suggestions. Inspect/edit and trace each as a Transition before it can enter a quotation; they are currently outside zones, totals and pricing.</div>
+    ${rows}
+  </div>`;
+}
+
 function channelProposalForId(proposalId) {
   return channelProposals.find(proposal => String(proposal.proposal_id || '') === String(proposalId));
 }
@@ -1657,6 +1700,7 @@ function renderJobDetails(job) {
   const segmentationComponentSummary = renderSegmentationComponentSummary(job);
   const candidateSummary = renderCandidateSummary(job);
   const channelProposalSummary = renderChannelProposalSummary(job);
+  const transitionCandidateSummary = renderTransitionCandidateSummary(job);
   const exclusionSummary = renderExclusionSummary(job);
   document.getElementById('jobDetails').innerHTML = `
     ${projRow}
@@ -1671,6 +1715,7 @@ function renderJobDetails(job) {
     ${manholeRows}
     <div class="kv"><span class="k">Scale src</span><span class="v">${esc(res.scale_src||res.scale_k)}</span></div>
     ${channelProposalSummary}
+    ${transitionCandidateSummary}
     ${exclusionSummary}
     ${candidateSummary}
     ${segmentationComponentSummary}
@@ -2248,6 +2293,21 @@ function draw() {
       ctx.fillStyle = 'rgba(111,66,193,0.95)';
       ctx.beginPath(); ctx.arc(point.x, point.y, dotR, 0, Math.PI*2); ctx.fill();
     });
+    ctx.restore();
+  });
+
+  // Transition assisted prefills (orange/dashed). These are display-only until the
+  // assessor traces/confirms a Transition line; they never enter measured zones here.
+  transitionCandidates.forEach(candidate => {
+    if (!candidate.points || candidate.points.length < 2) return;
+    ctx.save();
+    ctx.setLineDash([5,5]);
+    ctx.beginPath();
+    candidate.points.forEach((point, index) => index
+      ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+    ctx.strokeStyle = 'rgba(230,126,34,0.95)';
+    ctx.lineWidth = lw * 1.5;
+    ctx.stroke();
     ctx.restore();
   });
 

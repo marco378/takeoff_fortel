@@ -132,7 +132,22 @@ ck("detected level without a defensible outline is reported, never dropped",
        for flag in _office_unresolved["flags"]),
    _office_unresolved)
 
-_office_no_sibling_pdf = "/tmp/_office_candidates_no_sibling_copy.pdf"
+_steelwork_title_pdf = "/tmp/_office_first_floor_steelwork_title.pdf"
+_steelwork_title_canvas = canvas.Canvas(_steelwork_title_pdf, pagesize=(900, 500))
+_steelwork_title_canvas.drawString(250, 60, "First Floor Steelwork Layout")
+_steelwork_title_canvas.drawString(650, 450, "Metal Deck Notes")
+_steelwork_title_canvas.save()
+_steelwork_title_result = _office_candidates(
+    _steelwork_title_pdf, scale_k=0.1, scale_verified=False)
+ck("First Floor Steelwork Layout creates an upper-floor assisted row, not a silent drop",
+   len(_steelwork_title_result["candidate_polygons"]) == 1 and
+   _steelwork_title_result["candidate_polygons"][0]["level"] == 1 and
+   _steelwork_title_result["candidate_polygons"][0]["category"] == "upper_floor" and
+   _steelwork_title_result["candidate_polygons"][0]["outline_status"] == "unresolved" and
+   "area_m2" not in _steelwork_title_result["candidate_polygons"][0],
+   _steelwork_title_result)
+
+_office_no_sibling_pdf = "/tmp/_office_candidates_sibling_prefill.pdf"
 _office_no_sibling_canvas = canvas.Canvas(_office_no_sibling_pdf, pagesize=(900, 500))
 _office_no_sibling_canvas.rect(60, 220, 100, 100, stroke=1, fill=0)
 _office_no_sibling_canvas.drawString(60, 190, "Office Plan Level 01")
@@ -144,14 +159,16 @@ _office_no_sibling_by_level = {
     candidate["level"]: candidate
     for candidate in _office_no_sibling["candidate_polygons"]
 }
-ck("missing local Office loop is never replaced by a translated sibling area",
+ck("missing local Office loop gets geometry-only sibling prefill, never a measured area",
    _office_no_sibling_by_level[1]["outline_status"] == "resolved" and
-   _office_no_sibling_by_level[2]["outline_status"] == "unresolved" and
-   not _office_no_sibling_by_level[2]["regions"] and
+   _office_no_sibling_by_level[2]["outline_status"] == "prefill" and
+   _office_no_sibling_by_level[2]["regions"] and
+   "area_m2" not in _office_no_sibling_by_level[2] and
    "no level-local dark closed plate loop" in
        " ".join(_office_no_sibling_by_level[2]["confidence_reasons"]) and
-   all("sibling-level-template" not in candidate["source"]
-       for candidate in _office_no_sibling["candidate_polygons"]),
+   "sibling-level-prefill" in _office_no_sibling_by_level[2]["source"] and
+   any("LOW-CONFIDENCE PREFILL" in flag
+       for flag in _office_no_sibling_by_level[2]["flags"]),
    _office_no_sibling)
 
 print("accuracy scorecard harness")
@@ -1284,6 +1301,95 @@ ck("matched legend chip is geometrically excluded, never promoted as another Yar
     {"excluded_legend_m2": _multi_yard_diag.get("excluded_legend_m2"),
      "components": _multi_yard_diag.get("component_candidates")})
 
+# Raster boundaries can be serrated by internal linework.  Perimeter is permitted only when
+# an independently encoded closed CAD path strongly overlaps the segmented tint.  This fixture
+# has two disjoint regions and deliberately nicks raster pixels along one edge; neither expected
+# perimeter is inferred from an area or a client value.
+import fitz as _fitz_native_boundary
+from takeoff_unmarked import _native_boundary_for_mask as _native_boundary_for_mask_test
+
+def _closed_line_drawing(_points):
+    _closed = _points + [_points[0]]
+    return {
+        "rect": _fitz_native_boundary.Rect(
+            min(p.x for p in _points), min(p.y for p in _points),
+            max(p.x for p in _points), max(p.y for p in _points)),
+        "items": [("l", start, end) for start, end in zip(_closed, _closed[1:])],
+        "closePath": True,
+    }
+
+class _BoundaryPage:
+    rotation_matrix = _fitz_native_boundary.Matrix(1, 1)
+    def __init__(self, drawings):
+        self._drawings = drawings
+    def get_drawings(self):
+        return self._drawings
+
+_boundary_a = [_fitz_native_boundary.Point(10, 10), _fitz_native_boundary.Point(60, 10),
+               _fitz_native_boundary.Point(60, 40), _fitz_native_boundary.Point(10, 40)]
+_boundary_b = [_fitz_native_boundary.Point(90, 55), _fitz_native_boundary.Point(140, 55),
+               _fitz_native_boundary.Point(140, 90), _fitz_native_boundary.Point(120, 90),
+               _fitz_native_boundary.Point(120, 75), _fitz_native_boundary.Point(90, 75)]
+_boundary_page = _BoundaryPage([
+    _closed_line_drawing(_boundary_a), _closed_line_drawing(_boundary_b)])
+_boundary_mask_a = _np_multi_yard.zeros((120, 170), dtype=bool)
+_boundary_mask_a[10:41, 10:61] = True
+_boundary_mask_a[10:12, 20:25] = False  # raster-only nick: must not become extra perimeter
+_boundary_mask_b = _np_multi_yard.zeros((120, 170), dtype=_np_multi_yard.uint8)
+import cv2 as _cv2_native_boundary
+_cv2_native_boundary.fillPoly(
+    _boundary_mask_b, [_np_multi_yard.array(_boundary_b, dtype=_np_multi_yard.int32)], 1)
+_native_a, _native_a_reason = _native_boundary_for_mask_test(
+    _boundary_page, _boundary_mask_a, S=1.0, k=0.1)
+_native_b, _native_b_reason = _native_boundary_for_mask_test(
+    _boundary_page, _boundary_mask_b.astype(bool), S=1.0, k=0.1)
+ck("native CAD perimeter ignores raster/internal-edge serration on each disjoint region",
+   _native_a is not None and _native_b is not None and
+   abs(_native_a["perimeter_lm"] - 16.0) < 0.01 and
+   abs(_native_b["perimeter_lm"] - 17.0) < 0.01,
+   {"region_a": _native_a or _native_a_reason,
+    "region_b": _native_b or _native_b_reason})
+_unresolved_boundary, _unresolved_reason = _native_boundary_for_mask_test(
+    _BoundaryPage([]), _boundary_mask_a, S=1.0, k=0.1)
+ck("perimeter refuses when no corroborating native boundary exists",
+   _unresolved_boundary is None and "no explicit closed" in _unresolved_reason,
+   _unresolved_reason)
+
+from takeoff_unmarked import (
+    _transition_candidates_from_surface_mask as _transition_candidates_from_mask_test,
+    _native_boundary_stream_budget as _native_boundary_stream_budget_test,
+    MAX_NATIVE_BOUNDARY_STREAM_BYTES as _native_boundary_stream_limit_test,
+)
+ck("dense native-vector pages refuse optional perimeter parsing before the robustness timeout",
+   _native_boundary_stream_budget_test(_native_boundary_stream_limit_test) and
+   not _native_boundary_stream_budget_test(_native_boundary_stream_limit_test + 1))
+_transition_surface = _np_multi_yard.zeros((100, 160), dtype=bool)
+_transition_surface[41:46, 10:61] = True
+_transition_yard = [{
+    "region_id": "yard-region-1",
+    "polygon_pts": [[10, 10], [60, 10], [60, 40], [10, 40]],
+    "perimeter_confidence": "high",
+}]
+_transition_prefills, _transition_prefill_reasons = \
+    _transition_candidates_from_mask_test(
+        _transition_yard, _transition_surface, k=0.1, S=1.0)
+ck("legend-surface adjacency creates one assisted Transition prefill outside measured zones",
+   len(_transition_prefills) == 1 and
+   _transition_prefills[0]["proposed_length_lm"] == 5.0 and
+   _transition_prefills[0]["assumed"] is True and
+   "length_lm" not in _transition_prefills[0] and
+   _transition_prefills[0]["category"] == "transition",
+   _transition_prefills or _transition_prefill_reasons)
+_transition_ambiguous_surface = _transition_surface.copy()
+_transition_ambiguous_surface[4:10, 10:61] = True
+_transition_ambiguous, _transition_ambiguous_reasons = \
+    _transition_candidates_from_mask_test(
+        _transition_yard, _transition_ambiguous_surface, k=0.1, S=1.0)
+ck("two disjoint adjacent surface runs refuse instead of guessing a Yard entrance",
+   not _transition_ambiguous and
+   any("disjoint" in reason for reason in _transition_ambiguous_reasons),
+   _transition_ambiguous_reasons)
+
 # Source: Fortel's Yard Markup.pdf supplied for 2165 Tanro Voltage Business Park:
 # Unit-1&2 = 235.37 m² and Unit-3 = 133.79 m².  Production sees only a temporary
 # annotation-stripped copy; these client answers stay here in the validation assertion.
@@ -1315,6 +1421,35 @@ try:
            all(region.get("area_m2") and region.get("bbox_pdf_pts")
                and region.get("perimeter_lm") for region in _tanro_regions),
            _tanro_regions)
+        _tanro_actual = sorted(
+            (region["area_m2"], region["perimeter_lm"]) for region in _tanro_regions)
+        _tanro_perimeter_truth = sorted([(235.37, 61.54), (133.79, 49.80)])
+        ck("Tanro raw Yard native per-region perimeters are within 5%",
+           len(_tanro_actual) == 2 and all(
+               abs(actual_perimeter - truth_perimeter) / truth_perimeter * 100 <= 5
+               for (_, actual_perimeter), (_, truth_perimeter)
+               in zip(_tanro_actual, _tanro_perimeter_truth)
+           ), {"actual": _tanro_actual, "truth": _tanro_perimeter_truth})
+        _tanro_transition_truth = sorted([14.25, 12.30])
+        _tanro_transition_candidates = _tanro_result.get("transition_candidates") or []
+        _tanro_transition_actual = sorted(
+            candidate.get("proposed_length_lm")
+            for candidate in _tanro_transition_candidates)
+        ck("Tanro raw macadam/Yard adjacency prefills both client Transition runs within 5%",
+           len(_tanro_transition_actual) == 2 and all(
+               abs(actual - expected) / expected * 100 <= 5
+               for actual, expected in zip(
+                   _tanro_transition_actual, _tanro_transition_truth)
+           ), {"actual": _tanro_transition_actual,
+               "truth": _tanro_transition_truth})
+        ck("raw Transition prefills never leak into measured zones or the measured total",
+           all(candidate.get("assumed") is True and
+               "length_lm" not in candidate
+               for candidate in _tanro_transition_candidates) and
+           not any(zone.get("category") == "transition"
+                   for zone in (_tanro_result.get("zones") or [])),
+           {"candidates": _tanro_transition_candidates,
+            "zones": _tanro_result.get("zones")})
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
 try:

@@ -221,3 +221,59 @@ TIMEOUT: **1**
 | `drawings/castle_donington/Office Floors Unit-4.pdf` — raw-equivalent Upper Floor | 792.45 m² | REFUSED (assisted) | — | REFUSED |
 
 Coverage flips: **2 REFUSED-MISS → PASS** (Tanro Unit-1&2 Yard and Unit-3 Yard). The two newly surfaced raw perimeters are numeric but fail the 5% comparison, so they are not claimed as passes.
+
+## After GOAL 100 build 2026-08-09
+
+| File | Fortel answer | AI estimate | Diff % | Outcome |
+|---|---:|---:|---:|---|
+| `2165 Tanro- Voltage Business Park/Markup/1st Floor.pdf` — total | 570.0 m² | REFUSED (assisted) | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/1st Floor.pdf` — Upper Floor | 570.05 m² | REFUSED (assisted) | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/1st Floor.pdf` — Upper Floor perimeter | 194.24 Lm | REFUSED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/1st Floor.pdf` — unclassified length | 2.24 Lm | REFUSED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/Drainage Markup.pdf` — MH Counts | 1 Nr | REFUSED | — | REFUSED-MISS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — total | 369.2 m² | 366.0 m² | -0.87% | PASS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Unit-1&2 Yard | 235.37 m² | 234.2 m² | -0.50% | PASS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Unit-1&2 perimeter | 61.54 Lm | 61.51 Lm | -0.05% | PASS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Unit-3 Yard | 133.79 m² | 132.0 m² | -1.34% | PASS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Unit-3 perimeter | 49.80 Lm | 49.80 Lm | 0.00% | PASS |
+| `2165 Tanro- Voltage Business Park/Markup/Yard Markup.pdf` — Transition | 26.55 Lm | REFUSED (assisted) | — | REFUSED-MISS |
+| `drawings/castle_donington/External Markup Unit-1.pdf` — raw-equivalent scorecard total | 3,185.8 m² | 3,244.4 m² | +1.84% | PASS |
+| `drawings/castle_donington/External Markup Unit-1.pdf` — raw-equivalent Yard | 3,080.26 m² | 3,138 m² | +1.87% | PASS |
+| `drawings/castle_donington/External Markup Unit-1.pdf` — raw-equivalent Dock | 105.57 m² | 106.4 m² | +0.79% | PASS |
+| `drawings/castle_donington/External Markup Unit-1.pdf` — raw-equivalent Channel | 96.71 Lm | UNMEASURED | — | REFUSED |
+| `drawings/castle_donington/External Markup Unit-1.pdf` — raw-equivalent Transition | 8.75 Lm | UNMEASURED | — | REFUSED |
+| `drawings/castle_donington/External Markup Unit-2.pdf` — raw-equivalent scorecard total | 6,769.3 m² | 6,759.6 m² | -0.14% | PASS |
+| `drawings/castle_donington/External Markup Unit-2.pdf` — raw-equivalent Yard | 6,378.03 m² | 6,357 m² | -0.33% | PASS |
+| `drawings/castle_donington/External Markup Unit-2.pdf` — raw-equivalent Dock | 391.30 m² | 402.6 m² | +2.89% | PASS |
+| `drawings/castle_donington/External Markup Unit-2.pdf` — raw-equivalent Channel | 235.72 Lm | UNMEASURED | — | REFUSED |
+| `drawings/castle_donington/External Markup Unit-2.pdf` — raw-equivalent Transition | 14.08 Lm | UNMEASURED | — | REFUSED |
+| `drawings/castle_donington/External Markup Unit-3.pdf` — raw-equivalent scorecard total | 17,139.3 m² | 17,081.4 m² | -0.34% | PASS |
+| `drawings/castle_donington/External Markup Unit-3.pdf` — raw-equivalent Yard | 16,115.03 m² | 16,074 m² | -0.25% | PASS |
+| `drawings/castle_donington/External Markup Unit-3.pdf` — raw-equivalent Dock | 1,024.26 m² | 1,007.4 m² | -1.65% | PASS |
+| `drawings/castle_donington/External Markup Unit-3.pdf` — raw-equivalent Channel | 545.36 Lm | UNMEASURED | — | REFUSED |
+| `drawings/castle_donington/External Markup Unit-3.pdf` — raw-equivalent Transition | 18.19 Lm | UNMEASURED | — | REFUSED |
+| `drawings/castle_donington/External Markup Unit-4.pdf` — raw-equivalent scorecard total | 7,624.6 m² | 7,674.5 m² | +0.65% | PASS |
+| `drawings/castle_donington/External Markup Unit-4.pdf` — raw-equivalent Yard | 7,222.08 m² | 7,270 m² | +0.66% | PASS |
+| `drawings/castle_donington/External Markup Unit-4.pdf` — raw-equivalent Dock | 402.57 m² | 404.5 m² | +0.48% | PASS |
+| `drawings/castle_donington/External Markup Unit-4.pdf` — raw-equivalent Channel | 242.91 Lm | UNMEASURED | — | REFUSED |
+| `drawings/castle_donington/External Markup Unit-4.pdf` — raw-equivalent Transition | 10.71 Lm | UNMEASURED | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-1.pdf` — raw-equivalent scorecard total | 760.4 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-1.pdf` — raw-equivalent Ground Floor | 104.65 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-1.pdf` — raw-equivalent Upper Floor | 655.72 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-2.pdf` — raw-equivalent scorecard total | 1,103.1 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-2.pdf` — raw-equivalent Ground Floor | 104.62 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-2.pdf` — raw-equivalent Upper Floor | 998.50 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-3.pdf` — raw-equivalent scorecard total | 1,113.2 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-3.pdf` — raw-equivalent Ground Floor | 115.52 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-3.pdf` — raw-equivalent Upper Floor | 997.69 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-4.pdf` — raw-equivalent scorecard total | 904.1 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-4.pdf` — raw-equivalent Ground Floor | 111.68 m² | REFUSED (assisted) | — | REFUSED |
+| `drawings/castle_donington/Office Floors Unit-4.pdf` — raw-equivalent Upper Floor | 792.45 m² | REFUSED (assisted) | — | REFUSED |
+
+Rows with both numbers: **17**
+
+PASS count: **17**
+
+REFUSED count: **26**
+
+GOAL 100 score including the 17 aggregate golds, 8 zone golds and 1 manhole gold: **43 PASS, 0 FAIL, 26 honest REFUSED**. The two prior numeric failures are now PASS; office and Transition aids remain explicitly assisted/refused rather than being scored as measurements.
