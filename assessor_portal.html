@@ -532,7 +532,7 @@ let traceRegions = [];    // completed assessor regions: [{points:[{x,y}], candi
 let activeCandidateId = null;
 let candidatePolygons = []; // assisted candidates in CANVAS pixels; never authoritative by themselves
 let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never measured/priced
-let transitionCandidates = []; // macadam/Yard boundary prefills; never measured/priced
+let transitionCandidates = []; // provisional prefills until assessor action; never auto-priced
 let channelDrag = null;     // {proposalIndex, pointIndex, axis}; edits stay axis-aligned
 let cutoutPolygons = [];    // completed cut-out regions: [{points:[{x,y}]}]
 let userChannels = [];      // user-drawn channel lines: [{points:[{x,y},{x,y}]}]
@@ -1117,6 +1117,13 @@ function effectiveChannelProposalDecisions(job) {
   return nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : {};
 }
 
+function effectiveTransitionCandidateDecisions(job) {
+  const direct = job && job.transition_candidate_decisions;
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+  const nested = job && job.result && job.result.transition_candidate_decisions;
+  return nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : {};
+}
+
 function effectiveSegmentationComponents(job) {
   const direct = job && job.segmentation_components;
   if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
@@ -1166,13 +1173,18 @@ function initialiseTraceState(job, res) {
     };
   }).filter(proposal => proposal.points.length === 2);
 
-  transitionCandidates = effectiveTransitionCandidates(job).map(candidate => ({
-    ...candidate,
-    points: (candidate.polyline_pts || []).map(point => ({
+  const transitionDecisions = effectiveTransitionCandidateDecisions(job);
+  transitionCandidates = effectiveTransitionCandidates(job).map(candidate => {
+    const decision = transitionDecisions[String(candidate.candidate_id || '')] || {};
+    return {
+      ...candidate,
+      decision,
+      points: (candidate.polyline_pts || []).map(point => ({
       x: Number(point[0]) * snapScale,
       y: Number(point[1]) * snapScale
-    }))
-  })).filter(candidate => candidate.points.length >= 2);
+      }))
+    };
+  }).filter(candidate => candidate.points.length >= 2);
 
   const adjusted = job.adjusted || {};
   let storedRegions = Array.isArray(adjusted.regions) ? adjusted.regions : [];
@@ -1545,25 +1557,82 @@ function renderChannelProposalSummary(job) {
 function renderTransitionCandidateSummary(job) {
   const candidates = effectiveTransitionCandidates(job);
   if (!candidates.length) return '';
+  const decisions = effectiveTransitionCandidateDecisions(job);
   const rows = candidates.map(candidate => {
+    const id = String(candidate.candidate_id || '');
+    const decision = decisions[id] || {};
     const why = (candidate.confidence_reasons || []).join(' · ');
     const basis = candidate.basis || why || 'Assessor must resolve the Yard entrance boundary';
-    const length = Number(candidate.proposed_length_lm);
-    return `<div class="candidate-row assumption-item">
-      <span class="candidate-label">
+    const displayedLength = decision.decision === 'accepted' && decision.length_lm != null
+      ? Number(decision.length_lm) : Number(candidate.proposed_length_lm);
+    const status = decision.decision || 'pending review';
+    return `<div class="channel-proposal-row assumption-item">
+      <div class="candidate-label">
         ${assumptionBadge('PROPOSED', basis)}
         <strong>${esc(candidate.region_id || 'Yard entrance')}</strong>
-        · ${Number.isFinite(length) ? length.toFixed(2) + ' Lm' : 'length unresolved'}
         · ${esc(candidate.confidence || 'low')} confidence
+        · <span class="transition-candidate-status">${esc(status)}</span>
         <span class="candidate-why">Basis: ${esc(why || basis)}</span>
-      </span>
+      </div>
+      <div class="channel-proposal-actions">
+        <label>Proposed/edited Lm
+          <input id="transitionLength-${esc(id)}" type="number" min="0.01" step="0.01"
+                 data-candidate-id="${esc(id)}"
+                 oninput="editTransitionLength(this.dataset.candidateId)"
+                 value="${Number.isFinite(displayedLength) ? displayedLength.toFixed(2) : ''}">
+        </label>
+        <button type="button" data-candidate-id="${esc(id)}"
+                onclick="reviewTransitionCandidate(this.dataset.candidateId,'accept')">Accept / save edit</button>
+        <button type="button" class="remove" data-candidate-id="${esc(id)}"
+                onclick="reviewTransitionCandidate(this.dataset.candidateId,'remove')">Remove</button>
+      </div>
     </div>`;
   }).join('');
   return `<div class="candidate-panel">
-    <div style="font-size:11px;font-weight:800;color:#9a4f00;margin-bottom:3px">TRANSITION ASSISTED PREFILLS - NOT MEASURED OR PRICED</div>
-    <div class="candidate-note">Orange dashed runs are on-sheet macadam/Yard boundary suggestions. Inspect/edit and trace each as a Transition before it can enter a quotation; they are currently outside zones, totals and pricing.</div>
+    <div style="font-size:11px;font-weight:800;color:#9a4f00;margin-bottom:3px">ASSUMED TRANSITION CANDIDATES - NOT PRICED UNTIL REVIEWED</div>
+    <div class="candidate-note">Orange dashed runs are on-sheet macadam/Yard boundary suggestions. Edit the Lm if needed, then accept or remove every row. Accepted quantities enter the quotation provisionally with a blank assessor rate; pending rows remain outside totals.</div>
     ${rows}
   </div>`;
+}
+
+function transitionCandidateForId(candidateId) {
+  return transitionCandidates.find(candidate =>
+    String(candidate.candidate_id || '') === String(candidateId));
+}
+
+function editTransitionLength(candidateId) {
+  const candidate = transitionCandidateForId(candidateId);
+  const input = document.getElementById(`transitionLength-${candidateId}`);
+  const length = input ? Number(input.value) : NaN;
+  if (!candidate || !Number.isFinite(length) || length <= 0) return;
+  candidate.editedLengthLm = length;
+}
+
+async function reviewTransitionCandidate(candidateId, action) {
+  if (!currentJob) return;
+  const input = document.getElementById(`transitionLength-${candidateId}`);
+  const length = input ? Number(input.value) : null;
+  if (action === 'accept' && (!Number.isFinite(length) || length <= 0)) {
+    toast('Enter a positive Transition length first', 'error');
+    return;
+  }
+  try {
+    const response = await fetch(`${BASE}/transition-candidates/${currentJob.id}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({decisions:[{
+        candidate_id:candidateId, action,
+        length_lm:action === 'accept' ? length : null
+      }]})
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    toast(action === 'remove'
+      ? 'Transition candidate removed'
+      : 'Transition candidate accepted/edited with blank assessor rate');
+    await selectJob(currentJob.id);
+  } catch (error) {
+    toast(`Transition review failed: ${error.message}`, 'error');
+  }
 }
 
 function channelProposalForId(proposalId) {
@@ -2296,8 +2365,8 @@ function draw() {
     ctx.restore();
   });
 
-  // Transition assisted prefills (orange/dashed). These are display-only until the
-  // assessor traces/confirms a Transition line; they never enter measured zones here.
+  // Transition assisted prefills (orange/dashed). Assessor decisions are persisted through
+  // /transition-candidates; accepted quantities remain provisional and outside measured zones.
   transitionCandidates.forEach(candidate => {
     if (!candidate.points || candidate.points.length < 2) return;
     ctx.save();

@@ -486,6 +486,52 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                     "price is included."
                 )
 
+    # Transition candidates follow the same assessor-review lifecycle as channels.  They are
+    # assumptions until explicitly accepted/edited, never measured zones or automatic prices.
+    for unit in source_results:
+        drawing = unit.get("file") or Path(str(unit.get("pdf_path") or "")).name
+        candidates = [candidate for candidate in (unit.get("transition_candidates") or [])
+                      if isinstance(candidate, dict) and candidate.get("candidate_id")]
+        decisions = unit.get("transition_candidate_decisions") or {}
+        for candidate in candidates:
+            candidate_id = candidate["candidate_id"]
+            decision = decisions.get(candidate_id) if isinstance(decisions, dict) else None
+            decision = decision if isinstance(decision, dict) else {}
+            status = decision.get("decision")
+            region_label = str(candidate.get("region_id") or "Yard entrance")
+            basis = str(candidate.get("basis") or
+                        "assessor-reviewed tarmac-to-concrete Yard entrance assumption")
+            if status == "accepted":
+                length_lm = decision.get("length_lm")
+                if (isinstance(length_lm, (int, float)) and not isinstance(length_lm, bool)
+                        and length_lm > 0):
+                    edited = "assessor-edited" if decision.get("edited") else "assessor-accepted"
+                    extra_rows.append({
+                        "section": "External yard slabs",
+                        "description": f"Transition — {region_label} ({edited} proposal)",
+                        "qty": round(float(length_lm), 2), "unit": "Lm",
+                        "rate": None, "value": None, "assessor_rate_required": True,
+                        "provisional": True, "provisional_reason": PROVISIONAL_LABEL,
+                        "assumption_basis": basis,
+                        "drawings": [drawing] if drawing else [],
+                    })
+                    declarations.append(
+                        f"{PROVISIONAL_LABEL}: Transition at {region_label} — {length_lm:g} Lm "
+                        f"included as an {edited} assumption with rate left blank; basis: {basis}."
+                    )
+                else:
+                    declarations.append(
+                        f"{PROVISIONAL_LABEL}: accepted Transition candidate {candidate_id!r} "
+                        "has no valid length and is not included; assessor must correct it "
+                        "before issue."
+                    )
+            elif status != "removed":
+                declarations.append(
+                    f"{PROVISIONAL_LABEL}: Transition candidate at {region_label} on "
+                    f"{drawing or 'drawing'} has not been actioned; no Transition quantity "
+                    "or price is included."
+                )
+
     # User-drawn channels (red dotted lines added by the assessor)
     for unit in source_results:
         drawing = unit.get("file") or Path(str(unit.get("pdf_path") or "")).name

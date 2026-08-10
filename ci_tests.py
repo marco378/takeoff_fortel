@@ -896,6 +896,45 @@ ck("unactioned channel proposal is declared explicitly and never becomes a quote
    any("has not been actioned" in note and "no channel quantity or price is included" in note
        for note in _q_pending_channel["declarations"]))
 
+_transition_quote_unit = _quotation_unit("External Unit-2.pdf", "External yard slabs", 100)
+_transition_quote_unit["transition_candidates"] = [{
+    "candidate_id":"transition-yard-region-1", "region_id":"yard-region-1",
+    "proposed_length_lm":15.0,
+    "basis":"macadam-to-concrete boundary at the Yard entrance",
+}]
+_transition_quote_unit["transition_candidate_decisions"] = {
+    "transition-yard-region-1": {
+        "decision":"accepted", "length_lm":17.5, "edited":True,
+    }
+}
+_q_transition_candidate = generate_quotation(
+    _transition_quote_unit, ref="TRANSITION-QUOTE-001")
+_transition_candidate_rows = [
+    item for item in _q_transition_candidate["line_items"]
+    if item["description"].startswith("Transition —")
+]
+ck("accepted/edited Transition candidate becomes provisional blank-rate Lm quote line",
+   len(_transition_candidate_rows) == 1 and
+   _transition_candidate_rows[0]["qty"] == 17.5 and
+   _transition_candidate_rows[0]["unit"] == "Lm" and
+   _transition_candidate_rows[0]["rate"] is None and
+   _transition_candidate_rows[0]["value"] is None and
+   _transition_candidate_rows[0]["assessor_rate_required"] and
+   _transition_candidate_rows[0]["provisional"] and
+   "macadam-to-concrete" in _transition_candidate_rows[0]["assumption_basis"],
+   _transition_candidate_rows)
+_pending_transition_unit = _copy.deepcopy(_transition_quote_unit)
+_pending_transition_unit["transition_candidate_decisions"] = {}
+_q_pending_transition = generate_quotation(
+    _pending_transition_unit, ref="TRANSITION-PENDING-001")
+ck("unactioned Transition candidate stays outside totals and is declared explicitly",
+   not any(item["description"].startswith("Transition —")
+           for item in _q_pending_transition["line_items"]) and
+   any("has not been actioned" in note and
+       "no Transition quantity or price is included" in note
+       for note in _q_pending_transition["declarations"]),
+   _q_pending_transition["declarations"])
+
 print("marked zone-aware measurement + multi-unit BOQ allocation")
 import fitz as _fitz_zones
 from robust_takeoff import read_marked as _read_marked_legacy, read_marked_zones as _read_marked_zones
@@ -2795,6 +2834,84 @@ try:
            _channel_saved_rows[0]["provisional"],
            _channel_saved_rows)
 
+        _transition_job_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        _transition_candidates = [
+            {"candidate_id":"transition-yard-region-1", "region_id":"yard-region-1",
+             "category":"transition", "proposed_length_lm":14.0,
+             "polyline_pts":[[10,10],[150,10]], "assumed":True,
+             "basis":"macadam-to-concrete Yard entrance boundary"},
+            {"candidate_id":"transition-yard-region-2", "region_id":"yard-region-2",
+             "category":"transition", "proposed_length_lm":12.0,
+             "polyline_pts":[[20,20],[140,20]], "assumed":True,
+             "basis":"macadam-to-concrete Yard entrance boundary"},
+        ]
+        _AS.save_jobs({_transition_job_id: {
+            "id":_transition_job_id, "status":"pending", "decision":None,
+            "measurement_state":"MEASURED_VERIFIED", "scale_confirmed":False,
+            "zones":_copy.deepcopy(_channel_zones),
+            "transition_candidates":_copy.deepcopy(_transition_candidates),
+            "transition_candidate_decisions":{},
+            "accepted_transition_quantities":[],
+            "costing":_copy.deepcopy(_channel_costing),
+            "result":{"file":"Raw External transitions.pdf", "area_m2":120.0,
+                      "scale_k":0.1, "measurement_state":"MEASURED_VERIFIED",
+                      "zones":_copy.deepcopy(_channel_zones),
+                      "transition_candidates":_copy.deepcopy(_transition_candidates),
+                      "transition_candidate_decisions":{},
+                      "accepted_transition_quantities":[],
+                      "costing":_copy.deepcopy(_channel_costing)},
+        }})
+        ck("unreviewed assumed Transition candidates block approval",
+           "accept/edit/remove" in (_AS._approve_block_reason(
+               _AS.load_jobs()[_transition_job_id]) or ""))
+        _transition_accept_resp = _client_up.post(
+            f"/transition-candidates/{_transition_job_id}", json={"decisions":[{
+                "candidate_id":"transition-yard-region-1", "action":"accept",
+                "length_lm":15.25,
+            }]})
+        _transition_accept_job = _AS.load_jobs()[_transition_job_id]
+        ck("Transition endpoint persists assessor-edited accepted quantity",
+           _transition_accept_resp.status_code == 200 and
+           not _transition_accept_resp.get_json()["review_complete"] and
+           _transition_accept_job["transition_candidate_decisions"][
+               "transition-yard-region-1"]["length_lm"] == 15.25 and
+           _transition_accept_job["transition_candidate_decisions"][
+               "transition-yard-region-1"]["edited"] is True and
+           _transition_accept_job["accepted_transition_quantities"] == [{
+               "candidate_id":"transition-yard-region-1",
+               "region_id":"yard-region-1", "category":"transition",
+               "measurement_kind":"length", "length_lm":15.25, "unit":"Lm",
+               "assumed":True, "provisional":True,
+               "basis":"macadam-to-concrete Yard entrance boundary",
+               "source":None, "assessor_edited":True,
+           }], _transition_accept_resp.get_json())
+        ck("one pending Transition candidate continues to block approval",
+           _AS._approve_block_reason(_transition_accept_job) is not None)
+        _transition_remove_resp = _client_up.post(
+            f"/transition-candidates/{_transition_job_id}", json={"decisions":[{
+                "candidate_id":"transition-yard-region-2", "action":"remove",
+            }]})
+        _transition_reviewed_job = _AS.load_jobs()[_transition_job_id]
+        ck("Transition remove completes review and releases the approval gate",
+           _transition_remove_resp.status_code == 200 and
+           _transition_remove_resp.get_json()["review_complete"] and
+           _AS._approve_block_reason(_transition_reviewed_job) is None)
+        ck("accepted Transition remains provisional state, never measured zone or costing",
+           not any(zone.get("category") == "transition"
+                   for zone in _transition_reviewed_job["zones"]) and
+           _transition_reviewed_job["costing"] == _channel_costing and
+           _transition_reviewed_job["accepted_transition_quantities"][0][
+               "provisional"] is True)
+        _transition_quote = _AS._quotation_for_job(_transition_job_id)
+        _transition_rows = [item for item in _transition_quote["line_items"]
+                            if str(item.get("description") or "").startswith(
+                                "Transition —")]
+        ck("persisted accepted Transition reaches server quotation with blank rate",
+           len(_transition_rows) == 1 and _transition_rows[0]["qty"] == 15.25 and
+           _transition_rows[0]["rate"] is None and
+           _transition_rows[0]["value"] is None and
+           _transition_rows[0]["provisional"], _transition_rows)
+
         # Critical assisted-loop regression: begin with a real /upload-created record, then
         # install the completed zoned MEASURED_UNVERIFIED takeoff that the background worker
         # would save. Confirming the existing scale/extent must preserve both zones, release
@@ -3225,6 +3342,12 @@ try:
                "channel_proposals", "reviewChannelProposal(",
                "/channel-proposals/", "Accept / save edit", "Remove",
                "Dock-level retaining-wall/loading face", "Full Yard width (no Dock level)")))
+        ck("portal gives Transition candidates the full accept/edit/remove lifecycle",
+           all(marker in _portal_html_up for marker in (
+               "ASSUMED TRANSITION CANDIDATES - NOT PRICED UNTIL REVIEWED",
+               "transition_candidate_decisions", "editTransitionLength(",
+               "reviewTransitionCandidate(", "/transition-candidates/",
+               "Accept / save edit", "Remove", "blank assessor rate")))
         ck("portal visibly carries exclusion checks and construction-joint classification",
            all(marker in _portal_html_up for marker in (
                "SLAB EXCLUSIONS", "CHECK EXCLUSION", "EXCLUDED ·",

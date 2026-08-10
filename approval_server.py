@@ -505,6 +505,30 @@ def _channel_proposal_block_reason(job: dict) -> str | None:
     return None
 
 
+def _transition_candidate_block_reason(job: dict) -> str | None:
+    """Pending Transition assumptions require explicit accept/edit/remove review."""
+    result = job.get("result") or {}
+    candidates = job.get("transition_candidates")
+    if not isinstance(candidates, list):
+        candidates = (result.get("transition_candidates")
+                      if isinstance(result.get("transition_candidates"), list) else [])
+    candidates = [candidate for candidate in candidates
+                  if isinstance(candidate, dict) and candidate.get("candidate_id")]
+    if not candidates:
+        return None
+    decisions = job.get("transition_candidate_decisions")
+    if not isinstance(decisions, dict):
+        decisions = (result.get("transition_candidate_decisions")
+                     if isinstance(result.get("transition_candidate_decisions"), dict) else {})
+    pending = [candidate["candidate_id"] for candidate in candidates
+               if decisions.get(candidate["candidate_id"], {}).get("decision")
+               not in {"accepted", "removed"}]
+    if pending:
+        return (f"{len(pending)} assumed Transition candidate(s) require assessor "
+                "accept/edit/remove review before approval")
+    return None
+
+
 def _yard_region_block_reason(job: dict) -> str | None:
     """A multi-component tint result is a candidate total until every extent is reviewed."""
     result = job.get("result") or {}
@@ -540,6 +564,9 @@ def _approve_block_reason(job: dict) -> str | None:
     channel_reason = _channel_proposal_block_reason(job)
     if channel_reason:
         return channel_reason
+    transition_reason = _transition_candidate_block_reason(job)
+    if transition_reason:
+        return transition_reason
     if job.get("spec_pricing_warning"):
         return "slab specification is saved but requires human pricing review before approval"
     state = job.get("measurement_state") or result.get("measurement_state")
@@ -1451,6 +1478,129 @@ def review_channel_proposals(job_id):
     })
 
 
+@app.route("/transition-candidates/<job_id>", methods=["POST"])
+def review_transition_candidates(job_id):
+    """Persist assessor accept/edit/remove decisions for assumed Transition lengths.
+
+    Accepted candidates become explicit provisional quantities on the job, outside measured
+    zones and costing. Quotation generation consumes only those accepted quantities and leaves
+    their rate blank; pending candidates remain declarations only.
+    """
+    data = request.get_json(silent=True) or {}
+    submitted = data.get("decisions")
+    if not isinstance(submitted, list) or not submitted:
+        return jsonify({"error": "decisions must be a non-empty list"}), 400
+
+    normalised = []
+    for item in submitted:
+        if not isinstance(item, dict):
+            return jsonify({"error": "each decision must be an object"}), 400
+        candidate_id = str(item.get("candidate_id") or "").strip()
+        action = str(item.get("action") or "").strip().lower()
+        if not candidate_id or action not in {"accept", "remove"}:
+            return jsonify({
+                "error": "candidate_id and action accept/remove are required"
+            }), 400
+        length_lm = item.get("length_lm")
+        if action == "accept":
+            if (not isinstance(length_lm, (int, float)) or isinstance(length_lm, bool)
+                    or not math.isfinite(length_lm) or not 0 < length_lm <= 100_000):
+                return jsonify({"error": "accepted length_lm must be a positive number"}), 400
+            length_lm = round(float(length_lm), 2)
+        else:
+            length_lm = None
+        normalised.append((candidate_id, action, length_lm))
+    if len({candidate_id for candidate_id, _, _ in normalised}) != len(normalised):
+        return jsonify({"error": "candidate_id decisions must be unique"}), 400
+
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": f"job {job_id!r} not found"}), 404
+        result = dict(job.get("result") or {})
+        candidates = job.get("transition_candidates")
+        if not isinstance(candidates, list):
+            candidates = (result.get("transition_candidates")
+                          if isinstance(result.get("transition_candidates"), list) else [])
+        known = {
+            candidate.get("candidate_id"): candidate
+            for candidate in candidates
+            if isinstance(candidate, dict) and candidate.get("candidate_id")
+        }
+        unknown = [candidate_id for candidate_id, _, _ in normalised
+                   if candidate_id not in known]
+        if unknown:
+            return jsonify({"error": "unknown transition candidate_id(s): "
+                            + ", ".join(sorted(unknown))}), 409
+
+        decisions = dict(job.get("transition_candidate_decisions")
+                         or result.get("transition_candidate_decisions") or {})
+        decided_at = now_iso()
+        for candidate_id, action, length_lm in normalised:
+            candidate = known[candidate_id]
+            decisions[candidate_id] = {
+                "candidate_id": candidate_id,
+                "decision": "accepted" if action == "accept" else "removed",
+                "length_lm": length_lm,
+                "original_proposed_length_lm": candidate.get("proposed_length_lm"),
+                "edited": bool(
+                    action == "accept"
+                    and length_lm != candidate.get("proposed_length_lm")
+                ),
+                "decided_at": decided_at,
+            }
+        reviewed = bool(known) and all(
+            decisions.get(candidate_id, {}).get("decision") in {"accepted", "removed"}
+            for candidate_id in known
+        )
+        accepted_quantities = []
+        for candidate_id, candidate in known.items():
+            decision = decisions.get(candidate_id) or {}
+            if decision.get("decision") != "accepted":
+                continue
+            accepted_quantities.append({
+                "candidate_id": candidate_id,
+                "region_id": candidate.get("region_id"),
+                "category": "transition",
+                "measurement_kind": "length",
+                "length_lm": decision.get("length_lm"),
+                "unit": "Lm",
+                "assumed": True,
+                "provisional": True,
+                "basis": candidate.get("basis"),
+                "source": candidate.get("source"),
+                "assessor_edited": bool(decision.get("edited")),
+            })
+        result.update({
+            "transition_candidate_decisions": decisions,
+            "transition_candidates_reviewed": reviewed,
+            "accepted_transition_quantities": accepted_quantities,
+        })
+        job.update({
+            "transition_candidate_decisions": decisions,
+            "transition_candidates_reviewed": reviewed,
+            "accepted_transition_quantities": accepted_quantities,
+            "result": result,
+        })
+        jobs[job_id] = job
+        save_jobs(jobs)
+
+    log_training({
+        "event": "transition_candidates_reviewed",
+        "job_id": job_id,
+        "candidate_ids": [candidate_id for candidate_id, _, _ in normalised],
+        "review_complete": reviewed,
+        "timestamp": decided_at,
+    })
+    return jsonify({
+        "status": "transition_candidates_updated",
+        "decisions": decisions,
+        "accepted_quantities": accepted_quantities,
+        "review_complete": reviewed,
+    })
+
+
 @app.route("/yard-regions/<job_id>", methods=["POST"])
 def review_yard_regions(job_id):
     """Keep/exclude every retained same-tint component and recalculate its Yard quantity.
@@ -1872,6 +2022,12 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["channel_proposals"] = list(job["channel_proposals"])
     if isinstance(job.get("transition_candidates"), list):
         result["transition_candidates"] = list(job["transition_candidates"])
+    if isinstance(job.get("transition_candidate_decisions"), dict):
+        result["transition_candidate_decisions"] = dict(
+            job["transition_candidate_decisions"])
+    if isinstance(job.get("accepted_transition_quantities"), list):
+        result["accepted_transition_quantities"] = list(
+            job["accepted_transition_quantities"])
     if isinstance(job.get("channel_proposal_decisions"), dict):
         result["channel_proposal_decisions"] = dict(job["channel_proposal_decisions"])
     if isinstance(job.get("yard_regions"), list):
@@ -2451,6 +2607,8 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                     result.get("unit_group_review_required", False)),
                 "boundary_precision_risk": result.get("boundary_precision_risk"),
                 "channel_proposal_decisions": {},
+                "transition_candidate_decisions": {},
+                "accepted_transition_quantities": [],
                 "yard_regions":      result.get("yard_regions", []),
                 "yard_region_decisions": {},
                 "yard_region_review_required": bool(
