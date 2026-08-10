@@ -277,3 +277,22 @@ PASS count: **17**
 REFUSED count: **26**
 
 GOAL 100 score including the 17 aggregate golds, 8 zone golds and 1 manhole gold: **43 PASS, 0 FAIL, 26 honest REFUSED**. The two prior numeric failures are now PASS; office and Transition aids remain explicitly assisted/refused rather than being scored as measurements.
+
+## Re-score on 48fbd3c
+
+Executed 2026-08-11 against the raw tender siblings in the same 2165 Tanro project tree. Pairings: `Yard Markup.pdf` -> `13897-105-Proposed-Finishes-Plan-Rev.T1.pdf`; `1st Floor.pdf` -> `13897-0004-First-Floor-Steelwork-Layout-Rev.T01.pdf`; `Drainage Markup.pdf` -> `13897-101-Proposed-Drainage-Plan-Rev.T1.pdf`.
+
+| Truth row | Fortel answer | Before | AI on 48fbd3c | Current diff | Current outcome | Change |
+|---|---:|---:|---:|---:|---|---|
+| Yard total | 369.20 m² | 366.00 m² (-0.87%) | 366.00 m² (MEASURED_UNVERIFIED) | -0.87% | PASS | Unchanged |
+| Unit-1&2 Yard | 235.37 m² | 234.20 m² (-0.50%; earliest run UNMEASURED) | 234.20 m² (MEASURED_UNVERIFIED) | -0.50% | PASS | Unchanged from latest recorded run |
+| Unit-1&2 perimeter | 61.54 Lm | 61.51 Lm (-0.05%) | 61.51 Lm (MEASURED_UNVERIFIED) | -0.05% | PASS | Unchanged |
+| Unit-3 Yard | 133.79 m² | 132.00 m² (-1.34%; earliest run UNMEASURED) | 132.00 m² (MEASURED_UNVERIFIED) | -1.34% | PASS | Unchanged from latest recorded run |
+| Unit-3 perimeter | 49.80 Lm | 49.80 Lm (0.00%) | 49.80 Lm (MEASURED_UNVERIFIED) | 0.00% | PASS | Unchanged |
+| Transition - two runs | 26.55 Lm (14.25 + 12.30) | UNMEASURED | candidate 26.55 Lm (14.24 + 12.31), awaiting assessor accept | - | NOT MEASURED | Scoring unchanged; assisted workflow improved |
+| 1st Floor - Upper Floor | 570.05 m² | REFUSED | 560.70 m² (MEASURED_UNVERIFIED) | -1.64% | PASS | Improved |
+| 1st Floor - Upper Floor perimeter | 194.24 Lm | REFUSED | 191.44 Lm (MEASURED_UNVERIFIED) | -1.44% | PASS | Improved |
+| 1st Floor - unclassified `Length Measurement` | 2.24 Lm | REFUSED | UNMEASURED | - | REFUSED | Unchanged |
+| Drainage - MH Counts | 1 Nr | REFUSED | UNMEASURED - line/hatch drawing routed to assessor trace | - | REFUSED | Unchanged |
+
+Strict measurement-score changes: **2 improved / 8 unchanged / 0 regressed**. Transition assistance improved operationally, but its candidate is deliberately excluded from measured scoring until assessor acceptance.
