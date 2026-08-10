@@ -554,11 +554,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     ]
                     r["measurement_state"] = UNMEASURED
                     r["needs_assessor"] = True
-                    # Office GA sheets are line/hatch drawings with several level plans on one
-                    # page.  Deterministic closed-vector faces are useful trace *candidates*, but
-                    # validation against Inderjit's marked truth misses the 5% auto-measure gate.
-                    # Carry geometry only: no area, costing or authoritative polygon is emitted
-                    # until an assessor selects/edits the regions and submits /adjust.
+                    # Office GA sheets are commonly line/hatch drawings with several level plans
+                    # on one page.  Ordinary closed-vector faces remain trace candidates only.
+                    # A narrower, corroborated metal-deck hatch class may emit an assessor-gated
+                    # MEASURED_UNVERIFIED estimate; all other office geometry stays quantity-free.
                     try:
                         from office_candidates import detect_office_candidates
                         office_k, office_verified, office_note, office_sources = TU.scale_for(meas_pdf)
@@ -578,6 +577,29 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                                 "scale_sources": office_sources,
                             })
                             r["flags"] = r["flags"] + assisted.get("flags", [])
+                            office_auto = assisted.get("auto_measurement")
+                            if office_auto:
+                                # The colour path refused correctly before the independent
+                                # office-structure detector ran.  Do not leave its terminal
+                                # "no area emitted" wording beside the later gated estimate.
+                                r["flags"] = [
+                                    flag for flag in r["flags"]
+                                    if "no area emitted" not in str(flag).lower()
+                                ]
+                                r.update({
+                                    "method": office_auto["method"],
+                                    "area_m2": office_auto["area_m2"],
+                                    "regions": len(office_auto["regions"]),
+                                    "polygon_pts": office_auto["polygon_pts"],
+                                    "perimeter_lm": office_auto.get("perimeter_lm"),
+                                    "zones": office_auto["zones"],
+                                    "zones_total_area_m2": round(sum(
+                                        zone["area_m2"] for zone in office_auto["zones"]), 2),
+                                    # This new estimator is intentionally never VERIFIED even
+                                    # if the independent scale machinery later verifies scale.
+                                    "measurement_state": MEASURED_UNVERIFIED,
+                                    "needs_assessor": True,
+                                })
                     except Exception as exc:
                         # Candidate assistance is best-effort.  Failure preserves the existing
                         # safe UNMEASURED/manual-trace outcome instead of failing the job.
@@ -664,7 +686,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
 
     # Informational formwork quantity only: polygon_pts are PDF points and scale_k is m/pt,
     # so closed polygon length × scale_k gives linear metres.  This never enters pricing.
-    if r.get("polygon_pts") and r.get("scale_k"):
+    if (r.get("perimeter_lm") is None
+            and r.get("polygon_pts") and r.get("scale_k")):
         from geometry import polygon_perimeter_lm
         perimeter_lm = polygon_perimeter_lm(r["polygon_pts"], r["scale_k"])
         if perimeter_lm is not None:

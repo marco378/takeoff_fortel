@@ -1480,7 +1480,7 @@ function renderCandidateSummary(job) {
     const confidence = `${candidate.confidence || 'low'}${
       candidate.confidence_score == null ? '' : ` (${candidate.confidence_score}/100)`}`;
     const why = (candidate.confidence_reasons || candidate.flags || []).join(' · ');
-    const basis = why || candidate.basis || 'No detector basis supplied — inspect the suggested outline';
+    const basis = candidate.basis || why || 'No detector basis supplied — inspect the suggested outline';
     return `
       <div class="candidate-row assumption-item ${resolved ? '' : 'unresolved'}">
         <span class="candidate-label">
@@ -1496,7 +1496,7 @@ function renderCandidateSummary(job) {
   }).join('');
   return `<div class="candidate-panel">
     <div style="font-size:11px;font-weight:800;color:#6a4900;margin-bottom:3px">ASSISTED TRACE CANDIDATES</div>
-    <div class="candidate-note">One row is shown for every detected level. These are closed-linework tracing aids, not AI measurements; confidence and its evidence are shown per row. Inspect/edit every outline before submitting an adjustment.</div>
+    <div class="candidate-note">One row is shown for every detected level. Candidate geometry is always proposed and editable; any structural estimate is shown separately and remains unverified. Confidence and its evidence are shown per row. Inspect/edit every outline before submitting an adjustment.</div>
     ${rows}
   </div>`;
 }
@@ -2973,7 +2973,14 @@ function setupButtons() {
     document.getElementById('btnCutout').classList.remove('on');
   });
   document.getElementById('btnLoad').addEventListener('click', () => {
-    if (!aiPoly) { toast('No AI polygon for this job', 'warn'); return; }
+    const proposed = candidatePolygons.find(candidate =>
+      Array.isArray(candidate.regions) && candidate.regions.length);
+    if (proposed) {
+      loadTraceCandidate(proposed.candidate_id);
+      toast('Proposed assisted polygon loaded — inspect every edge before submitting');
+      return;
+    }
+    if (!aiPoly) { toast('No AI or assisted polygon for this job', 'warn'); return; }
     traceRegions = [];
     activeCandidateId = null;
     poly = aiPoly.map(p => ({x: p[0], y: p[1]}));

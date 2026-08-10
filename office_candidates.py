@@ -1,9 +1,10 @@
-"""Deterministic vector candidates for assessor-assisted Office GA tracing.
+"""Deterministic vector assistance for Office GA tracing.
 
-This module deliberately does *not* measure an office slab.  Architectural GA plans have
-open door breaks, room partitions, cores and stair/lift voids, so a candidate remains a
-tracing aid until an assessor selects/edits it.  The pipeline therefore carries geometry
-while keeping ``area_m2=None`` and ``measurement_state=UNMEASURED``.
+Architectural GA plans with open door breaks, room partitions, cores and stair/lift voids
+remain tracing aids until an assessor selects/edits them.  A narrower engineer-sheet class
+can be measured at most ``MEASURED_UNVERIFIED`` when the drawing itself supplies a repeated
+vector metal-deck hatch corroborated by its notes.  The same geometry is still exposed for
+assessor inspection; all other candidates remain quantity-free.
 
 There is exactly one candidate record per detected level title.  A record can contain
 several ``regions`` (Level 00 commonly has two separate cores), or be explicitly unresolved.
@@ -16,7 +17,10 @@ from __future__ import annotations
 import math
 import re
 
+import cv2
 import fitz
+import numpy as np
+from scipy.spatial import cKDTree
 from shapely.affinity import translate
 from shapely.geometry import LineString, Polygon
 from shapely.ops import polygonize, unary_union
@@ -28,6 +32,11 @@ MIN_CANDIDATE_M2 = 20.0
 MAX_CANDIDATE_M2 = 500.0
 IOU_DEDUPE_THRESHOLD = 0.90
 UNRESOLVED_REASON = "level detected but outline not resolved — trace manually"
+MIN_REPEATED_HATCH_SEGMENTS = 1000
+MIN_HATCH_SATURATION = 0.18
+MAX_HATCH_SEGMENT_P90_PT = 8.0
+HATCH_COMPONENT_MIN_FRACTION = 0.10
+HATCH_MASK_MAX_DIM = 4000
 
 
 def _level_titles(page) -> list[dict]:
@@ -42,8 +51,8 @@ def _level_titles(page) -> list[dict]:
             elif re.search(r"\bFirst\s+Floor\s+Steelwork\s+Layout\b", text, re.I):
                 # Engineer composite-deck sheets do not call the viewport an Office Plan,
                 # but this title is direct evidence of an upper-floor review target.  The
-                # title creates an assisted row only; fragmented deck hatch is not promoted
-                # to a measured boundary.
+                # The title creates an assisted row.  Only separately corroborated repeated
+                # metal-deck hatch structure may later produce an assessor-gated estimate.
                 level = 1
             elif re.search(r"\bThird\s+Floor\b", text, re.I):
                 # Unit 3 calls the last plan "Third Floor" instead of "Level 03".
@@ -120,6 +129,120 @@ def _white_fill_rectangles(page) -> list[dict]:
             "source": "office-vector-white-fill-loop",
         })
     return records
+
+
+def _metal_deck_hatch_prefill(page) -> tuple[list[dict], str | None, list[str]]:
+    """Derive editable outlines from a repeated vector metal-deck hatch.
+
+    Composite-deck engineer sheets may contain no closed slab-edge path at all.  They do,
+    however, carry thousands of short hatch strokes inside each deck panel.  This detector
+    selects a *drawing-derived* repeated saturated hatch only when the sheet text independently
+    corroborates metal decking, connects gaps using the observed hatch spacing, and returns
+    each substantial disconnected extent separately.  It does not calculate or expose area.
+    """
+    sheet_text = " ".join((page.get_text() or "").split())
+    if not re.search(r"\b(?:metal\s+deck(?:ing)?|composite\s+(?:metal\s+)?deck)\b",
+                     sheet_text, re.I):
+        return [], None, []
+
+    styles: dict[tuple[float, float, float], list] = {}
+    for drawing in page.get_drawings():
+        colour = drawing.get("color")
+        if not colour or max(colour) - min(colour) < MIN_HATCH_SATURATION:
+            continue
+        key = tuple(round(float(value), 3) for value in colour)
+        styles.setdefault(key, []).extend(
+            item for item in (drawing.get("items") or []) if item[0] == "l"
+        )
+
+    eligible_styles = []
+    for colour, lines in styles.items():
+        if len(lines) < MIN_REPEATED_HATCH_SEGMENTS:
+            continue
+        lengths = np.asarray([math.dist(item[1], item[2]) for item in lines])
+        if (float(np.median(lengths)) <= 3.0
+                and float(np.quantile(lengths, 0.90)) <= MAX_HATCH_SEGMENT_P90_PT):
+            eligible_styles.append((len(lines), colour, lines))
+    if not eligible_styles:
+        return [], None, []
+
+    segment_count, colour, lines = max(eligible_styles, key=lambda item: item[0])
+    width_pt, height_pt = page.mediabox.width, page.mediabox.height
+    raster_scale = min(1.0, HATCH_MASK_MAX_DIM / max(width_pt, height_pt))
+    width_px = max(1, int(math.ceil(width_pt * raster_scale)))
+    height_px = max(1, int(math.ceil(height_pt * raster_scale)))
+    mask = np.zeros((height_px, width_px), dtype=np.uint8)
+    centres = []
+    for item in lines:
+        start, end = item[1], item[2]
+        a = (int(round(start.x * raster_scale)), int(round(start.y * raster_scale)))
+        b = (int(round(end.x * raster_scale)), int(round(end.y * raster_scale)))
+        cv2.line(mask, a, b, 255, 1)
+        centres.append(((start.x + end.x) * raster_scale / 2,
+                        (start.y + end.y) * raster_scale / 2))
+
+    points = np.asarray(centres, dtype=float)
+    if len(points) < 2:
+        return [], None, []
+    nearest = cKDTree(points).query(points, k=2)[0][:, 1]
+    spacing_px = float(np.quantile(nearest[np.isfinite(nearest)], 0.99))
+    if not math.isfinite(spacing_px) or spacing_px <= 0:
+        return [], None, []
+
+    # Close gaps at twice the observed 99th-percentile hatch spacing, then apply a small
+    # spacing-derived allowance to the structural hatch edge.  Both distances come from this PDF; neither
+    # is a drawing name, scale, expected area, or client truth value.
+    close_px = max(3, int(math.ceil(2 * spacing_px)))
+    edge_px = max(1, int(math.ceil(spacing_px / 3)))
+    connected = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((close_px, close_px), dtype=np.uint8))
+    connected = cv2.dilate(
+        connected, np.ones((edge_px, edge_px), dtype=np.uint8))
+    contours, _ = cv2.findContours(
+        connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour_areas = [cv2.contourArea(contour) for contour in contours]
+    if not contour_areas or max(contour_areas) <= 0:
+        return [], None, []
+    min_component_px2 = max(
+        max(contour_areas) * HATCH_COMPONENT_MIN_FRACTION,
+        width_px * height_px * 0.0005,
+    )
+    simplify_pt = max(0.5, 1.5 * spacing_px / raster_scale)
+    records = []
+    for contour, contour_area in zip(contours, contour_areas):
+        if contour_area < min_component_px2:
+            continue
+        coords = [
+            (float(point[0][0]) / raster_scale, float(point[0][1]) / raster_scale)
+            for point in contour
+        ]
+        geometry = Polygon(coords)
+        if not geometry.is_valid:
+            geometry = geometry.buffer(0)
+        if geometry.is_empty or geometry.geom_type != "Polygon":
+            continue
+        geometry = geometry.simplify(simplify_pt, preserve_topology=True)
+        if geometry.is_valid and geometry.area > 0 and len(geometry.exterior.coords) >= 4:
+            records.append({
+                "geometry": geometry,
+                "source": "office-vector-metal-deck-hatch-prefill",
+            })
+    records.sort(key=lambda record: record["geometry"].area, reverse=True)
+    if not records:
+        return [], None, []
+
+    basis = (
+        "PROPOSED starting outline from substantial connected extents of a repeated short "
+        "vector hatch, corroborated by the sheet's Metal Deck notes; hatch spacing is read "
+        "from this PDF and the assessor must inspect/edit every edge and void"
+    )
+    evidence = [
+        f"{segment_count} repeated short vector hatch segments found",
+        f"{len(records)} substantial disconnected metal-deck extent(s) retained",
+        "on-sheet Metal Deck wording corroborates the hatch's construction role",
+        "no closed CAD slab-edge loop was available; this is proposed geometry, not a measurement",
+    ]
+    return records, basis, evidence
 
 
 def _geometry_iou(left, right) -> float:
@@ -295,7 +418,10 @@ def _upper_regions(records: list[dict], scale_k: float | None) -> tuple[list[dic
 
 
 def _candidate_record(page, page_number: int, title: dict, records: list[dict],
-                      *, translated: bool, scale_verified: bool,
+                      *, translated: bool, proposed: bool = False,
+                      proposal_basis: str | None = None,
+                      proposal_evidence: list[str] | None = None,
+                      scale_verified: bool,
                       unresolved_detail: str | None = None) -> dict:
     level = title["level"]
     resolved = bool(records)
@@ -324,6 +450,12 @@ def _candidate_record(page, page_number: int, title: dict, records: list[dict],
             resolved=False, translated=False, scale_verified=scale_verified, region_count=0)
     if unresolved_detail:
         reasons.append(unresolved_detail)
+    if proposed:
+        confidence, score = "low", 45
+        reasons = list(proposal_evidence or []) + [
+            "candidate geometry itself carries no quantity; any structural estimate remains "
+            "MEASURED_UNVERIFIED until assessor acceptance/edit"
+        ]
     sources = sorted({record["source"] for record in records})
     return {
         "candidate_id": f"office-p{page_number}-level-{level:02d}",
@@ -343,8 +475,10 @@ def _candidate_record(page, page_number: int, title: dict, records: list[dict],
         "diagnostic_void_count": void_count,
         "coordinate_space": "rotated_pdf_points",
         "source": "+".join(sources) if sources else "office-level-title-only",
-        "outline_status": ("prefill" if resolved and translated else
+        "outline_status": ("proposed" if resolved and proposed else
+                           "prefill" if resolved and translated else
                            "resolved" if resolved else "unresolved"),
+        "basis": proposal_basis,
         "confidence": confidence,
         "confidence_score": score,
         "confidence_reasons": reasons,
@@ -352,6 +486,9 @@ def _candidate_record(page, page_number: int, title: dict, records: list[dict],
             "ASSISTED TRACE candidate only — assessor must inspect/edit exterior doors, "
             "partitions and voids before submitting an adjustment"
         ] + ([
+            "PROPOSED STARTING OUTLINE: derived from visible metal-deck hatch structure; "
+            "no area is attached and assessor acceptance/edit is mandatory"
+        ] if proposed else []) + ([
             "LOW-CONFIDENCE PREFILL: geometry was translated from the nearest resolved "
             "level on this same sheet; it is not a measurement and must be accepted or edited"
         ] if translated else []) + ([] if level == 0 else [
@@ -413,6 +550,22 @@ def detect_office_candidates(pdf: str, page: int = 0, *, scale_k: float | None =
                 local_selection[level], local_reason[level] = _upper_regions(
                     grouped[level], scale_k)
 
+        # When closed CAD loops are absent, a repeated vector deck hatch can still give the
+        # assessor a real starting outline.  Keep it explicitly proposed and quantity-free.
+        hatch_records, hatch_basis, hatch_evidence = _metal_deck_hatch_prefill(pg)
+        hatch_by_level = {title["level"]: [] for title in titles}
+        for record in hatch_records:
+            centroid = record["geometry"].centroid
+            pos = centroid.x if title_axis == "x" else centroid.y
+            nearest = min(titles, key=lambda title: abs(pos - title[title_axis]))
+            hatch_by_level[nearest["level"]].append(record)
+        proposed_levels = set()
+        for title in ordered_titles:
+            level = title["level"]
+            if not local_selection[level] and hatch_by_level[level]:
+                local_selection[level] = hatch_by_level[level]
+                proposed_levels.add(level)
+
         # A repeated level plan with broken local exterior linework can still receive a useful
         # one-click starting outline.  Translation uses only same-sheet title spacing and a
         # genuinely resolved sibling polygon.  It never emits area and is visibly low-confidence;
@@ -451,6 +604,9 @@ def detect_office_candidates(pdf: str, page: int = 0, *, scale_k: float | None =
             candidates.append(_candidate_record(
                 pg, page, title, local_selection[level],
                 translated=level in translated_levels,
+                proposed=level in proposed_levels,
+                proposal_basis=hatch_basis if level in proposed_levels else None,
+                proposal_evidence=hatch_evidence if level in proposed_levels else None,
                 scale_verified=scale_verified,
                 unresolved_detail=local_reason[level],
             ))
@@ -460,7 +616,8 @@ def detect_office_candidates(pdf: str, page: int = 0, *, scale_k: float | None =
             if candidate["outline_status"] == "unresolved"
         ]
         prefill_count = sum(
-            candidate["outline_status"] == "prefill" for candidate in candidates)
+            candidate["outline_status"] in {"prefill", "proposed"}
+            for candidate in candidates)
         resolved_count = sum(
             candidate["outline_status"] == "resolved" for candidate in candidates)
         flags = [
@@ -501,8 +658,69 @@ def detect_office_candidates(pdf: str, page: int = 0, *, scale_k: float | None =
             "OFFICE EXCLUSION CHECK: candidate outlines do not prove lift/riser/stair-"
             "foundation voids; assessor must exclude them while tracing"
         )
-        return {"candidate_polygons": candidates, "flags": flags,
-                "exclusion_prompts": prompts}
+        result = {"candidate_polygons": candidates, "flags": flags,
+                  "exclusion_prompts": prompts}
+
+        # Auto-measure is deliberately narrow: one labelled engineer floor plan, a scale from
+        # the existing scale machinery, and a structurally corroborated metal-deck hatch.  It
+        # is always assessor-gated and never VERIFIED.  Ordinary Office GA closed loops and
+        # translated prefills do not enter this branch.
+        if scale_k and len(candidates) == 1 and candidates[0]["outline_status"] == "proposed":
+            candidate = candidates[0]
+            proposed_records = local_selection[candidate["level"]]
+            if (proposed_records and all(
+                    record["source"] == "office-vector-metal-deck-hatch-prefill"
+                    for record in proposed_records)):
+                area_m2 = round(
+                    unary_union([record["geometry"] for record in proposed_records]).area
+                    * scale_k * scale_k,
+                    2,
+                )
+                zones = []
+                for index, record in enumerate(proposed_records, 1):
+                    zones.append({
+                        "zone_key": f"upper_floor:level-{candidate['level']:02d}:deck-{index}",
+                        "category": "upper_floor",
+                        "subjects": [candidate["source_label"]],
+                        "measurement_kind": "area",
+                        "area_m2": round(record["geometry"].area * scale_k * scale_k, 2),
+                        "length_lm": None,
+                        # One total is carried at job level so quotation generation cannot
+                        # count the same component once here and again at document level.
+                        "perimeter_lm": None,
+                        "annotation_count": 0,
+                        "cutout_count": len(record["geometry"].interiors),
+                        "classification_source": (
+                            "on-sheet level title plus corroborated vector metal-deck hatch"
+                        ),
+                        "needs_assessor": True,
+                        "unit_label": None,
+                        "boq_scope": candidate["boq_scope"],
+                    })
+                result["auto_measurement"] = {
+                    "area_m2": area_m2,
+                    "regions": candidate["regions"],
+                    "polygon_pts": candidate["polygon_pts"],
+                    "zones": zones,
+                    "perimeter_lm": round(sum(
+                        record["geometry"].length for record in proposed_records
+                    ) * scale_k, 2),
+                    "measurement_state": "MEASURED_UNVERIFIED",
+                    "needs_assessor": True,
+                    "method": "office vector metal-deck structure",
+                    "basis": candidate["basis"],
+                }
+                flags.append(
+                    "OFFICE VECTOR MEASUREMENT: repeated metal-deck hatch extent measured, "
+                    "but capped at MEASURED_UNVERIFIED; assessor must confirm scale, extent, "
+                    "voids and BOQ scope"
+                )
+                flags[0] = (
+                    f"OFFICE VECTOR ASSISTANCE: {len(candidates)} candidate row(s), "
+                    f"{len(candidate['regions'])} proposed metal-deck extent(s); the separately "
+                    "reported area is MEASURED_UNVERIFIED and requires assessor confirmation"
+                )
+        return result
     finally:
         doc.close()
 

@@ -136,16 +136,40 @@ _steelwork_title_pdf = "/tmp/_office_first_floor_steelwork_title.pdf"
 _steelwork_title_canvas = canvas.Canvas(_steelwork_title_pdf, pagesize=(900, 500))
 _steelwork_title_canvas.drawString(250, 60, "First Floor Steelwork Layout")
 _steelwork_title_canvas.drawString(650, 450, "Metal Deck Notes")
+_steelwork_title_canvas.setStrokeColorRGB(0, 0.59, 0)
+for _deck_row in range(30):
+    for _deck_col in range(40):
+        _hx = 220 + _deck_col * 3
+        _hy = 210 + _deck_row * 3
+        _steelwork_title_canvas.line(_hx, _hy, _hx + 1, _hy + 1)
 _steelwork_title_canvas.save()
 _steelwork_title_result = _office_candidates(
     _steelwork_title_pdf, scale_k=0.1, scale_verified=False)
-ck("First Floor Steelwork Layout creates an upper-floor assisted row, not a silent drop",
+ck("First Floor Steelwork Layout creates a real quantity-free proposed polygon",
    len(_steelwork_title_result["candidate_polygons"]) == 1 and
    _steelwork_title_result["candidate_polygons"][0]["level"] == 1 and
    _steelwork_title_result["candidate_polygons"][0]["category"] == "upper_floor" and
-   _steelwork_title_result["candidate_polygons"][0]["outline_status"] == "unresolved" and
+   _steelwork_title_result["candidate_polygons"][0]["outline_status"] == "proposed" and
+   len(_steelwork_title_result["candidate_polygons"][0]["polygon_pts"]) >= 4 and
+   "Metal Deck" in (_steelwork_title_result["candidate_polygons"][0].get("basis") or "") and
    "area_m2" not in _steelwork_title_result["candidate_polygons"][0],
    _steelwork_title_result)
+_steelwork_auto = _steelwork_title_result.get("auto_measurement") or {}
+ck("corroborated repeated deck hatch measures only at MEASURED_UNVERIFIED",
+   _steelwork_auto.get("area_m2", 0) > 0 and
+   _steelwork_auto.get("measurement_state") == "MEASURED_UNVERIFIED" and
+   _steelwork_auto.get("needs_assessor") is True and
+   _steelwork_auto.get("perimeter_lm", 0) > 0 and
+   len(_steelwork_auto.get("zones") or []) == 1 and
+   _steelwork_auto["zones"][0]["category"] == "upper_floor",
+   _steelwork_auto)
+_steelwork_no_scale = _office_candidates(
+    _steelwork_title_pdf, scale_k=None, scale_verified=False)
+ck("deck-hatch polygon stays a quantity-free proposal when scale is absent",
+   _steelwork_no_scale["candidate_polygons"][0]["outline_status"] == "proposed" and
+   "auto_measurement" not in _steelwork_no_scale and
+   "area_m2" not in _steelwork_no_scale["candidate_polygons"][0],
+   _steelwork_no_scale)
 
 _office_no_sibling_pdf = "/tmp/_office_candidates_sibling_prefill.pdf"
 _office_no_sibling_canvas = canvas.Canvas(_office_no_sibling_pdf, pagesize=(900, 500))
@@ -3183,6 +3207,8 @@ try:
                "ground_floor_core", "main_upper_floor", "plant_deck",
                "pod_first_floor", "region_scopes: regionEntries.map")) and
            "function loadTraceCandidate" in _portal_html_up and
+           "const proposed = candidatePolygons.find" in _portal_html_up and
+           "loadTraceCandidate(proposed.candidate_id)" in _portal_html_up and
            "regions: regionPayload" in _portal_html_up and
            "region_categories: regionEntries.map" in _portal_html_up)
         ck("portal offers non-destructive existing scale+extent confirmation",
