@@ -622,10 +622,14 @@ def approve(job_id):
         })
         save_jobs(jobs)
 
-    # Trigger costing with the AI's area (use snapshot captured inside lock).
+    # Price the effective assessor-approved result, not the immutable pipeline snapshot.
+    # /adjust deliberately retains the AI result as audit evidence under job["result"], while
+    # the corrected geometry/area/scale live under job["adjusted"] and the replacement zones
+    # at job level. Quotation and approval must consume the same merged view or approval can
+    # silently re-price the original AI area after the portal displayed the correction.
+    res = _quotation_result_for_job(job)
     # If the assessor already used spec-override, preserve their costing rather than
     # recomputing with defaults — recomputing would silently undo the correction.
-    res = job.get("result", {})
     if job.get("costing") and job.get("spec_override"):
         costing_result = job["costing"]
     else:
@@ -946,16 +950,30 @@ def adjust(job_id):
     if regions and scale_k:
         try:
             from geometry import measure_regions, polygon_perimeter_lm
-            area_m2, gflags = measure_regions(regions, scale_k)
-            region_areas = [measure_regions([region], scale_k)[0] for region in regions]
+            gross_area_m2, gross_flags = measure_regions(regions, scale_k)
+            if cutout_regions:
+                # Apply each cut-out as a true geometric hole in every traced region. A hole
+                # outside a region subtracts nothing (geometry._build_region uses difference),
+                # and each persisted per-zone quantity is now net on the same basis as the
+                # displayed aggregate. The old path subtracted only from area_m2 after these
+                # gross region_areas had already been captured, so quotations restored the
+                # cut-out through their zone rows.
+                holes = {index: cutout_regions for index in range(len(regions))}
+                area_m2, gflags = measure_regions(regions, scale_k, holes=holes)
+                region_areas = [
+                    measure_regions([region], scale_k, holes={0: cutout_regions})[0]
+                    for region in regions
+                ]
+                cutout_area = round(max(0.0, gross_area_m2 - area_m2), 1)
+                gflags = list(gross_flags) + list(gflags)
+                if cutout_area > 0:
+                    gflags.append(f"cut-out: {cutout_area:,.1f} m² subtracted")
+            else:
+                area_m2, gflags = gross_area_m2, gross_flags
+                region_areas = [measure_regions([region], scale_k)[0]
+                                for region in regions]
             perimeters = [polygon_perimeter_lm(region, scale_k) for region in regions]
             perimeter_lm = round(sum(value for value in perimeters if value is not None), 2)
-            # Subtract cut-out areas from the measured area
-            if cutout_regions:
-                cutout_area, cutout_flags = measure_regions(cutout_regions, scale_k)
-                if cutout_area > 0:
-                    area_m2 = round(max(0, area_m2 - cutout_area), 1)
-                    gflags = gflags + [f"cut-out: {cutout_area:,.1f} m² subtracted"] + cutout_flags
         except Exception as e:
             area_m2, perimeter_lm, region_areas, perimeters, gflags = (
                 None, None, [], [], [f"geometry error: {e}"])
@@ -1139,10 +1157,11 @@ def adjust(job_id):
                 "needs_assessor": bool(zone_classification_required or zone_geometry_overlap),
             })
         costing_result = _run_costing(area_m2, stored_result) if area_m2 else None
-        jobs[job_id].update({
+        canonical_update = {
             "status":            "adjusted",
             "decision":          "adjusted",
             "decided_at":        now_iso(),
+            "area_m2":           area_m2,
             "scale_confirmed":   confirmed or job.get("scale_confirmed", False),
             "measurement_state": ("MEASURED_VERIFIED" if confirmed
                                   else "MEASURED_UNVERIFIED" if (area_m2 and plaus_flags)
@@ -1163,7 +1182,16 @@ def adjust(job_id):
             },
             "region_scopes": effective_region_scopes,
             "costing": costing_result,
-        })
+            "cutout_regions": cutout_regions,
+            "user_channels": user_channels,
+        }
+        # Scale belongs to the assessor geometry that it measures. Keep an earlier scale only
+        # for direct area-only adjustments where the assessor supplied no replacement scale.
+        if scale_k:
+            canonical_update["scale_k"] = scale_k
+        if perimeter_lm is not None:
+            canonical_update["perimeter_lm"] = perimeter_lm
+        jobs[job_id].update(canonical_update)
         if had_zone_allocation:
             if categorized_remeasure:
                 jobs[job_id].update({
@@ -2053,6 +2081,10 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
             # Preserve the route's existing adjusted-area total behaviour unchanged.
             result["costing"]["total_gbp"] = round(
                 adjusted["area_m2"] * (result["costing"].get("rate") or 0), 2)
+    if isinstance(adjusted.get("scale_k"), (int, float)) and adjusted["scale_k"] > 0:
+        # Assessor-drawn areas and lengths share this coordinate space. Leaving the pipeline
+        # k here made a 100 px channel submitted at 0.1 m/px quote as 17.64 Lm using 0.17639.
+        result["scale_k"] = adjusted["scale_k"]
     if adjusted and "perimeter_lm" in adjusted:
         if adjusted.get("perimeter_lm") is not None:
             result["perimeter_lm"] = adjusted["perimeter_lm"]

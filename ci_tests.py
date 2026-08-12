@@ -2581,6 +2581,7 @@ try:
     _orig_jobs_archive_file_up = _AS.JOBS_ARCHIVE_FILE
     _orig_backup_dir_up = _AS.BACKUP_DIR
     _orig_drawings_dir_up = _AS.DRAWINGS_DIR
+    _orig_quotations_dir_up = _AS.QUOTATIONS_DIR
     _orig_server_file_up = _AS.__file__
     _orig_thread_up = _AS.threading.Thread
     _started_up = []
@@ -2596,6 +2597,7 @@ try:
         _AS.JOBS_ARCHIVE_FILE = _tmpdir / "multi_upload_jobs_archive.json"
         _AS.BACKUP_DIR = _tmpdir / "multi_upload_backups"
         _AS.DRAWINGS_DIR = _tmpdir / "drawings"
+        _AS.QUOTATIONS_DIR = _tmpdir / "quotations"
         _AS.__file__ = str(_tmpdir / "approval_server.py")
         _AS.threading.Thread = _NoStartThread
         _client_up = _AS.app.test_client()
@@ -2968,8 +2970,136 @@ try:
            Path(_loop_paths.get("xlsx", "missing")).exists() and
            [spec["section"] for spec in _loop_quote.get("specifications", [])] ==
            ["External yard slabs", "Dock slabs"],
-           {"confirm":_loop_confirm.get_json(), "approve":_loop_approve.get_json(),
-            "status":_loop_approved_job.get("status"), "quotation_paths":_loop_paths})
+            {"confirm":_loop_confirm.get_json(), "approve":_loop_approve.get_json(),
+             "status":_loop_approved_job.get("status"), "quotation_paths":_loop_paths})
+
+        # Money-path regression: assessor geometry, cut-outs, and scale must replace the AI
+        # inputs everywhere that can be costed or quoted. These exercise the real Flask routes
+        # and then inspect the generated quotation, rather than trusting only /adjust's reply.
+        def _assessor_truth_job(job_id, project_ref, original_area=6816.0):
+            original_costing = _copy.deepcopy(_demo_result["costing"])
+            original_costing["area_m2"] = original_area
+            zones = [{"zone_key":"external_yard", "category":"external_yard",
+                      "area_m2":original_area}]
+            result = {
+                "file":f"{project_ref}_External.pdf", "type":"UNMARKED vector",
+                "source_discipline":"architect", "area_m2":original_area,
+                "scale_k":0.17639, "measurement_state":"MEASURED_UNVERIFIED",
+                "zones":_copy.deepcopy(zones), "flags":[],
+                "costing":_copy.deepcopy(original_costing),
+            }
+            return {
+                "id":job_id, "status":"pending", "decision":None,
+                "project_ref":project_ref, "project_name":"Assessor truth regression",
+                "client_name":"Fortel QA", "created_at":"2026-08-12T00:00:00",
+                "measurement_state":"MEASURED_UNVERIFIED", "scale_confirmed":False,
+                "zones":_copy.deepcopy(zones), "costing":original_costing,
+                "result":result,
+            }
+
+        def _confirm_and_adjust(job_id, *, width=200, cutouts=None, channels=None):
+            blocked_before = _AS._approve_block_reason(_AS.load_jobs()[job_id]) is not None
+            confirmed_response = _client_up.post(
+                f"/confirm-measurement/{job_id}", json={
+                    "confirm_scale_extent":True, "note":"assessor confirmed extent",
+                })
+            adjusted_response = _client_up.post(f"/adjust/{job_id}", json={
+                "regions":[[[100,100],[100 + width,100],[100 + width,200],[100,200]]],
+                "region_categories":["external_yard"], "region_scopes":["main"],
+                "scale_k":0.1, "cutout_regions":cutouts or [],
+                "user_channels":channels or [], "note":"categorized assessor trace",
+            })
+            return blocked_before, confirmed_response, adjusted_response
+
+        _money_cutout_id = "91000000-0000-4000-8000-000000000001"
+        _AS.save_jobs({_money_cutout_id:_assessor_truth_job(
+            _money_cutout_id, "MONEY-CUTOUT")})
+        _cutout_gate, _cutout_confirm, _cutout_adjust = _confirm_and_adjust(
+            _money_cutout_id,
+            cutouts=[[[150,120],[200,120],[200,140],[150,140]]])
+        _cutout_job = _AS.load_jobs()[_money_cutout_id]
+        _cutout_quote = _AS._quotation_for_job(_money_cutout_id)
+        _cutout_slab = next(item for item in _cutout_quote["line_items"]
+                            if "supply & lay" in item["description"])
+        _cutout_json = __import__("json").loads(quotation_json(_cutout_quote))
+        _cutout_json_slab = next(item for item in _cutout_json["line_items"]
+                                 if "supply & lay" in item["description"])
+        _cutout_text = quotation_text(_cutout_quote)
+        _cutout_html = quotation_html(_cutout_quote)
+        _cutout_text_slab = next(line for line in _cutout_text.splitlines()
+                                  if "supply & lay" in line)
+        _cutout_wb = _load_workbook(_BytesIO(quotation_xlsx(_cutout_quote)), data_only=False)
+        _cutout_ws = _cutout_wb["REV_01"]
+        _cutout_xlsx_source_values = [
+            _cutout_ws.cell(row, 2).value for row in range(1, _cutout_ws.max_row + 1)
+            if "External.pdf" in str(_cutout_ws.cell(row, 1).value or "")
+        ]
+        ck("assessor cut-out net area reaches zones and every quotation format",
+           _cutout_gate and _cutout_confirm.status_code == 200 and
+           _cutout_adjust.get_json()["area_m2"] == 190.0 and
+           _cutout_job["zones"][0]["area_m2"] == 190.0 and
+           _cutout_slab["qty"] == 190.0 and _cutout_json_slab["qty"] == 190.0 and
+           "190" in _cutout_text_slab and ">190 m²</td>" in _cutout_html and
+           190.0 in _cutout_xlsx_source_values and
+           200.0 not in _cutout_xlsx_source_values,
+           {"adjust":_cutout_adjust.get_json(), "zones":_cutout_job["zones"],
+            "slab":_cutout_slab, "xlsx_sources":_cutout_xlsx_source_values})
+        ck("assessor adjustment preserves four-state gate and explicit verification",
+           _cutout_job["measurement_state"] == "MEASURED_VERIFIED" and
+           _cutout_job["scale_confirmed"] is True and
+           _AS._approve_block_reason(_cutout_job) is None)
+
+        _money_approve_id = "91000000-0000-4000-8000-000000000002"
+        _AS.save_jobs({_money_approve_id:_assessor_truth_job(
+            _money_approve_id, "MONEY-APPROVE")})
+        _confirm_and_adjust(_money_approve_id, width=190)
+        _approve_response = _client_up.post(f"/approve/{_money_approve_id}", json={
+            "note":"approve assessor correction",
+        })
+        _approved_truth_job = _AS.load_jobs()[_money_approve_id]
+        _approved_truth_quote = _AS._quotation_for_job(_money_approve_id)
+        _approved_truth_slab = next(item for item in _approved_truth_quote["line_items"]
+                                    if "supply & lay" in item["description"])
+        ck("approval costs and quotes assessor-adjusted area instead of original AI area",
+           _approve_response.status_code == 200 and
+           _approve_response.get_json()["costing"]["area_m2"] == 190.0 and
+           _approved_truth_job["costing"]["area_m2"] == 190.0 and
+           _approved_truth_slab["qty"] == 190.0,
+           {"approve":_approve_response.get_json(), "slab":_approved_truth_slab})
+
+        _money_channel_id = "91000000-0000-4000-8000-000000000003"
+        _AS.save_jobs({_money_channel_id:_assessor_truth_job(
+            _money_channel_id, "MONEY-CHANNEL")})
+        _confirm_and_adjust(
+            _money_channel_id, channels=[[[100,250],[200,250]]])
+        _channel_truth_quote = _AS._quotation_for_job(_money_channel_id)
+        _channel_truth_row = next(item for item in _channel_truth_quote["line_items"]
+                                  if "assessor-drawn run" in item["description"])
+        ck("assessor channel quotation length uses assessor scale travelling with geometry",
+           _channel_truth_row["qty"] == 10.0 and
+           _AS._quotation_result_for_job(
+               _AS.load_jobs()[_money_channel_id])["scale_k"] == 0.1,
+           _channel_truth_row)
+
+        _money_plain_id = "91000000-0000-4000-8000-000000000004"
+        _plain_job = _assessor_truth_job(_money_plain_id, "MONEY-PLAIN", original_area=125.0)
+        _plain_job["measurement_state"] = "MEASURED_VERIFIED"
+        _plain_job["scale_confirmed"] = True
+        _plain_job["result"]["measurement_state"] = "MEASURED_VERIFIED"
+        _AS.save_jobs({_money_plain_id:_plain_job})
+        _plain_approve = _client_up.post(f"/approve/{_money_plain_id}", json={
+            "note":"unchanged normal path",
+        })
+        _plain_saved = _AS.load_jobs()[_money_plain_id]
+        _plain_quote = _AS._quotation_for_job(_money_plain_id)
+        _plain_slab = next(item for item in _plain_quote["line_items"]
+                           if "supply & lay" in item["description"])
+        ck("unadjusted verified job keeps its original pricing path unchanged",
+           _plain_approve.status_code == 200 and
+           _plain_approve.get_json()["costing"]["area_m2"] == 125.0 and
+           _plain_saved["costing"]["area_m2"] == 125.0 and
+           _plain_slab["qty"] == 125.0,
+           {"approve":_plain_approve.get_json(), "slab":_plain_slab})
 
         _route_costing_a = _copy.deepcopy(_demo_result["costing"])
         _route_costing_a.update({"area_m2": 100, "assumed": True})
@@ -3384,6 +3514,7 @@ try:
         _AS.JOBS_ARCHIVE_FILE = _orig_jobs_archive_file_up
         _AS.BACKUP_DIR = _orig_backup_dir_up
         _AS.DRAWINGS_DIR = _orig_drawings_dir_up
+        _AS.QUOTATIONS_DIR = _orig_quotations_dir_up
 
     # approve hard-block mirrors the >£200k escalation guard mechanism (fb5b92b)
     ck("UNMEASURED job blocks approve",
