@@ -16,6 +16,8 @@ class StoragePaths:
     jobs_file: Path
     jobs_archive_file: Path
     backup_dir: Path
+    training_log_file: Path
+    learned_patterns_file: Path
     drawings_dir: Path
     quotations_dir: Path
 
@@ -37,11 +39,23 @@ def resolve_storage_paths(environ: Mapping[str, str] | None = None,
     storage_base = jobs_file.parent
     archive_default = storage_base / f"{jobs_file.stem}_archive.json"
     backup_name = "backups" if jobs_file.stem == "approval_jobs" else f"backups_{jobs_file.stem}"
+    training_log_default = (
+        storage_base / "training_log.jsonl"
+        if jobs_file.stem == "approval_jobs"
+        else storage_base / f"{jobs_file.stem}_training_log.jsonl"
+    )
+    learned_patterns_default = (
+        storage_base / "learned_patterns.json"
+        if jobs_file.stem == "approval_jobs"
+        else storage_base / f"{jobs_file.stem}_learned_patterns.json"
+    )
 
     return StoragePaths(
         jobs_file=jobs_file,
         jobs_archive_file=Path(env.get("JOBS_ARCHIVE_FILE") or archive_default),
         backup_dir=Path(env.get("BACKUP_DIR") or (storage_base / backup_name)),
+        training_log_file=Path(env.get("TRAINING_LOG_FILE") or training_log_default),
+        learned_patterns_file=Path(env.get("LEARNED_PATTERNS_FILE") or learned_patterns_default),
         drawings_dir=Path(env.get("DRAWINGS_DIR") or (storage_base / "drawings")),
         quotations_dir=Path(env.get("QUOTATIONS_DIR") or (storage_base / "quotations")),
     )

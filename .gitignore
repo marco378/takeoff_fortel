@@ -31,4 +31,8 @@ approval_jobs.*_archive.json
 client_rates.json
 client_rates.json.tmp*
 training_log.jsonl
+training_log.jsonl.bak*
+*_training_log.jsonl
+learned_patterns.json
+*_learned_patterns.json
 quotations/

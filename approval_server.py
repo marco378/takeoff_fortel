@@ -14,7 +14,7 @@ Flask app that handles all manual-review interactions:
   POST /adjust/<id>          → accept assessor's corrected polygon/scale; re-cost
 
 All state lives in approval_jobs.json (created by approval_email.py).
-Training data (decisions + corrections) is appended to training_log.jsonl.
+Training data (decisions + corrections) is appended to a volume-aware training log.
 
 Run:
   pip install flask pillow pymupdf shapely --break-system-packages
@@ -61,7 +61,8 @@ CLIENT_RATES_FILE = Path(os.getenv("CLIENT_RATES_FILE") or rates_path_for_jobs(J
 # instance's approval_jobs_archive.json / backups/. Dedicated env overrides win if set
 # (e.g. a QA setup that wants archive/backups somewhere else entirely).
 JOBS_ARCHIVE_FILE = _STORAGE_PATHS.jobs_archive_file
-TRAINING_LOG = Path(__file__).parent / "training_log.jsonl"
+TRAINING_LOG = _STORAGE_PATHS.training_log_file
+LEARNED_PATTERNS_FILE = _STORAGE_PATHS.learned_patterns_file
 PORTAL_HTML  = Path(__file__).parent / "assessor_portal.html"
 BACKUP_DIR   = _STORAGE_PATHS.backup_dir
 BACKUP_KEEP  = 14   # keep the newest N daily backups
@@ -275,9 +276,28 @@ def save_jobs(jobs: dict):
 
 def log_training(entry: dict):
     """Append a decision to the training log for model improvement."""
-    TRAINING_LOG.parent.mkdir(exist_ok=True)
+    TRAINING_LOG.parent.mkdir(parents=True, exist_ok=True)
     with TRAINING_LOG.open("a") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+def _refresh_learned_patterns() -> dict:
+    from training_analytics import build_learned_patterns, save_json_atomic
+    patterns = build_learned_patterns(load_jobs())
+    save_json_atomic(LEARNED_PATTERNS_FILE, patterns)
+    return patterns
+
+
+def _load_learned_patterns() -> dict:
+    from training_analytics import load_or_build_patterns
+    return load_or_build_patterns(load_jobs(), LEARNED_PATTERNS_FILE)
+
+
+def _decorate_job(job_id: str, job: dict, patterns: dict | None = None) -> dict:
+    from training_analytics import attach_prior_approval
+    if patterns is None:
+        patterns = _load_learned_patterns()
+    return attach_prior_approval(job_id, job, patterns)
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
@@ -343,13 +363,15 @@ def portal():
 
 @app.route("/jobs")
 def list_jobs():
-    return jsonify(load_jobs())
+    jobs = load_jobs()
+    patterns = _load_learned_patterns()
+    return jsonify({job_id: _decorate_job(job_id, job, patterns) for job_id, job in jobs.items()})
 
 @app.route("/job/<job_id>")
 def single_job(job_id):
     j, err, code = require_job(job_id)
     if err: return err, code
-    return jsonify(j)
+    return jsonify(_decorate_job(job_id, j))
 
 
 def _client_rate_defaults() -> dict:
@@ -660,10 +682,14 @@ def approve(job_id):
         "event":      "approve",
         "job_id":     job_id,
         "file":       res.get("file"),
+        "project_ref": job.get("project_ref") or res.get("project_ref"),
+        "project_name": job.get("project_name") or res.get("project_name"),
         "area_m2":    res.get("area_m2"),
         "flags":      res.get("flags", []),
+        "decision_source": "json" if request.is_json else "form",
         "timestamp":  now_iso(),
     })
+    _refresh_learned_patterns()
 
     if quotation_error:
         message = ("approval was recorded, but quotation generation failed; the job has been "

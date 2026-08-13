@@ -146,7 +146,11 @@ async def portal_switch_flow(base, page, job_ids, cookie_token=None):
 
 
 async def run():
-    from playwright.async_api import async_playwright
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        print(f"[SKIP] Playwright not installed; browser QA skipped ({exc})")
+        return 0
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -278,6 +282,22 @@ async def run():
             st_appr, body_appr = http_post(base3, f"/approve/{jid_appr}")
             record("delete-flow: setup — job approved for refusal test", st_appr == 200,
                    f"status={st_appr} body={body_appr}")
+
+            # Re-upload the same approved drawing and confirm the portal shows the prior-approval note.
+            jid_appr2 = upload(base3, YARD_PDF, "QA Approve Then Delete",
+                                "QA-PRODREADY-APPROVE", "QA Client")
+            ja2 = wait_done(base3, jid_appr2)
+            record("delete-flow: repeated approved job processes",
+                   ja2.get("status") not in (None, "processing"),
+                   f"status={ja2.get('status')} state={ja2.get('measurement_state')}")
+            await page3.evaluate("(id) => selectJob(id)", jid_appr2)
+            await page3.wait_for_timeout(1200)
+            prior_banner = await page3.query_selector(".prior-approval")
+            prior_text = await prior_banner.inner_text() if prior_banner else ""
+            record("delete-flow: portal renders prior approval note for repeated approved job",
+                   "Previously approved as-is" in prior_text and "matched on" in prior_text,
+                   prior_text)
+            await page3.screenshot(path=str(SCREEN_DIR / "flow3c_prior_approval.png"))
 
             st_del, body_del = http_post(base3, f"/archive/{jid_appr}")
             record("delete-flow: approved job refuses deletion (409)", st_del == 409,

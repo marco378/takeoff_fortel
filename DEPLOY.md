@@ -112,7 +112,8 @@ How it works once set:
 | Job database (archived)      | `<JOBS_FILE stem>_archive.json`   | e.g. `approval_jobs_archive.json` for the live default, `approval_jobs.qa_archive.json` for a `JOBS_FILE=approval_jobs.qa.json` QA instance. Where soft-deleted / archived jobs land (`/archive` endpoint). Never a hard delete of client data. Archived jobs stay reachable via `/job/<id>`, `/snapshot/<id>` and `/quotation/<id>.<fmt>` — only the default `/jobs` listing hides them (see `/jobs/archived`). Overridable via `JOBS_ARCHIVE_FILE`. |
 | Rolling backups              | `backups/approval_jobs.YYYY-MM-DD.json` (live default) or `backups_<JOBS_FILE stem>/<stem>.YYYY-MM-DD.json` (any other `JOBS_FILE`) | Daily snapshot taken before the first save of a new day. Keeps the newest 14 by default (`BACKUP_KEEP`). A QA instance's backups never land in the live `backups/` directory — each distinct `JOBS_FILE` stem gets its own backup directory. Overridable via `BACKUP_DIR`. |
 | Quotation PDFs/output        | `quotations/`                     | Generated quote documents. Gitignored. |
-| Training log                 | `training_log.jsonl`              | Append-only log of assessor decisions/corrections. Gitignored. |
+| Training log                 | `training_log.jsonl` (default) / `<JOBS_FILE stem>_training_log.jsonl` for isolated QA instances | Append-only log of assessor decisions/corrections. Gitignored. |
+| Learned patterns             | `learned_patterns.json` (default) / `<JOBS_FILE stem>_learned_patterns.json` for isolated QA instances | Generated from approved jobs only. Informational memory for the portal; never auto-applied. |
 | Uploaded drawings             | `drawings/`                       | Client PDFs. **Never commit** — already gitignored. |
 | Env config                   | `.env` (from `.env.example`)      | Never commit — gitignored below. |
 

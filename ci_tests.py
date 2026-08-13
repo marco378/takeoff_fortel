@@ -4152,6 +4152,8 @@ try:
        _volume_paths.jobs_file == _volume_root / "approval_jobs.json" and
        _volume_paths.drawings_dir == _volume_root / "drawings" and
        _volume_paths.quotations_dir == _volume_root / "quotations" and
+       _volume_paths.training_log_file == _volume_root / "training_log.jsonl" and
+       _volume_paths.learned_patterns_file == _volume_root / "learned_patterns.json" and
        _volume_paths.jobs_archive_file.parent == _volume_root and
        _volume_paths.backup_dir.parent == _volume_root, _volume_paths)
     _override_paths = _resolve_storage_paths({
@@ -4163,7 +4165,10 @@ try:
     ck("explicit jobs/drawings/quotations path overrides still win over the volume default",
        _override_paths.jobs_file == _storage_root / "custom" / "jobs.qa.json" and
        _override_paths.drawings_dir == _storage_root / "custom-drawings" and
-       _override_paths.quotations_dir == _storage_root / "custom-quotes", _override_paths)
+       _override_paths.quotations_dir == _storage_root / "custom-quotes" and
+       _override_paths.training_log_file == _storage_root / "custom" / "jobs.qa_training_log.jsonl" and
+       _override_paths.learned_patterns_file == _storage_root / "custom" / "jobs.qa_learned_patterns.json",
+       _override_paths)
 
     _orig_storage_jobs = _AS_storage.JOBS_FILE
     _orig_storage_backups = _AS_storage.BACKUP_DIR
@@ -4203,6 +4208,96 @@ try:
         _shutil_storage.rmtree(_storage_root, ignore_errors=True)
 except (ImportError, OSError, ValueError) as _e:
     ck("persistent storage deploy-cycle test imports and runs", False, _e)
+
+print("approved-only pattern memory: prior approval is built from approved jobs only")
+try:
+    import tempfile as _tempfile_memory
+    import shutil as _shutil_memory
+    from training_analytics import build_learned_patterns as _build_learned_patterns
+    from training_analytics import prior_approval_for_job as _prior_approval_for_job
+    from training_analytics import attach_prior_approval as _attach_prior_approval
+    import approval_server as _AS_memory
+
+    _memory_root = Path(_tempfile_memory.mkdtemp(prefix="ci_memory_"))
+    _orig_memory_jobs = _AS_memory.JOBS_FILE
+    _orig_memory_log = _AS_memory.TRAINING_LOG
+    _orig_memory_patterns = _AS_memory.LEARNED_PATTERNS_FILE
+    try:
+        _AS_memory.JOBS_FILE = _memory_root / "jobs.json"
+        _AS_memory.TRAINING_LOG = _memory_root / "training_log.jsonl"
+        _AS_memory.LEARNED_PATTERNS_FILE = _memory_root / "learned_patterns.json"
+        _approved_job = {
+            "id": "approved-1", "status": "approved", "decision": "approved",
+            "project_ref": "MEM-001", "project_name": "Memory Case",
+            "result": {"file": "memory.pdf", "area_m2": 100.0, "project_ref": "MEM-001",
+                        "project_name": "Memory Case", "scale_src": "bar"},
+            "costing": {"assumed": False},
+            "flags": ["approved-flag"],
+            "decided_at": "2026-08-13T10:00:00",
+        }
+        _adjusted_job = {
+            "id": "adjusted-1", "status": "adjusted", "decision": "adjusted",
+            "project_ref": "MEM-001", "project_name": "Memory Case",
+            "result": {"file": "memory.pdf", "area_m2": 110.0, "project_ref": "MEM-001",
+                        "project_name": "Memory Case"},
+            "adjusted": {"area_m2": 110.0},
+            "flags": ["adjusted-flag"],
+            "decided_at": "2026-08-13T11:00:00",
+        }
+        _pending_job = {
+            "id": "pending-1", "status": "pending", "decision": None,
+            "project_ref": "MEM-001", "project_name": "Memory Case",
+            "result": {"file": "memory.pdf", "area_m2": 120.0, "project_ref": "MEM-001",
+                        "project_name": "Memory Case"},
+        }
+        _AS_memory.save_jobs({
+            "approved-1": _approved_job,
+            "adjusted-1": _adjusted_job,
+            "pending-1": _pending_job,
+        })
+        _patterns_memory = _build_learned_patterns(_AS_memory.load_jobs())
+        ck("approved-only builder ignores adjusted jobs",
+           "memory.pdf" in _patterns_memory["by_file"] and
+           _patterns_memory["by_file"]["memory.pdf"]["latest"]["job_id"] == "approved-1" and
+           len(_patterns_memory["by_file"]["memory.pdf"]["history"]) == 1,
+           _patterns_memory["by_file"].get("memory.pdf"))
+        _prior_memory = _prior_approval_for_job(_pending_job, _patterns_memory)
+        ck("matching pending job gets prior approval from approved job only",
+           _prior_memory and _prior_memory.get("job_id") == "approved-1" and
+           _prior_memory.get("matched_on") == "file", _prior_memory)
+        _attached_memory = _attach_prior_approval("pending-1", _pending_job, _patterns_memory)
+        ck("attach_prior_approval adds informational prior_approval payload",
+           _attached_memory.get("prior_approval", {}).get("job_id") == "approved-1", _attached_memory)
+        ck("prior_approval does not affect approve-block logic",
+           _AS_memory._approve_block_reason({
+               "measurement_state": "MEASURED_VERIFIED",
+               "scale_confirmed": False,
+               "prior_approval": _attached_memory.get("prior_approval"),
+           }) is None)
+    finally:
+        _AS_memory.JOBS_FILE = _orig_memory_jobs
+        _AS_memory.TRAINING_LOG = _orig_memory_log
+        _AS_memory.LEARNED_PATTERNS_FILE = _orig_memory_patterns
+        _shutil_memory.rmtree(_memory_root, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] approved-only pattern memory tests — missing dependency: {_e}")
+
+print("training log cleanup: fixture contamination filter keeps only real assessor history")
+try:
+    import json as _json_cleanup
+    from cleanup_training_log import clean_entries as _clean_training_log_entries
+
+    _clean_sample = [
+        _json_cleanup.dumps({"event": "approve", "job_id": "job-csrf-approve", "file": "csrf_test.pdf"}),
+        _json_cleanup.dumps({"event": "reject", "job_id": "real-1", "file": "12345-real.pdf"}),
+        _json_cleanup.dumps({"event": "approve", "job_id": "55555555-5555-4555-8555-555555555555",
+                             "file": "Mixed perimeter case.pdf"}),
+    ]
+    _kept_log, _removed_log = _clean_training_log_entries(_clean_sample)
+    ck("cleanup removes explicit fixture lines and preserves real entries",
+       len(_kept_log) == 1 and len(_removed_log) == 2 and 'real-1' in _kept_log[0], _removed_log)
+except ImportError as _e:
+    print(f"  [SKIP] training log cleanup tests — missing dependency: {_e}")
 
 print("critical approval safeguards: quotation errors visible; email uses canonical saved job")
 try:
