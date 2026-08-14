@@ -2472,6 +2472,25 @@ def status():
     return jsonify({"status": "ok", "job_count": len(jobs), "build": BUILD_INFO})
 
 
+# ── Admin file download ──────────────────────────────────────────────────────
+
+_ALLOWED_DOWNLOADS = {
+    "training_log.jsonl": TRAINING_LOG,
+    "learned_patterns.json": LEARNED_PATTERNS_FILE,
+    "approval_jobs.json": JOBS_FILE,
+    "approval_jobs_archive.json": JOBS_ARCHIVE_FILE,
+}
+
+
+@app.route("/admin/download/<filename>")
+def admin_download(filename):
+    """Download a server-side data file (auth handled by before_request hook)."""
+    path = _ALLOWED_DOWNLOADS.get(filename)
+    if path is None or not path.exists():
+        return jsonify({"error": "file not found"}), 404
+    return send_file(path, as_attachment=True, download_name=filename)
+
+
 # ── Upload endpoint ───────────────────────────────────────────────────────────
 
 TAKEOFF_TIMEOUT_S = int(os.getenv("TAKEOFF_TIMEOUT_S", "120"))
