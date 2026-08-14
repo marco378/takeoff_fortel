@@ -13,6 +13,8 @@ import datetime as _dt
 import json
 import os
 import re
+import shutil
+import uuid
 from pathlib import Path
 from typing import Iterable
 
@@ -75,17 +77,20 @@ def is_fixture_entry(entry: dict) -> tuple[bool, str]:
     job_id = _entry_value(entry, "job_id")
     file_name = _entry_value(entry, "file")
     project_ref = _entry_value(entry, "project_ref")
+    environment = _entry_value(entry, "environment").lower()
 
     if job_id in KNOWN_JOB_IDS or job_id in KNOWN_JOB_EXACT:
         return True, f"job_id={job_id}"
     if any(job_id.startswith(prefix) for prefix in KNOWN_JOB_PREFIXES):
         return True, f"job_id prefix={job_id}"
-    if file_name in KNOWN_FILE_EXACT:
-        return True, f"file={file_name}"
-    if any(snippet in file_name for snippet in KNOWN_FILE_CONTAINS):
-        return True, f"file contains={file_name}"
-    if any(project_ref.startswith(prefix) for prefix in KNOWN_PROJECT_PREFIXES):
-        return True, f"project_ref prefix={project_ref}"
+    # Common-looking filenames and project refs can be legitimate client data. Only use
+    # those broad signals when the producer explicitly labelled the event non-production,
+    # or when both independent fixture signals agree.
+    file_signal = (file_name in KNOWN_FILE_EXACT
+                   or any(snippet in file_name for snippet in KNOWN_FILE_CONTAINS))
+    project_signal = any(project_ref.startswith(prefix) for prefix in KNOWN_PROJECT_PREFIXES)
+    if environment in {"test", "ci"} and (file_signal or project_signal):
+        return True, f"environment={environment}; fixture filename/project"
 
     return False, ""
 
@@ -99,10 +104,12 @@ def clean_entries(lines: Iterable[str]) -> tuple[list[str], list[tuple[str, str]
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
-            removed.append(("<invalid-json>", "invalid JSON line"))
+            # A malformed historical line may still be the only evidence of a real action.
+            # Preserve it for a human repair pass instead of deleting it as "test noise".
+            kept.append(line)
             continue
         if not isinstance(entry, dict):
-            removed.append(("<non-dict>", "non-object entry"))
+            kept.append(line)
             continue
         drop, reason = is_fixture_entry(entry)
         if drop:
@@ -113,8 +120,8 @@ def clean_entries(lines: Iterable[str]) -> tuple[list[str], list[tuple[str, str]
 
 
 def backup_path_for(path: Path) -> Path:
-    stamp = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    return path.with_name(f"{path.name}.bak-{stamp}")
+    stamp = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S.%fZ")
+    return path.with_name(f"{path.name}.bak-{stamp}-{uuid.uuid4().hex}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -139,7 +146,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     backup = args.backup or backup_path_for(path)
-    backup.write_text(path.read_text())
+    if backup.exists():
+        raise SystemExit(f"refusing to overwrite existing backup: {backup}")
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, backup)
+    if backup.read_bytes() != path.read_bytes():
+        raise SystemExit("backup verification failed; active log was not modified")
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
     tmp.write_text("\n".join(kept) + ("\n" if kept else ""))
     os.replace(tmp, path)

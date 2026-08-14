@@ -13,8 +13,8 @@ Flask app that handles all manual-review interactions:
   POST /reject/<id>          → mark rejected; log reason
   POST /adjust/<id>          → accept assessor's corrected polygon/scale; re-cost
 
-All state lives in approval_jobs.json (created by approval_email.py).
-Training data (decisions + corrections) is appended to a volume-aware training log.
+All state lives in approval_jobs.json (created by approval_email.py). Assessor learning episodes
+are stored atomically inside that job record; a volume-aware JSONL log remains a derivative.
 
 Run:
   pip install flask pillow pymupdf shapely --break-system-packages
@@ -35,7 +35,7 @@ Environment:
   CLIENT_RATES_FILE optional override path; otherwise client_rates.json is stored beside
                     JOBS_FILE (including on the same Railway volume).
 """
-import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib, math, html
+import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib, math, html, copy
 from email import policy
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
@@ -68,6 +68,8 @@ BACKUP_DIR   = _STORAGE_PATHS.backup_dir
 BACKUP_KEEP  = 14   # keep the newest N daily backups
 
 _jobs_lock = threading.Lock()
+_training_log_lock = threading.Lock()
+_learned_patterns_lock = threading.Lock()
 
 # ── Auth (pragmatic shared-secret — right-sized for a single small team) ─────
 # PORTAL_TOKEN (or its older alias APPROVAL_TOKEN — both accepted, PORTAL_TOKEN wins if both
@@ -275,22 +277,66 @@ def save_jobs(jobs: dict):
     os.replace(tmp, JOBS_FILE)
 
 def log_training(entry: dict):
-    """Append a decision to the training log for model improvement."""
-    TRAINING_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with TRAINING_LOG.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
+    """Append a best-effort derivative event; the atomic job episode is authoritative."""
+    payload = dict(entry)
+    payload.setdefault("environment", os.getenv("LEARNING_ENVIRONMENT") or
+                       ("production" if os.getenv("RAILWAY_ENVIRONMENT") else "local"))
+    payload.setdefault("build", BUILD_INFO)
+    try:
+        TRAINING_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _training_log_lock, TRAINING_LOG.open("a") as f:
+            f.write(json.dumps(payload) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except OSError as exc:
+        print(f"[learning] derivative training-log append failed: {type(exc).__name__}: {exc}")
+        return False
 
 
-def _refresh_learned_patterns() -> dict:
-    from training_analytics import build_learned_patterns, save_json_atomic
-    patterns = build_learned_patterns(load_jobs())
-    save_json_atomic(LEARNED_PATTERNS_FILE, patterns)
-    return patterns
+def _refresh_learned_patterns(job_id: str, job: dict) -> dict:
+    """Update the approved-only derivative incrementally; never fail an approval."""
+    from training_analytics import load_json, update_learned_patterns, save_json_atomic
+    try:
+        with _learned_patterns_lock:
+            patterns = update_learned_patterns(load_json(LEARNED_PATTERNS_FILE), job_id, job)
+            save_json_atomic(LEARNED_PATTERNS_FILE, patterns)
+        return patterns
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"[learning] learned-pattern refresh failed: {type(exc).__name__}: {exc}")
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def _load_learned_patterns() -> dict:
-    from training_analytics import load_or_build_patterns
-    return load_or_build_patterns(load_jobs(), LEARNED_PATTERNS_FILE)
+    from training_analytics import build_learned_patterns, load_json, save_json_atomic
+    with _learned_patterns_lock:
+        loaded = load_json(LEARNED_PATTERNS_FILE)
+        if loaded is not None:
+            return loaded
+        patterns = build_learned_patterns(load_jobs())
+        try:
+            save_json_atomic(LEARNED_PATTERNS_FILE, patterns)
+        except OSError as exc:
+            print(f"[learning] learned-pattern cache unavailable: {type(exc).__name__}: {exc}")
+    return patterns
+
+
+def _ensure_learning_episode(job_id: str, job: dict, *, source="pipeline",
+                             original_available=True, pdf_path=None):
+    from learning_capture import ensure_learning_episode
+    return ensure_learning_episode(
+        job_id, job, build=BUILD_INFO, source=source,
+        original_available=original_available, pdf_path=pdf_path,
+    )
+
+
+def _record_learning_event(job_id: str, job: dict, before: dict, event: str,
+                           *, details=None, terminal=False):
+    from learning_capture import append_learning_event
+    return append_learning_event(
+        job_id, job, event_type=event, before_job=before,
+        details=details, terminal=terminal, build=BUILD_INFO,
+    )
 
 
 def _decorate_job(job_id: str, job: dict, patterns: dict | None = None) -> dict:
@@ -636,12 +682,28 @@ def approve(job_id):
         block_reason = _approve_block_reason(job)
         if block_reason:
             return jsonify({"error": f"approve blocked: {block_reason}"}), 409
+        before_job = copy.deepcopy(job)
         jobs[job_id].update({
             "status":     "approved",
             "decision":   "approved",
             "decided_at": now_iso(),
             "note":       data.get("note", ""),
         })
+        previous_events = ((job.get("learning_episode") or {}).get("events") or [])
+        corrected_before_approval = any(
+            event.get("event") not in {"confirmed_existing_measurement"}
+            for event in previous_events if isinstance(event, dict)
+        ) or any(job.get(key) for key in (
+            "adjusted", "spec_override", "zone_classification_required",
+            "yard_region_decisions", "channel_proposal_decisions",
+            "transition_candidate_decisions",
+        ))
+        approval_event = ("approved_after_correction" if corrected_before_approval
+                          else "approved_unchanged")
+        _record_learning_event(
+            job_id, jobs[job_id], before_job, approval_event,
+            details={"note": data.get("note", "")}, terminal=True,
+        )
         save_jobs(jobs)
 
     # Price the effective assessor-approved result, not the immutable pipeline snapshot.
@@ -676,6 +738,7 @@ def approve(job_id):
         else:
             jobs[job_id].update({"quotation_status": "ready"})
             jobs[job_id].pop("quotation_error", None)
+        saved_approved_job = copy.deepcopy(jobs[job_id])
         save_jobs(jobs)
 
     log_training({
@@ -689,7 +752,7 @@ def approve(job_id):
         "decision_source": "json" if request.is_json else "form",
         "timestamp":  now_iso(),
     })
-    _refresh_learned_patterns()
+    _refresh_learned_patterns(job_id, saved_approved_job)
 
     if quotation_error:
         message = ("approval was recorded, but quotation generation failed; the job has been "
@@ -732,12 +795,17 @@ def reject(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job["status"] == "processing":
             return jsonify({"error": "job is still processing"}), 409
+        before_job = copy.deepcopy(job)
         jobs[job_id].update({
             "status":     "rejected",
             "decision":   "rejected",
             "decided_at": now_iso(),
             "note":       data.get("note", "rejected via portal"),
         })
+        _record_learning_event(
+            job_id, jobs[job_id], before_job, "rejected",
+            details={"note": data.get("note", "rejected via portal")}, terminal=True,
+        )
         save_jobs(jobs)
 
     res = job.get("result", {})
@@ -780,6 +848,7 @@ def confirm_measurement(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job.get("status") == "processing":
             return jsonify({"error": "job is still processing"}), 409
+        before_job = copy.deepcopy(job)
 
         result = dict(job.get("result") or {})
         area_m2 = result.get("area_m2")
@@ -834,6 +903,10 @@ def confirm_measurement(job_id):
         })
         result["exclusion_prompts"] = list(job["exclusion_prompts"])
         jobs[job_id] = job
+        _record_learning_event(
+            job_id, job, before_job, "confirmed_existing_measurement",
+            details={"note": str(data.get("note") or "")},
+        )
         save_jobs(jobs)
 
     log_training({
@@ -1025,6 +1098,7 @@ def adjust(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job["status"] == "processing":
             return jsonify({"error": "job is still processing"}), 409
+        before_job = copy.deepcopy(job)
         stored_candidate_records = {
             candidate.get("candidate_id"): candidate
             for candidate in (job.get("candidate_polygons")
@@ -1254,6 +1328,18 @@ def adjust(job_id):
                 "flags": _without_zone_stale_flags(jobs[job_id].get("flags")) + list(gflags),
                 "region_scopes": effective_region_scopes,
             })
+        before_state = (before_job.get("measurement_state")
+                        or (before_job.get("result") or {}).get("measurement_state"))
+        event_type = "refusal_recovered" if before_state == "UNMEASURED" else "measurement_adjusted"
+        _record_learning_event(
+            job_id, jobs[job_id], before_job, event_type,
+            details={
+                "note": note,
+                "candidate_ids": list(candidate_ids),
+                "region_categories": list(effective_region_categories),
+                "region_scopes": list(effective_region_scopes),
+            },
+        )
         save_jobs(jobs)
 
     res = job.get("result", {})
@@ -1308,6 +1394,7 @@ def classify_zones(job_id):
         job = jobs.get(job_id)
         if not job:
             return jsonify({"error": f"job {job_id!r} not found"}), 404
+        before_job = copy.deepcopy(job)
         result = dict(job.get("result") or {})
         source_zones = job.get("zones") if isinstance(job.get("zones"), list) else result.get("zones")
         zones = [dict(zone) for zone in (source_zones or []) if isinstance(zone, dict)]
@@ -1383,7 +1470,18 @@ def classify_zones(job_id):
             "result": result,
         })
         jobs[job_id] = job
+        _record_learning_event(
+            job_id, job, before_job, "zones_classified",
+            details={"classifications": copy.deepcopy(classifications),
+                     "acknowledge_reference_mismatch": acknowledge_mismatch},
+        )
         save_jobs(jobs)
+    log_training({
+        "event": "zones_classified", "job_id": job_id,
+        "classifications": classifications,
+        "acknowledge_reference_mismatch": acknowledge_mismatch,
+        "timestamp": now_iso(),
+    })
     return jsonify({"status": "zones_updated", "zones": zones,
                     "zone_classification_required": still_unclassified,
                     "zone_reference_mismatch": False if acknowledge_mismatch else bool(
@@ -1453,6 +1551,7 @@ def review_channel_proposals(job_id):
         job = jobs.get(job_id)
         if not job:
             return jsonify({"error": f"job {job_id!r} not found"}), 404
+        before_job = copy.deepcopy(job)
         result = dict(job.get("result") or {})
         proposals = job.get("channel_proposals")
         if not isinstance(proposals, list):
@@ -1516,12 +1615,17 @@ def review_channel_proposals(job_id):
             "result": result,
         })
         jobs[job_id] = job
+        _record_learning_event(
+            job_id, job, before_job, "channel_proposals_reviewed",
+            details={"decisions": copy.deepcopy(decisions), "review_complete": reviewed},
+        )
         save_jobs(jobs)
 
     log_training({
         "event": "channel_proposals_reviewed",
         "job_id": job_id,
         "proposal_ids": [proposal_id for proposal_id, _, _, _ in normalised],
+        "decisions": decisions,
         "review_complete": reviewed,
         "timestamp": decided_at,
     })
@@ -1572,6 +1676,7 @@ def review_transition_candidates(job_id):
         job = jobs.get(job_id)
         if not job:
             return jsonify({"error": f"job {job_id!r} not found"}), 404
+        before_job = copy.deepcopy(job)
         result = dict(job.get("result") or {})
         candidates = job.get("transition_candidates")
         if not isinstance(candidates, list):
@@ -1638,12 +1743,20 @@ def review_transition_candidates(job_id):
             "result": result,
         })
         jobs[job_id] = job
+        _record_learning_event(
+            job_id, job, before_job, "transition_candidates_reviewed",
+            details={"decisions": copy.deepcopy(decisions),
+                     "accepted_quantities": copy.deepcopy(accepted_quantities),
+                     "review_complete": reviewed},
+        )
         save_jobs(jobs)
 
     log_training({
         "event": "transition_candidates_reviewed",
         "job_id": job_id,
         "candidate_ids": [candidate_id for candidate_id, _, _ in normalised],
+        "decisions": decisions,
+        "accepted_quantities": accepted_quantities,
         "review_complete": reviewed,
         "timestamp": decided_at,
     })
@@ -1687,6 +1800,7 @@ def review_yard_regions(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job.get("status") == "processing":
             return jsonify({"error": "job is still processing"}), 409
+        before_job = copy.deepcopy(job)
         result = dict(job.get("result") or {})
         regions = job.get("yard_regions")
         if not isinstance(regions, list):
@@ -1755,6 +1869,10 @@ def review_yard_regions(job_id):
             "result": result,
         })
         jobs[job_id] = job
+        _record_learning_event(
+            job_id, job, before_job, "yard_regions_reviewed",
+            details={"decisions": copy.deepcopy(decisions), "final_area_m2": area_m2},
+        )
         save_jobs(jobs)
 
     log_training({
@@ -1807,6 +1925,7 @@ def spec_override(job_id):
             return jsonify({"error": f"job {job_id!r} not found"}), 404
         if job["status"] == "processing":
             return jsonify({"error": "job is still processing"}), 409
+        before_job = copy.deepcopy(job)
 
         res     = dict(job.get("result") or {})
         adj     = job.get("adjusted") or {}
@@ -1835,7 +1954,17 @@ def spec_override(job_id):
             job["brief_specs"] = brief_specs
             job["result"] = res
             jobs[job_id] = job
+            _record_learning_event(
+                job_id, job, before_job, "spec_overridden",
+                details={"zone_category": zone_category,
+                         "fields": copy.deepcopy(supplied_fields), "repriced": False},
+            )
             save_jobs(jobs)
+            log_training({
+                "event": "spec_override", "job_id": job_id,
+                "zone_category": zone_category, "fields": supplied_fields,
+                "repriced": False, "timestamp": now_iso(),
+            })
             return jsonify({
                 "status": "ok", "job_id": job_id, "costing": job.get("costing"),
                 "brief_spec": brief_spec, "brief_specs": brief_specs,
@@ -1948,8 +2077,18 @@ def spec_override(job_id):
             jobs[job_id]["spec_pricing_warning"] = pricing_warning
         else:
             jobs[job_id].pop("spec_pricing_warning", None)
+        _record_learning_event(
+            job_id, jobs[job_id], before_job, "spec_overridden",
+            details={"zone_category": None, "fields": copy.deepcopy(supplied_fields),
+                     "repriced": repriced},
+        )
         save_jobs(jobs)
 
+    log_training({
+        "event": "spec_override", "job_id": job_id,
+        "zone_category": None, "fields": supplied_fields,
+        "repriced": repriced, "timestamp": now_iso(),
+    })
     return jsonify({
         "status": "ok", "job_id": job_id, "costing": costing,
         "brief_spec": brief_spec, "spec_schema": schema_definition(),
@@ -2516,6 +2655,11 @@ def _mark_job_unmeasured(job_id: str, flag: str, extra: dict = None, watchdog_fi
         res.setdefault("measurement_state", "UNMEASURED")
         res.setdefault("area_m2", job.get("area_m2"))
         job["result"] = res
+        _ensure_learning_episode(
+            job_id, job,
+            source="watchdog" if watchdog_fired else "pipeline_error",
+            original_available=True,
+        )
         jobs[job_id] = job
         save_jobs(jobs)
 
@@ -2686,6 +2830,9 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "result":           result,
                 "status":           "pending",
             })
+            _ensure_learning_episode(
+                job_id, job, source="pipeline", original_available=True, pdf_path=pdf_path,
+            )
             jobs[job_id] = job
             save_jobs(jobs)
         if result.get("measurement_state") != "REJECTED":
@@ -2745,6 +2892,13 @@ def _rejected_job_record(project_name, project_ref, client_name, filename, reaso
         "result":           {"file": filename, "measurement_state": "REJECTED",
                              "flags": [f"REJECTED: {reason}"]},
     }
+    _ensure_learning_episode(
+        job_id, job, source="pipeline_rejection", original_available=True,
+    )
+    job["learning_episode"]["terminal"] = {
+        "event": "pipeline_rejected", "at": now_iso(),
+        "snapshot": copy.deepcopy(job["learning_episode"]["initial"]["snapshot"]),
+    }
     return job_id, job
 
 
@@ -2761,10 +2915,12 @@ def _create_rejected_job(project_name, project_ref, client_name, filename, reaso
 
 
 def _processing_job_record(project_name, project_ref, client_name, pdf_path, flags) -> tuple[str, dict]:
+    from learning_capture import document_sha256
     job_id = str(uuid.uuid4())
     return job_id, {
         "id":               job_id,
         "pdf_path":         str(pdf_path),
+        "document_sha256":  document_sha256(pdf_path),
         "project_name":     project_name,
         "project_ref":      project_ref,
         "client_name":      client_name,
