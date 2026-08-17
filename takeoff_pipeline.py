@@ -69,7 +69,7 @@ def _fast_report_refusal(pdf_path: str, doc) -> str | None:
 
 # ── Auto-extract engineer spec from the drawing pack ─────────────────────────
 
-def find_engineer_spec(pdf_path: str) -> dict | None:
+def find_engineer_spec(pdf_path: str, project_ref: str | None = None) -> dict | None:
     """
     Look for a construction-detail PDF near the input drawing and extract the slab spec.
     Search order (mirrors Inderjit's method):
@@ -78,33 +78,132 @@ def find_engineer_spec(pdf_path: str) -> dict | None:
     Returns spec dict or None (falls through to defaults if nothing found).
     """
     from router import DETAIL_KEYWORDS
-    from spec_extractor import extract_spec, extract_spec_from_text
+    from spec_extractor import extract_spec
     import fitz
 
     parent = Path(pdf_path).parent
+    target = Path(pdf_path)
+    safe_project_ref = __import__("re").sub(
+        r"[^\w.\-]", "", str(project_ref or "").replace(" ", "_"))[:80]
 
-    # ── Search sibling files for construction-detail drawings ────────────────
-    for p in sorted(parent.glob("*.pdf")):
-        name_lower = p.name.lower()
-        if any(kw in name_lower for kw in DETAIL_KEYWORDS):
-            spec = extract_spec(str(p))
-            spec.pop("_source", None)
-            if any(k in spec for k in ("depth_mm", "mesh", "conc_mix")):
-                spec["_from_file"] = p.name
-                return spec
+    # Portal uploads from every client project share one persistent drawings directory.  The
+    # filename prefix is therefore a security/correctness boundary, not decoration: scanning an
+    # unscoped sibling previously let an alphabetically-earlier project's 150 mm detail become
+    # this project's apparently-confirmed spec.  Direct/local corpus runs have no project_ref and
+    # retain same-directory discovery.
+    def in_project(path: Path) -> bool:
+        return not safe_project_ref or path.name.startswith(f"{safe_project_ref}_")
 
-    # ── Fallback: scan all pages of the input PDF itself ────────────────────
     try:
-        doc = fitz.open(pdf_path)
-        full_text = "\n".join(doc[i].get_text() for i in range(doc.page_count))
-        spec = extract_spec_from_text(full_text)
-        if any(k in spec for k in ("depth_mm", "mesh", "conc_mix")):
-            spec["_from_file"] = Path(pdf_path).name + " (self)"
-            return spec
+        with fitz.open(pdf_path) as target_doc:
+            target_text = "\n".join(target_doc[i].get_text() or ""
+                                     for i in range(min(target_doc.page_count, 3)))
     except Exception:
-        pass
+        target_text = ""
+    target_probe = f"{target.name} {target_text[:6000]}".casefold().replace("_", " ")
+    if any(term in target_probe for term in ("service yard", "external yard", "concrete yard")):
+        target_context = "external service yard concrete yard"
+    elif "dock" in target_probe:
+        target_context = "dock slab"
+    elif any(term in target_probe for term in ("upper floor", "first floor", "metal deck")):
+        target_context = "upper floor slab metal deck"
+    elif any(term in target_probe for term in ("ground floor", "office core")):
+        target_context = "ground floor office core slab"
+    else:
+        # Filename-only fallback avoids feeding every word in a full tender sheet into the
+        # candidate scorer (generic words repeated all over a page are not local evidence).
+        target_context = target.name
 
-    return None
+    spec_sheet_terms = tuple(DETAIL_KEYWORDS) + (
+        "external works details", "joint layout", "construction thickness",
+        "slab specification", "pavement details",
+    )
+    normalised_spec_terms = tuple(
+        __import__("re").sub(r"[-_]+", " ", term.casefold())
+        for term in spec_sheet_terms
+    )
+    candidates = [target]
+    for sibling in sorted(parent.glob("*.pdf")):
+        if sibling == target or not in_project(sibling):
+            continue
+        normalised_name = __import__("re").sub(r"[-_]+", " ", sibling.name.casefold())
+        if any(term in normalised_name for term in normalised_spec_terms):
+            candidates.append(sibling)
+
+    extracted = []
+    for candidate in candidates:
+        try:
+            candidate_spec = extract_spec(str(candidate), context=target_context)
+        except Exception:
+            continue
+        if (any(key in candidate_spec for key in
+                ("depth_mm", "mesh", "layers", "conc_mix", "bay_sizes", "joint_details"))
+                or candidate_spec.get("_joint_layout") or candidate_spec.get("_conflicts")):
+            extracted.append(candidate_spec)
+
+    if not extracted:
+        return None
+
+    merged, evidence, conflicts, flags = {}, {}, {}, []
+    for field in ("depth_mm", "mesh", "layers", "conc_mix", "bay_sizes", "joint_details"):
+        field_records = []
+        for candidate_spec in extracted:
+            if candidate_spec.get(field) is not None:
+                field_records.append((candidate_spec[field],
+                                      (candidate_spec.get("_evidence") or {}).get(field) or {}))
+            if field in (candidate_spec.get("_conflicts") or {}):
+                conflicts.setdefault(field, []).extend(candidate_spec["_conflicts"][field])
+        if field in conflicts:
+            # A clean callout on one sheet does not erase unresolved competing callouts on
+            # another sheet in the same case. Include it in the review evidence, but confirm
+            # nothing until the assessor identifies the applicable build-up.
+            conflicts[field].extend(
+                {"value": value, **record_evidence}
+                for value, record_evidence in field_records
+            )
+            continue
+        distinct = {str(value) for value, _ in field_records}
+        if len(distinct) == 1:
+            merged[field] = field_records[0][0]
+            evidence[field] = field_records[0][1]
+        elif len(distinct) > 1:
+            conflicts[field] = [
+                {"value": value, **record_evidence}
+                for value, record_evidence in field_records
+            ]
+
+    joint_layouts = [candidate_spec["_joint_layout"] for candidate_spec in extracted
+                     if candidate_spec.get("_joint_layout")]
+    if joint_layouts:
+        merged["_joint_layout"] = joint_layouts[0]
+        if "bay_sizes" not in merged:
+            layout = joint_layouts[0]
+            flags.append(
+                "JOINT LAYOUT DETECTED: "
+                f"{layout.get('file')} page {layout.get('page') or '?'}; spacing text could "
+                "not be extracted reliably — assessor must read/enter the bay sizes."
+            )
+            merged.setdefault("_field_notes", {})["bay_sizes"] = {
+                "source": "joint_layout_detected_unreadable",
+                "note": "Joint layout detected, but spacing text could not be extracted; assessor entry required",
+                "evidence": layout,
+            }
+    if conflicts:
+        merged["_conflicts"] = conflicts
+        for field, records in sorted(conflicts.items()):
+            values = ", ".join(sorted({str(record.get('value')) for record in records}))
+            flags.append(
+                f"SPEC CONFLICT: {field} has competing drawing values ({values}); no value "
+                "was confirmed — assessor must select the applicable detail."
+            )
+    if evidence:
+        merged["_evidence"] = evidence
+    if flags:
+        merged["_flags"] = flags
+    source_files = sorted({str(item.get("file")) for item in evidence.values()
+                           if item.get("file")})
+    merged["_from_file"] = ", ".join(source_files) if source_files else target.name
+    return merged
 
 
 # ── Approval flags — any of these triggers a manual review email ─────────────
@@ -397,10 +496,22 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
 
     # ── Auto-extract engineer spec from the pack (if not already provided)
     if engineer_spec is None and auto_extract_spec:
-        found = find_engineer_spec(pdf)
+        found = find_engineer_spec(pdf, project_ref=project_ref)
         if found:
-            engineer_spec = found
-            r["spec_source"] = found.get("_from_file", "auto")
+            extracted_pricing_fields = {
+                key: found[key] for key in ("depth_mm", "mesh", "layers", "conc_mix")
+                if found.get(key) is not None
+            }
+            if extracted_pricing_fields:
+                engineer_spec = found
+                r["spec_source"] = found.get("_from_file", "auto")
+            if found.get("_evidence"):
+                r["spec_evidence"] = found["_evidence"]
+            if found.get("_field_notes"):
+                r["spec_field_notes"] = found["_field_notes"]
+            if found.get("_conflicts"):
+                r["spec_conflicts"] = found["_conflicts"]
+            r["flags"].extend(found.get("_flags") or [])
 
     # ── Drawing source discipline (engineer vs architect)
     from router import source_discipline
@@ -684,6 +795,15 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             r["flags"] = r["flags"] + reference_flags
             r["zone_reference_mismatch"] = True
 
+    # The estimator works in metres per PDF point; Fortel assessors work in conventional
+    # drawing ratios. Carry the exact same scale as a presentation value (1:N), never as a
+    # second measurement source and never as a numeric adjustment.
+    if r.get("scale_k"):
+        from scale import ratio_from_k
+        scale_ratio = ratio_from_k(r["scale_k"])
+        if scale_ratio:
+            r["scale_ratio"] = scale_ratio
+
     # Informational formwork quantity only: polygon_pts are PDF points and scale_k is m/pt,
     # so closed polygon length × scale_k gives linear metres.  This never enters pricing.
     if (r.get("perimeter_lm") is None
@@ -705,7 +825,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     # Carry Fortel's client-supplied slab checklist independently from pricing.  Values
     # already used by fallback costing are useful context but remain field-by-field
     # provisional; only fields actually read from an engineer source are confirmed.
-    from slab_spec import COMMON_FIELDS, build_brief_spec, normalise_slab_type
+    from slab_spec import (COMMON_FIELDS, FIELD_LABELS, build_brief_spec,
+                           normalise_slab_type)
     confirmed_spec = {
         key: engineer_spec[key]
         for key in COMMON_FIELDS
@@ -714,6 +835,11 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     if confirmed_spec:
         # Persist only the client-facing construction fields, not extractor metadata.
         r["engineer_spec"] = dict(confirmed_spec)
+    confirmed_brief_spec = {
+        key: engineer_spec[key]
+        for key in FIELD_LABELS
+        if engineer_spec and engineer_spec.get(key) is not None
+    }
     effective_spec = (r.get("costing") or {}).get("spec") or {}
     slab_type = normalise_slab_type(
         r.get("quotation_section"),
@@ -722,8 +848,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     r["brief_spec"] = build_brief_spec(
         slab_type,
         effective_spec=effective_spec,
-        confirmed=confirmed_spec,
+        confirmed=confirmed_brief_spec,
         source="engineer_drawing",
+        evidence=r.get("spec_evidence") or {},
+        field_notes=r.get("spec_field_notes") or {},
     )
 
     # A marked drawing may contain several BOQ slab categories.  Carry one checklist per
@@ -742,8 +870,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             category: build_brief_spec(
                 category,
                 effective_spec={} if mixed_zones else effective_spec,
-                confirmed={} if mixed_zones else confirmed_spec,
+                confirmed={} if mixed_zones else confirmed_brief_spec,
                 source="engineer_drawing",
+                evidence={} if mixed_zones else (r.get("spec_evidence") or {}),
+                field_notes={} if mixed_zones else (r.get("spec_field_notes") or {}),
             )
             for category in slab_categories
         }

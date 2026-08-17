@@ -138,7 +138,8 @@ def empty_brief_spec(slab_type=None):
 
 
 def build_brief_spec(slab_type=None, *, effective_spec=None, confirmed=None,
-                     source="assessor", existing=None, replace=False):
+                     source="assessor", existing=None, replace=False,
+                     evidence=None, field_notes=None):
     """Build a checklist while preserving assumed-vs-confirmed field provenance.
 
     ``effective_spec`` is the already-computed costing specification.  Its values are
@@ -166,11 +167,24 @@ def build_brief_spec(slab_type=None, *, effective_spec=None, confirmed=None,
                 continue
             value = coerce_field_value(key, field.get("value"))
             if value is not None:
-                result["fields"][key].update({
+                carried = {
                     "value": value,
                     "source": str(field.get("source") or "not_provided"),
                     "provisional": bool(field.get("provisional", True)),
+                }
+                if isinstance(field.get("evidence"), dict):
+                    carried["evidence"] = dict(field["evidence"])
+                if field.get("note"):
+                    carried["note"] = str(field["note"])
+                result["fields"][key].update(carried)
+            elif field.get("note"):
+                result["fields"][key].update({
+                    "source": str(field.get("source") or "drawing_text_unreadable"),
+                    "provisional": True,
+                    "note": str(field["note"]),
                 })
+                if isinstance(field.get("evidence"), dict):
+                    result["fields"][key]["evidence"] = dict(field["evidence"])
 
     for key, raw_value in (confirmed or {}).items():
         if key not in applicable:
@@ -180,11 +194,34 @@ def build_brief_spec(slab_type=None, *, effective_spec=None, confirmed=None,
             # A cleared field remains visible as either the effective pricing assumption or
             # an unprovided blank.  It is never silently marked confirmed.
             continue
-        result["fields"][key].update({
+        confirmed_field = {
             "value": value,
             "source": source,
             "provisional": False,
+        }
+        if isinstance((evidence or {}).get(key), dict):
+            confirmed_field["evidence"] = dict(evidence[key])
+        result["fields"][key].update(confirmed_field)
+        if not isinstance((evidence or {}).get(key), dict):
+            result["fields"][key].pop("evidence", None)
+        result["fields"][key].pop("note", None)
+
+    # A detected joint-layout sheet is materially different from "no details provided" even
+    # when its spacing text layer cannot be parsed. Keep the quantity blank/provisional, but
+    # tell the assessor exactly which sheet/page must be read rather than implying no detail
+    # exists. Notes never become pricing inputs.
+    for key, note in (field_notes or {}).items():
+        if key not in applicable or not isinstance(note, dict):
+            continue
+        if result["fields"][key].get("value") is not None:
+            continue
+        result["fields"][key].update({
+            "source": str(note.get("source") or "drawing_text_unreadable"),
+            "note": str(note.get("note") or "Drawing detail detected; assessor entry required"),
+            "provisional": True,
         })
+        if isinstance(note.get("evidence"), dict):
+            result["fields"][key]["evidence"] = dict(note["evidence"])
     return result
 
 
@@ -215,6 +252,8 @@ def display_value(key, field):
     """Human-readable value that can never hide missing/provisional provenance."""
     value = (field or {}).get("value")
     if value is None:
+        if (field or {}).get("note"):
+            return str(field["note"])
         return NO_DETAILS
     text = f"{value} mm" if key == "depth_mm" else str(value)
     if (field or {}).get("provisional", True):
@@ -230,7 +269,20 @@ def display_lines(brief_spec):
             "label": field.get("label") or FIELD_LABELS.get(key, key),
             "value": display_value(key, field),
             "provisional": bool(field.get("provisional", True)),
+            "source_citation": _source_citation(field.get("evidence")),
+            "evidence_text": ((field.get("evidence") or {}).get("text")
+                              if isinstance(field.get("evidence"), dict) else None),
         }
         for key, field in ((brief_spec or {}).get("fields") or {}).items()
         if isinstance(field, dict)
     ]
+
+
+def _source_citation(evidence):
+    if not isinstance(evidence, dict):
+        return ""
+    filename = str(evidence.get("file") or "").strip()
+    page = evidence.get("page")
+    if filename and page:
+        return f"{filename}, page {page}"
+    return filename

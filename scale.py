@@ -7,7 +7,7 @@ never hardcode. Breaks this addresses:
   - PDF /UserUnit ignored (large drawings) -> area under-sized by UserUnit^2
   - multi-page tender packs -> never assume page 0; route every page
 """
-import re, fitz
+import math, re, fitz
 
 
 def detect_scale_bar(pdf, page=0):
@@ -252,6 +252,18 @@ PT_PER_M = 0.0254 / 72   # 1 PDF point in metres of paper
 def title_block_k(denominator):
     """k (m/pt) implied by a stated drawing scale 1:N. Fortel enter '1 mm = N/1000 m'."""
     return denominator * PT_PER_M if denominator else None
+
+
+def ratio_from_k(k_m_per_pt):
+    """Return the conventional 1:N denominator for a PDF-point scale.
+
+    Measurement continues to use ``k``.  This is presentation-only conversion for assessors
+    who work in 1:N drawing scales; it changes no scale source, consensus, or tolerance.
+    """
+    if (not isinstance(k_m_per_pt, (int, float)) or isinstance(k_m_per_pt, bool)
+            or not math.isfinite(k_m_per_pt) or k_m_per_pt <= 0):
+        return None
+    return max(1, int(round(float(k_m_per_pt) / PT_PER_M)))
 
 
 def scale_from_bay(bay_width_pt, bay_m=UK_PARKING_BAY_M):

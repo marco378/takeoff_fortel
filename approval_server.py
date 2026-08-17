@@ -674,7 +674,21 @@ def approve(job_id):
                 "flags": flags,
             })
         else:
-            jobs[job_id].update({"quotation_status": "ready"})
+            revision = int(jobs[job_id].get("quotation_revision") or 1)
+            history = list(jobs[job_id].get("quotation_history") or [])
+            if not any(int(entry.get("revision") or 0) == revision for entry in history):
+                history.append({
+                    "revision": revision,
+                    "label": f"REV_{revision:02d}",
+                    "issued_at": now_iso(),
+                    "reason": "initial approval" if revision == 1 else "approved revision",
+                    "paths": dict(quotation_paths),
+                })
+            jobs[job_id].update({
+                "quotation_status": "ready",
+                "quotation_revision": revision,
+                "quotation_history": history,
+            })
             jobs[job_id].pop("quotation_error", None)
         save_jobs(jobs)
 
@@ -882,7 +896,7 @@ def adjust(job_id):
     area_m2    = data.get("assessed_area_m2")
     note       = data.get("note", "")
     cutout_regions_in = data.get("cutout_regions") or []  # [[[x,y], ...], ...]
-    user_channels_in = data.get("user_channels") or []    # [[[x,y], [x,y]], ...]
+    user_channels_in = data.get("user_channels") or []    # open polylines [[[x,y], ...], ...]
 
     def _valid_region(region):
         return (
@@ -953,21 +967,25 @@ def adjust(job_id):
             return jsonify({"error": "cutout_regions must contain 0-50 valid polygons"}), 400
         cutout_regions = cutout_regions_in
 
-    # Validate user-drawn channels (two-point lines)
+    # Validate assessor-drawn channel polylines. AI proposals remain separately constrained to
+    # straight/non-diagonal two-point assumptions in /channel-proposals; a real drainage run may
+    # bend and the assessor must be able to trace that actual geometry.
     user_channels = []
     if user_channels_in:
         if not isinstance(user_channels_in, list) or len(user_channels_in) > 20:
             return jsonify({"error": "user_channels must contain 0-20 channel lines"}), 400
         for ch in user_channels_in:
-            if (not isinstance(ch, list) or len(ch) != 2
+            if (not isinstance(ch, list) or not 2 <= len(ch) <= 100
                     or any(not isinstance(point, (list, tuple)) or len(point) != 2
                            or any(not isinstance(value, (int, float)) or not math.isfinite(value)
                                   for value in point)
                            for point in ch)):
-                return jsonify({"error": "each user_channel must contain exactly two [x,y] points"}), 400
-            dx = abs(ch[1][0] - ch[0][0])
-            dy = abs(ch[1][1] - ch[0][1])
-            if dx <= 1e-6 and dy <= 1e-6:
+                return jsonify({
+                    "error": "each user_channel must contain 2-100 finite [x,y] points"
+                }), 400
+            length_px = sum(math.dist(ch[index - 1], ch[index])
+                            for index in range(1, len(ch)))
+            if length_px <= 1e-6:
                 return jsonify({"error": "user_channels must have positive length"}), 400
         user_channels = user_channels_in
 
@@ -1772,6 +1790,170 @@ def review_yard_regions(job_id):
     })
 
 
+def _brief_spec_changes(before: dict, after: dict) -> list[dict]:
+    """Auditable field changes, excluding source metadata that does not change the spec."""
+    from slab_spec import FIELD_LABELS
+    before_fields = (before or {}).get("fields") or {}
+    after_fields = (after or {}).get("fields") or {}
+    changes = []
+    for key in FIELD_LABELS:
+        old = before_fields.get(key) if isinstance(before_fields.get(key), dict) else {}
+        new = after_fields.get(key) if isinstance(after_fields.get(key), dict) else {}
+        old_state = (old.get("value"), bool(old.get("provisional", True)))
+        new_state = (new.get("value"), bool(new.get("provisional", True)))
+        if old_state == new_state:
+            continue
+        changes.append({
+            "field": key,
+            "label": FIELD_LABELS[key],
+            "old": old.get("value"),
+            "new": new.get("value"),
+            "old_provisional": bool(old.get("provisional", True)),
+            "new_provisional": bool(new.get("provisional", True)),
+        })
+    return changes
+
+
+def _mark_post_approval_spec_correction(job: dict, before: dict, after: dict,
+                                        *, zone_category: str | None = None) -> dict | None:
+    """Turn an approved-job edit into a visible revised decision, never an in-place rewrite."""
+    if job.get("decision") != "approved":
+        return None
+    changes = _brief_spec_changes(before, after)
+    if not changes:
+        return None
+    corrected_at = now_iso()
+    history = list(job.get("quotation_history") or [])
+    issued_revisions = [int(entry.get("revision") or 0) for entry in history
+                        if isinstance(entry, dict) and entry.get("paths")]
+    prior_revision = max(issued_revisions, default=(
+        int(job.get("quotation_revision") or 1)
+        if job.get("quotation_status") == "ready" and job.get("quotation_paths") else 1
+    ))
+    if not any(int(entry.get("revision") or 0) == prior_revision for entry in history):
+        history.append({
+            "revision": prior_revision,
+            "label": f"REV_{prior_revision:02d}",
+            "issued_at": job.get("decided_at"),
+            "reason": "approval before specification correction",
+            "paths": dict(job.get("quotation_paths") or {}),
+        })
+    correction = {
+        "corrected_at": corrected_at,
+        "prior_decision": "approved",
+        "prior_revision": prior_revision,
+        "revision": prior_revision + 1,
+        "zone_category": zone_category,
+        "changes": changes,
+    }
+    corrections = list(job.get("spec_correction_history") or [])
+    corrections.append(correction)
+    job.update({
+        # The assessor is correcting their own approved specification. Keep that authority
+        # explicit: this is still approved, but it is a later commercial revision. Demoting it
+        # to the generic "adjusted" state hid the fact that an issued quote had been corrected
+        # and made subsequent corrections stop creating revisions.
+        "status": "approved",
+        "decision": "approved",
+        "spec_corrected_after_approval": True,
+        "spec_corrected_at": corrected_at,
+        "spec_correction_history": corrections,
+        "quotation_revision": prior_revision + 1,
+        "quotation_history": history,
+        "quotation_status": "revision_pending",
+    })
+    job.pop("quotation_error", None)
+    return correction
+
+
+def _issue_post_approval_spec_revision(jobs: dict, job_id: str,
+                                       correction: dict | None) -> dict:
+    """Save REV_N beside (never over) the earlier issued files and update its audit history."""
+    if not correction:
+        return {}
+    job = jobs[job_id]
+    revision = int(correction["revision"])
+    safe_ref = _sanitise_filename(str(job.get("project_ref") or job_id)) or job_id
+    result = _quotation_result_for_job(job)
+    paths = _save_quotation(
+        job_id, result, job.get("costing"),
+        file_stem=f"{safe_ref}-REV_{revision:02d}",
+    )
+    error = paths.get("error") if isinstance(paths, dict) else None
+    if error:
+        job.update({
+            "quotation_status": "error",
+            "quotation_error": error,
+        })
+    else:
+        history = list(job.get("quotation_history") or [])
+        history.append({
+            "revision": revision,
+            "label": f"REV_{revision:02d}",
+            "issued_at": now_iso(),
+            "reason": "specification correction after approval",
+            "paths": dict(paths),
+            "changes": list(correction.get("changes") or []),
+        })
+        job.update({
+            "quotation_paths": paths,
+            "quotation_history": history,
+            "quotation_status": "ready",
+        })
+        job.pop("quotation_error", None)
+    jobs[job_id] = job
+    save_jobs(jobs)
+    return paths
+
+
+def _costing_for_brief_spec(area_m2: float, brief_spec: dict) -> tuple[dict | None, dict, str]:
+    """Use the existing calculation for one assessor-scoped slab specification.
+
+    This is an adapter above the denylisted pricing modules: it supplies the assessor's
+    confirmed fields, applies the existing defaults/client-rate layer, and returns an explicit
+    per-zone costing. Unsupported open text remains saved but produces a pricing-review warning,
+    never a guessed rate.
+    """
+    from slab_spec import COMMON_FIELDS, build_brief_spec, confirmed_values
+    from defaults import spec_with_defaults, assumption_note, flag_assumed
+    from costing import rate_buildup
+
+    confirmed = confirmed_values(brief_spec)
+    pricing_override = {key: confirmed[key] for key in COMMON_FIELDS if key in confirmed}
+    try:
+        spec, _ = spec_with_defaults(pricing_override)
+        spec, _manhole_rate, rates_provenance = _apply_current_client_rates(spec)
+        assumed = not all(key in pricing_override for key in COMMON_FIELDS)
+        rate, parts = rate_buildup(**{key: spec[key] for key in [
+            "depth_mm", "conc_rate", "conc_wastage", "mesh", "layers",
+            "steel_rate_t", "steel_wastage", "lap_acc", "dpm", "curing",
+            "labour", "trim", "margin"]})
+        costing = {
+            "area_m2": area_m2,
+            "rate": rate,
+            "total_gbp": round(area_m2 * rate, 2),
+            "spec": spec,
+            "assumed": assumed,
+            "note": assumption_note(spec) if assumed else "Spec overridden by assessor",
+            "flags": flag_assumed(spec, assumed),
+            "breakdown": parts,
+        }
+        costing.update(rates_provenance)
+        rebuilt = build_brief_spec(
+            brief_spec.get("slab_type"),
+            effective_spec=spec,
+            confirmed=confirmed,
+            source="assessor",
+            replace=True,
+        )
+        return costing, rebuilt, ""
+    except Exception:
+        return None, brief_spec, (
+            "Specification saved, but the current rate build-up does not support one or more "
+            "supplied pricing fields; human pricing review required."
+        )
+
+
 @app.route("/spec-override/<job_id>", methods=["POST"])
 def spec_override(job_id):
     """Capture Fortel's slab checklist and re-price only its supplied pricing fields.
@@ -1820,27 +2002,83 @@ def spec_override(job_id):
                        if isinstance(zone, dict)):
                 return jsonify({"error": "zone_category is not present on this job"}), 400
             brief_specs = dict(job.get("brief_specs") or res.get("brief_specs") or {})
+            existing_zone_brief = brief_specs.get(zone_category) or {}
             try:
                 brief_spec = build_brief_spec(
                     zone_category,
                     confirmed=supplied_fields,
                     source="assessor",
-                    existing=brief_specs.get(zone_category) or {},
+                    existing=existing_zone_brief,
                     replace=nested_fields is not None,
                 )
             except (TypeError, ValueError) as e:
                 return jsonify({"error": f"invalid spec field: {e}"}), 400
+            existing_zone_confirmed = confirmed_values(existing_zone_brief)
+            pricing_fields_submitted = any(
+                key in supplied_fields and supplied_fields.get(key) not in (None, "")
+                for key in COMMON_FIELDS
+            ) or any(
+                key in existing_zone_confirmed and key in supplied_fields
+                and supplied_fields.get(key) in (None, "")
+                for key in COMMON_FIELDS
+            )
+            zone_area_m2 = round(sum(
+                float(zone.get("area_m2") or 0)
+                for zone in zones if isinstance(zone, dict)
+                and zone.get("category") == zone_category
+            ), 2)
+            zone_costing = None
+            repriced = False
+            pricing_warning = job.get("spec_pricing_warning") or ""
+            if pricing_fields_submitted and zone_area_m2 > 0:
+                zone_costing, brief_spec, pricing_warning = _costing_for_brief_spec(
+                    zone_area_m2, brief_spec)
+                repriced = zone_costing is not None
+            elif pricing_fields_submitted:
+                pricing_warning = ""
             brief_specs[zone_category] = brief_spec
             res["brief_specs"] = brief_specs
             job["brief_specs"] = brief_specs
+            if zone_costing:
+                zone_costings = dict(job.get("zone_costings") or res.get("zone_costings") or {})
+                zone_costings[zone_category] = zone_costing
+                res["zone_costings"] = zone_costings
+                job["zone_costings"] = zone_costings
+                measured_categories = {
+                    zone.get("category") for zone in zones if isinstance(zone, dict)
+                    and zone.get("area_m2") is not None
+                }
+                if measured_categories == {zone_category}:
+                    # A one-zone result has no mixed-spec ambiguity: keep the portal's costing
+                    # card and the later approve path on the same assessor-corrected build-up.
+                    res["costing"] = zone_costing
+                    job["costing"] = zone_costing
+                    job["spec_override"] = confirmed_values(brief_spec)
+            if pricing_warning:
+                job["spec_pricing_warning"] = pricing_warning
+            else:
+                job.pop("spec_pricing_warning", None)
             job["result"] = res
+            correction = _mark_post_approval_spec_correction(
+                job, existing_zone_brief, brief_spec, zone_category=zone_category)
             jobs[job_id] = job
             save_jobs(jobs)
+            revision_paths = _issue_post_approval_spec_revision(jobs, job_id, correction)
+            if correction:
+                log_training({
+                    "event": "spec_correction_after_approval", "job_id": job_id,
+                    "revision": correction["revision"], "zone_category": zone_category,
+                    "changes": correction["changes"], "timestamp": correction["corrected_at"],
+                })
             return jsonify({
                 "status": "ok", "job_id": job_id, "costing": job.get("costing"),
+                "zone_costing": zone_costing,
                 "brief_spec": brief_spec, "brief_specs": brief_specs,
-                "spec_schema": schema_definition(), "repriced": False,
-                "pricing_warning": "",
+                "spec_schema": schema_definition(), "repriced": repriced,
+                "pricing_warning": pricing_warning,
+                "post_approval_correction": bool(correction),
+                "quotation_revision": correction.get("revision") if correction else None,
+                "quotation_paths": revision_paths,
             })
         try:
             existing_brief = job.get("brief_spec") or res.get("brief_spec") or {}
@@ -1948,12 +2186,24 @@ def spec_override(job_id):
             jobs[job_id]["spec_pricing_warning"] = pricing_warning
         else:
             jobs[job_id].pop("spec_pricing_warning", None)
+        correction = _mark_post_approval_spec_correction(
+            jobs[job_id], existing_brief, brief_spec)
         save_jobs(jobs)
+        revision_paths = _issue_post_approval_spec_revision(jobs, job_id, correction)
+        if correction:
+            log_training({
+                "event": "spec_correction_after_approval", "job_id": job_id,
+                "revision": correction["revision"],
+                "changes": correction["changes"], "timestamp": correction["corrected_at"],
+            })
 
     return jsonify({
         "status": "ok", "job_id": job_id, "costing": costing,
         "brief_spec": brief_spec, "spec_schema": schema_definition(),
         "repriced": repriced, "pricing_warning": pricing_warning,
+        "post_approval_correction": bool(correction),
+        "quotation_revision": correction.get("revision") if correction else None,
+        "quotation_paths": revision_paths,
     })
 
 
@@ -2070,6 +2320,8 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["brief_spec"] = dict(job["brief_spec"])
     if isinstance(job.get("brief_specs"), dict):
         result["brief_specs"] = dict(job["brief_specs"])
+    if isinstance(job.get("zone_costings"), dict):
+        result["zone_costings"] = dict(job["zone_costings"])
     if isinstance(job.get("zones"), list):
         result["zones"] = list(job["zones"])
     if isinstance(job.get("channel_proposals"), list):
@@ -2167,6 +2419,18 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
     else:
         siblings = [(job_id, anchor)]
 
+    # A project quotation is deliberately identical whichever sibling drawing the assessor
+    # opens. Revision metadata must follow the latest corrected sibling too; otherwise opening
+    # Unit B could produce corrected Unit A money under the old REV_01 label with no caveat.
+    revision_anchor = max(
+        (sibling for _, sibling in siblings),
+        key=lambda sibling: (
+            int(sibling.get("quotation_revision") or 1),
+            str(sibling.get("spec_corrected_at") or sibling.get("decided_at") or ""),
+        ),
+        default=anchor,
+    )
+
     zone_blocks = []
     for sibling_id, sibling in siblings:
         # Zone gates only apply to documents CONTRIBUTING quantities — an unmeasured
@@ -2182,6 +2446,19 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
     # inside the workbook instead of a 409, so the team can see the whole case early.
     draft = anchor.get("decision") not in ("approved", "adjusted")
     caveats = []
+    correction_history = revision_anchor.get("spec_correction_history") or []
+    if correction_history:
+        latest_correction = correction_history[-1]
+        changed_labels = ", ".join(
+            str(change.get("label") or change.get("field"))
+            for change in latest_correction.get("changes", [])
+        ) or "slab specification"
+        caveats.append(
+            "CORRECTION AFTER APPROVAL — "
+            f"revision REV_{int(revision_anchor.get('quotation_revision') or 2):02d}; "
+            f"corrected fields: {changed_labels}. The earlier issued quotation remains in "
+            "the job's quotation history and has not been overwritten."
+        )
     if zone_blocks:
         if not draft:
             sibling_id, reason = zone_blocks[0]
@@ -2212,18 +2489,22 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
         results.append(unit)
     project = anchor.get("project_name") or (results[0].get("file", "") if results else "")
     client = anchor.get("client_name") or ""
+    commercial = dict(anchor.get("commercial") or {})
+    if revision_anchor.get("quotation_revision"):
+        commercial["revision"] = f"REV_{int(revision_anchor['quotation_revision']):02d}"
     return generate_quotation(
         results, project=project, client=client, ref=project_ref or None,
-        commercial=anchor.get("commercial") or None,
+        commercial=commercial or None,
         unmeasured=unmeasured or None, caveats=caveats or None,
     )
 
-def _save_quotation(job_id: str, result: dict, costing: dict | None) -> dict:
+def _save_quotation(job_id: str, result: dict, costing: dict | None,
+                    *, file_stem: str | None = None) -> dict:
     """Generate and save quotation files for this job. Returns paths dict."""
     try:
         from quotation import save_quotation
         q = _quotation_for_job(job_id, result_override=result, costing_override=costing)
-        return save_quotation(q, out_dir=str(QUOTATIONS_DIR))
+        return save_quotation(q, out_dir=str(QUOTATIONS_DIR), file_stem=file_stem)
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
