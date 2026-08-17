@@ -1418,6 +1418,33 @@ def _native_boundary_for_mask(page, region_mask, S, k, min_iou=0.90, drawings=No
     return best, None
 
 
+def _yard_extent_corroboration(yard_regions):
+    """Return whether independent native geometry corroborates the emitted Yard extent.
+
+    A verified scale proves metres-per-point; a legend/body colour match proves material
+    identity. Neither proves that a selected connected raster island is the complete slab.
+    Only a closed native CAD boundary independently matched to every included region supplies
+    that missing extent evidence. Multi-region sets remain assessor-gated separately.
+    """
+    included = [region for region in (yard_regions or []) if region.get("included")]
+    if not included:
+        return False, "no included Yard region was available for independent boundary matching"
+    unresolved = [
+        region.get("region_id") or "unknown region"
+        for region in included
+        if region.get("perimeter_confidence") != "high"
+    ]
+    if unresolved:
+        return False, (
+            "no independently matched closed native CAD boundary for "
+            + ", ".join(unresolved)
+        )
+    return True, (
+        f"independently matched closed native CAD boundary for all {len(included)} included "
+        "Yard region(s)"
+    )
+
+
 # Parsing every native vector on dense landscape/boundary sheets can exceed the robustness
 # harness's per-file ceiling merely to obtain an optional perimeter.  This budget is a
 # performance/safety limit on compressed page-content bytes, not a measurement tolerance.
@@ -2175,6 +2202,24 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         )
         region_confidence = "low"
 
+    extent_corroborated, extent_corroboration_reason = _yard_extent_corroboration(
+        yard_regions)
+    component_evidence["extent_corroborated"] = extent_corroborated
+    component_evidence["extent_corroboration_reason"] = extent_corroboration_reason
+    if extent_corroborated:
+        flags.append(f"Yard extent corroborated: {extent_corroboration_reason}")
+    else:
+        # Do not change the candidate number: without the reported client PDF there is no
+        # honest basis for changing geometry. The safe correction is confidence only. An
+        # assessor can see/confirm the existing region, while the raw estimator cannot call a
+        # possibly partial connected component VERIFIED merely because its scale is good.
+        region_confidence = "low"
+        flags.append(
+            "YARD EXTENT UNCORROBORATED: " + extent_corroboration_reason
+            + "; a verified scale/legend does not prove the full intended slab was captured — "
+              "capped at MEASURED_UNVERIFIED for assessor extent confirmation"
+        )
+
     # Yard-entrance Transition assistance is deliberately separate from measured zones.
     # It requires two independent on-sheet signals: a tarmac/macadam legend swatch and a
     # contiguous shared run on an independently matched native Yard boundary.  The assessor
@@ -2428,6 +2473,8 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             "segmentation_components": component_evidence,
             "yard_regions": yard_regions,
             "yard_region_review_required": yard_region_review_required,
+            "extent_corroborated": extent_corroborated,
+            "extent_corroboration_reason": extent_corroboration_reason,
             "channel_proposals": channel_proposals,
             "transition_candidates": transition_candidates,
             "exclusion_prompts": exclusion_prompts,

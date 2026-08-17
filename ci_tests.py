@@ -68,6 +68,48 @@ ck("obvious DAS report refuses before page ranking/raster measurement",
    _das_result.get("area_m2") is None and
    any("no page was rasterised" in flag for flag in _das_result.get("flags", [])),
    _das_result)
+
+_spec_pdf = "/tmp/Project_Technical_Specification.pdf"
+_spec_canvas = canvas.Canvas(_spec_pdf, pagesize=(900, 700))
+for _spec_page in range(6):
+    _spec_canvas.drawString(60, 650, "DEVELOPMENT TECHNICAL SPECIFICATION")
+    _spec_canvas.drawString(60, 620, f"Written requirements page {_spec_page + 1}")
+    _spec_canvas.showPage()
+_spec_canvas.save()
+_spec_result = _pipeline_takeoff_fast_report(
+    _spec_pdf, auto_extract_spec=False, send_approval=False)
+ck("obvious specification refuses before page ranking/raster measurement",
+   _spec_result.get("measurement_state") == "UNMEASURED" and
+   _spec_result.get("method") == "fast-refuse" and
+   _spec_result.get("area_m2") is None and
+   any("filename 'Specification'" in flag and "first-page text 'TECHNICAL SPECIFICATION'" in flag
+       for flag in _spec_result.get("flags", [])),
+   _spec_result)
+
+_schedule_pdf = "/tmp/Tender_Query_Schedule.pdf"
+_schedule_canvas = canvas.Canvas(_schedule_pdf, pagesize=(900, 700))
+_schedule_canvas.drawString(60, 650, "Tender Query Schedule")
+_schedule_canvas.save()
+_schedule_result = _pipeline_takeoff_fast_report(
+    _schedule_pdf, auto_extract_spec=False, send_approval=False)
+ck("single-page schedule is refused from strong filename evidence",
+   _schedule_result.get("measurement_state") == "UNMEASURED" and
+   _schedule_result.get("method") == "fast-refuse" and
+   _schedule_result.get("area_m2") is None,
+   _schedule_result)
+
+_incidental_pdf = "/tmp/External_Works_Layout.pdf"
+_incidental_canvas = canvas.Canvas(_incidental_pdf, pagesize=(900, 700))
+_incidental_canvas.drawString(60, 650, "External Works Layout")
+_incidental_canvas.drawString(60, 620, "Refer to door schedule for ancillary information")
+_incidental_canvas.save()
+import fitz as _fitz_fast_refusal
+with _fitz_fast_refusal.open(_incidental_pdf) as _incidental_doc:
+    _incidental_reason = __import__("takeoff_pipeline")._fast_report_refusal(
+        _incidental_pdf, _incidental_doc)
+ck("incidental schedule note on a one-sheet drawing is not fast-refused",
+   _incidental_reason is None, _incidental_reason)
+
 _fake_large_container = Path("/tmp/_synthetic_large_tender.zip")
 _fake_large_container.write_bytes(b"PK\x03\x04" + b"not-a-pdf" * 1024)
 _container_result = _pipeline_takeoff_fast_report(
@@ -2196,6 +2238,46 @@ try:
        _d77.get("scale_verified") is True)
     ck("D77 measurement_state MEASURED_VERIFIED", _d77.get("measurement_state") == MEASURED_VERIFIED)
     ck("D77 needs_assessor False", _d77.get("needs_assessor") is False)
+    ck("D77 VERIFIED state has independent native-boundary extent corroboration",
+       _d77.get("extent_corroborated") is True and
+       all(region.get("perimeter_confidence") == "high"
+           for region in _d77.get("yard_regions", []) if region.get("included")),
+       {"extent_corroborated": _d77.get("extent_corroborated"),
+        "regions": _d77.get("yard_regions")})
+
+    # Corpus-backed confidence regression for the live 575 vs 1,212 failure class. Keep the
+    # real D77 pixels, legend and verified scale, but remove only the independent native-boundary
+    # corroboration. The candidate area must remain unchanged while VERIFIED is withheld.
+    import takeoff_unmarked as _tu_extent_guard
+    _real_native_drawings_extent = _tu_extent_guard._native_boundary_drawings
+    try:
+        _tu_extent_guard._native_boundary_drawings = lambda page: (
+            [], "regression fixture: native extent unavailable")
+        _d77_uncorroborated = _tu_extent_guard.takeoff("drawings/_int_d77.pdf")
+        from takeoff_pipeline import takeoff as _pipeline_extent_guard
+        _d77_uncorroborated_pipeline = _pipeline_extent_guard(
+            "drawings/_int_d77.pdf", send_approval=False, auto_extract_spec=False)
+    finally:
+        _tu_extent_guard._native_boundary_drawings = _real_native_drawings_extent
+    ck("uncorroborated raw extent preserves the measured candidate number",
+       _d77_uncorroborated.get("area_m2") == _d77.get("area_m2") == 3159.0,
+       {"corroborated": _d77.get("area_m2"),
+        "uncorroborated": _d77_uncorroborated.get("area_m2")})
+    ck("verified scale + legend alone cannot promote a partial raw extent to VERIFIED",
+       _d77_uncorroborated.get("scale_verified") is True and
+       _d77_uncorroborated.get("extent_corroborated") is False and
+       _d77_uncorroborated.get("measurement_state") == MEASURED_UNVERIFIED and
+       _d77_uncorroborated.get("needs_assessor") is True and
+       any("YARD EXTENT UNCORROBORATED" in flag
+           for flag in _d77_uncorroborated.get("flags", [])),
+       {"state": _d77_uncorroborated.get("measurement_state"),
+        "flags": _d77_uncorroborated.get("flags")})
+    ck("pipeline preserves the raw extent confidence cap",
+       _d77_uncorroborated_pipeline.get("extent_corroborated") is False and
+       _d77_uncorroborated_pipeline.get("measurement_state") == MEASURED_UNVERIFIED and
+       _d77_uncorroborated_pipeline.get("needs_assessor") is True,
+       {"state": _d77_uncorroborated_pipeline.get("measurement_state"),
+        "extent": _d77_uncorroborated_pipeline.get("extent_corroborated")})
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
 except (ImportError, FileNotFoundError) as _e:
@@ -2583,14 +2665,12 @@ try:
     _orig_drawings_dir_up = _AS.DRAWINGS_DIR
     _orig_quotations_dir_up = _AS.QUOTATIONS_DIR
     _orig_server_file_up = _AS.__file__
-    _orig_thread_up = _AS.threading.Thread
+    _orig_dispatcher_up = _AS._TAKEOFF_DISPATCHER
     _started_up = []
 
-    class _NoStartThread:
-        def __init__(self, target, args, daemon):
-            self.target, self.args, self.daemon = target, args, daemon
-        def start(self):
-            _started_up.append(self.args)
+    class _RecordingDispatcher:
+        def submit(self, *args):
+            _started_up.append(args)
 
     try:
         _AS.JOBS_FILE = _tmpdir / "multi_upload_jobs.json"
@@ -2599,7 +2679,7 @@ try:
         _AS.DRAWINGS_DIR = _tmpdir / "drawings"
         _AS.QUOTATIONS_DIR = _tmpdir / "quotations"
         _AS.__file__ = str(_tmpdir / "approval_server.py")
-        _AS.threading.Thread = _NoStartThread
+        _AS._TAKEOFF_DISPATCHER = _RecordingDispatcher()
         _client_up = _AS.app.test_client()
         _pdf_a_bytes = _pdf_a.read_bytes()
         _pdf_b_bytes = _pdf_b.read_bytes()
@@ -2624,8 +2704,8 @@ try:
         ck("multi-file upload preserves prefixed, non-overwriting source paths",
            len({j.get("pdf_path") for j in _multi_jobs.values()}) == 2 and
            all(Path(j["pdf_path"]).name.startswith("MULTI-001_") for j in _multi_jobs.values()))
-        ck("multi-file upload launches one independent takeoff worker per drawing",
-           len(_started_up) == 2)
+        ck("multi-file upload queues every drawing for bounded takeoff",
+           len(_started_up) == 2 and all(len(args) == 4 for args in _started_up))
 
         _AS.save_jobs({})
         _started_up.clear()
@@ -3508,7 +3588,7 @@ try:
         ck("one-click candidate load is non-mutating until Submit Adjustment",
            "fetch(" not in _candidate_fn and "poly = regions[0]" in _candidate_fn)
     finally:
-        _AS.threading.Thread = _orig_thread_up
+        _AS._TAKEOFF_DISPATCHER = _orig_dispatcher_up
         _AS.__file__ = _orig_server_file_up
         _AS.JOBS_FILE = _orig_jobs_file_up
         _AS.JOBS_ARCHIVE_FILE = _orig_jobs_archive_file_up
@@ -3530,6 +3610,128 @@ try:
     shutil.rmtree(_tmpdir, ignore_errors=True)
 except ImportError as _e:
     print(f"  [SKIP] approval_server upload/approve tests — missing dependency: {_e}")
+
+print("approval_server: bounded 26-PDF queue excludes wait time from watchdog budget")
+try:
+    import approval_server as _AS_queue
+    import fitz as _fitz_queue, io as _io_queue, tempfile as _tempfile_queue
+    import sys as _sys_queue, time as _time_queue, threading as _threading_queue
+
+    _queue_tmp = Path(_tempfile_queue.mkdtemp(prefix="ci_takeoff_queue_"))
+    _queue_originals = {
+        "jobs": _AS_queue.JOBS_FILE,
+        "archive": _AS_queue.JOBS_ARCHIVE_FILE,
+        "backup": _AS_queue.BACKUP_DIR,
+        "drawings": _AS_queue.DRAWINGS_DIR,
+        "dispatcher": _AS_queue._TAKEOFF_DISPATCHER,
+        "timeout": _AS_queue.TAKEOFF_TIMEOUT_S,
+    }
+    _real_pipeline_queue = _sys_queue.modules.get("takeoff_pipeline")
+    _active_queue = 0
+    _max_active_queue = 0
+    _active_lock_queue = _threading_queue.Lock()
+
+    ck("takeoff worker default is CPU-sized and deliberately capped at two",
+       _AS_queue._takeoff_worker_count(raw_value="", cpu_count=8) == 2 and
+       _AS_queue._takeoff_worker_count(raw_value="", cpu_count=1) == 1)
+    ck("TAKEOFF_WORKERS explicitly overrides the CPU-sized default",
+       _AS_queue._takeoff_worker_count(raw_value="3", cpu_count=1) == 3)
+
+    class _QueuePipeline:
+        @staticmethod
+        def takeoff(pdf_path, project_name=None, project_ref=None,
+                    client_rates_path=None, approval_job_id=None):
+            global _active_queue, _max_active_queue
+            with _active_lock_queue:
+                _active_queue += 1
+                _max_active_queue = max(_max_active_queue, _active_queue)
+            try:
+                _time_queue.sleep(0.03)
+                return {
+                    "file": Path(pdf_path).name,
+                    "project_name": project_name,
+                    "project_ref": project_ref,
+                    "area_m2": 250.0,
+                    "measurement_state": "MEASURED_VERIFIED",
+                    "needs_assessor": False,
+                    "scale_verified": True,
+                    "flags": ["queue regression stub completed"],
+                }
+            finally:
+                with _active_lock_queue:
+                    _active_queue -= 1
+
+    try:
+        _AS_queue.JOBS_FILE = _queue_tmp / "approval_jobs.json"
+        _AS_queue.JOBS_ARCHIVE_FILE = _queue_tmp / "approval_jobs_archive.json"
+        _AS_queue.BACKUP_DIR = _queue_tmp / "backups"
+        _AS_queue.DRAWINGS_DIR = _queue_tmp / "drawings"
+        _AS_queue.TAKEOFF_TIMEOUT_S = 0.15
+        _AS_queue._TAKEOFF_DISPATCHER = _AS_queue._TakeoffDispatcher(2)
+        _sys_queue.modules["takeoff_pipeline"] = _QueuePipeline
+        _AS_queue.save_jobs({})
+
+        _queue_doc = _fitz_queue.open()
+        _queue_doc.new_page(width=300, height=200)
+        _queue_bytes = _queue_doc.tobytes()
+        _queue_doc.close()
+        _queue_files = [
+            (_io_queue.BytesIO(_queue_bytes), f"Tender_Drawing_{index:02d}.pdf")
+            for index in range(1, 27)
+        ]
+        _queue_started = _time_queue.monotonic()
+        _queue_response = _AS_queue.app.test_client().post("/upload", data={
+            "project_ref": "QUEUE-26",
+            "project_name": "26 Drawing Tender Pack",
+            "pdf": _queue_files,
+        }, content_type="multipart/form-data")
+        _AS_queue._TAKEOFF_DISPATCHER.wait_for_idle()
+        _queue_elapsed = _time_queue.monotonic() - _queue_started
+        _queue_jobs = _AS_queue.load_jobs()
+        _queue_states = [job.get("measurement_state") for job in _queue_jobs.values()]
+        _queue_timeout_flags = [
+            flag for job in _queue_jobs.values() for flag in (job.get("flags") or [])
+            if "PIPELINE TIMEOUT" in flag
+        ]
+
+        ck("26-PDF upload returns one queued job per drawing",
+           _queue_response.status_code == 202 and len(_queue_jobs) == 26 and
+           len(_queue_response.get_json().get("job_ids", [])) == 26,
+           {"http": _queue_response.status_code,
+            "jobs": len(_queue_jobs), "body": _queue_response.get_json()})
+        ck("bounded takeoff queue never exceeds configured worker concurrency",
+           _max_active_queue == 2, _max_active_queue)
+        ck("every queued drawing reaches a legitimate four-state outcome",
+           all(state in {"MEASURED_VERIFIED", "MEASURED_UNVERIFIED", "UNMEASURED", "REJECTED"}
+               for state in _queue_states) and
+           all(job.get("takeoff_phase") == "completed" for job in _queue_jobs.values()),
+           {"states": _queue_states,
+            "phases": [job.get("takeoff_phase") for job in _queue_jobs.values()]})
+        ck("queue wait longer than one watchdog budget causes zero watchdog failures",
+           _queue_elapsed > _AS_queue.TAKEOFF_TIMEOUT_S and not _queue_timeout_flags and
+           not any(job.get("status") == "error" for job in _queue_jobs.values()),
+           {"elapsed_s": round(_queue_elapsed, 3),
+            "watchdog_s": _AS_queue.TAKEOFF_TIMEOUT_S,
+            "timeout_flags": _queue_timeout_flags})
+        ck("26-file bounded batch finishes promptly",
+           _queue_elapsed < 5.0, round(_queue_elapsed, 3))
+        print(f"  [EVIDENCE] 26 files, workers=2, watchdog=0.15s, "
+              f"batch={_queue_elapsed:.3f}s, max_active={_max_active_queue}, "
+              f"watchdog_kills={len(_queue_timeout_flags)}")
+    finally:
+        _AS_queue.JOBS_FILE = _queue_originals["jobs"]
+        _AS_queue.JOBS_ARCHIVE_FILE = _queue_originals["archive"]
+        _AS_queue.BACKUP_DIR = _queue_originals["backup"]
+        _AS_queue.DRAWINGS_DIR = _queue_originals["drawings"]
+        _AS_queue._TAKEOFF_DISPATCHER = _queue_originals["dispatcher"]
+        _AS_queue.TAKEOFF_TIMEOUT_S = _queue_originals["timeout"]
+        if _real_pipeline_queue is None:
+            _sys_queue.modules.pop("takeoff_pipeline", None)
+        else:
+            _sys_queue.modules["takeoff_pipeline"] = _real_pipeline_queue
+        shutil.rmtree(_queue_tmp, ignore_errors=True)
+except ImportError as _e:
+    print(f"  [SKIP] bounded takeoff queue tests — missing dependency: {_e}")
 
 print("approval_server: /snapshot status codes for all four measurement states "
       "(Aryan field report — 'session which renders screenshots is not working properly')")

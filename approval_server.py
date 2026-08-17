@@ -35,7 +35,7 @@ Environment:
   CLIENT_RATES_FILE optional override path; otherwise client_rates.json is stored beside
                     JOBS_FILE (including on the same Railway volume).
 """
-import os, json, io, datetime, traceback, uuid, re, threading, zipfile, email, shutil, secrets, hashlib, math, html
+import os, json, io, datetime, traceback, uuid, re, threading, queue, zipfile, email, shutil, secrets, hashlib, math, html
 from email import policy
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
@@ -2496,6 +2496,90 @@ def admin_download(filename):
 TAKEOFF_TIMEOUT_S = int(os.getenv("TAKEOFF_TIMEOUT_S", "120"))
 
 
+def _takeoff_worker_count(raw_value=None, cpu_count=None) -> int:
+    """Resolve a deliberately small measurement pool without making startup fragile."""
+    if raw_value is None:
+        raw_value = os.getenv("TAKEOFF_WORKERS")
+    if raw_value not in (None, ""):
+        try:
+            configured = int(raw_value)
+            if configured > 0:
+                return configured
+        except (TypeError, ValueError):
+            pass
+        print(f"[takeoff-queue] ignoring invalid TAKEOFF_WORKERS={raw_value!r}; using CPU default")
+    detected = cpu_count if cpu_count is not None else os.cpu_count()
+    try:
+        detected = max(1, int(detected or 1))
+    except (TypeError, ValueError):
+        detected = 1
+    # Railway's takeoff is CPU- and memory-heavy. Two concurrent drawings are enough to use
+    # a multi-core service without recreating the 26-way contention that caused the incident.
+    return min(2, detected)
+
+
+TAKEOFF_WORKERS = _takeoff_worker_count()
+
+
+class _TakeoffDispatcher:
+    """Fixed daemon-worker queue for CPU-heavy takeoffs.
+
+    Uploading N drawings creates N queue entries, not N measurement threads.  `_run_takeoff`
+    (and therefore its watchdog) is called only after a worker removes an entry from the queue,
+    so time spent waiting for CPU can never consume a drawing's measurement budget.
+    """
+
+    def __init__(self, max_workers: int, runner=None):
+        self.max_workers = max(1, int(max_workers))
+        self._runner = runner
+        self._queue = queue.Queue()
+        self._start_lock = threading.Lock()
+        self._started = False
+
+    def _ensure_started(self):
+        if self._started:
+            return
+        with self._start_lock:
+            if self._started:
+                return
+            for index in range(self.max_workers):
+                threading.Thread(
+                    target=self._worker,
+                    name=f"takeoff-worker-{index + 1}",
+                    daemon=True,
+                ).start()
+            self._started = True
+
+    def _worker(self):
+        while True:
+            args = self._queue.get()
+            try:
+                runner = self._runner or _run_takeoff
+                runner(*args)
+            except Exception as exc:
+                # `_run_takeoff` already converts ordinary failures to UNMEASURED. This is a
+                # final dispatcher boundary so even a regression before that handler cannot
+                # strand a queued job forever.
+                _mark_job_unmeasured(
+                    args[0],
+                    f"PIPELINE DISPATCH ERROR: {type(exc).__name__}: {exc}; route to assessor",
+                    extra={"takeoff_phase": "failed", "takeoff_finished_at": now_iso()},
+                )
+            finally:
+                self._queue.task_done()
+
+    def submit(self, job_id: str, pdf_path: str, project_name: str, project_ref: str):
+        self._ensure_started()
+        self._queue.put((job_id, pdf_path, project_name, project_ref))
+
+    def wait_for_idle(self):
+        """Test/maintenance hook; production requests never block on the queue."""
+        self._queue.join()
+
+
+_TAKEOFF_DISPATCHER = _TakeoffDispatcher(TAKEOFF_WORKERS)
+
+
 def _mark_job_unmeasured(job_id: str, flag: str, extra: dict = None, watchdog_fired: bool = False):
     """Flip a job to UNMEASURED with a flag — used by both the error handler and the
     watchdog so a job NEVER gets stranded on 'processing' forever.
@@ -2587,6 +2671,23 @@ def _notify_saved_review_job(job_id: str, pdf_path: str, result: dict,
     return outcome
 
 
+def _mark_takeoff_started(job_id: str) -> bool:
+    """Move one queued record into active measurement immediately before its watchdog."""
+    with _jobs_lock:
+        jobs = load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return False
+        job.update({
+            "status": "processing",
+            "takeoff_phase": "measuring",
+            "takeoff_started_at": now_iso(),
+        })
+        jobs[job_id] = job
+        save_jobs(jobs)
+    return True
+
+
 def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str):
     """
     Background thread: run takeoff pipeline and update job record when done.
@@ -2594,8 +2695,9 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
     Hardened per the "never break, never strand" invariant:
       - ANY exception during takeoff -> job becomes UNMEASURED with a
         "PIPELINE ERROR: ... ; route to assessor" flag, never a bare crash/"error" dead-end.
-      - A watchdog timer flips the job to UNMEASURED with a timeout flag if the pipeline
-        hasn't finished within TAKEOFF_TIMEOUT_S; the worker thread may keep running (daemon
+      - A watchdog timer flips the job to UNMEASURED with a timeout flag if actual measurement
+        hasn't finished within TAKEOFF_TIMEOUT_S. Queue wait is excluded because this function
+        is entered only after a fixed worker takes the job; the worker may keep running (daemon
         thread, no forced kill) but the job record is never left stuck on "processing".
       - watchdog-vs-completion race: threading.Timer.cancel() is a no-op once the timer has
         already fired, so if takeoff() finishes just after the 120s mark the watchdog may have
@@ -2606,13 +2708,17 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
         in fact succeeded). Detect the "_watchdog_fired" sentinel, strip that one flag, and log
         the race so it's visible in the server log rather than silently swallowed.
     """
+    if not _mark_takeoff_started(job_id):
+        return
     watchdog = threading.Timer(
         TAKEOFF_TIMEOUT_S, _mark_job_unmeasured, args=(
             job_id,
-            f"PIPELINE TIMEOUT: takeoff did not finish within {TAKEOFF_TIMEOUT_S}s; "
-            "route to assessor — the worker thread may still be running in the background.",
+            f"PIPELINE TIMEOUT: measurement exceeded {TAKEOFF_TIMEOUT_S}s after a worker "
+            "started it (queue wait excluded); route to assessor — the worker may still be "
+            "running in the background.",
         ),
-        kwargs={"watchdog_fired": True},
+        kwargs={"watchdog_fired": True, "extra": {
+            "takeoff_phase": "timed_out", "takeoff_finished_at": now_iso()}},
     )
     watchdog.daemon = True
     watchdog.start()
@@ -2690,6 +2796,9 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "yard_region_decisions": {},
                 "yard_region_review_required": bool(
                     result.get("yard_region_review_required", False)),
+                "extent_corroborated": result.get("extent_corroborated"),
+                "extent_corroboration_reason": result.get(
+                    "extent_corroboration_reason"),
                 "perimeter_lm":     result.get("perimeter_lm"),
                 # Mirror zone-aware marked-PDF evidence at job level for the portal while
                 # retaining the canonical nested pipeline result for backward compatibility.
@@ -2704,6 +2813,8 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
                 "zone_allocation_stale": bool(result.get("zone_allocation_stale", False)),
                 "result":           result,
                 "status":           "pending",
+                "takeoff_phase":    "completed",
+                "takeoff_finished_at": now_iso(),
             })
             jobs[job_id] = job
             save_jobs(jobs)
@@ -2718,7 +2829,8 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
         _mark_job_unmeasured(
             job_id,
             f"PIPELINE ERROR: {e}; route to assessor",
-            extra={"error": traceback.format_exc()},
+            extra={"error": traceback.format_exc(), "takeoff_phase": "failed",
+                   "takeoff_finished_at": now_iso()},
         )
 
 
@@ -2803,6 +2915,8 @@ def _processing_job_record(project_name, project_ref, client_name, pdf_path, fla
         "polygon_pts":      None,
         "status":           "processing",
         "created_at":       datetime.datetime.utcnow().isoformat(),
+        "takeoff_phase":    "queued",
+        "takeoff_queued_at": now_iso(),
         "decision":         None,
         "adjusted":         None,
         "result":           {"file": Path(pdf_path).name},
@@ -3067,11 +3181,7 @@ def upload():
         save_jobs(jobs)
 
     for job_id, pdf_path in workers:
-        threading.Thread(
-            target=_run_takeoff,
-            args=(job_id, pdf_path, project_name, project_ref),
-            daemon=True,
-        ).start()
+        _TAKEOFF_DISPATCHER.submit(job_id, pdf_path, project_name, project_ref)
 
     primary = next((j for j in response_jobs if j["status"] == "processing"), response_jobs[0])
     payload = {"job_id": primary["job_id"], "status": primary["status"]}
@@ -3087,24 +3197,29 @@ def upload():
 # ── Startup sweep ─────────────────────────────────────────────────────────────
 
 def _sweep_stranded_processing_jobs():
-    """Any job left on status='processing' at process start was orphaned by a restart/crash —
-    the watchdog Timer and worker thread that would have resolved it die with the old process,
-    and nothing else ever revisits it. No takeoff can legitimately still be "running" at boot
-    (threads are daemon, they don't survive), so unconditionally flip every such job to
-    UNMEASURED with a clear flag rather than leaving it spinning in the portal forever."""
+    """Route queued/measuring jobs orphaned by a prior process to assessor review.
+
+    Both fixed workers and their in-memory queue are daemon/process-local, so neither can
+    survive a restart. No processing record can legitimately still be active at boot.
+    """
     with _jobs_lock:
         jobs = load_jobs()
         changed = False
         for job_id, job in jobs.items():
             if job.get("status") == "processing":
                 flags = list(job.get("flags") or [])
-                flags.append("PIPELINE INTERRUPTED: server restarted while takeoff was "
-                              "running; route to assessor")
+                old_phase = job.get("takeoff_phase") or "measuring"
+                flags.append(
+                    f"PIPELINE INTERRUPTED: server restarted while takeoff was {old_phase}; "
+                    "route to assessor"
+                )
                 job.update({
                     "status":            "error",
                     "measurement_state": "UNMEASURED",
                     "needs_assessor":    True,
                     "flags":             flags,
+                    "takeoff_phase":     "interrupted",
+                    "takeoff_finished_at": now_iso(),
                 })
                 res = dict(job.get("result") or {})
                 res["flags"] = flags

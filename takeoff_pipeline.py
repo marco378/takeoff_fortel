@@ -41,30 +41,71 @@ _REPORT_CLASS_RX = __import__("re").compile(
     __import__("re").I,
 )
 
+_WRITTEN_DOCUMENT_FILENAME_RX = __import__("re").compile(
+    r"(?:\bspecification(?:[ _-]+notes?)?\b|\bschedule\b|\bdrawing[ _-]+log\b|"
+    r"\bdocument[ _-]+log\b|\btender[ _-]+quer(?:y|ies)\b|\bsubmittal\b|"
+    r"\bbill[ _-]+of[ _-]+quantities\b|\btrade[ _-]+bill\b|"
+    r"\bemployer(?:'s)?[ _-]+requirements?\b|\bpre[ _-]+construction[ _-]+information\b)",
+    __import__("re").I,
+)
+_WRITTEN_DOCUMENT_TEXT_RX = __import__("re").compile(
+    r"(?:\bdevelopment[ _-]+specification\b|\btechnical[ _-]+specification\b|"
+    r"\bspecifications?[ _-]+included\b|\bdrawings?[ _-]+included\b|"
+    r"\bschedule[ _-]+of[ _-]+works\b|\bbill[ _-]+of[ _-]+quantities\b|"
+    r"\bemployer(?:'s)?[ _-]+requirements?\b|\bpre[ _-]+construction[ _-]+information\b)",
+    __import__("re").I,
+)
+
 
 def _fast_report_refusal(pdf_path: str, doc) -> str | None:
     """Identify obvious multi-page planning/report documents without rasterising them.
 
     This is deliberately a document-class gate, not a measurement heuristic.  It examines
-    only the filename and first page text already available from the PDF catalogue.  A
-    single-sheet drawing is never rejected here, and an uncertain document continues through
-    the normal router.  The gate exists so a large DAS cannot consume the render watchdog.
+    only the filename and first page text already available from the PDF catalogue. A
+    single-sheet file is rejected only when its filename directly identifies a written
+    specification/schedule/log/bill class; uncertain documents continue through the normal
+    router. The gate exists so a large DAS cannot consume the render watchdog.
     """
-    if doc.page_count < 4:
-        return None
-    filename_evidence = _REPORT_CLASS_RX.search(Path(pdf_path).stem.replace("_", " "))
+    normalised_name = Path(pdf_path).stem.replace("_", " ").replace("-", " ")
+    filename_evidence = _REPORT_CLASS_RX.search(normalised_name)
+    written_filename_evidence = _WRITTEN_DOCUMENT_FILENAME_RX.search(normalised_name)
     try:
         first_page_text = " ".join((doc[0].get_text() or "").split())[:12_000]
     except Exception:
         first_page_text = ""
     text_evidence = _REPORT_CLASS_RX.search(first_page_text)
-    evidence = filename_evidence or text_evidence
-    if not evidence:
-        return None
-    return (
-        f"FAST REFUSE: multi-page non-drawing report class matched '{evidence.group(0)}' "
-        f"({doc.page_count} pages); no page was rasterised or measured"
-    )
+    written_text_evidence = _WRITTEN_DOCUMENT_TEXT_RX.search(first_page_text)
+
+    # Existing planning-report rule: require a multi-page document so a one-sheet drawing
+    # carrying a planning note cannot be discarded on text alone.
+    report_evidence = filename_evidence or text_evidence
+    if doc.page_count >= 4 and report_evidence:
+        return (
+            f"FAST REFUSE: multi-page non-drawing report class matched "
+            f"'{report_evidence.group(0)}' ({doc.page_count} pages); no page was rasterised "
+            "or measured"
+        )
+
+    # Specification/schedule/log/bill filenames are direct document-class evidence even for
+    # a single-page index. First-page text is inspected as corroboration and is allowed to
+    # classify on its own only for a multi-page document. This intentionally refuses the
+    # written tender-pack artefacts that consumed live worker slots, while an ordinary drawing
+    # with an incidental word such as "schedule" in its notes continues through the router.
+    written_evidence = written_filename_evidence or (
+        written_text_evidence if doc.page_count >= 4 else None)
+    if written_evidence:
+        sources = []
+        if written_filename_evidence:
+            sources.append(f"filename '{written_filename_evidence.group(0)}'")
+        if written_text_evidence:
+            sources.append(f"first-page text '{written_text_evidence.group(0)}'")
+        return (
+            "FAST REFUSE: non-drawing specification/schedule class matched "
+            + " + ".join(sources)
+            + f" ({doc.page_count} page{'s' if doc.page_count != 1 else ''}); no page was "
+              "rasterised or measured"
+        )
+    return None
 
 
 # ── Auto-extract engineer spec from the drawing pack ─────────────────────────
@@ -511,6 +552,9 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                         "yard_regions": tu.get("yard_regions", []),
                         "yard_region_review_required": bool(
                             tu.get("yard_region_review_required", False)),
+                        "extent_corroborated": tu.get("extent_corroborated"),
+                        "extent_corroboration_reason": tu.get(
+                            "extent_corroboration_reason"),
                         # Assumed channel runs are tracing/review aids only. They stay outside
                         # measured zones and every costing/quotation total.
                         "channel_proposals": tu.get("channel_proposals", []),
@@ -633,6 +677,9 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     "yard_regions": tu.get("yard_regions", []),
                     "yard_region_review_required": bool(
                         tu.get("yard_region_review_required", False)),
+                    "extent_corroborated": tu.get("extent_corroborated"),
+                    "extent_corroboration_reason": tu.get(
+                        "extent_corroboration_reason"),
                     "channel_proposals": tu.get("channel_proposals", []),
                     "transition_candidates": tu.get("transition_candidates", []),
                     "exclusion_prompts": tu.get("exclusion_prompts", []),
