@@ -56,6 +56,15 @@ _WRITTEN_DOCUMENT_TEXT_RX = __import__("re").compile(
     __import__("re").I,
 )
 
+_DEDICATED_BOUNDARY_TREATMENT_RX = __import__("re").compile(
+    r"\bboundary[ _-]+treatments?[ _-]+plan\b",
+    __import__("re").I,
+)
+_SLAB_SCOPE_FILENAME_RX = __import__("re").compile(
+    r"\b(?:hard[ _-]+landscap(?:e|ing)|external[ _-]+works?|surfacing|slabs?|yards?)\b",
+    __import__("re").I,
+)
+
 
 def _fast_report_refusal(pdf_path: str, doc) -> str | None:
     """Identify obvious multi-page planning/report documents without rasterising them.
@@ -75,6 +84,19 @@ def _fast_report_refusal(pdf_path: str, doc) -> str | None:
         first_page_text = ""
     text_evidence = _REPORT_CLASS_RX.search(first_page_text)
     written_text_evidence = _WRITTEN_DOCUMENT_TEXT_RX.search(first_page_text)
+
+    # A dedicated Boundary Treatment Plan is a fencing/site-boundary deliverable, not a slab
+    # measurement drawing.  Two real one-sheet examples exhausted the render watchdog despite
+    # containing no slab scope.  Refuse only from this precise drawing title and retain combined
+    # Hard Landscaping / External Works / Surfacing / Slab / Yard plans: those can contain the
+    # very quantities this pipeline is meant to measure.
+    boundary_treatment_evidence = _DEDICATED_BOUNDARY_TREATMENT_RX.search(normalised_name)
+    slab_scope_evidence = _SLAB_SCOPE_FILENAME_RX.search(normalised_name)
+    if boundary_treatment_evidence and not slab_scope_evidence:
+        return (
+            "FAST REFUSE: dedicated boundary-treatment/fencing plan matched filename "
+            f"'{boundary_treatment_evidence.group(0)}'; no page was rasterised or measured"
+        )
 
     # Existing planning-report rule: require a multi-page document so a one-sheet drawing
     # carrying a planning note cannot be discarded on text alone.
@@ -110,12 +132,15 @@ def _fast_report_refusal(pdf_path: str, doc) -> str | None:
 
 # ── Auto-extract engineer spec from the drawing pack ─────────────────────────
 
-def find_engineer_spec(pdf_path: str, project_ref: str | None = None) -> dict | None:
+def find_engineer_spec(pdf_path: str, project_ref: str | None = None,
+                       project_files=None) -> dict | None:
     """
     Look for a construction-detail PDF near the input drawing and extract the slab spec.
     Search order (mirrors Inderjit's method):
-      1. Same directory — files whose names match DETAIL_KEYWORDS from router.py
-      2. The PDF's own text (in case the detail is on a separate page)
+      1. The PDF's own text (in case the detail is on a separate page)
+      2. Same directory — files whose names match DETAIL_KEYWORDS from router.py
+      3. Detail drawings explicitly registered to the same portal project, even when their
+         persisted paths are in different upload directories
     Returns spec dict or None (falls through to defaults if nothing found).
     """
     from router import DETAIL_KEYWORDS
@@ -164,12 +189,33 @@ def find_engineer_spec(pdf_path: str, project_ref: str | None = None) -> dict | 
         for term in spec_sheet_terms
     )
     candidates = [target]
+    candidate_keys = {str(target.resolve())}
+
+    def add_detail_candidate(path, *, registry_scoped=False):
+        """Add one readable detail PDF without weakening cross-project isolation.
+
+        ``registry_scoped`` means approval_server obtained the path from a job record with the
+        exact same project_ref. Those paths do not need a filename prefix; local directory
+        discovery still requires the prefix because unrelated projects share that directory.
+        """
+        try:
+            path = Path(path)
+            key = str(path.resolve())
+        except (TypeError, ValueError, OSError):
+            return
+        if (key in candidate_keys or path.suffix.casefold() != ".pdf" or
+                not path.is_file() or (not registry_scoped and not in_project(path))):
+            return
+        normalised_name = __import__("re").sub(r"[-_]+", " ", path.name.casefold())
+        if not any(term in normalised_name for term in normalised_spec_terms):
+            return
+        candidate_keys.add(key)
+        candidates.append(path)
+
     for sibling in sorted(parent.glob("*.pdf")):
-        if sibling == target or not in_project(sibling):
-            continue
-        normalised_name = __import__("re").sub(r"[-_]+", " ", sibling.name.casefold())
-        if any(term in normalised_name for term in normalised_spec_terms):
-            candidates.append(sibling)
+        add_detail_candidate(sibling)
+    for registered in sorted(project_files or (), key=lambda value: str(value).casefold()):
+        add_detail_candidate(registered, registry_scoped=True)
 
     extracted = []
     for candidate in candidates:
@@ -456,7 +502,7 @@ def price_with_defaults(area_m2: float, engineer_spec: dict = None,
 
 def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extract_spec=True,
             project_name: str = None, project_ref: str = None, client_rates_path=None,
-            approval_job_id: str = None):
+            approval_job_id: str = None, project_files=None):
     """
     vision (optional) = {'regions':[[...]], 'voids':{i:[...]}, 'scale_ref':[[x1,y1],[x2,y2],metres]}
     engineer_spec (optional) = dict from construction-detail drawing (depth_mm, mesh, etc.)
@@ -468,6 +514,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     client_rates_path       = optional explicit client_rates.json store (server/test isolation)
     approval_job_id         = job record the caller already owns; the approval email attaches
                               to it instead of minting a duplicate ghost job
+    project_files           = authoritative paths from other jobs sharing project_ref; detail
+                              drawings may therefore supply cited spec across upload folders
     """
     # ── Multi-page tender pack: never assume page 0. Classify every page, rank candidates
     # by router.drawing_priority (external-works/hard-landscaping/construction-thickness
@@ -537,7 +585,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
 
     # ── Auto-extract engineer spec from the pack (if not already provided)
     if engineer_spec is None and auto_extract_spec:
-        found = find_engineer_spec(pdf, project_ref=project_ref)
+        found = find_engineer_spec(
+            pdf, project_ref=project_ref, project_files=project_files)
         if found:
             extracted_pricing_fields = {
                 key: found[key] for key in ("depth_mm", "mesh", "layers", "conc_mix")

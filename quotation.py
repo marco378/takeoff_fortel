@@ -583,6 +583,75 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             f"on {drawing or 'drawing'} by assessor."
         )
 
+    # ``+ Area`` elements are assessor-traced independent quantities.  They deliberately do
+    # not enter the main slab group above: each client-entered name becomes one separate row
+    # and inherits only an already-existing, unambiguous rate.  No rate is created here.
+    for unit in source_results:
+        drawing = unit.get("file") or Path(str(unit.get("pdf_path") or "")).name
+        parent_costing = unit.get("costing") or {}
+        parent_zone_categories = {
+            str(zone.get("category") or "").strip().lower()
+            for zone in (unit.get("zones") or []) if isinstance(zone, dict)
+            and zone.get("area_m2") is not None
+        }
+        zone_costings = unit.get("zone_costings") or {}
+        for element in unit.get("area_elements") or []:
+            if not isinstance(element, dict) or not isinstance(
+                    element.get("area_m2"), (int, float)):
+                continue
+            name = str(element.get("name") or "").strip()
+            if not name:
+                continue
+            category = str(element.get("category") or "").strip().lower()
+            section = ZONE_SECTION.get(category)
+            section_unresolved = section is None
+            if section_unresolved:
+                # Drafts may be downloaded before approval. Keep the element visible with a
+                # loud declaration; /approve hard-blocks this state, so it cannot silently
+                # become a client-issued priced row in the wrong section.
+                section = quotation_section(unit)
+                declarations.append(
+                    f"{PROVISIONAL_LABEL}: separately named area {name!r} has no confirmed "
+                    "BOQ section; assessor must classify it before approval."
+                )
+            explicit_costing = (element.get("costing")
+                                or zone_costings.get(category) or {})
+            if explicit_costing:
+                effective_costing = explicit_costing
+            elif (len(parent_zone_categories) <= 1
+                  and ZONE_SECTION.get(category) == quotation_section(unit)):
+                # A single aggregate rate is reusable only inside its own BOQ section. Copying
+                # a Yard build-up onto a separately named Dock/Office element would create a
+                # plausible but wrong price; leave that editable workbook rate blank instead.
+                effective_costing = parent_costing
+            else:
+                # One aggregate rate cannot safely be copied across a mixed Yard/Dock/Office
+                # drawing. The editable workbook leaves the rate cell blank for the assessor.
+                effective_costing = {}
+            rate = effective_costing.get("rate")
+            provisional = bool(effective_costing.get(
+                "assumed", parent_costing.get("assumed", True))) or section_unresolved
+            quantity = round(float(element["area_m2"]), 3)
+            extra_rows.append({
+                "section": section,
+                "description": name,
+                "qty": quantity,
+                "unit": "m²",
+                "rate": rate,
+                "value": (round(quantity * rate, 2)
+                          if isinstance(rate, (int, float)) else None),
+                "assessor_rate_required": rate is None,
+                "provisional": provisional,
+                "provisional_reason": PROVISIONAL_LABEL if provisional else "",
+                "drawings": [drawing] if drawing else [],
+                "assessor_named_area": True,
+                "element_id": element.get("element_id"),
+            })
+            declarations.append(
+                f"ASSESSOR-NAMED AREA — {name}: {quantity:g} m² measured separately from "
+                f"the main region on {drawing or 'the drawing'}."
+            )
+
     line_items = []
     specifications = []
     for group_number, group in enumerate(

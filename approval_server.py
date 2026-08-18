@@ -509,6 +509,64 @@ def snapshot(job_id):
         return jsonify({"error": traceback.format_exc()}), 500
 
 
+@app.route("/snapshot-vector/<job_id>.svg")
+def snapshot_vector(job_id):
+    """Serve the measured page as a scalable vector viewport for close corner picking.
+
+    The ordinary PNG remains the coordinate authority: its exact X-Snapshot-Scale continues
+    to define every assessor point and m/px conversion.  This SVG is a visual layer in rotated
+    PDF-point space, CSS-scaled to that unchanged canvas, so zoom quality improves without a
+    second measurement coordinate system. Flattened raster sheets remain raster (honestly);
+    native line/text drawings stay sharp at arbitrary browser zoom.
+    """
+    job, err, code = require_job(job_id)
+    if err:
+        return err, code
+    try:
+        import fitz as _fitz
+        import gzip as _gzip
+        result = job.get("result") or {}
+        pdf_path = result.get("pdf_path") or job.get("pdf_path") or job.get("pdf", "")
+        if pdf_path and not Path(pdf_path).is_absolute():
+            pdf_path = str(Path(__file__).parent / pdf_path)
+        if not pdf_path or not Path(pdf_path).exists():
+            return jsonify({"error": "PDF not on disk — vector viewport unavailable"}), 404
+        page_index = int(result.get("page") or 0)
+        with _fitz.open(pdf_path) as document:
+            if not 0 <= page_index < document.page_count:
+                page_index = 0
+            # Bluebeam markups are annotations, not page drawing commands. Bake only this
+            # in-memory copy so the scalable viewport does not make client markups disappear;
+            # the persisted uploaded PDF remains byte-for-byte untouched.
+            if any(page.first_annot for page in document):
+                document.bake(annots=True, widgets=True)
+            page = document[page_index]
+            svg_bytes = page.get_svg_image(text_as_path=False).encode("utf-8")
+            width, height = page.rect.width, page.rect.height
+        max_bytes = int(os.getenv("VECTOR_SNAPSHOT_MAX_BYTES", str(64 * 1024 * 1024)))
+        if len(svg_bytes) > max_bytes:
+            return jsonify({
+                "error": "vector viewport exceeds the safe response limit; raster view retained"
+            }), 413
+        response_bytes = svg_bytes
+        response = Response(response_bytes, mimetype="image/svg+xml")
+        if "gzip" in (request.headers.get("Accept-Encoding") or "").lower():
+            response_bytes = _gzip.compress(svg_bytes, compresslevel=6)
+            response = Response(response_bytes, mimetype="image/svg+xml")
+            response.headers["Content-Encoding"] = "gzip"
+        response.headers["Vary"] = "Accept-Encoding"
+        response.headers["Cache-Control"] = "private, max-age=3600"
+        response.headers["X-Vector-Coordinate-Space"] = "rotated_pdf_points"
+        response.headers["X-Vector-Page-Width"] = f"{width:g}"
+        response.headers["X-Vector-Page-Height"] = f"{height:g}"
+        response.headers["Access-Control-Expose-Headers"] = (
+            "X-Vector-Coordinate-Space, X-Vector-Page-Width, X-Vector-Page-Height"
+        )
+        return response
+    except Exception:
+        return jsonify({"error": traceback.format_exc()}), 500
+
+
 # ── Decision endpoints ────────────────────────────────────────────────────────
 
 def _zone_block_reason(job: dict) -> str | None:
@@ -609,6 +667,30 @@ def _yard_region_block_reason(job: dict) -> str | None:
     return None
 
 
+def _area_element_block_reason(job: dict) -> str | None:
+    """Independent assessor areas need an explicit BOQ section before approval.
+
+    A free-text name is client-facing, not reliable classification evidence.  Keeping an
+    unclassified named element out of approval is safer than silently pricing a footpath,
+    dock or duct slab under the drawing filename's section.
+    """
+    adjusted = job.get("adjusted") or {}
+    elements = job.get("area_elements")
+    if not isinstance(elements, list):
+        elements = adjusted.get("area_elements") if isinstance(
+            adjusted.get("area_elements"), list) else []
+    unresolved = [
+        str(element.get("name") or "Unnamed area")
+        for element in elements if isinstance(element, dict)
+        and str(element.get("category") or "").strip().lower()
+        not in {"external_yard", "dock", "ground_floor", "upper_floor"}
+    ]
+    if unresolved:
+        return (f"{len(unresolved)} separately named area element(s) require an explicit "
+                "BOQ section: " + ", ".join(unresolved[:3]))
+    return None
+
+
 def _approve_block_reason(job: dict) -> str | None:
     """
     Server-side hard-block mirroring the escalation-guard mechanism (fb5b92b, >£200k
@@ -629,6 +711,9 @@ def _approve_block_reason(job: dict) -> str | None:
     yard_reason = _yard_region_block_reason(job)
     if yard_reason:
         return yard_reason
+    area_element_reason = _area_element_block_reason(job)
+    if area_element_reason:
+        return area_element_reason
     channel_reason = _channel_proposal_block_reason(job)
     if channel_reason:
         return channel_reason
@@ -966,10 +1051,13 @@ def adjust(job_id):
     region_categories_in = data.get("region_categories")
     region_scopes_in = data.get("region_scopes")
     scale_k    = data.get("scale_k")         # m/px
+    snapshot_scale_in = data.get("snapshot_scale")  # canvas px per rotated PDF point
     area_m2    = data.get("assessed_area_m2")
     note       = data.get("note", "")
     cutout_regions_in = data.get("cutout_regions") or []  # [[[x,y], ...], ...]
     user_channels_in = data.get("user_channels") or []    # open polylines [[[x,y], ...], ...]
+    area_elements_present = "area_elements" in data
+    area_elements_in = data.get("area_elements") if area_elements_present else None
 
     def _valid_region(region):
         return (
@@ -1032,6 +1120,41 @@ def adjust(job_id):
     else:
         region_scopes = []
 
+    # ``+ Area`` polygons are independent priced elements, not additions to the main slab
+    # outline.  Their names are assessor-entered client text; retain it verbatim (bounded and
+    # control-character free) and escape only at presentation boundaries.
+    submitted_area_elements = []
+    if area_elements_present:
+        if not isinstance(area_elements_in, list) or len(area_elements_in) > 50:
+            return jsonify({"error": "area_elements must contain 0-50 named polygons"}), 400
+        for index, element in enumerate(area_elements_in, 1):
+            if not isinstance(element, dict):
+                return jsonify({"error": "each area element must be an object"}), 400
+            name = " ".join(str(element.get("name") or "").split())
+            points = element.get("polygon_pts") or element.get("points")
+            category = str(element.get("category") or "unclassified").strip().lower()
+            scope = str(element.get("boq_scope") or "main").strip().lower()
+            element_id = str(element.get("element_id") or f"area-element-{index}").strip()
+            if not name or len(name) > 120 or any(ord(char) < 32 for char in name):
+                return jsonify({
+                    "error": "each area element needs a 1-120 character printable name"
+                }), 400
+            if not element_id or len(element_id) > 120:
+                return jsonify({"error": "area element_id must be 1-120 characters"}), 400
+            if not _valid_region(points):
+                return jsonify({"error": "each area element needs a valid polygon"}), 400
+            if category not in area_categories:
+                return jsonify({"error": "area element category is invalid"}), 400
+            if scope not in allowed_region_scopes:
+                return jsonify({"error": "area element BOQ scope is invalid"}), 400
+            submitted_area_elements.append({
+                "element_id": element_id,
+                "name": name,
+                "category": category,
+                "boq_scope": scope,
+                "polygon_pts": points,
+            })
+
     # Validate cut-out regions (polygons to subtract from the measured area)
     cutout_regions = []
     if cutout_regions_in:
@@ -1039,6 +1162,14 @@ def adjust(job_id):
                 or not all(_valid_region(region) for region in cutout_regions_in)):
             return jsonify({"error": "cutout_regions must contain 0-50 valid polygons"}), 400
         cutout_regions = cutout_regions_in
+
+    if snapshot_scale_in is not None:
+        if (not isinstance(snapshot_scale_in, (int, float))
+                or isinstance(snapshot_scale_in, bool)
+                or not math.isfinite(snapshot_scale_in)
+                or not 0 < snapshot_scale_in <= 100):
+            return jsonify({"error": "snapshot_scale must be a positive finite number"}), 400
+        snapshot_scale_in = float(snapshot_scale_in)
 
     # Validate assessor-drawn channel polylines. AI proposals remain separately constrained to
     # straight/non-diagonal two-point assumptions in /channel-proposals; a real drainage run may
@@ -1100,6 +1231,39 @@ def adjust(job_id):
         perimeter_lm = None
         gflags = []
 
+    computed_area_elements = []
+    if submitted_area_elements:
+        if (not isinstance(scale_k, (int, float)) or isinstance(scale_k, bool)
+                or not math.isfinite(scale_k) or scale_k <= 0):
+            return jsonify({
+                "error": "a positive scale_k is required to measure named area elements"
+            }), 400
+        try:
+            from geometry import measure_regions, polygon_perimeter_lm
+            for element in submitted_area_elements:
+                element_area, element_flags = measure_regions(
+                    [element["polygon_pts"]], scale_k)
+                if not element_area or element_area <= 0:
+                    return jsonify({
+                        "error": f"named area element {element['name']!r} has no measurable area"
+                    }), 400
+                computed_area_elements.append({
+                    **element,
+                    "area_m2": round(float(element_area), 1),
+                    "perimeter_lm": polygon_perimeter_lm(
+                        element["polygon_pts"], scale_k),
+                    "measurement_source": "assessor-traced-independent-area",
+                    "assessor_supplied": True,
+                    "flags": list(element_flags or []),
+                })
+        except Exception as exc:
+            return jsonify({"error": f"named area geometry error: {exc}"}), 400
+
+    # Adding/renaming an independent area must not replace, confirm or invalidate the main
+    # measurement.  This is the key semantic difference from ``+ Region``.
+    main_measurement_changed = bool(regions or cutout_regions or area_m2 is not None)
+    preserve_main_measurement = bool(area_elements_present and not main_measurement_changed)
+
     # A valid assessor-supplied area (however it arrived) is a human confirmation of
     # scale+extent — this is what unblocks approve for MEASURED_UNVERIFIED/UNMEASURED jobs.
     # Still run the plausibility guard (sanity.plausible): an assessor can fat-finger a trace
@@ -1126,6 +1290,20 @@ def adjust(job_id):
         if any(candidate_id not in stored_candidate_records for candidate_id in candidate_ids):
             return jsonify({"error": "one or more candidate_ids are stale or unknown"}), 409
         stored_result = dict(job.get("result") or {})
+        existing_adjusted = dict(job.get("adjusted") or {})
+        if not area_elements_present:
+            existing_elements = job.get("area_elements")
+            if not isinstance(existing_elements, list):
+                existing_elements = existing_adjusted.get("area_elements")
+            computed_area_elements = copy.deepcopy(existing_elements or [])
+        if preserve_main_measurement:
+            area_m2 = (existing_adjusted.get("area_m2") or job.get("area_m2")
+                       or stored_result.get("area_m2"))
+            perimeter_lm = (existing_adjusted.get("perimeter_lm")
+                            if "perimeter_lm" in existing_adjusted
+                            else job.get("perimeter_lm", stored_result.get("perimeter_lm")))
+            confirmed = bool(job.get("scale_confirmed"))
+            gflags = list(existing_adjusted.get("flags") or [])
         # Cutout-only: subtract from existing measured area when no new trace regions
         if cutout_regions and scale_k and not regions:
             existing_area = (job.get("adjusted") or {}).get("assessed_area_m2") or stored_result.get("area_m2")
@@ -1175,7 +1353,7 @@ def adjust(job_id):
             and len(effective_region_scopes) == len(regions)
             and len(region_areas) == len(regions)
         )
-        had_zone_allocation = bool(area_m2 and area_m2 > 0) and bool(
+        had_zone_allocation = main_measurement_changed and bool(area_m2 and area_m2 > 0) and bool(
             (isinstance(job.get("zones"), list) and job.get("zones"))
             or (isinstance(stored_result.get("zones"), list) and stored_result.get("zones"))
         )
@@ -1274,38 +1452,74 @@ def adjust(job_id):
                 "flags": _without_zone_stale_flags(stored_result.get("flags")) + list(gflags),
                 "needs_assessor": bool(zone_classification_required or zone_geometry_overlap),
             })
-        costing_result = _run_costing(area_m2, stored_result) if area_m2 else None
+        costing_result = ((job.get("costing") or stored_result.get("costing"))
+                          if preserve_main_measurement
+                          else _run_costing(area_m2, stored_result) if area_m2 else None)
+        if preserve_main_measurement:
+            adjusted_payload = existing_adjusted
+            adjusted_payload.update({
+                "area_elements": computed_area_elements,
+                "note": note or existing_adjusted.get("note", ""),
+            })
+            if snapshot_scale_in is not None:
+                adjusted_payload["snapshot_scale"] = snapshot_scale_in
+        else:
+            adjusted_payload = {
+                "vertices": regions[0] if len(regions) == 1 else [],
+                "regions": regions,
+                "candidate_ids": candidate_ids,
+                "region_categories": effective_region_categories,
+                "region_scopes": effective_region_scopes,
+                "scale_k": scale_k,
+                # Assessor points are stored in canvas/snapshot pixels. Persist the exact
+                # px-per-PDF-point mapping with those points so marked-PDF export and a future
+                # importer never have to infer it from a later render configuration.
+                "snapshot_scale": snapshot_scale_in,
+                "area_m2": area_m2,
+                "perimeter_lm": perimeter_lm,
+                "flags": gflags,
+                "note": note,
+                "cutout_regions": cutout_regions,
+                "user_channels": user_channels,
+                "area_elements": computed_area_elements,
+            }
+        persisted_cutout_regions = (
+            copy.deepcopy(existing_adjusted.get("cutout_regions") or [])
+            if preserve_main_measurement else cutout_regions
+        )
+        persisted_user_channels = (
+            copy.deepcopy(existing_adjusted.get("user_channels") or [])
+            if preserve_main_measurement else user_channels
+        )
+        persisted_region_scopes = (
+            list(existing_adjusted.get("region_scopes") or job.get("region_scopes") or [])
+            if preserve_main_measurement else effective_region_scopes
+        )
         canonical_update = {
             "status":            "adjusted",
             "decision":          "adjusted",
             "decided_at":        now_iso(),
             "area_m2":           area_m2,
             "scale_confirmed":   confirmed or job.get("scale_confirmed", False),
-            "measurement_state": ("MEASURED_VERIFIED" if confirmed
+            "measurement_state": (job.get("measurement_state") if preserve_main_measurement
+                                  else "MEASURED_VERIFIED" if confirmed
                                   else "MEASURED_UNVERIFIED" if (area_m2 and plaus_flags)
                                   else job.get("measurement_state")),
-            "adjusted": {
-                "vertices": regions[0] if len(regions) == 1 else [],
-                "regions":  regions,
-                "candidate_ids": candidate_ids,
-                "region_categories": effective_region_categories,
-                "region_scopes": effective_region_scopes,
-                "scale_k":  scale_k,
-                "area_m2":  area_m2,
-                "perimeter_lm": perimeter_lm,
-                "flags":    gflags,
-                "note":     note,
-                "cutout_regions": cutout_regions,
-                "user_channels": user_channels,
-            },
-            "region_scopes": effective_region_scopes,
+            "adjusted": adjusted_payload,
+            "region_scopes": persisted_region_scopes,
             "costing": costing_result,
-            "cutout_regions": cutout_regions,
-            "user_channels": user_channels,
+            "cutout_regions": persisted_cutout_regions,
+            "user_channels": persisted_user_channels,
+            "area_elements": computed_area_elements,
+            "area_element_classification_required": any(
+                str(element.get("category") or "").strip().lower() not in {
+                    "external_yard", "dock", "ground_floor", "upper_floor"
+                } for element in computed_area_elements
+            ),
         }
         # Scale belongs to the assessor geometry that it measures. Keep an earlier scale only
         # for direct area-only adjustments where the assessor supplied no replacement scale.
-        if scale_k:
+        if scale_k and not preserve_main_measurement:
             canonical_update["scale_k"] = scale_k
         if perimeter_lm is not None:
             canonical_update["perimeter_lm"] = perimeter_lm
@@ -1385,6 +1599,10 @@ def adjust(job_id):
         "perimeter_lm": perimeter_lm,
         "region_count": len(regions),
         "zone_count": len(replacement_zones),
+        "main_area_m2": area_m2,
+        "area_element_count": len(computed_area_elements),
+        "area_elements_total_m2": round(sum(
+            float(element.get("area_m2") or 0) for element in computed_area_elements), 1),
         "costing":  costing_result,
         "flags":    gflags,
     })
@@ -2481,6 +2699,8 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["yard_region_decisions"] = dict(job["yard_region_decisions"])
     if isinstance(job.get("user_channels"), list):
         result["user_channels"] = list(job["user_channels"])
+    if isinstance(job.get("area_elements"), list):
+        result["area_elements"] = copy.deepcopy(job["area_elements"])
     if "yard_region_review_required" in job:
         result["yard_region_review_required"] = bool(job["yard_region_review_required"])
     if "zone_classification_required" in job:
@@ -2514,6 +2734,9 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
         result["user_channels"] = list(adjusted["user_channels"])
     if isinstance(adjusted.get("cutout_regions"), list):
         result["cutout_regions"] = list(adjusted["cutout_regions"])
+    if (not isinstance(job.get("area_elements"), list)
+            and isinstance(adjusted.get("area_elements"), list)):
+        result["area_elements"] = copy.deepcopy(adjusted["area_elements"])
     return result
 
 
@@ -2821,6 +3044,46 @@ def quotation_download(job_id, fmt):
         return jsonify({"error": traceback.format_exc()}), 500
 
 
+@app.route("/marked-pdf/<job_id>.pdf")
+def marked_pdf_download(job_id):
+    """Export the assessor-approved drawing with permanent, recoverable markup.
+
+    The page vectors and labels are burned into a copy of the original PDF. A versioned JSON
+    attachment retains job/page/geometry metadata for a future re-import feature; this endpoint
+    deliberately performs no import or job mutation.
+    """
+    job, err, code = require_job(job_id)
+    if err:
+        return err, code
+    if job.get("decision") not in {"approved", "adjusted"}:
+        return jsonify({
+            "error": "marked PDF is available after assessor approval or adjustment"
+        }), 409
+    result = job.get("result") or {}
+    pdf_path = result.get("pdf_path") or job.get("pdf_path") or job.get("pdf")
+    if pdf_path and not Path(pdf_path).is_absolute():
+        pdf_path = str(Path(__file__).parent / pdf_path)
+    try:
+        from approval_email import snapshot_scale
+        from marked_pdf import build_marked_pdf, marked_pdf_filename
+        page_index = int(result.get("page") or 0)
+        fallback_snapshot_scale = snapshot_scale(pdf_path, page=page_index)
+        pdf_bytes, manifest = build_marked_pdf(
+            job, pdf_path, snapshot_scale_value=fallback_snapshot_scale)
+        response = send_file(
+            io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=True,
+            download_name=marked_pdf_filename(job),
+        )
+        response.headers["X-Fortel-Markup-Schema"] = manifest["schema"]
+        response.headers["Access-Control-Expose-Headers"] = "X-Fortel-Markup-Schema"
+        return response
+    except Exception as exc:
+        from marked_pdf import MarkedPdfError
+        if isinstance(exc, MarkedPdfError):
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({"error": traceback.format_exc()}), 500
+
+
 # ── n8n webhook endpoint ──────────────────────────────────────────────────────
 
 @app.route("/webhook/n8n", methods=["POST"])
@@ -3113,6 +3376,39 @@ def _mark_takeoff_started(job_id: str) -> bool:
     return True
 
 
+def _project_pdf_paths(project_ref: str, current_pdf: str | None = None) -> list[str]:
+    """Return readable PDFs belonging to the exact persisted portal project.
+
+    ``find_engineer_spec`` must not infer project membership from a shared upload directory.
+    The job store is the authority: only records with the same non-empty project_ref are
+    exposed, and the current file remains available for direct/local-style extraction.
+    """
+    paths = {}
+
+    def include(raw_path):
+        if not raw_path:
+            return
+        try:
+            path = Path(raw_path)
+            if path.suffix.casefold() != ".pdf" or not path.is_file():
+                return
+            paths[str(path.resolve())] = str(path)
+        except (TypeError, ValueError, OSError):
+            return
+
+    include(current_pdf)
+    ref = str(project_ref or "").strip()
+    if not ref:
+        return sorted(paths.values(), key=str.casefold)
+    with _jobs_lock:
+        project_jobs = list(load_jobs().values())
+    for job in project_jobs:
+        if str(job.get("project_ref") or "").strip() != ref:
+            continue
+        include(job.get("pdf_path") or (job.get("result") or {}).get("pdf_path"))
+    return sorted(paths.values(), key=str.casefold)
+
+
 def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str):
     """
     Background thread: run takeoff pipeline and update job record when done.
@@ -3162,6 +3458,8 @@ def _run_takeoff(job_id: str, pdf_path: str, project_name: str, project_ref: str
         # pending forever.
         if "approval_job_id" in _takeoff_params:
             takeoff_kwargs["approval_job_id"] = job_id
+        if "project_files" in _takeoff_params:
+            takeoff_kwargs["project_files"] = _project_pdf_paths(project_ref, pdf_path)
         result = takeoff_pipeline.takeoff(pdf_path, **takeoff_kwargs)
         watchdog.cancel()
         with _jobs_lock:
@@ -3479,6 +3777,8 @@ def upload():
                      the specific reason instead of a bare HTTP 400.
       project_name – human-readable project name (required)
       project_ref  – Fortel reference / sequential number (required)
+      existing_project_job_id – optional anchor job; server reuses its project identity so
+                                 later drawings cannot drift into a look-alike project
 
     Returns 202 {"job_id": "...", "status": "processing"} for a takeoff-bound job, or
     201 {"job_id": "...", "status": "rejected"} for a REJECTED job — always 2xx with a job
@@ -3489,6 +3789,23 @@ def upload():
     project_name = (request.form.get("project_name") or "").strip()
     project_ref  = (request.form.get("project_ref")  or "").strip()
     client_name  = (request.form.get("client_name")  or "").strip()
+    existing_project_job_id = (request.form.get("existing_project_job_id") or "").strip()
+    if existing_project_job_id:
+        existing_project = get_job(existing_project_job_id)
+        if not existing_project:
+            return jsonify({
+                "error": f"existing project anchor {existing_project_job_id!r} not found"
+            }), 404
+        existing_ref = str(existing_project.get("project_ref") or "").strip()
+        if not existing_ref:
+            return jsonify({
+                "error": "existing project anchor has no project_ref; add one before upload"
+            }), 409
+        # The persisted anchor is authoritative. Do not trust editable form text to recreate
+        # the same-looking project under a different ref/name/client.
+        project_ref = existing_ref
+        project_name = str(existing_project.get("project_name") or project_name).strip()
+        client_name = str(existing_project.get("client_name") or client_name).strip()
     # Optional enquiry identification from the n8n workflow (Aryan, 16 Jul: "the request now
     # include the subject and body information for better identification") — stored on every
     # job in the batch so a failure/review is attributable to the right enquiry email.
@@ -3627,6 +3944,12 @@ def upload():
             "project_ref": project_ref,
             "job_ids": [j["job_id"] for j in response_jobs],
             "jobs": response_jobs,
+        })
+    if existing_project_job_id:
+        payload.update({
+            "project_ref": project_ref,
+            "added_to_project": True,
+            "existing_project_job_id": existing_project_job_id,
         })
     return jsonify(payload), (202 if workers else 201)
 

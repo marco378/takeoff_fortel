@@ -116,6 +116,31 @@ with _fitz_fast_refusal.open(_incidental_pdf) as _incidental_doc:
 ck("incidental schedule note on a one-sheet drawing is not fast-refused",
    _incidental_reason is None, _incidental_reason)
 
+_boundary_pdf = "/tmp/Standalone_Boundary_Treatment_Plan.pdf"
+_boundary_canvas = canvas.Canvas(_boundary_pdf, pagesize=(900, 700))
+_boundary_canvas.drawString(60, 650, "BOUNDARY TREATMENT PLAN")
+_boundary_canvas.drawString(60, 620, "Paladin fencing and timber acoustic fence")
+_boundary_canvas.save()
+_boundary_result = _pipeline_takeoff_fast_report(
+    _boundary_pdf, auto_extract_spec=False, send_approval=False)
+ck("dedicated boundary-treatment drawing refuses before raster measurement",
+   _boundary_result.get("measurement_state") == "UNMEASURED" and
+   _boundary_result.get("method") == "fast-refuse" and
+   _boundary_result.get("area_m2") is None and
+   any("boundary-treatment/fencing" in flag and "no page was rasterised" in flag
+       for flag in _boundary_result.get("flags", [])),
+   _boundary_result)
+
+_combined_boundary_pdf = "/tmp/Hub_Hard_Landscaping_and_Boundary_Treatment_Plan.pdf"
+_combined_boundary_canvas = canvas.Canvas(_combined_boundary_pdf, pagesize=(900, 700))
+_combined_boundary_canvas.drawString(60, 650, "HARD LANDSCAPING AND BOUNDARY TREATMENT PLAN")
+_combined_boundary_canvas.save()
+with _fitz_fast_refusal.open(_combined_boundary_pdf) as _combined_boundary_doc:
+    _combined_boundary_reason = __import__("takeoff_pipeline")._fast_report_refusal(
+        _combined_boundary_pdf, _combined_boundary_doc)
+ck("combined hard-landscaping boundary plan is not fast-refused",
+   _combined_boundary_reason is None, _combined_boundary_reason)
+
 _fake_large_container = Path("/tmp/_synthetic_large_tender.zip")
 _fake_large_container.write_bytes(b"PK\x03\x04" + b"not-a-pdf" * 1024)
 _container_result = _pipeline_takeoff_fast_report(
@@ -708,6 +733,42 @@ ck("competing same-project slab callouts remain a visible conflict, never an aut
    _conflicted_spec and "depth_mm" not in _conflicted_spec and
    {record["value"] for record in _conflicted_spec["_conflicts"]["depth_mm"]} ==
        {190, 205}, _conflicted_spec)
+
+# Portal project membership, unlike same-directory discovery, is explicit. A later detail
+# upload may therefore live in another persisted folder and must still supply cited evidence.
+_cross_project_dir = _spec_scope_dir / "project_registry"
+_cross_layout_dir = _cross_project_dir / "layout_upload"
+_cross_detail_dir = _cross_project_dir / "later_detail_upload"
+_cross_layout_dir.mkdir(parents=True)
+_cross_detail_dir.mkdir(parents=True)
+_cross_target = _cross_layout_dir / "CROSS_Yard_Layout.pdf"
+_cross_detail = _cross_detail_dir / "CROSS_External_Works_Details.pdf"
+for _cross_path, _cross_text in (
+    (_cross_target, "EXTERNAL SERVICE YARD GENERAL ARRANGEMENT"),
+    (_cross_detail,
+     "EXTERNAL SERVICE YARD — 215 mm thick concrete slab with A393 mesh, C35/45 concrete"),
+):
+    _spec_canvas = canvas.Canvas(str(_cross_path), pagesize=(500, 300))
+    _spec_canvas.drawString(40, 240, _cross_text)
+    _spec_canvas.save()
+_cross_without_registry = _find_engineer_spec(
+    str(_cross_target), project_ref="CROSS")
+_cross_with_registry = _find_engineer_spec(
+    str(_cross_target), project_ref="CROSS",
+    project_files=[str(_cross_target), str(_cross_detail)])
+ck("project-wide spec lookup crosses upload folders only through the explicit job registry",
+   _cross_without_registry is None and
+   _cross_with_registry.get("depth_mm") == 215 and
+   _cross_with_registry.get("mesh") == "A393" and
+   _cross_with_registry.get("conc_mix") == "C35/45",
+   {"without_registry":_cross_without_registry,
+    "with_registry":_cross_with_registry})
+ck("project-wide extracted fields retain exact drawing and page citations",
+   all((_cross_with_registry.get("_evidence") or {}).get(field, {}).get("file") ==
+       _cross_detail.name for field in ("depth_mm","mesh","conc_mix")) and
+   all((_cross_with_registry.get("_evidence") or {}).get(field, {}).get("page") == 1
+       for field in ("depth_mm","mesh","conc_mix")),
+   _cross_with_registry.get("_evidence"))
 
 _joint_fixture = Path(
     "drawings/inderjit_markups_31jul/2165 Tanro- Voltage Business Park/"
@@ -2759,6 +2820,115 @@ try:
 except ImportError as _e:
     print(f"  [SKIP] manhole E/O costing test — missing dependency: {_e}")
 
+print("marked-PDF export: permanent Bluebeam-ready markup + recoverable manifest")
+try:
+    import json as _json_marked
+    import fitz as _fitz_marked
+    from marked_pdf import (MANIFEST_NAME as _MARKED_MANIFEST_NAME,
+                            MarkedPdfError as _MarkedPdfError,
+                            build_marked_pdf as _build_marked_pdf,
+                            marked_pdf_filename as _marked_pdf_filename)
+
+    _marked_source = Path("/tmp/ci_marked_pdf_source.pdf")
+    _marked_doc = _fitz_marked.open()
+    _marked_page = _marked_doc.new_page(width=300, height=200)
+    _marked_page.insert_text((20, 30), "FORTEL MARKED PDF ROTATION QA")
+    _source_annot = _marked_page.add_rect_annot(_fitz_marked.Rect(20, 45, 80, 85))
+    _source_annot.set_info(content="Existing Bluebeam-style source annotation")
+    _source_annot.update()
+    _marked_page.set_rotation(90)
+    _marked_doc.save(_marked_source)
+    _marked_doc.close()
+
+    # Assessor geometry is saved in 2 px/PDF-point snapshot space. Region gross=400m2,
+    # contained cut-out=16m2, therefore the exported/priced net region label must be 384m2.
+    _marked_job = {
+        "id": "marked-pdf-ci-job", "project_ref": "MARKED/QA 01",
+        "project_name": "Marked PDF QA", "decision": "adjusted",
+        "quotation_revision": 3, "pdf_path": str(_marked_source),
+        "result": {"file": "Rotated Drawing.pdf", "pdf_path": str(_marked_source),
+                   "page": 0, "area_m2": 384.0, "scale_k": 0.2},
+        "adjusted": {
+            "regions": [[[40,40],[240,40],[240,240],[40,240]]],
+            "region_categories": ["external_yard"], "region_scopes": ["main"],
+            "scale_k": 0.1, "snapshot_scale": 2.0, "area_m2": 384.0,
+            "cutout_regions": [[[80,80],[120,80],[120,120],[80,120]]],
+            "user_channels": [[[40,300],[140,300],[140,380]]],
+        },
+        "channel_proposals": [{
+            "proposal_id": "channel-assumed", "component": "Dock channel",
+            "polyline_pts": [[30,230],[130,230]], "basis": "client rule",
+        }],
+        "channel_proposal_decisions": {"channel-assumed": {
+            "decision": "accepted", "length_lm": 10.0,
+            "polyline_pts": [[30,230],[130,230]],
+        }},
+        "transition_candidates": [{
+            "candidate_id": "transition-1", "polyline_pts": [[30,200],[130,200]],
+            "basis": "yard entrance",
+        }],
+        "transition_candidate_decisions": {"transition-1": {
+            "decision": "accepted", "length_lm": 10.0,
+        }},
+    }
+    _marked_bytes, _marked_manifest = _build_marked_pdf(_marked_job)
+    ck("marked-PDF filename carries project, drawing and commercial revision",
+       _marked_pdf_filename(_marked_job) ==
+       "MARKED_QA_01_Rotated_Drawing_REV_03_MARKED.pdf",
+       _marked_pdf_filename(_marked_job))
+    _prefixed_marked_job = _copy.deepcopy(_marked_job)
+    _prefixed_marked_job["result"]["file"] = "MARKED_QA_01_Rotated_Drawing.pdf"
+    ck("marked-PDF client filename does not repeat the storage collision prefix",
+       _marked_pdf_filename(_prefixed_marked_job) ==
+       "MARKED_QA_01_Rotated_Drawing_REV_03_MARKED.pdf",
+       _marked_pdf_filename(_prefixed_marked_job))
+    with _fitz_marked.open(stream=_marked_bytes, filetype="pdf") as _marked_roundtrip:
+        _marked_annots = sum(1 for _page in _marked_roundtrip
+                             for _annot in (_page.annots() or []))
+        _marked_embedded = _json_marked.loads(
+            _marked_roundtrip.embfile_get(_MARKED_MANIFEST_NAME))
+        _marked_text = "\n".join(page.get_text() for page in _marked_roundtrip)
+        ck("marked-PDF reopens with original page rotation and all annotations burned in",
+           _marked_roundtrip.page_count == 1 and
+           _marked_roundtrip[0].rotation == 90 and _marked_annots == 0 and
+           _marked_embedded["source_annotations_burned_in"] == 1,
+           {"pages":_marked_roundtrip.page_count,"rotation":_marked_roundtrip[0].rotation,
+            "annots":_marked_annots})
+        ck("marked-PDF embeds versioned job/page geometry for future re-import",
+           _marked_roundtrip.embfile_names() == [_MARKED_MANIFEST_NAME] and
+           _marked_embedded["schema"] == "fortel.markup.v1" and
+           _marked_embedded["job_id"] == "marked-pdf-ci-job" and
+           _marked_embedded["source_page_index"] == 0 and
+           _marked_embedded["geometry"]["regions"][0]["points"][0] == [20.0,20.0] and
+           _marked_embedded["geometry"]["regions"][0]["area_m2"] == 384.0,
+           _marked_embedded)
+        ck("marked-PDF permanently labels net area, cut-out, channel and transition quantities",
+           all(marker in _marked_text for marker in (
+               "Service yard - 384.00 m2", "Cut-out 1 - 16.00 m2",
+               "Channel 1 - 18.00 Lm", "Dock channel - 10.00 Lm - PROVISIONAL",
+               "Transition - 10.00 Lm - PROVISIONAL")), _marked_text[-1000:])
+        ck("marked-PDF metadata identifies Fortel schema/job/revision",
+           "job_id=marked-pdf-ci-job" in _marked_roundtrip.metadata.get("keywords", "") and
+           _marked_roundtrip.metadata.get("subject") ==
+               "Fortel assessor marked-up takeoff drawing")
+
+    _marked_blank_source = Path("/tmp/ci_marked_pdf_blank_source.pdf")
+    _marked_blank_doc = _fitz_marked.open()
+    _marked_blank_doc.new_page(width=300, height=200)
+    _marked_blank_doc.save(_marked_blank_source)
+    _marked_blank_doc.close()
+    try:
+        _build_marked_pdf({
+            "id":"empty-markup", "decision":"adjusted", "pdf_path":str(_marked_blank_source),
+            "result":{"pdf_path":str(_marked_blank_source), "page":0},
+        })
+        ck("marked-PDF refuses a job with no exportable geometry", False)
+    except _MarkedPdfError as _marked_error:
+        ck("marked-PDF refuses a job with no exportable geometry",
+           "no measured/assessor markup geometry" in str(_marked_error), str(_marked_error))
+except (ImportError, FileNotFoundError) as _e:
+    print(f"  [SKIP] marked-PDF export tests — missing dependency or file: {_e}")
+
 print("approval_server: upload format handling + approve hard-block")
 try:
     import approval_server as _AS
@@ -2827,6 +2997,178 @@ try:
         _pdf_a_bytes = _pdf_a.read_bytes()
         _pdf_b_bytes = _pdf_b.read_bytes()
 
+        # Full HTTP lifecycle: a pending AI result cannot be issued as assessor markup;
+        # /adjust persists exact snapshot coordinates, then the real download route returns
+        # a permanent PDF with the same recoverable geometry and a client-safe filename.
+        _marked_route_job = _copy.deepcopy(_marked_job)
+        _marked_route_job.update({
+            "status":"pending", "decision":None,
+            "measurement_state":"MEASURED_UNVERIFIED", "adjusted":None,
+            "flags":["assessor: confirm extent + scale"],
+        })
+        _marked_route_job["result"].update({
+            "measurement_state":"MEASURED_UNVERIFIED",
+            "flags":["assessor: confirm extent + scale"],
+        })
+        _AS.save_jobs({_marked_route_job["id"]:_marked_route_job})
+        _premature_marked = _client_up.get(
+            f"/marked-pdf/{_marked_route_job['id']}.pdf")
+        ck("marked-PDF route refuses unreviewed AI geometry",
+           _premature_marked.status_code == 409 and
+           "after assessor approval or adjustment" in
+               (_premature_marked.get_json().get("error") or ""),
+           _premature_marked.get_json())
+        import gzip as _gzip_marked
+        _vector_view = _client_up.get(
+            f"/snapshot-vector/{_marked_route_job['id']}.svg",
+            headers={"Accept-Encoding":"gzip"})
+        _vector_svg = _gzip_marked.decompress(_vector_view.data).decode("utf-8")
+        _base_snapshot = _client_up.get(f"/snapshot/{_marked_route_job['id']}")
+        ck("true-resolution viewport serves the rotated measured page as scalable SVG",
+           _vector_view.status_code == 200 and
+           _vector_view.mimetype == "image/svg+xml" and
+           _vector_view.headers.get("Content-Encoding") == "gzip" and
+           _vector_view.headers.get("X-Vector-Coordinate-Space") ==
+               "rotated_pdf_points" and
+           _vector_view.headers.get("X-Vector-Page-Width") == "200" and
+           _vector_view.headers.get("X-Vector-Page-Height") == "300" and
+           '<svg ' in _vector_svg and 'viewBox="0 0 200 300"' in _vector_svg,
+           dict(_vector_view.headers))
+        ck("vector viewport leaves the exact PNG snapshot coordinate mapping unchanged",
+           _base_snapshot.status_code == 200 and
+           float(_base_snapshot.headers["X-Snapshot-Scale"]) == 4.0,
+           _base_snapshot.headers.get("X-Snapshot-Scale"))
+        _marked_adjust = _client_up.post(f"/adjust/{_marked_route_job['id']}", json={
+            "regions":[[[40,40],[240,40],[240,240],[40,240]]],
+            "region_categories":["external_yard"], "region_scopes":["main"],
+            "scale_k":0.1, "snapshot_scale":2.0,
+            "cutout_regions":[[[80,80],[120,80],[120,120],[80,120]]],
+            "user_channels":[[[40,300],[140,300],[140,380]]],
+        })
+        _marked_saved = _AS.load_jobs()[_marked_route_job["id"]]
+        ck("adjust route persists the exact snapshot transform beside assessor geometry",
+           _marked_adjust.status_code == 200 and
+           _marked_saved["adjusted"]["snapshot_scale"] == 2.0 and
+           _marked_saved["adjusted"]["area_m2"] == 384.0,
+           _marked_adjust.get_json())
+        _marked_route_response = _client_up.get(
+            f"/marked-pdf/{_marked_route_job['id']}.pdf")
+        with _fitz_marked.open(
+                stream=_marked_route_response.data, filetype="pdf") as _route_marked_doc:
+            _route_manifest = _json_marked.loads(
+                _route_marked_doc.embfile_get(_MARKED_MANIFEST_NAME))
+            _route_annots = sum(1 for page in _route_marked_doc
+                                for _annot in (page.annots() or []))
+        ck("real marked-PDF endpoint returns Bluebeam-openable permanent PDF + manifest",
+           _marked_route_response.status_code == 200 and
+           _marked_route_response.mimetype == "application/pdf" and
+           _marked_route_response.headers.get("X-Fortel-Markup-Schema") ==
+               "fortel.markup.v1" and
+           "MARKED_QA_01_Rotated_Drawing_REV_03_MARKED.pdf" in
+               _marked_route_response.headers.get("Content-Disposition", "") and
+           _route_manifest["geometry"]["regions"][0]["area_m2"] == 384.0 and
+           _route_annots == 0,
+           {"status":_marked_route_response.status_code,
+            "content_disposition":_marked_route_response.headers.get("Content-Disposition"),
+            "manifest":_route_manifest})
+
+        # P2 lifecycle: adding two independently named areas to an already-adjusted main
+        # slab must preserve 384m2 (not turn it into 454m2), and each name must become its
+        # own line in the same case workbook. This uses the real HTTP routes.
+        _named_area_adjust = _client_up.post(f"/adjust/{_marked_route_job['id']}", json={
+            "scale_k":0.1, "snapshot_scale":2.0,
+            "area_elements":[
+                {"element_id":"footpath-1", "name":"Footpath",
+                 "category":"external_yard", "boq_scope":"main",
+                 "polygon_pts":[[300,40],[400,40],[400,90],[300,90]]},
+                {"element_id":"duct-slab-1", "name":"Duct slab",
+                 "category":"dock", "boq_scope":"main",
+                 "polygon_pts":[[300,120],[340,120],[340,170],[300,170]]},
+            ],
+        })
+        _named_area_saved = _AS.load_jobs()[_marked_route_job["id"]]
+        ck("+Area preserves the main measured total and measures each polygon independently",
+           _named_area_adjust.status_code == 200 and
+           _named_area_adjust.get_json()["main_area_m2"] == 384.0 and
+           _named_area_adjust.get_json()["area_elements_total_m2"] == 70.0 and
+           _named_area_saved["area_m2"] == 384.0 and
+           _named_area_saved["cutout_regions"] ==
+               [[[80,80],[120,80],[120,120],[80,120]]] and
+           _named_area_saved["user_channels"] ==
+               [[[40,300],[140,300],[140,380]]] and
+           [(element["name"], element["area_m2"])
+            for element in _named_area_saved["area_elements"]] ==
+               [("Footpath",50.0),("Duct slab",20.0)],
+           _named_area_adjust.get_json())
+        ck("unclassified +Area is approval-blocked instead of silently filename-bucketed",
+           "explicit BOQ section" in (_AS._area_element_block_reason({
+               "area_elements":[{"name":"Unknown separate slab",
+                                 "category":"unclassified"}]
+           }) or ""))
+        _named_area_approve = _client_up.post(
+            f"/approve/{_marked_route_job['id']}", json={"note":"named areas confirmed"})
+        ck("classified +Area elements complete the real approval flow",
+           _named_area_approve.status_code == 200,
+           _named_area_approve.get_json())
+
+        _named_q_response = _client_up.get(
+            f"/quotation/{_marked_route_job['id']}.json")
+        _named_q = _json_marked.loads(_named_q_response.data)
+        _named_rows = [item for item in _named_q["line_items"]
+                       if item.get("assessor_named_area")]
+        _main_slab_rows = [item for item in _named_q["line_items"]
+                           if "slab" in item.get("description", "").lower()
+                           and not item.get("assessor_named_area")]
+        ck("each +Area name is one distinct quotation row in its assessor-selected section",
+           [(item["section"],item["description"],item["qty"],item["rate"])
+            for item in _named_rows] == [
+                ("External yard slabs","Footpath",50.0,45.07),
+                ("Dock slabs","Duct slab",20.0,None),
+            ], _named_rows)
+        ck("+Area rows do not merge into or inflate the 384m2 main slab row",
+           any(item.get("qty") == 384.0 for item in _main_slab_rows) and
+           not any(item.get("qty") == 454.0 for item in _named_q["line_items"]),
+           _main_slab_rows)
+
+        from openpyxl import load_workbook as _load_named_workbook
+        _named_xlsx_response = _client_up.get(
+            f"/quotation/{_marked_route_job['id']}.xlsx")
+        _named_wb = _load_named_workbook(
+            _io3.BytesIO(_named_xlsx_response.data), data_only=False)
+        _named_ws = _named_wb.active
+        _named_xlsx_rows = [
+            (cell.value.split("\n",1)[0], _named_ws.cell(cell.row,2).value,
+             _named_ws.cell(cell.row,3).value, _named_ws.cell(cell.row,4).value,
+             _named_ws.cell(cell.row,5).value)
+            for row in _named_ws.iter_rows() for cell in row if cell.column == 1
+            and isinstance(cell.value, str)
+            and cell.value.split("\n",1)[0] in {"Footpath","Duct slab"}
+        ]
+        ck("same-workbook xlsx keeps named quantities numeric and values as live formulas",
+           len(_named_wb.sheetnames) == 1 and
+           [(row[0],row[1],row[2],row[3]) for row in _named_xlsx_rows] == [
+               ("Footpath",50,"m2",45.07),
+               ("Duct slab",20,"m2",None),
+           ] and isinstance(_named_xlsx_rows[0][4], str) and
+           _named_xlsx_rows[0][4].startswith("=B") and
+           isinstance(_named_xlsx_rows[1][4], str) and
+           _named_xlsx_rows[1][4].startswith('=IF(D'), _named_xlsx_rows)
+
+        _named_marked_response = _client_up.get(
+            f"/marked-pdf/{_marked_route_job['id']}.pdf")
+        with _fitz_marked.open(
+                stream=_named_marked_response.data, filetype="pdf") as _named_marked_doc:
+            _named_marked_text = "\n".join(
+                page.get_text() for page in _named_marked_doc)
+            _named_manifest = _json_marked.loads(
+                _named_marked_doc.embfile_get(_MARKED_MANIFEST_NAME))
+        ck("marked-PDF burns separately named areas and preserves their independent identity",
+           "Footpath - 50.00 m2" in _named_marked_text and
+           "Duct slab - 20.00 m2" in _named_marked_text and
+           sum(bool(region.get("independent_area_element"))
+               for region in _named_manifest["geometry"]["regions"]) == 2,
+           _named_manifest["geometry"]["regions"])
+
         _AS.save_jobs({})
         _started_up.clear()
         _multi_resp = _client_up.post("/upload", data={
@@ -2849,6 +3191,77 @@ try:
            all(Path(j["pdf_path"]).name.startswith("MULTI-001_") for j in _multi_jobs.values()))
         ck("multi-file upload queues every drawing for bounded takeoff",
            len(_started_up) == 2 and all(len(args) == 4 for args in _started_up))
+
+        # Adding a later drawing through an existing job anchor must use the persisted project
+        # identity, even if a stale/tampered browser submits different visible form text.
+        _existing_anchor_id = _multi_json["job_ids"][0]
+        _existing_add_resp = _client_up.post("/upload", data={
+            "existing_project_job_id": _existing_anchor_id,
+            "project_ref": "WRONG-REF", "project_name": "Wrong look-alike project",
+            "client_name": "Wrong client",
+            "pdf": (_io3.BytesIO(_pdf_a_bytes), "Later folder drawing.pdf"),
+        }, content_type="multipart/form-data")
+        _existing_add_json = _existing_add_resp.get_json()
+        _existing_add_jobs = _AS.load_jobs()
+        _existing_new_job = _existing_add_jobs.get(_existing_add_json.get("job_id"), {})
+        ck("existing-project upload adds one job without replacing prior project drawings",
+           _existing_add_resp.status_code == 202 and
+           _existing_add_json.get("added_to_project") is True and
+           len(_existing_add_jobs) == 3 and
+           all(job_id in _existing_add_jobs for job_id in _multi_json["job_ids"]),
+           _existing_add_json)
+        ck("existing-project anchor is authoritative for ref/name/client grouping",
+           _existing_new_job.get("project_ref") == "MULTI-001" and
+           _existing_new_job.get("project_name") == "Four Slab Project" and
+           _existing_new_job.get("client_name") == "Fortel QA",
+           _existing_new_job)
+        _missing_existing_add = _client_up.post("/upload", data={
+            "existing_project_job_id":"missing-anchor",
+            "pdf":(_io3.BytesIO(_pdf_a_bytes),"orphan.pdf"),
+        }, content_type="multipart/form-data")
+        ck("existing-project upload refuses an unknown anchor without creating an orphan",
+           _missing_existing_add.status_code == 404 and
+           len(_AS.load_jobs()) == 3,
+           _missing_existing_add.get_json())
+
+        _registered_project_paths = _AS._project_pdf_paths(
+            "MULTI-001", _existing_new_job["pdf_path"])
+        ck("server resolves every readable same-project PDF from persisted job membership",
+           len(_registered_project_paths) == 3 and
+           set(_registered_project_paths) ==
+               {job["pdf_path"] for job in _existing_add_jobs.values()},
+           _registered_project_paths)
+
+        # The background worker must hand that registry to the real pipeline. A narrow legacy
+        # callable remains compatible because _run_takeoff introspects the optional parameter.
+        import sys as _sys_project_files
+        _real_project_pipeline = _sys_project_files.modules.get("takeoff_pipeline")
+        _project_file_capture = {}
+        class _ProjectFilePipeline:
+            @staticmethod
+            def takeoff(pdf_path, project_name=None, project_ref=None,
+                        client_rates_path=None, approval_job_id=None, project_files=None):
+                _project_file_capture["paths"] = list(project_files or [])
+                return {
+                    "file":Path(pdf_path).name, "pdf_path":pdf_path,
+                    "project_name":project_name, "project_ref":project_ref,
+                    "area_m2":None, "measurement_state":"UNMEASURED",
+                    "needs_assessor":True, "flags":["project registry handoff test"],
+                }
+        try:
+            _sys_project_files.modules["takeoff_pipeline"] = _ProjectFilePipeline
+            _AS._run_takeoff(
+                _existing_anchor_id,
+                _existing_add_jobs[_existing_anchor_id]["pdf_path"],
+                "Four Slab Project", "MULTI-001")
+        finally:
+            if _real_project_pipeline is None:
+                _sys_project_files.modules.pop("takeoff_pipeline", None)
+            else:
+                _sys_project_files.modules["takeoff_pipeline"] = _real_project_pipeline
+        ck("takeoff worker passes the complete project registry to spec extraction",
+           set(_project_file_capture.get("paths") or []) ==
+               set(_registered_project_paths), _project_file_capture)
 
         _AS.save_jobs({})
         _started_up.clear()
@@ -3799,6 +4212,28 @@ try:
         ck("portal exposes editable xlsx quotation download",
            'id="linkXlsx"' in _portal_html_up and
            "quotation/${job.id}.xlsx" in _portal_html_up)
+        ck("portal exposes marked-up PDF independently of quotation pricing state",
+           all(marker in _portal_html_up for marker in (
+               'id="markedPdfLinks"', 'id="linkMarkedPdf"',
+               "marked-pdf/${job.id}.pdf", "Permanent Bluebeam-ready markup",
+               "recoverable Fortel geometry embedded")))
+        ck("portal exposes renameable +Area geometry separately from main regions",
+           all(marker in _portal_html_up for marker in (
+               'id="btnNewArea"', "startNewAreaElement",
+               "Separate area name", "area_elements: namedAreaEntries.map",
+               "main area:")))
+        ck("portal accumulates folder selections and can target an existing project anchor",
+           all(marker in _portal_html_up for marker in (
+               "selectedUploadFiles.push(...Array.from(fileList || []))",
+               "document.getElementById('upFile').value = ''",
+               'id="upFileList"', 'id="btnAddDrawings"',
+               "beginAddDrawingsById", "existing_project_job_id")))
+        ck("portal switches to a scalable PDF visual layer on zoom without changing snapScale",
+           all(marker in _portal_html_up for marker in (
+               "ensureVectorSurface", "snapshot-vector/${encodeURIComponent(requestedJobId)}.svg",
+               "if (!vectorSurfaceReady && img)",
+               "if (vectorSurface) vectorSurface.style.transform = transform",
+               "res.scale_k ? res.scale_k / snapScale : null")))
         ck("portal exposes exact Brief_Spec fields without silent fallback form values",
            all(label in _portal_html_up for label in (
                "External/Service Yard Slabs", "Dock Slabs", "Ground Floor Slabs(Core Areas)",

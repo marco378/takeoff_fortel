@@ -98,12 +98,25 @@ header span{opacity:.7;font-size:12px}
 .toolbar button.cutout:hover{background:#d35400;color:#fff}
 .toolbar button.channel{background:#fff;color:#c0392b;border-color:#c0392b}
 .toolbar button.channel:hover{background:#c0392b;color:#fff}
+.toolbar button.area-element{background:#fff;color:#7d3c98;border-color:#7d3c98}
+.toolbar button.area-element:hover{background:#7d3c98;color:#fff}
+.area-elements-editor{margin-top:8px;border:1px solid #d8c6e3;border-radius:6px;overflow:hidden}
+.area-element-row{display:grid;grid-template-columns:minmax(100px,1fr) minmax(105px,1fr) auto;
+  gap:5px;align-items:center;padding:5px;background:#f8f1fb;border-top:1px solid #eadff0}
+.area-element-row:first-child{border-top:0}
+.area-element-row input,.area-element-row select{min-width:0;width:100%;box-sizing:border-box;
+  padding:4px;border:1px solid #cbb4d8;border-radius:4px;background:#fff;font-size:10px}
+.area-element-row button{padding:3px 6px;border:1px solid #a569bd;border-radius:4px;
+  background:#fff;color:#7d3c98;cursor:pointer;font-size:10px}
+.area-element-qty{grid-column:1 / -1;color:#69417a;font-size:9px;font-weight:700}
 #readout{margin-left:auto;font-size:13px;font-weight:700;color:var(--blue)}
 .divider{width:1px;background:var(--border);height:24px;margin:0 4px}
 
 /* ── Canvas area ─────────────────────────── */
 .canvas-wrap{flex:1;overflow:hidden;position:relative;padding:16px;background:var(--bg)}
-canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.08);cursor:crosshair;position:absolute;transform-origin:0 0;image-rendering:crisp-edges}
+canvas{display:block;border:1px solid var(--border);background:transparent;box-shadow:0 2px 8px rgba(0,0,0,.08);cursor:crosshair;position:absolute;transform-origin:0 0;z-index:2}
+.vector-surface{display:block;position:absolute;left:0;top:0;transform-origin:0 0;
+  pointer-events:none;z-index:1;background:#fff}
 
 /* ── Zoom controls ─────────────────────────── */
 .zoom-controls{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:4px;background:#fff;border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:10}
@@ -218,7 +231,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .upload-toggle .chevron{margin-left:auto;font-size:11px;opacity:.6;transition:transform .2s}
 .upload-toggle.open .chevron{transform:rotate(180deg)}
 .upload-form-wrap{overflow:hidden;max-height:0;transition:max-height .25s ease}
-.upload-form-wrap.open{max-height:380px}
+.upload-form-wrap.open{max-height:70vh;overflow-y:auto}
 .upload-form{padding:4px 16px 14px;display:flex;flex-direction:column;gap:8px}
 .upload-form label{font-size:11px;color:#8fa8cc;font-weight:600;letter-spacing:.4px;text-transform:uppercase;margin-bottom:2px}
 .upload-form-group{display:flex;flex-direction:column;gap:3px}
@@ -228,6 +241,15 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
 .upload-form input[type="text"]:focus{border-color:var(--pink)}
 .upload-form input[type="file"]{padding:4px 6px;cursor:pointer}
 .upload-form input[type="file"]::file-selector-button{background:var(--blue);color:#cdd8eb;border:none;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;margin-right:6px}
+.upload-file-list{margin-top:5px;display:grid;gap:3px}
+.upload-file-row{display:flex;align-items:center;gap:5px;padding:4px 5px;background:#182f55;
+  border:1px solid #2d4e7e;border-radius:4px;color:#cdd8eb;font-size:10px}
+.upload-file-row span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.upload-file-row button{border:0;background:transparent;color:#ffb0a8;cursor:pointer;font-size:12px}
+.existing-project-target{display:none;margin-bottom:7px;padding:6px;background:#173d67;
+  border:1px solid #4a7fc1;border-radius:5px;color:#cde7ff;font-size:10px;line-height:1.35}
+.existing-project-target button{float:right;border:0;background:transparent;color:#fff;
+  text-decoration:underline;cursor:pointer;font-size:9px}
 .btn-run-takeoff{background:var(--pink);color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;font-weight:700;cursor:pointer;transition:background .15s;display:flex;align-items:center;justify-content:center;gap:6px}
 .btn-run-takeoff:hover{background:#c40069}
 .btn-run-takeoff:disabled{opacity:.5;cursor:not-allowed}
@@ -281,6 +303,11 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       </button>
       <div class="upload-form-wrap" id="uploadFormWrap">
         <form class="upload-form" id="uploadForm" onsubmit="submitUpload(event)">
+          <input type="hidden" id="upExistingJob" name="existing_project_job_id">
+          <div class="existing-project-target" id="upExistingBanner">
+            <button type="button" onclick="clearExistingUploadTarget()">Use a new project</button>
+            <strong id="upExistingLabel"></strong><br>New drawings will join this existing project.
+          </div>
           <div class="upload-form-group">
             <label for="upRef">Project Ref</label>
             <input type="text" id="upRef" name="project_ref" required placeholder="e.g. 2132">
@@ -295,7 +322,10 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
           </div>
           <div class="upload-form-group">
             <label for="upFile">PDF Drawing(s) or ZIP</label>
-            <input type="file" id="upFile" name="pdf" accept=".pdf,.zip" multiple required>
+            <input type="file" id="upFile" name="pdf" accept=".pdf,.zip" multiple
+                   onchange="accumulateUploadFiles(this.files)">
+            <div class="upload-file-list" id="upFileList"></div>
+            <div style="font-size:9px;color:#8ab4cc;margin-top:3px">Choose again from another folder to add more files; earlier selections stay queued.</div>
           </div>
           <button type="submit" class="btn-run-takeoff" id="btnRunTakeoff">
             🚀 Run Takeoff
@@ -334,6 +364,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <button id="btnUndo">↩ Undo</button>
       <button id="btnClear">🗑 Clear</button>
       <button id="btnNewRegion" title="Finish this outline and start another slab/core region">＋ Region</button>
+      <button id="btnNewArea" class="area-element" title="Trace a separately named and separately priced area">＋ Area</button>
       <button id="btnCutout" class="cutout" title="Draw a polygon over unwanted area to subtract it">✂️ Cut-out</button>
       <button id="btnChannel" class="channel" title="Draw a bending channel polyline; click again to finish">📏 Channel</button>
       <select id="traceScope" title="BOQ scope for the active trace" style="max-width:150px">
@@ -352,6 +383,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
               title="Confirm the existing AI scale and extent without replacing its measured zones">✅ Confirm scale + extent</button>
       <button id="btnReject"  class="reject">✗ Reject</button>
       <button id="btnAdjust"  class="adjust">✏️ Submit Adjustment</button>
+      <button id="btnAddDrawings" title="Add more drawing files to this existing project">＋ Drawings</button>
       <div class="divider"></div>
       <button id="btnDelete"  class="delete" title="Soft delete — archives the job, recoverable, does not erase data">🗑️ Delete</button>
       <span id="readout">area: —</span>
@@ -421,6 +453,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <div class="area-big" id="areaDisplay">—</div>
       <div class="area-sub" id="areaSource"></div>
       <div class="kv" style="margin-top:7px"><span class="k">Slab perimeter</span><span class="v" id="perimeterDisplay">—</span></div>
+      <div id="areaElementsEditor" class="area-elements-editor" style="display:none"></div>
     </div>
 
     <div class="info-section">
@@ -476,6 +509,15 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
         <a id="linkHtml" href="#" target="_blank" style="display:block;font-size:12px;color:#13294b;margin-bottom:2px">🌐 View quotation (HTML)</a>
         <a id="linkXlsx" href="#" target="_blank" style="display:block;font-size:12px;color:#13294b">📊 Download editable quotation (.xlsx)</a>
       </div>
+      <div id="markedPdfLinks" style="margin-top:8px;display:none">
+        <a id="linkMarkedPdf" href="#" target="_blank" download
+           style="display:block;font-size:12px;color:#13294b;font-weight:700">
+          🖍 Download marked-up drawing (.pdf)
+        </a>
+        <div style="font-size:10px;color:var(--muted);margin-top:2px">
+          Permanent Bluebeam-ready markup · recoverable Fortel geometry embedded
+        </div>
+      </div>
     </div>
 
   </div>
@@ -523,6 +565,7 @@ let _archivedJobs = {};         // cache of archived jobs (fetched only when the
 let _showArchived = false;      // "Show archived" sidebar toggle state
 let _collapsedProjects = new Set();
 let _jobRenderInFlight = false;
+let selectedUploadFiles = [];   // additive across repeated file-picker/folder selections
 // Monotonic generation counter guarding selectJob() against out-of-order completion.
 // selectJob is async (fetch /job/<id> then render); with no guard, rapidly switching
 // jobs (or a poll-triggered re-select racing a user click) can let an OLDER in-flight
@@ -535,9 +578,16 @@ let _jobRenderInFlight = false;
 let _selectGen = 0;
 let canvas = null, ctx = null;
 let img = null;
+let vectorSurface = null;       // scalable native-PDF visual layer beneath the trace canvas
+let vectorSurfaceReady = false;
+let vectorSurfaceLoading = false;
+let vectorSurfaceJobId = null;
 let mode = 'trace';       // 'trace' | 'cal'
 let poly = [];            // [{x,y}]
 let traceRegions = [];    // completed assessor regions: [{points:[{x,y}], candidateId:?, category:?}]
+let areaElements = [];     // independent +Area polygons; never included in the main region total
+let activeAreaElement = null; // metadata for the polygon currently being traced as +Area
+let areaElementCounter = 0;
 let activeCandidateId = null;
 let candidatePolygons = []; // assisted candidates in CANVAS pixels; never authoritative by themselves
 let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never measured/priced
@@ -799,6 +849,9 @@ function renderJobList(jobs) {
             <a class="project-quote-link" href="${BASE}/quotation/${esc(first.id)}.xlsx" target="_blank"
                title="One Excel for the whole case — every document included (unmeasured ones listed as awaiting trace)"
                onclick="event.stopPropagation()" style="font-size:10px;color:#9fd0ff;white-space:nowrap;text-decoration:none">📊 case xlsx</a>
+            <button type="button" title="Add drawing files to this project"
+                    onclick="event.stopPropagation();beginAddDrawingsById('${esc(first.id)}')"
+                    style="border:0;background:transparent;color:#9fd0ff;font-size:10px;cursor:pointer;white-space:nowrap">＋ drawings</button>
           </button>
           <div class="project-group-children ${collapsed?'collapsed':''}">
             ${children.map(j => renderJobRow(j, true)).join('')}
@@ -870,7 +923,8 @@ async function selectJob(jobId) {
   // the new one loads. Clearing img/poly/cal/aiPoly + the visible canvas, and
   // resetting snapScale/mpp, guarantees the canvas reloads fresh for each job.
   img = null;
-  poly = []; traceRegions = []; activeCandidateId = null; candidatePolygons = [];
+  poly = []; traceRegions = []; areaElements = []; activeAreaElement = null;
+  activeCandidateId = null; candidatePolygons = [];
   channelProposals = []; transitionCandidates = [];
   cutoutPolygons = []; userChannels = [];
   cutoutDrag = null; userChannelDrag = null;
@@ -938,6 +992,7 @@ async function renderJobUI(job, gen) {
   // (mirrors _approve_block_reason's server-is-source-of-truth pattern elsewhere in this file).
   const canDelete = job.status !== 'processing' && job.decision !== 'approved';
   document.getElementById('btnDelete').style.display = canDelete ? '' : 'none';
+  document.getElementById('btnAddDrawings').style.display = job.project_ref ? '' : 'none';
   // Remove any previous status message before re-rendering
   const _prevMsg = document.getElementById('_statusMsg');
   if (_prevMsg) _prevMsg.remove();
@@ -1215,6 +1270,18 @@ function initialiseTraceState(job, res) {
     category: storedCategories[index] || candidateCategory(alignedStoredIds[index]),
     boqScope: storedScopes[index] || candidateScope(alignedStoredIds[index])
   }));
+  const storedAreaElements = Array.isArray(job.area_elements)
+    ? job.area_elements : (Array.isArray(adjusted.area_elements) ? adjusted.area_elements : []);
+  areaElements = storedAreaElements.map((element, index) => ({
+    elementId: String(element.element_id || `area-element-${index + 1}`),
+    name: String(element.name || `Area ${index + 1}`),
+    category: String(element.category || 'unclassified'),
+    boqScope: String(element.boq_scope || 'main'),
+    points: (element.polygon_pts || element.points || []).map(point => ({
+      x:Number(point[0]), y:Number(point[1])
+    }))
+  })).filter(element => element.points.length >= 3);
+  activeAreaElement = null;
   poly = [];
   activeCandidateId = null;
   cal = [];
@@ -2129,6 +2196,7 @@ function renderFlags(flags) {
 function renderDecision(job) {
   const el = document.getElementById('decisionBlock');
   const ql = document.getElementById('quotationLinks');
+  const ml = document.getElementById('markedPdfLinks');
   const projectPricingBlocked = !!job.spec_pricing_warning || zoneReviewRequired(job) || !!(job.project_ref &&
     _jobs.some(sibling => sibling.project_ref === job.project_ref &&
       (sibling.spec_pricing_warning || zoneReviewRequired(sibling)) &&
@@ -2136,6 +2204,7 @@ function renderDecision(job) {
   if (!job.decision) {
     el.innerHTML = '<div style="color:var(--muted);font-size:13px">No decision yet</div>';
     ql.style.display = 'none';
+    ml.style.display = 'none';
     return;
   }
   el.innerHTML = `<div class="decision-banner ${esc(job.decision)}">
@@ -2147,6 +2216,11 @@ function renderDecision(job) {
       📝 <strong>CORRECTED AFTER APPROVAL · REV_${String(rev).padStart(2,'0')}</strong>
       <br><span style="font-size:11px">The earlier issued quotation is preserved in revision history; downloads below are the corrected revision.</span>
     </div>`;
+  }
+  const markedPdfReady = job.decision === 'approved' || job.decision === 'adjusted';
+  ml.style.display = markedPdfReady ? 'block' : 'none';
+  if (markedPdfReady) {
+    document.getElementById('linkMarkedPdf').href = `${BASE}/marked-pdf/${job.id}.pdf`;
   }
   if (job.quotation_error) {
     el.innerHTML += `<div class="flag err" style="margin-top:8px">
@@ -2249,10 +2323,18 @@ function loadImage(url, forJobId) {
       canvas = nextCanvas;
       ctx    = nextCtx;
       img    = nextImg;
+      vectorSurface = null;
+      vectorSurfaceReady = false;
+      vectorSurfaceLoading = false;
+      vectorSurfaceJobId = forJobId;
       // Reset zoom/pan for new image only after the image is actually available.
       zoom = 1; panX = 0; panY = 0;
       updateZoomDisplay();
+      // Keep zoom controls alive across drawing swaps; replaceChildren(nextCanvas) used to
+      // delete the controls on the first successful snapshot load.
+      const zoomControls = document.getElementById('zoomControls');
       wrap.replaceChildren(nextCanvas);
+      if (zoomControls) wrap.appendChild(zoomControls);
       setupCanvasEvents();
       zoomFit();
       draw();
@@ -2292,7 +2374,42 @@ function updateZoomDisplay() {
 
 function applyCanvasTransform() {
   if (!canvas) return;
-  canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  const transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  canvas.style.transform = transform;
+  if (vectorSurface) vectorSurface.style.transform = transform;
+}
+
+function ensureVectorSurface() {
+  if (!canvas || !vectorSurfaceJobId || vectorSurfaceReady || vectorSurfaceLoading) return;
+  vectorSurfaceLoading = true;
+  const requestedJobId = vectorSurfaceJobId;
+  const surface = new Image();
+  surface.className = 'vector-surface';
+  surface.alt = '';
+  surface.style.width = `${canvas.width}px`;
+  surface.style.height = `${canvas.height}px`;
+  surface.style.visibility = 'hidden';
+  vectorSurface = surface;
+  const wrap = document.getElementById('canvasWrap');
+  wrap.insertBefore(surface, canvas);
+  applyCanvasTransform();
+  surface.onload = () => {
+    if (requestedJobId !== selectedJobId || surface !== vectorSurface) return;
+    vectorSurfaceLoading = false;
+    vectorSurfaceReady = true;
+    surface.style.visibility = 'visible';
+    draw();  // clear the low-resolution raster, retaining only assessor vector overlays
+  };
+  surface.onerror = () => {
+    if (surface === vectorSurface) {
+      vectorSurfaceLoading = false;
+      vectorSurfaceReady = false;
+      surface.remove();
+      vectorSurface = null;
+      draw();  // honest fallback: keep the existing raster rather than a blank viewport
+    }
+  };
+  surface.src = `${BASE}/snapshot-vector/${encodeURIComponent(requestedJobId)}.svg`;
 }
 
 function zoomFit() {
@@ -2312,6 +2429,7 @@ function zoomFit() {
   panY = Math.max(0, (availH - scaledH) / 2);
   applyCanvasTransform();
   updateZoomDisplay();
+  if (zoom > 1.1) ensureVectorSurface();
 }
 
 function zoomReset() {
@@ -2345,6 +2463,7 @@ function zoomAtPoint(factor, clientPt) {
 
   applyCanvasTransform();
   updateZoomDisplay();
+  if (zoom > 1.1) ensureVectorSurface();
 }
 
 // ── Thumbnail helpers (info panel) ───────────────────
@@ -2375,7 +2494,7 @@ function hideThumb() {
 function draw() {
   if (!ctx) return;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (img) ctx.drawImage(img, 0, 0);
+  if (!vectorSurfaceReady && img) ctx.drawImage(img, 0, 0);
 
   // Scale-independent line widths: stay visible at any zoom
   const lw = Math.max(1, 2 / zoom);
@@ -2531,19 +2650,37 @@ function draw() {
     ctx.restore();
   });
 
+  // Separately named +Area elements (purple). These are independent quotation quantities,
+  // never an addition to the green main-region area shown above.
+  areaElements.forEach(element => {
+    if (!element.points || element.points.length < 3) return;
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    element.points.forEach((point,index) => index
+      ? ctx.lineTo(point.x,point.y) : ctx.moveTo(point.x,point.y));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(125,60,152,0.12)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(125,60,152,0.9)';
+    ctx.lineWidth = lw;
+    ctx.stroke();
+    ctx.restore();
+  });
+
   // Assessor polygon
   if (poly.length) {
     ctx.beginPath();
     poly.forEach((p,i)=> i ? ctx.lineTo(p.x,p.y) : ctx.moveTo(p.x,p.y));
     ctx.closePath();
-    ctx.fillStyle   = 'rgba(0,150,80,0.18)';
+    ctx.fillStyle   = activeAreaElement ? 'rgba(125,60,152,0.16)' : 'rgba(0,150,80,0.18)';
     ctx.fill();
-    ctx.strokeStyle = '#008000';
+    ctx.strokeStyle = activeAreaElement ? '#7d3c98' : '#008000';
     ctx.lineWidth   = lw * 1.2;
     ctx.setLineDash([]);
     ctx.stroke();
     poly.forEach(p => {
-      ctx.fillStyle = '#008000';
+      ctx.fillStyle = activeAreaElement ? '#7d3c98' : '#008000';
       ctx.beginPath();
       ctx.arc(p.x, p.y, dotR, 0, Math.PI*2);
       ctx.fill();
@@ -2608,11 +2745,85 @@ function shoelace(pts) {
 
 function traceRegionEntries() {
   const entries = traceRegions.filter(region => region.points && region.points.length >= 3);
-  if (poly.length >= 3) entries.push({
+  if (!activeAreaElement && poly.length >= 3) entries.push({
     points:poly, candidateId:activeCandidateId, category:candidateCategory(activeCandidateId),
     boqScope:document.getElementById('traceScope').value || candidateScope(activeCandidateId)
   });
   return entries;
+}
+
+function areaElementEntries() {
+  const entries = areaElements.filter(element => element.points && element.points.length >= 3);
+  if (activeAreaElement && poly.length >= 3) entries.push({
+    ...activeAreaElement,
+    points: poly
+  });
+  return entries;
+}
+
+function defaultAreaElementCategory() {
+  const categories = Array.from(new Set(effectiveZones(currentJob)
+    .map(zone => String(zone.category || '').trim().toLowerCase())
+    .filter(category => ['external_yard','dock','ground_floor','upper_floor'].includes(category))));
+  return categories.length === 1 ? categories[0] : 'unclassified';
+}
+
+function findAreaElement(elementId) {
+  if (activeAreaElement && activeAreaElement.elementId === elementId) return activeAreaElement;
+  return areaElements.find(element => element.elementId === elementId);
+}
+
+function updateAreaElementName(elementId, value) {
+  const element = findAreaElement(elementId);
+  if (!element) return;
+  const name = String(value || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  if (name) element.name = name;
+  renderAreaElementsEditor();
+  draw();
+}
+
+function updateAreaElementCategory(elementId, value) {
+  const element = findAreaElement(elementId);
+  if (!element) return;
+  element.category = String(value || 'unclassified');
+  renderAreaElementsEditor();
+}
+
+function removeAreaElement(elementId) {
+  if (activeAreaElement && activeAreaElement.elementId === elementId) {
+    activeAreaElement = null;
+    poly = [];
+  } else {
+    areaElements = areaElements.filter(element => element.elementId !== elementId);
+  }
+  draw();
+  toast('Separate area removed');
+}
+
+function renderAreaElementsEditor() {
+  const panel = document.getElementById('areaElementsEditor');
+  if (!panel) return;
+  const entries = areaElements.slice();
+  if (activeAreaElement) entries.push({...activeAreaElement, points:poly});
+  panel.style.display = entries.length ? 'block' : 'none';
+  panel.innerHTML = entries.map(element => {
+    const qty = mpp && element.points && element.points.length >= 3
+      ? `${(shoelace(element.points) * mpp * mpp).toLocaleString(undefined,{maximumFractionDigits:2})} m² — separate quotation line`
+      : 'Trace at least 3 points — separate from main total';
+    const options = [
+      ['unclassified','Choose BOQ section'],
+      ['external_yard','External yard slabs'], ['dock','Dock slabs'],
+      ['ground_floor','Ground floor slabs'], ['upper_floor','Upper floor slabs']
+    ].map(([value,label]) => `<option value="${value}" ${element.category===value?'selected':''}>${label}</option>`).join('');
+    return `<div class="area-element-row" data-element-id="${esc(element.elementId)}">
+      <input aria-label="Separate area name" maxlength="120" value="${esc(element.name)}"
+             onchange="updateAreaElementName(this.parentElement.dataset.elementId,this.value)">
+      <select aria-label="Separate area BOQ section"
+              onchange="updateAreaElementCategory(this.parentElement.dataset.elementId,this.value)">${options}</select>
+      <button type="button" onclick="removeAreaElement(this.parentElement.dataset.elementId)">Remove</button>
+      <div class="area-element-qty">${esc(qty)}</div>
+    </div>`;
+  }).join('');
 }
 
 function candidateCategory(candidateId) {
@@ -2629,22 +2840,50 @@ function candidateScope(candidateId) {
 
 function stashActiveRegion() {
   if (poly.length >= 3) {
-    traceRegions.push({
-      points: poly.map(point => ({x:point.x, y:point.y})),
-      candidateId: activeCandidateId,
-      candidateGroupId: activeCandidateId,
-      category: candidateCategory(activeCandidateId),
-      boqScope: document.getElementById('traceScope').value || candidateScope(activeCandidateId)
-    });
+    const savedPoints = poly.map(point => ({x:point.x, y:point.y}));
+    if (activeAreaElement) {
+      areaElements.push({...activeAreaElement, points:savedPoints});
+    } else {
+      traceRegions.push({
+        points: savedPoints,
+        candidateId: activeCandidateId,
+        candidateGroupId: activeCandidateId,
+        category: candidateCategory(activeCandidateId),
+        boqScope: document.getElementById('traceScope').value || candidateScope(activeCandidateId)
+      });
+    }
   }
   poly = [];
   activeCandidateId = null;
+  activeAreaElement = null;
 }
 
 function startNewTraceRegion() {
   stashActiveRegion();
   draw();
   toast('Previous outline kept — trace the next slab/core region');
+}
+
+function startNewAreaElement() {
+  stashActiveRegion();
+  const proposedName = window.prompt('Name this separate area element (for example Footpath or Duct slab):', 'New area');
+  const name = String(proposedName || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  if (!name) {
+    renderAreaElementsEditor();
+    toast('Separate area cancelled', 'warn');
+    return;
+  }
+  activeAreaElement = {
+    elementId:`area-${Date.now()}-${++areaElementCounter}`,
+    name,
+    category:defaultAreaElementCategory(),
+    boqScope:document.getElementById('traceScope').value || 'main'
+  };
+  mode = 'trace';
+  document.getElementById('btnTrace').classList.add('on');
+  renderAreaElementsEditor();
+  draw();
+  toast(`${name}: trace a closed polygon; it will remain separate from the main area`);
 }
 
 function loadTraceCandidate(candidateId) {
@@ -2757,7 +2996,8 @@ function updateAreaDisplay() {
     document.getElementById('areaSource').textContent = 'No polygon traced yet';
   }
   document.getElementById('readout').textContent =
-    `area: ${aStr}  ·  ${traceRegionEntries().length} region(s)  ·  ${cutoutPolygons.length} cut-out(s)  ·  ${userChannels.length} channel(s)  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
+    `main area: ${aStr}  ·  ${areaElementEntries().length} separate area(s)  ·  ${cutoutPolygons.length} cut-out(s)  ·  ${userChannels.length} channel(s)  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
+  renderAreaElementsEditor();
 }
 
 function applyScaleOverride(rawValue) {
@@ -3185,9 +3425,11 @@ function setupButtons() {
     draw();
   });
   document.getElementById('btnClear').addEventListener('click', () => {
-    poly=[]; traceRegions=[]; activeCandidateId=null; cal=[]; cutoutPolygons=[]; userChannels=[]; draw();
+    poly=[]; traceRegions=[]; areaElements=[]; activeAreaElement=null;
+    activeCandidateId=null; cal=[]; cutoutPolygons=[]; userChannels=[]; draw();
   });
   document.getElementById('btnNewRegion').addEventListener('click', startNewTraceRegion);
+  document.getElementById('btnNewArea').addEventListener('click', startNewAreaElement);
   document.getElementById('btnCutout').addEventListener('click', () => {
     // Close any open cutout polygon before switching/starting new
     if (cutoutPolygons.length > 0) {
@@ -3286,6 +3528,7 @@ function setupButtons() {
   document.getElementById('btnConfirmExisting').addEventListener('click', confirmExistingMeasurement);
   document.getElementById('btnReject') .addEventListener('click', () => submitDecision('reject'));
   document.getElementById('btnAdjust') .addEventListener('click', () => submitDecision('adjust'));
+  document.getElementById('btnAddDrawings').addEventListener('click', () => beginAddDrawings(currentJob));
   document.getElementById('btnDelete') .addEventListener('click', deleteCurrentJob);
 }
 
@@ -3355,9 +3598,10 @@ async function submitDecision(action) {
     }
   }
   const regionEntries = traceRegionEntries();
+  const namedAreaEntries = areaElementEntries();
   const a = calcArea();
   const hasCutouts = cutoutPolygons.some(r => r.points && r.points.length >= 3);
-  if (action === 'adjust' && !regionEntries.length && !a && !hasCutouts) {
+  if (action === 'adjust' && !regionEntries.length && !namedAreaEntries.length && !a && !hasCutouts) {
     toast('Trace or add at least one polygon, then Submit Adjustment', 'warn'); return;
   }
   const regionPayload = regionEntries.map(entry =>
@@ -3381,6 +3625,18 @@ async function submitDecision(action) {
     user_channels: userChannels.filter(ch => ch.points && ch.points.length >= 2)
       .map(ch => ch.points.map(point => [Math.round(point.x), Math.round(point.y)])),
     region_scopes: regionEntries.map(entry => entry.boqScope || 'main'),
+    // +Area elements are intentionally outside ``regions`` and ``assessed_area_m2``. The
+    // server measures each independently and writes one same-workbook quotation line/name.
+    area_elements: namedAreaEntries.map(entry => ({
+      element_id: entry.elementId,
+      name: entry.name,
+      category: entry.category || 'unclassified',
+      boq_scope: entry.boqScope || 'main',
+      polygon_pts: entry.points.map(point => [Math.round(point.x), Math.round(point.y)])
+    })),
+    // Geometry above is in snapshot/canvas pixels. Persist the exact transform beside it so
+    // marked-PDF export (and a future importer) can recover rotated PDF points exactly.
+    snapshot_scale: snapScale || null,
     note: ''
   };
   try {
@@ -3440,15 +3696,89 @@ function toggleUploadForm() {
   btn.classList.toggle('open', open);
 }
 
+function renderUploadFiles() {
+  const list = document.getElementById('upFileList');
+  if (!list) return;
+  list.innerHTML = selectedUploadFiles.map((file,index) =>
+    `<div class="upload-file-row"><span>${esc(file.name)} · ${(file.size/1024).toLocaleString(undefined,{maximumFractionDigits:1})} KB</span>
+      <button type="button" aria-label="Remove ${esc(file.name)}" onclick="removeUploadFile(${index})">×</button></div>`
+  ).join('');
+}
+
+function accumulateUploadFiles(fileList) {
+  // FileList is replaced by the browser on every folder choice. Copy each selection into an
+  // application queue, then clear the native input so another folder (or the same filename)
+  // can be selected without discarding what is already queued.
+  selectedUploadFiles.push(...Array.from(fileList || []));
+  document.getElementById('upFile').value = '';
+  renderUploadFiles();
+}
+
+function removeUploadFile(index) {
+  selectedUploadFiles.splice(index, 1);
+  renderUploadFiles();
+}
+
+function resetUploadFormState(clearFiles=true) {
+  document.getElementById('uploadForm').reset();
+  for (const id of ['upRef','upName','upClient']) {
+    document.getElementById(id).readOnly = false;
+  }
+  document.getElementById('upExistingJob').value = '';
+  document.getElementById('upExistingBanner').style.display = 'none';
+  document.querySelector('#uploadToggle span:first-child').textContent = '＋ New Estimate';
+  if (clearFiles) selectedUploadFiles = [];
+  renderUploadFiles();
+}
+
+function clearExistingUploadTarget() {
+  const queued = selectedUploadFiles.slice();
+  resetUploadFormState(false);
+  selectedUploadFiles = queued;
+  renderUploadFiles();
+}
+
+function beginAddDrawings(job) {
+  if (!job || !job.id || !job.project_ref) {
+    toast('This job has no project reference to add drawings under', 'error');
+    return;
+  }
+  selectedUploadFiles = [];
+  renderUploadFiles();
+  document.getElementById('upExistingJob').value = job.id;
+  document.getElementById('upRef').value = job.project_ref || '';
+  document.getElementById('upName').value = job.project_name || '';
+  document.getElementById('upClient').value = job.client_name || '';
+  for (const id of ['upRef','upName','upClient']) {
+    document.getElementById(id).readOnly = true;
+  }
+  document.getElementById('upExistingLabel').textContent =
+    `Adding to #${job.project_ref} · ${job.project_name || 'Unnamed project'}`;
+  document.getElementById('upExistingBanner').style.display = 'block';
+  document.querySelector('#uploadToggle span:first-child').textContent = '＋ Add project drawings';
+  document.getElementById('uploadFormWrap').classList.add('open');
+  document.getElementById('uploadToggle').classList.add('open');
+  document.getElementById('upFile').click();
+}
+
+function beginAddDrawingsById(jobId) {
+  const job = (_lastJobs && _lastJobs[jobId]) || _jobs.find(item => item.id === jobId);
+  beginAddDrawings(job);
+}
+
 async function submitUpload(e) {
   e.preventDefault();
   const btn = document.getElementById('btnRunTakeoff');
   const ref    = document.getElementById('upRef').value.trim();
   const name   = document.getElementById('upName').value.trim();
   const client = document.getElementById('upClient').value.trim();
-  const files  = Array.from(document.getElementById('upFile').files || []);
+  const files  = selectedUploadFiles.slice();
+  const existingJobId = document.getElementById('upExistingJob').value;
 
-  if (!ref || !name || !files.length) return;   // HTML5 required handles UI
+  if (!ref || !name || !files.length) {
+    toast('Project ref, project name and at least one queued file are required', 'warn');
+    return;
+  }
 
   // Spinner state
   btn.disabled = true;
@@ -3458,6 +3788,7 @@ async function submitUpload(e) {
   fd.append('project_ref',  ref);
   fd.append('project_name', name);
   fd.append('client_name',  client);
+  if (existingJobId) fd.append('existing_project_job_id', existingJobId);
   files.forEach(file => fd.append('pdf', file));
 
   try {
@@ -3470,12 +3801,14 @@ async function submitUpload(e) {
       const toggle = document.getElementById('uploadToggle');
       wrap.classList.remove('open');
       toggle.classList.remove('open');
-      document.getElementById('uploadForm').reset();
+      resetUploadFormState(true);
 
       const newIds = rj.job_ids || [rj.job_id || rj.id].filter(Boolean);
       toast(newIds.length > 1
-        ? `${newIds.length} drawings submitted under project #${ref}`
-        : 'Job submitted — processing…');
+        ? `${newIds.length} drawings submitted under project #${rj.project_ref || ref}`
+        : (rj.added_to_project
+          ? `Drawing added to existing project #${rj.project_ref}`
+          : 'Job submitted — processing…'));
 
       // Auto-select the primary job while all project drawings process independently
       const newId = rj.job_id || rj.id || newIds[0];
