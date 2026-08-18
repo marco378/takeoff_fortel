@@ -343,11 +343,13 @@ ck("impossible area blocked", len(plausible(95463, site_m2=34329)) >= 1)
 ck("correct area passes", plausible(26080, site_m2=34329) == [])
 
 print("Fortel scale verification (from the call)")
-from scale import calibrate_verified, verify_against_feature, title_block_k
+from scale import calibrate_verified, verify_against_feature, title_block_k, ratio_from_k
 geom = 2235703  # real yard polygon area in pt²
 k_v, _ = calibrate_verified(title_denominator=500, bay_width_pt=2.5/0.108)  # verify vs 2.5 m bay
 ck("parking-bay verify flips wrong title scale to truth", abs(geom*k_v*k_v - 26080) < 50)
 ck("title-only scale flagged as a lie", len(verify_against_feature(title_block_k(500), 2.5/0.108, 2.5)) >= 1)
+ck("the same internal scale k is presented to assessors as the conventional 1:250 ratio",
+   ratio_from_k(title_block_k(250)) == 250)
 
 print("drawing selection (from the call)")
 from router import drawing_priority
@@ -623,7 +625,7 @@ ck("full engineer spec -> assumed=False", _a2 is False)
 ck("engineer depth 175 overrides default 190", _s2["depth_mm"] == 175)
 
 print("spec extractor (construction-detail PDF text parsing)")
-from spec_extractor import describe_spec, extract_spec_from_text
+from spec_extractor import describe_spec, extract_spec, extract_spec_from_text
 _e1 = extract_spec_from_text("175 mm thick with A193 mesh, C32/40 concrete")
 ck("depth 175",  _e1.get("depth_mm") == 175)
 ck("mesh A193",  _e1.get("mesh") == "A193")
@@ -639,6 +641,105 @@ _e5 = extract_spec_from_text("A252 mesh")
 ck("mesh without a layer count keeps layers unknown", "layers" not in _e5, _e5)
 ck("mesh-only human summary says layers not provided",
    describe_spec(_e5) == "A252 mesh (layers not provided)", describe_spec(_e5))
+
+# Inderjit's first live-use review exposed a 150 mm false result while the sheet stated
+# 190 mm.  Scale-bar print dimensions and neighbouring build-ups are not slab evidence.
+_e6 = extract_spec_from_text(
+    "CHECK: scale bar must measure 150 mm when printed.\n"
+    "EXTERNAL SERVICE YARD — 190 mm thick reinforced concrete slab with A252 fabric.",
+    source_name="Live Yard Joint Layout.pdf", page_number=1,
+    context="external service yard",
+)
+ck("explicit 190mm Yard slab outranks a 150mm scale-bar print dimension",
+   _e6.get("depth_mm") == 190, _e6)
+ck("extracted thickness carries auditable file/page/text evidence",
+   (_e6.get("_evidence") or {}).get("depth_mm", {}).get("file") ==
+       "Live Yard Joint Layout.pdf" and
+   (_e6.get("_evidence") or {}).get("depth_mm", {}).get("page") == 1 and
+   "190 mm thick" in (_e6.get("_evidence") or {}).get("depth_mm", {}).get("text", ""),
+   _e6.get("_evidence"))
+_e6_detail = extract_spec_from_text(
+    "CONCRETE YARD — Concrete Slab: 205mm thickness of PAV2. "
+    "Min 300mm thickness of ground improvement. Sub Base 150mm Type 1. "
+    "H12 U-bars at 225mm crs.",
+    source_name="External Works Details.pdf", page_number=1,
+    context="external concrete yard",
+)
+ck("ground-improvement, sub-base and reinforcement-spacing dimensions are not slab depths",
+   _e6_detail.get("depth_mm") == 205 and
+   not (_e6_detail.get("_conflicts") or {}).get("depth_mm"), _e6_detail)
+
+_e7 = extract_spec_from_text(
+    "PROPOSED EXTERNAL YARD SLAB JOINT LAYOUT. "
+    "Allow for joints in external slab at maximum 4.9 by 6.5 metre centres.",
+    source_name="Yard Joint Layout.pdf", page_number=2,
+    context="external yard",
+)
+ck("joint-layout spacing is extracted instead of reported as no details",
+   _e7.get("bay_sizes") == "4.9 m x 6.5 m centres" and
+   (_e7.get("_evidence") or {}).get("bay_sizes", {}).get("page") == 2,
+   _e7)
+
+# Portal uploads from every project share one persistent drawings directory.  A details PDF
+# from project A must never supply project B's spec merely because it sorts first.
+_spec_scope_dir = Path("/tmp/_fortel_spec_scope")
+shutil.rmtree(_spec_scope_dir, ignore_errors=True)
+_spec_scope_dir.mkdir()
+for _spec_name, _spec_text in (
+    ("AAA_Other_External_Construction_Details.pdf", "150 mm thick concrete slab A193"),
+    ("BBB_Target_Yard.pdf", "190 mm thick external service yard slab A252"),
+):
+    _spec_canvas = canvas.Canvas(str(_spec_scope_dir / _spec_name), pagesize=(500, 300))
+    _spec_canvas.drawString(40, 240, _spec_text)
+    _spec_canvas.save()
+from takeoff_pipeline import find_engineer_spec as _find_engineer_spec
+_scoped_spec = _find_engineer_spec(
+    str(_spec_scope_dir / "BBB_Target_Yard.pdf"), project_ref="BBB")
+ck("project-scoped lookup cannot import another project's 150mm spec",
+   _scoped_spec and _scoped_spec.get("depth_mm") == 190 and
+   "AAA_Other" not in str(_scoped_spec), _scoped_spec)
+_same_project_detail = _spec_scope_dir / "BBB_Yard_Build-Up.pdf"
+_spec_canvas = canvas.Canvas(str(_same_project_detail), pagesize=(500, 300))
+_spec_canvas.drawString(40, 240, "CONCRETE YARD — Concrete slab 205mm thick with A393 mesh")
+_spec_canvas.save()
+_conflicted_spec = _find_engineer_spec(
+    str(_spec_scope_dir / "BBB_Target_Yard.pdf"), project_ref="BBB")
+ck("competing same-project slab callouts remain a visible conflict, never an auto-confirmed value",
+   _conflicted_spec and "depth_mm" not in _conflicted_spec and
+   {record["value"] for record in _conflicted_spec["_conflicts"]["depth_mm"]} ==
+       {190, 205}, _conflicted_spec)
+
+_joint_fixture = Path(
+    "drawings/inderjit_markups_31jul/2165 Tanro- Voltage Business Park/"
+    "Tanro Voltage Business Park/Bid_Drawings/A)-Tender-Stage/Current/"
+    "Engineer---Baynham-Meikle/"
+    "13897-114-Proposed-External-Yard-Slab-Joint-Layout-Rev.T1.pdf")
+try:
+    _require_fixture(_joint_fixture, "Tanro joint-layout fixture not present")
+    _joint_fixture_spec = extract_spec(str(_joint_fixture), context="external yard")
+    ck("real joint-layout scale-bar 100mm is never confirmed as slab thickness",
+       _joint_fixture_spec.get("depth_mm") != 100 and
+       bool(_joint_fixture_spec.get("_joint_layout")), _joint_fixture_spec)
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] real joint-layout spec guard — {_e} — fixture not present")
+
+_multi_build_fixture = Path(
+    "drawings/aryan_31jul/Bidding_Documents___27_0/Tender_drawings/Tender-Stage/"
+    "Current/Engineer---PRP/64426-112-External-Works-Details-Rev.T2.pdf")
+try:
+    _require_fixture(_multi_build_fixture, "PRP multi-build-up detail fixture not present")
+    _multi_build_spec = extract_spec(
+        str(_multi_build_fixture), context="external service yard concrete yard")
+    _depth_conflicts = {
+        record.get("value")
+        for record in (_multi_build_spec.get("_conflicts") or {}).get("depth_mm", [])
+    }
+    ck("real multi-build-up detail refuses scope ambiguity without retaining non-slab dimensions",
+       "depth_mm" not in _multi_build_spec and "mesh" not in _multi_build_spec and
+       {150, 190, 205}.issubset(_depth_conflicts) and
+       not ({155, 225, 300} & _depth_conflicts), _multi_build_spec)
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] real multi-build-up spec guard — {_e} — fixture not present")
 
 print("Fortel Brief_Spec schema + field provenance")
 from slab_spec import (COMMON_FIELDS as _SPEC_COMMON_FIELDS, SLAB_SPEC_SCHEMA as _SPEC_SCHEMA,
@@ -669,6 +770,16 @@ ck("effective costing values remain field-by-field assumed until confirmed",
    all(not _confirmed_brief["fields"][key]["provisional"] for key in _SPEC_COMMON_FIELDS))
 ck("assumed and confirmed copies of the same effective spec have different aggregation identity",
    _brief_signature(_assumed_brief) != _brief_signature(_confirmed_brief))
+_mesh_only_brief = _build_brief_spec(
+    "external_yard", confirmed={"mesh": "A252"}, source="engineer_drawing",
+    evidence={"mesh": {"file": "Yard Detail D-112.pdf", "page": 3,
+                       "text": "A252 fabric reinforcement"}},
+)
+ck("a fabric callout confirms mesh but never silently confirms one reinforcement layer",
+   not _mesh_only_brief["fields"]["mesh"]["provisional"] and
+   _mesh_only_brief["fields"]["layers"]["provisional"] and
+   _mesh_only_brief["fields"]["layers"]["value"] is None,
+   _mesh_only_brief)
 
 print("quotation generator")
 from quotation import (generate_quotation, quotation_text, quotation_html, quotation_json,
@@ -830,6 +941,32 @@ _xss_html = quotation_html(generate_quotation(_xss_unit))
 ck("assessor-entered Brief_Spec text is HTML-escaped in served quotation",
    "<script>alert(1)</script>" not in _xss_html and
    "&lt;script&gt;alert(1)&lt;/script&gt;" in _xss_html)
+
+_cited_brief = _build_brief_spec(
+    "external_yard", effective_spec=_effective_spec,
+    confirmed={"depth_mm": 190, "mesh": "A252"}, source="engineer_drawing",
+    evidence={
+        "depth_mm": {"file": "64426-112-External-Works-Details-Rev.T2.pdf", "page": 2,
+                     "text": "minimum 190mm developer specification"},
+        "mesh": {"file": "64426-112-External-Works-Details-Rev.T2.pdf", "page": 2,
+                 "text": "A252 mesh fabric reinforcement"},
+    },
+)
+_cited_unit = _quotation_unit("64426-111-Yard.pdf", "External yard slabs", 10)
+_cited_unit["brief_spec"] = _cited_brief
+_cited_quote = generate_quotation(_cited_unit, ref="TST-SPEC-CITATION")
+_cited_outputs = (
+    quotation_text(_cited_quote), quotation_html(_cited_quote),
+    quotation_json(_cited_quote), quotation_xlsx(_cited_quote),
+)
+_cited_wb = _load_workbook(_BytesIO(_cited_outputs[3]), data_only=False)
+_cited_xlsx_text = "\n".join(
+    str(cell.value or "") for row in _cited_wb.active.iter_rows() for cell in row)
+_source_citation = "64426-112-External-Works-Details-Rev.T2.pdf, page 2"
+ck("every quotation format cites the drawing file and page for extracted specification fields",
+   all(_source_citation in output for output in _cited_outputs[:3]) and
+   _source_citation in _cited_xlsx_text,
+   {"text": _cited_outputs[0], "xlsx": _cited_xlsx_text})
 
 _xlsx_bytes = quotation_xlsx(_q_multi)
 _xlsx_wb = _load_workbook(_BytesIO(_xlsx_bytes), data_only=False)
@@ -3167,6 +3304,26 @@ try:
                _AS.load_jobs()[_money_channel_id])["scale_k"] == 0.1,
            _channel_truth_row)
 
+        _money_bend_id = "91000000-0000-4000-8000-000000000005"
+        _AS.save_jobs({_money_bend_id:_assessor_truth_job(
+            _money_bend_id, "MONEY-BENDING-CHANNEL")})
+        _, _bend_confirm, _bend_adjust = _confirm_and_adjust(
+            _money_bend_id,
+            # Two segments: 30 px + 40 px at assessor k=0.1 m/px => 7.00 Lm.
+            channels=[[[100,250],[130,250],[130,290]]],
+        )
+        _bend_job = _AS.load_jobs()[_money_bend_id]
+        _bend_quote = _AS._quotation_for_job(_money_bend_id)
+        _bend_row = next(item for item in _bend_quote["line_items"]
+                         if "assessor-drawn run" in item["description"])
+        ck("assessor can persist a bending channel polyline instead of a forced straight chord",
+           _bend_confirm.status_code == 200 and _bend_adjust.status_code == 200 and
+           _bend_job["adjusted"]["user_channels"] ==
+               [[[100,250],[130,250],[130,290]]],
+           _bend_adjust.get_json())
+        ck("quotation sums every segment of the assessor channel polyline",
+           _bend_row["qty"] == 7.0, _bend_row)
+
         _money_plain_id = "91000000-0000-4000-8000-000000000004"
         _plain_job = _assessor_truth_job(_money_plain_id, "MONEY-PLAIN", original_area=125.0)
         _plain_job["measurement_state"] = "MEASURED_VERIFIED"
@@ -3356,6 +3513,26 @@ try:
             "area_m2": 100, "scale_k": 0.2,
             "polygon_pts": [[0, 0], [1, 0], [1, 1]],
         }
+        _initial_spec_costing = _copy.deepcopy(_spec_jobs_before[_spec_job_id]["costing"])
+        _initial_spec_paths = _AS._save_quotation(
+            _spec_job_id,
+            _AS._quotation_result_for_job(_spec_jobs_before[_spec_job_id]),
+            _initial_spec_costing,
+            file_stem="QUOTE-MULTI-001-REV_01",
+        )
+        _spec_jobs_before[_spec_job_id].update({
+            "quotation_paths": _initial_spec_paths,
+            "quotation_revision": 1,
+            "quotation_status": "ready",
+            "quotation_history": [{
+                "revision": 1, "label": "REV_01",
+                "issued_at": "2026-07-15T10:02:00",
+                "reason": "initial approval", "paths": dict(_initial_spec_paths),
+            }],
+        })
+        _initial_spec_bytes = {
+            fmt: Path(path).read_bytes() for fmt, path in _initial_spec_paths.items()
+        }
         _AS.save_jobs(_spec_jobs_before)
         _spec_resp = _client_up.post(f"/spec-override/{_spec_job_id}", json={
             "slab_type": "external_yard",
@@ -3369,11 +3546,110 @@ try:
            _spec_json["costing"]["assumed"] is True and
            not _spec_json["brief_spec"]["fields"]["depth_mm"]["provisional"] and
            _spec_json["brief_spec"]["fields"]["mesh"]["provisional"], _spec_json)
-        ck("Brief_Spec optional fields persist without changing four-state or geometry",
+        ck("approved specification correction preserves four-state, geometry and assessor approval",
            _spec_saved_job["brief_spec"]["fields"]["bay_sizes"]["value"] == "5m x 5m" and
            _spec_saved_job["measurement_state"] == "MEASURED_VERIFIED" and
+           _spec_saved_job["status"] == "approved" and
            _spec_saved_job["decision"] == "approved" and
            _spec_saved_job["adjusted"] == _spec_jobs_before[_spec_job_id]["adjusted"])
+        ck("approved specification correction re-costs the assessor-approved area",
+           _spec_json["post_approval_correction"] is True and
+           _spec_saved_job["costing"]["area_m2"] == 100 and
+           _spec_saved_job["costing"]["spec"]["depth_mm"] == 200 and
+           _spec_saved_job["costing"]["total_gbp"] !=
+               _initial_spec_costing["total_gbp"],
+           {"before": _initial_spec_costing, "after": _spec_saved_job["costing"]})
+        _revised_spec_paths = _spec_saved_job.get("quotation_paths") or {}
+        ck("post-approval correction creates visible REV_02 files and immutable revision history",
+           _spec_json["quotation_revision"] == 2 and
+           _spec_saved_job["quotation_revision"] == 2 and
+           [entry["label"] for entry in _spec_saved_job["quotation_history"]] ==
+               ["REV_01", "REV_02"] and
+           all("REV_02" in Path(path).stem for path in _revised_spec_paths.values()) and
+           all(Path(_initial_spec_paths[fmt]).read_bytes() == original
+               for fmt, original in _initial_spec_bytes.items()),
+           _spec_saved_job.get("quotation_history"))
+        _revised_spec_text = Path(_revised_spec_paths["txt"]).read_text()
+        ck("corrected quotation visibly declares correction-after-approval and revision",
+           "CORRECTION AFTER APPROVAL" in _revised_spec_text and
+           "REV_02" in _revised_spec_text, _revised_spec_text[:500])
+        _sibling_revised_text = quotation_text(_AS._quotation_for_job(
+            "22222222-2222-4222-8222-222222222222"))
+        ck("case correction remains REV_02 with a caveat when downloaded from a sibling drawing",
+           "CORRECTION AFTER APPROVAL" in _sibling_revised_text and
+           "REV_02" in _sibling_revised_text, _sibling_revised_text[:500])
+
+        # Normal pipeline jobs carry per-zone checklists. Their approved correction route must
+        # re-cost the corrected zone (and only that zone), otherwise the portal says REV_02 while
+        # the mixed-zone quotation still contains the pre-correction blank/stale rate.
+        from slab_spec import empty_brief_spec as _empty_zone_brief
+        _zone_spec_job_id = "11111111-1111-4111-8111-111111111119"
+        _zone_spec_zones = [
+            {"category": "external_yard", "area_m2": 100.0, "measurement_kind": "area"},
+            {"category": "dock", "area_m2": 20.0, "measurement_kind": "area"},
+        ]
+        _zone_briefs = {
+            "external_yard": _empty_zone_brief("external_yard"),
+            "dock": _empty_zone_brief("dock"),
+        }
+        _zone_result = {
+            "file": "Approved Mixed Zones.pdf", "area_m2": 120.0,
+            "measurement_state": "MEASURED_VERIFIED", "scale_k": 0.1,
+            "zones": _zone_spec_zones, "brief_specs": _zone_briefs,
+            "costing": _copy.deepcopy(_initial_spec_costing),
+        }
+        _zone_job = {
+            "id": _zone_spec_job_id, "project_ref": "ZONE-SPEC-CORR-1",
+            "project_name": "Zone correction QA", "status": "approved",
+            "decision": "approved", "decided_at": "2026-07-15T11:00:00",
+            "measurement_state": "MEASURED_VERIFIED", "scale_confirmed": True,
+            "result": _zone_result, "zones": _zone_spec_zones,
+            "brief_specs": _zone_briefs, "costing": _copy.deepcopy(_initial_spec_costing),
+        }
+        _zone_jobs = _AS.load_jobs()
+        _zone_jobs[_zone_spec_job_id] = _zone_job
+        _AS.save_jobs(_zone_jobs)
+        _zone_rev1_paths = _AS._save_quotation(
+            _zone_spec_job_id, _AS._quotation_result_for_job(_zone_job),
+            _zone_job["costing"], file_stem="ZONE-SPEC-CORR-1-REV_01")
+        _zone_jobs = _AS.load_jobs()
+        _zone_jobs[_zone_spec_job_id].update({
+            "quotation_paths": _zone_rev1_paths, "quotation_revision": 1,
+            "quotation_status": "ready", "quotation_history": [{
+                "revision": 1, "label": "REV_01", "issued_at": "2026-07-15T11:00:00",
+                "reason": "initial approval", "paths": dict(_zone_rev1_paths),
+            }],
+        })
+        _AS.save_jobs(_zone_jobs)
+        _zone_spec_resp = _client_up.post(f"/spec-override/{_zone_spec_job_id}", json={
+            "zone_category": "external_yard", "fields": {
+                "depth_mm": 200, "conc_mix": "C32/40", "mesh": "A252", "layers": 1,
+                "bay_sizes": None, "joint_details": None,
+            },
+        })
+        _zone_spec_json = _zone_spec_resp.get_json()
+        _zone_spec_saved = _AS.load_jobs()[_zone_spec_job_id]
+        _zone_costing = (_zone_spec_saved.get("zone_costings") or {}).get("external_yard")
+        ck("approved per-zone specification correction re-costs the exact assessor-scoped zone",
+           _zone_spec_resp.status_code == 200 and _zone_spec_json["repriced"] is True and
+           _zone_costing and _zone_costing["area_m2"] == 100.0 and
+           _zone_costing["spec"]["depth_mm"] == 200 and
+           "dock" not in (_zone_spec_saved.get("zone_costings") or {}),
+           {"response": _zone_spec_json, "zone_costings": _zone_spec_saved.get("zone_costings")})
+        _zone_quote = _AS._quotation_for_job(_zone_spec_job_id)
+        _zone_yard_lines = [item for item in _zone_quote["line_items"]
+                            if item["section"] == "External yard slabs"]
+        _zone_dock_lines = [item for item in _zone_quote["line_items"]
+                            if item["section"] == "Dock slabs"]
+        ck("zone correction prices Yard in REV_02 while unsupplied Dock stays blank",
+           _zone_spec_json["quotation_revision"] == 2 and
+           _zone_yard_lines and isinstance(_zone_yard_lines[0].get("rate"), (int, float)) and
+           _zone_dock_lines and _zone_dock_lines[0].get("rate") is None,
+           {"yard": _zone_yard_lines, "dock": _zone_dock_lines})
+        ck("per-zone correction never overwrites the legacy aggregate costing",
+           _zone_spec_saved["costing"] == _zone_job["costing"],
+           _zone_spec_saved["costing"])
+
         _bad_spec_resp = _client_up.post(f"/spec-override/{_spec_job_id}", json={
             "slab_type": "upper_floor", "fields": {"bay_sizes": "5m x 5m"},
         })
@@ -3489,9 +3765,11 @@ try:
                       "bay_sizes":None, "joint_details":None},
         })
         _zone_spec_job = _AS.load_jobs()[_mixed_zone_id]
-        ck("per-zone slab checklist persists without inheriting/recalculating aggregate rate",
-           _zone_spec_resp.status_code == 200 and not _zone_spec_resp.get_json()["repriced"] and
+        ck("per-zone slab checklist re-prices only its zone without overwriting aggregate rate",
+           _zone_spec_resp.status_code == 200 and _zone_spec_resp.get_json()["repriced"] and
            _zone_spec_job["brief_specs"]["dock"]["fields"]["depth_mm"]["value"] == 250 and
+           _zone_spec_job["zone_costings"]["dock"]["area_m2"] == 20 and
+           _zone_spec_job["zone_costings"]["dock"]["spec"]["depth_mm"] == 250 and
            _zone_spec_job["costing"] == _mixed_costing,
            _zone_spec_resp.get_json())
         _zone_adjust_resp = _client_up.post(f"/adjust/{_mixed_zone_id}", json={
@@ -3529,6 +3807,18 @@ try:
            "${esc(spec.mesh||'A252')}" not in _portal_html_up and
            "ASSUMED / no details provided" in _portal_html_up and
            "projectPricingBlocked" in _portal_html_up)
+        ck("portal displays drawing-file and page citations only when extraction evidence exists",
+           all(marker in _portal_html_up for marker in (
+               "function specSourceCitation", "evidence.file", "evidence.page",
+               "Source: ${esc(citation)}")))
+        ck("portal permits an approved spec correction and labels its immutable quote revision",
+           all(marker in _portal_html_up for marker in (
+               "Correct approved specification", "Save as new quotation revision",
+               "post_approval_correction", "CORRECTED AFTER APPROVAL", "quotation_revision")))
+        ck("portal presents the measurement scale as both internal m/px and conventional 1:N",
+           all(marker in _portal_html_up for marker in (
+               'id="scaleDisplay"', 'id="scaleRatioDisplay"', "Drawing scale ratio",
+               "(mpp * snapScale) * 72 / 0.0254")))
         ck("portal renders and captures per-zone quantities/classifications/specs",
            all(marker in _portal_html_up for marker in (
                "Measured zones", "ZONE REVIEW REQUIRED", "classifyZone(",
@@ -3572,6 +3862,10 @@ try:
            all(marker in _portal_html_up for marker in (
                "channelDrag", "function editChannelLength", "syncChannelLengthInput",
                "line remains straight/non-diagonal", "polyline_pts:polylinePts")))
+        ck("portal separately supports assessor-drawn bending channel polylines",
+           all(marker in _portal_html_up for marker in (
+               "click each bend", "active.points.push(p)", "active.points.length",
+               "ch.points.length >= 2", "all bends reach the server/quotation")))
         ck("portal surfaces every retained Yard region and posts explicit keep/exclude decisions",
            all(marker in _portal_html_up for marker in (
                "effectiveYardRegions", "yard-region-toggle", "saveYardRegionReview",

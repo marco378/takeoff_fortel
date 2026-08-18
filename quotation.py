@@ -539,13 +539,16 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         if not isinstance(user_channels, list):
             continue
         for idx, ch in enumerate(user_channels, 1):
-            if not isinstance(ch, list) or len(ch) != 2:
+            if not isinstance(ch, list) or len(ch) < 2:
                 continue
-            # Calculate channel length from the two points (in PDF-point space)
+            # Assessor geometry is an open polyline in canvas-point space. Sum every segment;
+            # using only its first/last points would silently omit bends from the BOQ quantity.
             try:
-                dx = float(ch[1][0]) - float(ch[0][0])
-                dy = float(ch[1][1]) - float(ch[0][1])
-                length_pts = (dx**2 + dy**2) ** 0.5
+                length_pts = sum(
+                    ((float(ch[point_index][0]) - float(ch[point_index - 1][0])) ** 2
+                     + (float(ch[point_index][1]) - float(ch[point_index - 1][1])) ** 2) ** 0.5
+                    for point_index in range(1, len(ch))
+                )
             except (TypeError, ValueError, IndexError):
                 continue
             # Convert to metres using the job's scale
@@ -791,7 +794,9 @@ def quotation_text(q: dict) -> str:
                 f"{specification.get('slab_type_label') or 'Specification'}"
             )
             for field in specification.get("display_lines", []):
-                lines.append(f"    {field['label']}: {field['value']}")
+                citation = (f" (Source: {field['source_citation']})"
+                            if field.get("source_citation") else "")
+                lines.append(f"    {field['label']}: {field['value']}{citation}")
         lines.append("")
     lines += [
         "=" * 70,
@@ -877,7 +882,10 @@ def quotation_html(q: dict) -> str:
         spec_blocks = []
         for specification in q["specifications"]:
             fields = "".join(
-                f"<tr><td>{_h(field['label'])}</td><td>{_h(field['value'])}</td></tr>"
+                f"<tr><td>{_h(field['label'])}</td><td>{_h(field['value'])}"
+                + (f"<br><small>Source: {_h(field['source_citation'])}</small>"
+                   if field.get("source_citation") else "")
+                + "</td></tr>"
                 for field in specification.get("display_lines", [])
             )
             spec_blocks.append(
@@ -1157,7 +1165,12 @@ def quotation_xlsx(q: dict) -> bytes:
             if display_lines:
                 ws.cell(row, 1, _excel_text(
                     f"Specification — {specification.get('slab_type_label') or section}\n" +
-                    "\n".join(f"{field['label']}: {field['value']}" for field in display_lines)
+                    "\n".join(
+                        f"{field['label']}: {field['value']}"
+                        + (f" (Source: {field['source_citation']})"
+                           if field.get("source_citation") else "")
+                        for field in display_lines
+                    )
                 ))
                 ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
                 ws.cell(row, 1).font = Font(name="Arial", size=8,
@@ -1279,9 +1292,9 @@ def quotation_xlsx(q: dict) -> bytes:
     return out.getvalue()
 
 
-def save_quotation(q: dict, out_dir: str = ".") -> dict:
+def save_quotation(q: dict, out_dir: str = ".", file_stem: str | None = None) -> dict:
     """Save text, HTML, JSON and editable Excel versions to disk. Returns paths dict."""
-    base = Path(out_dir) / q["ref"]
+    base = Path(out_dir) / (file_stem or q["ref"])
     paths = {}
     base.parent.mkdir(parents=True, exist_ok=True)
     (p := Path(f"{base}.txt")).write_text(quotation_text(q));  paths["txt"]  = str(p)

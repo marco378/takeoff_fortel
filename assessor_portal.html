@@ -335,7 +335,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
       <button id="btnClear">🗑 Clear</button>
       <button id="btnNewRegion" title="Finish this outline and start another slab/core region">＋ Region</button>
       <button id="btnCutout" class="cutout" title="Draw a polygon over unwanted area to subtract it">✂️ Cut-out</button>
-      <button id="btnChannel" class="channel" title="Draw a channel line (red dotted)">📏 Channel</button>
+      <button id="btnChannel" class="channel" title="Draw a bending channel polyline; click again to finish">📏 Channel</button>
       <select id="traceScope" title="BOQ scope for the active trace" style="max-width:150px">
         <option value="main">Main slab</option>
         <option value="ground_floor_core">Ground-floor core</option>
@@ -426,6 +426,7 @@ canvas{display:block;border:1px solid var(--border);background:#fff;box-shadow:0
     <div class="info-section">
       <h3>Scale Calibration</h3>
       <div class="kv"><span class="k">Current k (m/px)</span><span class="v" id="scaleDisplay">—</span></div>
+      <div class="kv"><span class="k">Drawing scale ratio</span><span class="v" id="scaleRatioDisplay">—</span></div>
       <div class="cal-row" style="margin-top:8px">
         <span style="font-size:12px;color:var(--muted)">Real length:</span>
         <input type="number" id="calMetres" value="50" step="any" min="0.1" placeholder="metres">
@@ -543,7 +544,7 @@ let channelProposals = [];  // assumed two-point lines in CANVAS pixels; never m
 let transitionCandidates = []; // provisional prefills until assessor action; never auto-priced
 let channelDrag = null;     // {proposalIndex, pointIndex, axis}; edits stay axis-aligned
 let cutoutPolygons = [];    // completed cut-out regions: [{points:[{x,y}]}]
-let userChannels = [];      // user-drawn channel lines: [{points:[{x,y},{x,y}]}]
+let userChannels = [];      // assessor-drawn open polylines: [{points:[{x,y},...],complete:true}]
 let cutoutDrag = null;      // {polygonIndex, pointIndex} — dragging a cut-out vertex
 let userChannelDrag = null; // {channelIndex, pointIndex} — dragging a channel endpoint
 let cutoutSnapTarget = null; // {polygonIndex} — when hovering near first point of open cutout
@@ -1227,8 +1228,8 @@ function initialiseTraceState(job, res) {
   // Restore user-drawn channels from stored state
   const storedChannels = Array.isArray(adjusted.user_channels) ? adjusted.user_channels : [];
   userChannels = storedChannels.map(ch => ({
-    points: ch.map(point => ({x:Number(point[0]), y:Number(point[1])}))
-  })).filter(ch => ch.points.length === 2);
+    points: ch.map(point => ({x:Number(point[0]), y:Number(point[1])})), complete:true
+  })).filter(ch => ch.points.length >= 2);
   // An adjusted scale is already metres/canvas-pixel. Pipeline scale_k is metres/PDF-point.
   mpp = Number(adjusted.scale_k) || (res.scale_k ? res.scale_k / snapScale : null);
 }
@@ -1867,9 +1868,19 @@ function effectiveBriefSpecs(job) {
 }
 
 function specValueText(key, field) {
-  if (!field || field.value == null || field.value === '') return 'ASSUMED / no details provided';
+  if (!field || field.value == null || field.value === '') {
+    return field && field.note ? String(field.note) : 'ASSUMED / no details provided';
+  }
   const value = key === 'depth_mm' ? `${field.value} mm` : String(field.value);
   return field.provisional ? `${value} — ASSUMED / provisional` : value;
+}
+
+function specSourceCitation(field) {
+  const evidence = field && field.evidence;
+  if (!evidence || typeof evidence !== 'object') return '';
+  const file = String(evidence.file || '').trim();
+  const page = Number(evidence.page);
+  return file ? `${file}${Number.isFinite(page) && page > 0 ? `, page ${page}` : ''}` : '';
 }
 
 function renderBriefSpecSummary(brief) {
@@ -1879,9 +1890,11 @@ function renderBriefSpecSummary(brief) {
     ${schema.fields.map(([key,label]) => {
       const field = (brief.fields||{})[key] || {value:null,provisional:true};
       const basis = field.source || 'not_provided';
+      const citation = specSourceCitation(field);
       return `<div class="kv" style="gap:8px"><span class="k" style="font-size:10px">${esc(label)}</span>
         <span class="v ${field.provisional?'assumption-item':''}" style="font-size:10px;color:${field.provisional?'#6f3500':'#b8e1c3'};padding:${field.provisional?'3px 5px':'0'}">
           ${esc(specValueText(key,field))} ${field.provisional?assumptionBadge('PROVISIONAL',basis):'· CONFIRMED'}
+          ${citation?`<span style="display:block;font-size:9px;color:#8fa8cc;margin-top:2px">Source: ${esc(citation)}</span>`:''}
         </span></div>`;
     }).join('')}
   </div>`;
@@ -1895,7 +1908,8 @@ function renderSpecFieldInputs(slabType, brief) {
   target.innerHTML = schema.fields.map(([key,label]) => {
     const field = storedFields[key] || {value:null,provisional:true};
     const confirmedValue = !field.provisional && field.value != null ? field.value : '';
-    const assumedHint = field.value != null
+    const citation = specSourceCitation(field);
+    const assumedHint = field.note ? String(field.note) : field.value != null
       ? `Assumed for current pricing: ${field.value}${key==='depth_mm'?' mm':''}`
       : 'No details provided — remains provisional';
     const inputType = (key === 'depth_mm' || key === 'layers') ? 'number' : 'text';
@@ -1906,6 +1920,7 @@ function renderSpecFieldInputs(slabType, brief) {
       <input data-spec-key="${key}" type="${inputType}" ${inputType==='number'?'min="1" step="1"':''}
              value="${esc(confirmedValue)}" placeholder="${esc(assumedHint)}"
              style="width:100%;margin-top:3px;padding:5px 6px;background:#1a3560;border:1px solid #2a4a80;border-radius:4px;color:#fff;font-size:12px">
+      ${citation?`<span style="display:block;font-size:9px;color:#8fa8cc;margin-top:2px">Source: ${esc(citation)}</span>`:''}
     </label>`;
   }).join('');
 }
@@ -1967,11 +1982,12 @@ function renderCosting(c, jobStatus, job={}) {
          🚨 <strong>Specification saved; pricing review required.</strong> ${esc(job.spec_pricing_warning)}
        </div>` : '';
 
-  const canOverride = jobStatus === 'pending' || jobStatus === 'adjusted';
+  const canOverride = jobStatus === 'pending' || jobStatus === 'adjusted' || jobStatus === 'approved';
+  const approvedCorrection = jobStatus === 'approved';
   const overrideForm = canOverride ? `
     <details id="specOverrideDetails" style="margin-top:8px">
       <summary style="cursor:pointer;font-size:12px;color:#8fa8cc;user-select:none;padding:4px 0">
-        ✏ Capture slab specification
+        ${approvedCorrection ? '✏ Correct approved specification' : '✏ Capture slab specification'}
       </summary>
       <form id="specOverrideForm" onsubmit="submitSpecOverride(event)"
             style="margin-top:8px;background:#0d1e38;border-radius:6px;padding:10px 12px;display:grid;gap:6px">
@@ -1991,9 +2007,9 @@ function renderCosting(c, jobStatus, job={}) {
         <div id="briefSpecFields" style="display:grid;gap:6px"></div>
         <button type="submit"
                 style="margin-top:4px;padding:6px 0;background:#1d6fa4;border:none;border-radius:4px;color:#fff;font-size:12px;font-weight:700;cursor:pointer">
-          Save specification
+          ${approvedCorrection ? 'Save as new quotation revision' : 'Save specification'}
         </button>
-        <div style="font-size:10px;color:#8fa8cc;line-height:1.35">Blank fields remain visibly provisional. Supplying pricing fields uses the existing rate build-up; bay/joint details are informational only.</div>
+        <div style="font-size:10px;color:#8fa8cc;line-height:1.35">Blank fields remain visibly provisional. Supplying pricing fields uses the existing rate build-up; bay/joint details are informational only.${approvedCorrection ? ' The prior issued quotation is preserved; this correction creates a visibly numbered revision.' : ''}</div>
         <div id="specOverrideMsg" style="font-size:11px;color:#8fa8cc;display:none"></div>
       </form>
     </details>` : '';
@@ -2054,6 +2070,13 @@ async function submitSpecOverride(e) {
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || r.statusText);
+    if (d.post_approval_correction) {
+      // Reload the saved job rather than locally approximating a commercial revision. The
+      // response has already persisted new costing, revision history, and immutable paths.
+      toast(`Specification corrected — REV_${String(d.quotation_revision).padStart(2,'0')} created; prior issue preserved`);
+      await selectJob(selectedJobId);
+      return;
+    }
     // Re-render costing inline without full panel reload
     const job = currentJob && currentJob.id === selectedJobId
       ? currentJob : (_jobs.find(j => j.id === selectedJobId) || {});
@@ -2118,6 +2141,13 @@ function renderDecision(job) {
   el.innerHTML = `<div class="decision-banner ${esc(job.decision)}">
     ${esc(job.decision).toUpperCase()} · ${(job.decided_at||'').substring(0,16).replace('T',' ')}
   </div>`;
+  if (job.spec_corrected_after_approval) {
+    const rev = Number(job.quotation_revision || 2);
+    el.innerHTML += `<div class="flag warn assumption-item" style="margin-top:8px">
+      📝 <strong>CORRECTED AFTER APPROVAL · REV_${String(rev).padStart(2,'0')}</strong>
+      <br><span style="font-size:11px">The earlier issued quotation is preserved in revision history; downloads below are the corrected revision.</span>
+    </div>`;
+  }
   if (job.quotation_error) {
     el.innerHTML += `<div class="flag err" style="margin-top:8px">
       ❌ <strong>Quotation generation failed.</strong> ${esc(job.quotation_error)}
@@ -2400,17 +2430,19 @@ function draw() {
     ctx.restore();
   });
 
-  // User-drawn channels (red dotted lines)
+  // Assessor-drawn channels (red dotted open polylines; bends are measured segment-by-segment)
   userChannels.forEach(ch => {
-    if (!ch.points || ch.points.length !== 2) return;
+    if (!ch.points || !ch.points.length) return;
     ctx.save();
     ctx.setLineDash([6,4]);
-    ctx.beginPath();
-    ctx.moveTo(ch.points[0].x, ch.points[0].y);
-    ctx.lineTo(ch.points[1].x, ch.points[1].y);
-    ctx.strokeStyle = 'rgba(192,57,43,0.9)';
-    ctx.lineWidth = lw * 1.5;
-    ctx.stroke();
+    if (ch.points.length >= 2) {
+      ctx.beginPath();
+      ch.points.forEach((point,index) => index
+        ? ctx.lineTo(point.x,point.y) : ctx.moveTo(point.x,point.y));
+      ctx.strokeStyle = 'rgba(192,57,43,0.9)';
+      ctx.lineWidth = lw * 1.5;
+      ctx.stroke();
+    }
     ch.points.forEach(point => {
       ctx.fillStyle = 'rgba(192,57,43,0.95)';
       ctx.beginPath(); ctx.arc(point.x, point.y, dotR, 0, Math.PI*2); ctx.fill();
@@ -2681,6 +2713,17 @@ function updateAreaDisplay() {
   document.getElementById('perimeterDisplay').textContent = displayedPerimeter
     ? `${displayedPerimeter.toLocaleString(undefined,{maximumFractionDigits:1})} m` : '—';
   document.getElementById('scaleDisplay').textContent = mpp ? mpp.toFixed(5) : '—';
+  // mpp is metres per rendered canvas pixel and snapScale is canvas pixels per PDF point.
+  // Multiplying restores the pipeline's metres/PDF-point k; 72 pt/in and 0.0254 m/in then
+  // give the conventional 1:N denominator. This is display-only and changes no measurement.
+  const ratioDenom = (mpp && snapScale)
+    ? Math.round((mpp * snapScale) * 72 / 0.0254)
+    : Number(currentJob && currentJob.result && currentJob.result.scale_ratio);
+  const scaleRatioDisplay = document.getElementById('scaleRatioDisplay');
+  if (scaleRatioDisplay) {
+    scaleRatioDisplay.textContent = Number.isFinite(ratioDenom) && ratioDenom > 0
+      ? `1:${ratioDenom}` : '—';
+  }
   const calDisplay = document.getElementById('calLineDisplay');
   const calLengthDisplay = document.getElementById('calLengthDisplay');
   if (calDisplay) {
@@ -2864,16 +2907,19 @@ function onContextMenu(e) {
   // Check user channels
   for (let ci = userChannels.length - 1; ci >= 0; ci--) {
     const ch = userChannels[ci];
-    if (!ch.points || ch.points.length !== 2) continue;
-    const [a, b] = ch.points;
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const lenSq = dx * dx + dy * dy;
-    let t = lenSq > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq)) : 0;
-    const projX = a.x + t * dx, projY = a.y + t * dy;
-    if (Math.hypot(p.x - projX, p.y - projY) < hitDist) {
-      userChannels.splice(ci, 1);
-      toast(`Channel ${ci + 1} deleted`);
-      draw(); return;
+    if (!ch.points || ch.points.length < 2) continue;
+    for (let si = 1; si < ch.points.length; si++) {
+      const a = ch.points[si - 1], b = ch.points[si];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const lenSq = dx * dx + dy * dy;
+      const t = lenSq > 0
+        ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq)) : 0;
+      const projX = a.x + t * dx, projY = a.y + t * dy;
+      if (Math.hypot(p.x - projX, p.y - projY) < hitDist) {
+        userChannels.splice(ci, 1);
+        toast(`Channel ${ci + 1} deleted`);
+        draw(); return;
+      }
     }
   }
 
@@ -2940,7 +2986,7 @@ function onDown(e) {
     // User channel endpoint drag
     for (let ci = 0; ci < userChannels.length; ci++) {
       const ch = userChannels[ci];
-      if (!ch.points || ch.points.length !== 2) continue;
+      if (!ch.points) continue;
       for (let pi = 0; pi < ch.points.length; pi++) {
         if (Math.hypot(ch.points[pi].x - p.x, ch.points[pi].y - p.y) < 10) {
           userChannelDrag = {channelIndex: ci, pointIndex: pi};
@@ -3028,15 +3074,17 @@ function onDown(e) {
     draw(); return;
   }
 
-  // Channel mode: draw two-point line
+  // Channel mode: each click extends the open polyline. Clicking the Channel button again
+  // finishes it; AI proposals use a separate axis-locked two-point workflow above.
   if (mode === 'channel') {
-    if (userChannels.length > 0 && userChannels[userChannels.length-1].points.length === 2) {
-      userChannels.push({points: [p]});
-    } else if (userChannels.length === 0) {
-      userChannels.push({points: [p]});
+    let active = userChannels.length ? userChannels[userChannels.length - 1] : null;
+    if (!active || active.complete) {
+      active = {points:[p], complete:false};
+      userChannels.push(active);
+      toast(`Channel ${userChannels.length} started — click each bend, then Channel again to finish`);
     } else {
-      userChannels[userChannels.length-1].points.push(p);
-      toast(`Channel ${userChannels.length} placed — click Submit Adjustment to save`);
+      active.points.push(p);
+      toast(`Channel ${userChannels.length}: ${active.points.length} vertices — click Channel again to finish`);
     }
     draw(); return;
   }
@@ -3070,7 +3118,7 @@ function onMove(e) {
   // User channel endpoint drag
   if (userChannelDrag) {
     const ch = userChannels[userChannelDrag.channelIndex];
-    if (ch && ch.points && ch.points.length === 2) {
+    if (ch && ch.points) {
       ch.points[userChannelDrag.pointIndex] = pos(e);
       if (canvas) canvas.style.cursor = 'move';
       draw();
@@ -3126,7 +3174,16 @@ function setupButtons() {
     document.getElementById('btnCutout').classList.remove('on');
     document.getElementById('btnChannel').classList.remove('on');
   });
-  document.getElementById('btnUndo').addEventListener('click', () => { poly.pop(); draw(); });
+  document.getElementById('btnUndo').addEventListener('click', () => {
+    const activeChannel = userChannels.length ? userChannels[userChannels.length - 1] : null;
+    if (mode === 'channel' && activeChannel && !activeChannel.complete) {
+      activeChannel.points.pop();
+      if (!activeChannel.points.length) userChannels.pop();
+    } else {
+      poly.pop();
+    }
+    draw();
+  });
   document.getElementById('btnClear').addEventListener('click', () => {
     poly=[]; traceRegions=[]; activeCandidateId=null; cal=[]; cutoutPolygons=[]; userChannels=[]; draw();
   });
@@ -3148,11 +3205,26 @@ function setupButtons() {
     draw();
   });
   document.getElementById('btnChannel').addEventListener('click', () => {
+    if (mode === 'channel') {
+      const active = userChannels.length ? userChannels[userChannels.length - 1] : null;
+      if (!active || active.complete || active.points.length < 2) {
+        toast('A channel needs at least two points before it can be finished', 'warn');
+        return;
+      }
+      active.complete = true;
+      mode = 'trace';
+      document.getElementById('btnChannel').classList.remove('on');
+      document.getElementById('btnTrace').classList.add('on');
+      toast(`Channel ${userChannels.length} finished with ${active.points.length} vertices`);
+      draw();
+      return;
+    }
     mode = 'channel';
     document.getElementById('btnChannel').classList.add('on');
     document.getElementById('btnTrace').classList.remove('on');
     document.getElementById('btnCal').classList.remove('on');
     document.getElementById('btnCutout').classList.remove('on');
+    toast('Click each channel bend; click Channel again to finish the open polyline');
   });
   document.getElementById('btnLoad').addEventListener('click', () => {
     const proposed = candidatePolygons.find(candidate =>
@@ -3305,8 +3377,8 @@ async function submitDecision(action) {
     // Cut-out regions to subtract from the measured area
     cutout_regions: cutoutPolygons.filter(r => r.points && r.points.length >= 3)
       .map(r => r.points.map(point => [Math.round(point.x), Math.round(point.y)])),
-    // User-drawn channel lines (red dotted)
-    user_channels: userChannels.filter(ch => ch.points && ch.points.length === 2)
+    // Assessor-drawn channel polylines (red dotted); all bends reach the server/quotation.
+    user_channels: userChannels.filter(ch => ch.points && ch.points.length >= 2)
       .map(ch => ch.points.map(point => [Math.round(point.x), Math.round(point.y)])),
     region_scopes: regionEntries.map(entry => entry.boqScope || 'main'),
     note: ''
