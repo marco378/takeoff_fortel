@@ -34,22 +34,15 @@ def _job_file(job: dict) -> str:
 
 def _approved_job_record(job_id: str, job: dict) -> dict:
     res = job.get("result") or {}
-    costing = job.get("costing") or res.get("costing") or {}
+    episode = job.get("learning_episode") if isinstance(job.get("learning_episode"), dict) else {}
     return {
         "job_id": job_id,
         "approved_at": _job_timestamp(job),
         "project_ref": job.get("project_ref") or res.get("project_ref") or "",
-        "project_name": job.get("project_name") or res.get("project_name") or "",
         "file": _job_file(job),
-        "area_m2": job.get("area_m2") or res.get("area_m2"),
-        "flags": list(job.get("flags") or res.get("flags") or []),
-        "scale_src": job.get("scale_src") or res.get("scale_src") or "",
-        "scale_k": job.get("scale_k") or res.get("scale_k"),
-        "method": job.get("method") or res.get("method") or "",
-        "source_discipline": job.get("source_discipline") or res.get("source_discipline") or "",
-        "confidence": job.get("confidence") or res.get("confidence"),
+        "document_sha256": str(job.get("document_sha256")
+                                or episode.get("document_sha256") or ""),
         "measurement_state": job.get("measurement_state") or res.get("measurement_state") or "",
-        "build_up_assumed": bool(costing.get("assumed")),
     }
 
 
@@ -66,6 +59,7 @@ def iter_approved_jobs(jobs: dict[str, dict]) -> Iterable[tuple[str, dict]]:
 def build_learned_patterns(jobs: dict[str, dict]) -> dict[str, Any]:
     by_file: dict[str, dict[str, Any]] = {}
     by_project_ref: dict[str, dict[str, Any]] = {}
+    by_document_sha256: dict[str, dict[str, Any]] = {}
 
     def update_bucket(bucket: dict[str, dict[str, Any]], key: str, match_type: str,
                       record: dict[str, Any]) -> None:
@@ -90,13 +84,63 @@ def build_learned_patterns(jobs: dict[str, dict]) -> dict[str, Any]:
         record = _approved_job_record(job_id, job)
         update_bucket(by_file, record["file"], "file", record)
         update_bucket(by_project_ref, record["project_ref"], "project_ref", record)
+        update_bucket(by_document_sha256, record["document_sha256"],
+                      "document_sha256", record)
 
     return {
         "generated_at": _iso_now(),
         "source": "approved jobs only",
         "by_file": by_file,
         "by_project_ref": by_project_ref,
+        "by_document_sha256": by_document_sha256,
     }
+
+
+def update_learned_patterns(patterns: dict[str, Any] | None, job_id: str, job: dict) -> dict[str, Any]:
+    """Increment one approved job without rebuilding the full jobs store."""
+    payload = dict(patterns or {})
+    payload.setdefault("source", "approved jobs only")
+    payload["generated_at"] = _iso_now()
+    record = _approved_job_record(job_id, job)
+    allowed_record_keys = set(record) | {"match_type", "match_value"}
+    # Older cache versions carried area, scale, confidence and flags. They were never
+    # auto-applied, but they are unnecessary client data in a cross-job derivative; scrub
+    # them opportunistically on the next approved update.
+    for old_bucket_name in ("by_file", "by_project_ref", "by_document_sha256"):
+        old_bucket = payload.get(old_bucket_name)
+        if not isinstance(old_bucket, dict):
+            continue
+        for old_key, old_value in list(old_bucket.items()):
+            if not isinstance(old_value, dict):
+                continue
+            clean_history = [
+                {key: value for key, value in item.items() if key in allowed_record_keys}
+                for item in (old_value.get("history") or []) if isinstance(item, dict)
+            ]
+            clean_latest = old_value.get("latest")
+            if isinstance(clean_latest, dict):
+                clean_latest = {
+                    key: value for key, value in clean_latest.items()
+                    if key in allowed_record_keys
+                }
+            old_bucket[old_key] = {"latest": clean_latest, "history": clean_history}
+    for bucket_name, key, match_type in (
+        ("by_file", record["file"], "file"),
+        ("by_project_ref", record["project_ref"], "project_ref"),
+        ("by_document_sha256", record["document_sha256"], "document_sha256"),
+    ):
+        bucket = payload.setdefault(bucket_name, {})
+        if not key:
+            continue
+        entry = dict(record, match_type=match_type, match_value=key)
+        current = dict(bucket.get(key) or {})
+        history = [item for item in (current.get("history") or [])
+                   if item.get("job_id") != job_id]
+        history.append(entry)
+        current["history"] = history
+        current["latest"] = max(history, key=lambda item: item.get("approved_at") or "")
+        bucket[key] = current
+    return payload
 
 
 def save_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -126,30 +170,33 @@ def load_or_build_patterns(jobs: dict[str, dict], path: Path) -> dict[str, Any]:
     return patterns
 
 
-def prior_approval_for_job(job: dict, patterns: dict[str, Any]) -> dict[str, Any] | None:
-    res = job.get("result") or {}
-    file_value = _job_file(job)
-    ref_value = (job.get("project_ref") or res.get("project_ref") or "").strip()
-    by_file = patterns.get("by_file") if isinstance(patterns, dict) else {}
-    by_project_ref = patterns.get("by_project_ref") if isinstance(patterns, dict) else {}
-    for match_type, match_value, bucket in (
-        ("file", file_value, by_file),
-        ("project_ref", ref_value, by_project_ref),
-    ):
-        if not match_value or not isinstance(bucket, dict):
-            continue
-        entry = bucket.get(match_value) or {}
-        latest = entry.get("latest")
+def prior_approval_for_job(job: dict, patterns: dict[str, Any],
+                           exclude_job_id: str | None = None) -> dict[str, Any] | None:
+    file_hash = str(job.get("document_sha256") or "").strip().lower()
+    by_hash = patterns.get("by_document_sha256") if isinstance(patterns, dict) else {}
+    if file_hash and isinstance(by_hash, dict):
+        bucket = by_hash.get(file_hash) or {}
+        candidates = list(bucket.get("history") or [])
+        if bucket.get("latest") and not candidates:
+            candidates = [bucket["latest"]]
+        candidates.sort(key=lambda item: item.get("approved_at") or "", reverse=True)
+        latest = next((item for item in candidates
+                       if item.get("job_id") != exclude_job_id), None)
         if latest:
-            prior = dict(latest)
-            prior["matched_on"] = match_type
-            return prior
+            # The API/UI receives identity and provenance only. Learned measurements,
+            # geometry, costing and rates are never copied into a current job payload.
+            return {
+                "job_id": latest.get("job_id"),
+                "approved_at": latest.get("approved_at"),
+                "document_sha256": file_hash,
+                "matched_on": "exact document SHA-256",
+            }
     return None
 
 
 def attach_prior_approval(job_id: str, job: dict, patterns: dict[str, Any]) -> dict[str, Any]:
     payload = dict(job)
-    prior = prior_approval_for_job(job, patterns)
+    prior = prior_approval_for_job(job, patterns, exclude_job_id=job_id)
     if prior:
         payload["prior_approval"] = prior
     payload["id"] = payload.get("id") or job_id
@@ -161,20 +208,34 @@ def analytics_report(jobs: dict[str, dict]) -> dict[str, Any]:
     by_project: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "deltas": []})
     for job_id, job in iter_approved_jobs(jobs):
         res = job.get("result") or {}
-        area = job.get("area_m2") or res.get("area_m2")
-        assessed = (job.get("adjusted") or {}).get("area_m2")
+        episode = job.get("learning_episode") if isinstance(job.get("learning_episode"), dict) else {}
+        initial = episode.get("initial") if isinstance(episode.get("initial"), dict) else {}
+        initial_snapshot = (initial.get("snapshot")
+                            if isinstance(initial.get("snapshot"), dict) else {})
+        terminal = episode.get("terminal") if isinstance(episode.get("terminal"), dict) else {}
+        terminal_snapshot = (terminal.get("snapshot")
+                             if isinstance(terminal.get("snapshot"), dict) else {})
+        original_available = bool(initial.get("original_available"))
+        ai_area = initial_snapshot.get("area_m2") if original_available else None
+        assessed = (terminal_snapshot.get("area_m2")
+                    if terminal_snapshot else (job.get("adjusted") or {}).get("area_m2"))
+        final_area = assessed if isinstance(assessed, (int, float)) else (
+            job.get("area_m2") or res.get("area_m2"))
         delta = None
-        if isinstance(area, (int, float)) and isinstance(assessed, (int, float)):
-            delta = round(float(assessed) - float(area), 3)
+        if isinstance(ai_area, (int, float)) and isinstance(final_area, (int, float)):
+            delta = round(float(final_area) - float(ai_area), 3)
         row = {
             "job_id": job_id,
             "file": _job_file(job),
             "project_ref": job.get("project_ref") or res.get("project_ref") or "",
             "project_name": job.get("project_name") or res.get("project_name") or "",
             "approved_at": _job_timestamp(job),
-            "area_m2": area,
-            "assessed_area_m2": assessed,
+            "area_m2": final_area,
+            "ai_area_m2": ai_area,
+            "assessed_area_m2": final_area,
             "delta_m2": delta,
+            "learning_outcome": terminal.get("event") or None,
+            "original_available": original_available,
         }
         rows.append(row)
         ref = row["project_ref"] or "__no_project_ref__"
