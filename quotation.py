@@ -55,6 +55,7 @@ STANDARD_TERMS = (
 
 SECTION_ORDER = (
     "External yard slabs",
+    "Footpath slabs",
     "Dock slabs",
     "Ground floor slabs",
     "Upper floor slabs",
@@ -68,6 +69,15 @@ ZONE_SECTION = {
     "dock": "Dock slabs",
     "ground_floor": "Ground floor slabs",
     "upper_floor": "Upper floor slabs",
+}
+
+FORTEL_MH_ROW = "E/O for MH details"
+FORTEL_CHANNEL_ROW = "Pouring top of Channel Lengths"
+FORTEL_TRANSITION_ROW = "E/O for Transition Details"
+_FORTEL_EO_ORDER = {
+    FORTEL_MH_ROW: 0,
+    FORTEL_CHANNEL_ROW: 1,
+    FORTEL_TRANSITION_ROW: 2,
 }
 
 
@@ -157,6 +167,8 @@ def quotation_section(result: dict) -> str:
     )).casefold().replace("_", "-")
     if "prelim" in label:
         return "Prelims"
+    if "footpath" in label or "foot path" in label:
+        return "Footpath slabs"
     if "dock" in label:
         return "Dock slabs"
     if any(term in label for term in (
@@ -173,6 +185,8 @@ def _normalise_section(section, fallback="External yard slabs"):
     aliases = {
         "yard": "External yard slabs", "external": "External yard slabs",
         "external yard": "External yard slabs", "external yard slabs": "External yard slabs",
+        "footpath": "Footpath slabs", "foot path": "Footpath slabs",
+        "footpath slab": "Footpath slabs", "footpath slabs": "Footpath slabs",
         "dock": "Dock slabs", "dock slabs": "Dock slabs",
         "ground": "Ground floor slabs", "ground floor": "Ground floor slabs",
         "ground floor slabs": "Ground floor slabs", "gf ancillary": "Ground floor slabs",
@@ -197,6 +211,76 @@ def _provisional_text(li):
 
 def _unique_notes(notes):
     return list(dict.fromkeys(note for note in notes if note))
+
+
+def _fortel_eo_description(description) -> str | None:
+    """Map legacy/source wording onto Fortel's standard extra-over row labels."""
+    text = str(description or "").strip()
+    if text in _FORTEL_EO_ORDER:
+        return text
+    folded = text.casefold()
+    if folded.startswith("e/o for mh details") or folded.startswith("manholes ("):
+        return FORTEL_MH_ROW
+    if folded.startswith("channel ") or folded.startswith("channel —"):
+        return FORTEL_CHANNEL_ROW
+    if folded in {"channel", "channel length"}:
+        return FORTEL_CHANNEL_ROW
+    if folded.startswith("transition ") or folded.startswith("transition —"):
+        return FORTEL_TRANSITION_ROW
+    if folded in {"transition", "transition length"}:
+        return FORTEL_TRANSITION_ROW
+    return None
+
+
+def _fortel_concrete_description(spec: dict) -> str:
+    """Build the concrete-row label only from specification values already in the job."""
+    parts = []
+    if spec.get("depth_mm") is not None:
+        parts.append(f"{spec['depth_mm']}mm. th")
+    parts.append("Concrete Slabs")
+    if spec.get("conc_mix"):
+        parts.append(str(spec["conc_mix"]))
+    if spec.get("air_entrained") is True:
+        parts.append("AE")
+    if spec.get("aggregate_mm") is not None:
+        parts.append(f"{spec['aggregate_mm']}mm agg.")
+    return " ".join(parts)
+
+
+def _fortel_mesh_description(mesh, layers) -> str:
+    parts = [str(mesh)] if mesh else []
+    parts.append("Mesh Fabric")
+    if layers is not None:
+        layer_text = "Single Layer" if int(layers) == 1 else f"{int(layers)} Layers"
+        parts.append(f"x {layer_text}")
+    return " ".join(parts)
+
+
+def _bay_size_pair(brief_spec: dict):
+    field = (brief_spec.get("fields") or {}).get("bay_sizes") or {}
+    value = field.get("value") if isinstance(field, dict) else None
+    if not value:
+        return None
+    numbers = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:m(?:etre)?s?)?", str(value), re.I)
+    if len(numbers) < 2:
+        return None
+
+    def clean(number):
+        return f"{float(number):g}"
+
+    return clean(numbers[0]), clean(numbers[1])
+
+
+def _fortel_joints_description(section: str, brief_spec: dict) -> str:
+    if section in {"External yard slabs", "Footpath slabs"}:
+        pair = _bay_size_pair(brief_spec)
+        if pair:
+            return (f"Joints (Excl. Mastic) - Based on {pair[0]}m wide x "
+                    f"{pair[1]}m long bays")
+        return "Joints (Excl. Mastic)"
+    if section == "Ground floor slabs":
+        return "Saw Cuts and Movement Joints (Excl. Mastic)"
+    return "Saw Cuts and Movement Joints"
 
 
 # ── Core generator ────────────────────────────────────────────────────────────
@@ -245,6 +329,33 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
     rates_updated_at = []
     client_rate_fields = []
     commercial = dict(commercial or {})
+
+    def add_assessor_eo(section, description, quantity, unit, *, drawing="",
+                        provisional=False, basis=""):
+        """Aggregate assessor quantities into Fortel's one-row-per-E/O workbook shape."""
+        existing = next((item for item in extra_rows
+                         if item.get("section") == section
+                         and item.get("description") == description
+                         and item.get("unit") == unit
+                         and item.get("rate") is None), None)
+        if existing is None:
+            existing = {
+                "section": section, "description": description, "qty": 0.0,
+                "unit": unit, "rate": None, "value": None,
+                "assessor_rate_required": True, "provisional": False,
+                "provisional_reason": "", "assumption_basis": basis,
+                "drawings": [],
+            }
+            extra_rows.append(existing)
+        existing["qty"] = round(float(existing["qty"]) + float(quantity), 2)
+        existing["provisional"] = bool(existing["provisional"] or provisional)
+        existing["provisional_reason"] = (PROVISIONAL_LABEL
+                                            if existing["provisional"] else "")
+        if basis and not existing.get("assumption_basis"):
+            existing["assumption_basis"] = basis
+        if drawing and drawing not in existing["drawings"]:
+            existing["drawings"].append(drawing)
+        return existing
 
     for unit in results:
         costing = unit.get("costing") or {}
@@ -359,11 +470,12 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
 
         assumed_manhole_count = unit.get("manhole_count_assumed")
         if assumed_manhole_count is not None:
-            mkey = (section, "Manholes (assumed fallback)", "Nr", True)
+            mkey = (section, FORTEL_MH_ROW, "Nr", True)
             measurement = measurements_by_key.setdefault(mkey, {
-                "section": section, "description": "Manholes (assumed fallback)", "qty": 0,
+                "section": section, "description": FORTEL_MH_ROW, "qty": 0,
                 "unit": "Nr", "provisional": True, "drawings": [],
                 "provisional_reason": PROVISIONAL_LABEL,
+                "assessor_rate_required": True,
             })
             measurement["qty"] += int(assumed_manhole_count)
             if drawing and drawing not in measurement["drawings"]:
@@ -382,6 +494,7 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                     "section": _normalise_section(ex.get("section"), section),
                     "description": ex["description"], "qty": ex["qty"], "unit": ex["unit"],
                     "rate": item_rate, "value": item_value,
+                    "assessor_rate_required": (item_rate is None and not ex.get("value_status")),
                     "value_status": ex.get("value_status") or "",
                     "provisional": provisional,
                     "provisional_reason": PROVISIONAL_LABEL if provisional else "",
@@ -405,8 +518,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 quantities.append((
                     (ZONE_SECTION.get(zone.get("slab_category"), quotation_section(unit))
                      if category == "construction_joint" else "External yard slabs"),
-                    ("Channel length" if category == "channel" else
-                     "Transition length" if category == "transition" else
+                    (FORTEL_CHANNEL_ROW if category == "channel" else
+                     FORTEL_TRANSITION_ROW if category == "transition" else
                      "Internal construction joint (CJ)"),
                     float(zone["length_lm"]),
                 ))
@@ -461,15 +574,10 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 if (isinstance(length_lm, (int, float)) and not isinstance(length_lm, bool)
                         and length_lm > 0):
                     edited = "assessor-edited" if decision.get("edited") else "assessor-accepted"
-                    extra_rows.append({
-                        "section": "External yard slabs",
-                        "description": f"Channel — {component_label} ({edited} proposal)",
-                        "qty": round(float(length_lm), 2), "unit": "Lm",
-                        "rate": None, "value": None, "assessor_rate_required": True,
-                        "provisional": True, "provisional_reason": PROVISIONAL_LABEL,
-                        "assumption_basis": basis,
-                        "drawings": [drawing] if drawing else [],
-                    })
+                    add_assessor_eo(
+                        "External yard slabs", FORTEL_CHANNEL_ROW, length_lm, "Lm",
+                        drawing=drawing, provisional=True, basis=basis,
+                    )
                     declarations.append(
                         f"{PROVISIONAL_LABEL}: {component_label} — {length_lm:g} Lm included "
                         f"as an {edited} assumption with rate left blank; basis: {basis}."
@@ -506,15 +614,10 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 if (isinstance(length_lm, (int, float)) and not isinstance(length_lm, bool)
                         and length_lm > 0):
                     edited = "assessor-edited" if decision.get("edited") else "assessor-accepted"
-                    extra_rows.append({
-                        "section": "External yard slabs",
-                        "description": f"Transition — {region_label} ({edited} proposal)",
-                        "qty": round(float(length_lm), 2), "unit": "Lm",
-                        "rate": None, "value": None, "assessor_rate_required": True,
-                        "provisional": True, "provisional_reason": PROVISIONAL_LABEL,
-                        "assumption_basis": basis,
-                        "drawings": [drawing] if drawing else [],
-                    })
+                    add_assessor_eo(
+                        "External yard slabs", FORTEL_TRANSITION_ROW, length_lm, "Lm",
+                        drawing=drawing, provisional=True, basis=basis,
+                    )
                     declarations.append(
                         f"{PROVISIONAL_LABEL}: Transition at {region_label} — {length_lm:g} Lm "
                         f"included as an {edited} assumption with rate left blank; basis: {basis}."
@@ -558,15 +661,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             length_lm = round(length_pts * scale_k, 2)
             if length_lm <= 0:
                 continue
-            extra_rows.append({
-                "section": "External yard slabs",
-                "description": f"Channel — assessor-drawn run #{idx}",
-                "qty": length_lm, "unit": "Lm",
-                "rate": None, "value": None, "assessor_rate_required": True,
-                "provisional": True, "provisional_reason": PROVISIONAL_LABEL,
-                "assumption_basis": "assessor-drawn channel on portal",
-                "drawings": [drawing] if drawing else [],
-            })
+            add_assessor_eo(
+                "External yard slabs", FORTEL_CHANNEL_ROW, length_lm, "Lm",
+                drawing=drawing, provisional=True,
+                basis="assessor-drawn channel on portal",
+            )
             declarations.append(
                 f"{PROVISIONAL_LABEL}: assessor-drawn channel #{idx} — {length_lm:g} Lm "
                 f"included with rate left blank; basis: assessor-drawn on portal."
@@ -667,7 +766,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "id": group_id,
             "section": group["section"],
             "slab_type": group["brief_spec"].get("slab_type"),
-            "slab_type_label": group["brief_spec"].get("slab_type_label"),
+            "slab_type_label": ("Footpath Slabs" if group["section"] == "Footpath slabs"
+                                else group["brief_spec"].get("slab_type_label")),
             "fields": group["brief_spec"].get("fields") or {},
             "display_lines": brief_spec_display_lines(group["brief_spec"]),
             "provisional": group["assumed"],
@@ -679,16 +779,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "section": group["section"], "qty": area, "unit": "m²",
             "drawings": group["drawings"], "specification_id": group_id,
         }
-        known_parts = []
-        if depth_mm is not None: known_parts.append(f"{depth_mm}mm")
-        if mix: known_parts.append(str(mix))
-        known_parts.append("slab")
-        if layers is not None and mesh: known_parts.append(f"{layers}× {mesh} mesh")
         scope_prefix = {
             "plant_deck": "Plant deck — ",
             "pod_first_floor": "POD first floor — ",
         }.get(group.get("boq_scope"), "")
-        slab_desc = scope_prefix + " ".join(known_parts) + " (supply & lay)"
+        slab_desc = scope_prefix + _fortel_concrete_description(spec)
         line_items.append({
             **common, "description": slab_desc, "rate": group["rate"],
             "value": (round(area * group["rate"], 2)
@@ -696,18 +791,47 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "assessor_rate_required": group.get("rate") is None,
             "provisional": group["assumed"],
             "provisional_reason": PROVISIONAL_LABEL if group["assumed"] else "",
+            "line_role": "concrete_slab",
         })
+
+        # Fortel's standard sheet shows these components as included in the concrete slab
+        # rate.  They are presentation rows only: no component rate is split out, derived or
+        # copied from the supplied commercial workbook, so the quotation total is unchanged.
+        included_rows = (
+            (_fortel_mesh_description(mesh, layers), "mesh"),
+            ("Curing Agent", "curing"),
+            ("DPM 1200G (Excl. tapes and seals to laps)", "dpm"),
+            (("Brush Finish" if group["section"] in {
+                "External yard slabs", "Footpath slabs", "Dock slabs"
+            } else "Eazifloat Finish"), "finish"),
+        )
+        for description, line_role in included_rows:
+            line_items.append({
+                **common, "description": description, "rate": None, "value": None,
+                "value_status": "Incl.", "assessor_rate_required": False,
+                "provisional": group["assumed"],
+                "provisional_reason": PROVISIONAL_LABEL if group["assumed"] else "",
+                "line_role": line_role,
+            })
+
         # Existing quotation adders are preserved unchanged; only their section/aggregated
         # quantity changes so all units share the client's requested one-tab structure.
-        adders = ([
-            ("Final trim ±50mm", area, "m²", 1.40),
-            ("Saw cuts & bay joints", area, "m²", 4.85),
-        ] if isinstance(group.get("rate"), (int, float)) else [])
+        priced_group = isinstance(group.get("rate"), (int, float))
+        adders = [
+            ("Final Trimm +/-50mm dp. LP Only", area, "m²",
+             1.40 if priced_group else None),
+            (_fortel_joints_description(group["section"], group["brief_spec"]),
+             area, "m²", 4.85 if priced_group else None),
+        ]
         for desc, qty, unit_name, item_rate in adders:
+            rate_missing = item_rate is None
             line_items.append({
                 **common, "description": desc, "qty": qty, "unit": unit_name,
-                "rate": item_rate, "value": round(qty * item_rate, 2),
-                "provisional": False,
+                "rate": item_rate,
+                "value": (round(qty * item_rate, 2) if not rate_missing else None),
+                "assessor_rate_required": rate_missing,
+                "provisional": rate_missing,
+                "provisional_reason": PROVISIONAL_LABEL if rate_missing else "",
             })
 
     if extras is not None:
@@ -732,6 +856,7 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             extra_rows.append({
                 "section": section, "description": desc, "qty": qty, "unit": unit_name,
                 "rate": item_rate, "value": item_value, "value_status": value_status,
+                "assessor_rate_required": item_rate is None and not value_status,
                 "provisional": provisional,
                 "provisional_reason": PROVISIONAL_LABEL if provisional else "",
                 "drawings": [],
@@ -740,7 +865,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 declarations.append(f"{PROVISIONAL_LABEL}: {desc} must be confirmed before issue.")
 
     line_items.extend(extra_rows)
-    line_items.sort(key=lambda li: _SECTION_RANK.get(li["section"], len(SECTION_ORDER)))
+    line_items.sort(key=lambda li: (
+        _SECTION_RANK.get(li["section"], len(SECTION_ORDER)),
+        1 if _fortel_eo_description(li.get("description")) else 0,
+        _FORTEL_EO_ORDER.get(_fortel_eo_description(li.get("description")), 0),
+    ))
     measurements = sorted(measurements_by_key.values(),
                           key=lambda item: _SECTION_RANK[item["section"]])
     subtotal = round(sum(float(li["value"]) for li in line_items
@@ -758,9 +887,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
 
     if extras is None:
         declarations.append(
-            "NOTE — Extra-over items (slot drains, transitions, etc. other than manholes) "
-            "not included: quantities cannot be measured from the drawing automatically "
-            "and require manual assessment by the assessor before issue."
+            "NOTE — Other extra-over items not explicitly listed in this quotation are not "
+            "included; the assessor must add any further quantities before issue."
         )
 
     distinct_rate_versions = sorted(set(rates_versions))
@@ -1068,8 +1196,9 @@ def _excel_unit(value):
 def _excel_section_title(section, items):
     labels = {
         "External yard slabs": "External Yard Slabs",
+        "Footpath slabs": "Footpath Slabs",
         "Dock slabs": "Dock Slabs",
-        "Ground floor slabs": "Ground Floor Slabs (Ancillary Areas)",
+        "Ground floor slabs": "Ground Floor Slabs",
         "Upper floor slabs": "Upper Floors",
         "Prelims": "Prelims",
     }
@@ -1171,10 +1300,15 @@ def quotation_xlsx(q: dict) -> bytes:
             if item.get("specification_id")
         ))
         ungrouped = [item for item in section_items if not item.get("specification_id")]
+        special_ungrouped = [item for item in ungrouped
+                             if _fortel_eo_description(item.get("description"))]
+        ungrouped = [item for item in ungrouped
+                     if not _fortel_eo_description(item.get("description"))]
 
         def _write_item(item, qty_formula=None):
             nonlocal row
-            description = item["description"]
+            description = (_fortel_eo_description(item.get("description"))
+                           or item["description"])
             if item.get("provisional"):
                 description += f"\n{PROVISIONAL_LABEL}"
             ws.cell(row, 1, _excel_text(description))
@@ -1187,9 +1321,9 @@ def quotation_xlsx(q: dict) -> bytes:
             if value_status:
                 ws.cell(row, 5, _excel_text(value_status))
             elif isinstance(rate, (int, float)):
-                ws.cell(row, 5, f"=B{row}*D{row}")
+                ws.cell(row, 5, f"=ROUND(B{row}*D{row},2)")
             elif item.get("assessor_rate_required"):
-                ws.cell(row, 5, f'=IF(D{row}="","",B{row}*D{row})')
+                ws.cell(row, 5, f'=IF(D{row}="","",ROUND(B{row}*D{row},2))')
             elif isinstance(item.get("value"), (int, float)):
                 ws.cell(row, 5, float(item["value"]))
             ws.cell(row, 2).number_format = '#,##0.##'
@@ -1259,8 +1393,10 @@ def quotation_xlsx(q: dict) -> bytes:
         for item in ungrouped:
             _write_item(item)
 
-        for measurement in (m for m in assessor_measurements if m["section"] == section):
-            quantity_rows = measurement.get("quantity_rows") or []
+        def _write_measurement(measurement, *, show_sources=True):
+            nonlocal row
+            quantity_rows = ((measurement.get("quantity_rows") or [])
+                             if show_sources else [])
             first_quantity_row = row
             for quantity_row in quantity_rows:
                 ws.cell(row, 1, _excel_text(quantity_row.get("description") or "Measured length"))
@@ -1281,11 +1417,45 @@ def quotation_xlsx(q: dict) -> bytes:
                 row += 1
                 quantity_formula = f"=B{total_quantity_row}"
             _write_item({
-                "description": measurement["description"], "qty": measurement["qty"],
+                "description": (_fortel_eo_description(measurement["description"])
+                                or measurement["description"]),
+                "qty": measurement["qty"],
                 "unit": measurement["unit"], "rate": None, "value": None,
                 "provisional": measurement.get("provisional", False),
                 "assessor_rate_required": True,
             }, qty_formula=quantity_formula)
+
+        section_measurements = [m for m in assessor_measurements
+                                if m["section"] == section]
+        for measurement in section_measurements:
+            if not _fortel_eo_description(measurement.get("description")):
+                _write_measurement(measurement)
+
+        # The supplied Fortel sheet places its extra-over rows after the slab/perimeter rows,
+        # in MH -> Channel -> Transition order.  Legacy descriptions are normalised here so
+        # old saved jobs also export into the current standard layout.
+        special_entries = [
+            (_FORTEL_EO_ORDER[_fortel_eo_description(item["description"])], index,
+             "item", item)
+            for index, item in enumerate(special_ungrouped)
+        ]
+        special_entries.extend(
+            (_FORTEL_EO_ORDER[_fortel_eo_description(measurement["description"])],
+             len(special_entries) + index, "measurement", measurement)
+            for index, measurement in enumerate(section_measurements)
+            if _fortel_eo_description(measurement.get("description"))
+        )
+        for _rank, _index, kind, record in sorted(special_entries):
+            if kind == "item":
+                _write_item(record)
+            else:
+                _write_measurement(record, show_sources=False)
+
+        if section == "Dock slabs":
+            ws.cell(row, 1, "Foundation thickenings directly underneath Dock Slab region")
+            ws.cell(row, 1).font = Font(name="Arial", size=8, bold=True)
+            ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+            row += 1
 
         row += 2
 

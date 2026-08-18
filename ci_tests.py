@@ -844,7 +844,8 @@ ck("a fabric callout confirms mesh but never silently confirms one reinforcement
 
 print("quotation generator")
 from quotation import (generate_quotation, quotation_text, quotation_html, quotation_json,
-                       quotation_xlsx, SECTION_ORDER, PROVISIONAL_LABEL)
+                       quotation_xlsx, SECTION_ORDER, PROVISIONAL_LABEL,
+                       FORTEL_MH_ROW, FORTEL_CHANNEL_ROW, FORTEL_TRANSITION_ROW)
 from geometry import polygon_perimeter_lm
 from openpyxl import load_workbook as _load_workbook
 from io import BytesIO as _BytesIO
@@ -883,6 +884,7 @@ def _quotation_unit(filename, section, area, *, mesh="A252", assumed=False):
 _quote_units = [
     _quotation_unit("Upper.pdf", "Upper floor slabs", 40),
     _quotation_unit("Yard-A.pdf", "External yard slabs", 100, assumed=True),
+    _quotation_unit("Footpath.pdf", "Footpath slabs", 15),
     _quotation_unit("Dock.pdf", "Dock slabs", 30),
     _quotation_unit("Ground.pdf", "Ground floor slabs", 20),
     _quotation_unit("Yard-B.pdf", "External yard slabs", 150, assumed=True),
@@ -895,7 +897,8 @@ _q_multi = generate_quotation(
 _actual_sections = list(dict.fromkeys(li["section"] for li in _q_multi["line_items"]))
 ck("quotation sections follow client order", _actual_sections == list(SECTION_ORDER), _actual_sections)
 _yard_slabs = [li for li in _q_multi["line_items"]
-               if li["section"] == "External yard slabs" and "supply & lay" in li["description"]]
+               if li["section"] == "External yard slabs"
+               and li.get("line_role") == "concrete_slab"]
 ck("matching-spec units aggregate into one slab row", len(_yard_slabs) == 1 and
    _yard_slabs[0]["qty"] == 250, _yard_slabs)
 _q_diff_spec = generate_quotation([
@@ -903,7 +906,8 @@ _q_diff_spec = generate_quotation([
     _quotation_unit("Yard-C.pdf", "External yard slabs", 50, mesh="A393"),
 ], ref="TST-DIFF-SPEC")
 ck("different unit specs remain separate on one quotation",
-   len([li for li in _q_diff_spec["line_items"] if "supply & lay" in li["description"]]) == 2)
+   len([li for li in _q_diff_spec["line_items"]
+        if li.get("line_role") == "concrete_slab"]) == 2)
 _unit1_ground = _quotation_unit(
     "Unit-1 Ground Floor Core.pdf", "Ground floor slabs", 100)
 _unit5_ground = _quotation_unit(
@@ -918,7 +922,8 @@ _q_ground_spec_split = generate_quotation(
     [_unit1_ground, _unit5_ground], ref="TST-GROUND-SPEC-SPLIT")
 _ground_spec_rows = [
     item for item in _q_ground_spec_split["line_items"]
-    if item["section"] == "Ground floor slabs" and "supply & lay" in item["description"]
+    if item["section"] == "Ground floor slabs"
+    and item.get("line_role") == "concrete_slab"
 ]
 ck("193mm A252 and 150mm A252 ground slabs in one case are never merged",
    len(_ground_spec_rows) == 2 and
@@ -933,13 +938,13 @@ _confirmed_unit_b["brief_spec"] = _copy.deepcopy(_confirmed_brief)
 _q_confirmed_aggregate = generate_quotation([_confirmed_unit_a, _confirmed_unit_b])
 ck("equally confirmed Brief_Spec units aggregate",
    len([li for li in _q_confirmed_aggregate["line_items"]
-        if "supply & lay" in li["description"]]) == 1)
+        if li.get("line_role") == "concrete_slab"]) == 1)
 _assumed_unit = _quotation_unit("Assumed.pdf", "External yard slabs", 40, assumed=True)
 _assumed_unit["brief_spec"] = _assumed_brief
 _q_provenance_split = generate_quotation([_confirmed_unit_a, _assumed_unit])
 ck("assumed and confirmed equal-value Brief_Spec units remain separate",
    len([li for li in _q_provenance_split["line_items"]
-        if "supply & lay" in li["description"]]) == 2)
+        if li.get("line_role") == "concrete_slab"]) == 2)
 
 _rect = [[0, 0], [40, 0], [40, 20], [0, 20]]
 ck("perimeter_lm rectangle: 20m × 10m -> 60.0m",
@@ -1047,8 +1052,9 @@ ck("xlsx drawing register is multiline in the real BOQ's A5 cell",
    all(name in _xlsx_ws["A5"].value for name in ("Yard-A.pdf", "Yard-B.pdf")))
 _expected_xlsx_sections = (
     "External Yard Slabs- Provisional Cost (No Details)",
+    "Footpath Slabs- Provisional Cost (No Details)",
     "Dock Slabs- Provisional Cost (No Details)",
-    "Ground Floor Slabs (Ancillary Areas)- Provisional Cost (No Details)",
+    "Ground Floor Slabs- Provisional Cost (No Details)",
     "Upper Floors- Provisional Cost (No Details)",
     "Prelims",
 )
@@ -1059,7 +1065,7 @@ _xlsx_section_rows = {
 ck("xlsx section headers follow client order",
    tuple(_xlsx_section_rows) == _expected_xlsx_sections, _xlsx_section_rows)
 _xlsx_item_row = next(row for row in range(1, _xlsx_ws.max_row + 1)
-                      if "supply & lay" in str(_xlsx_ws.cell(row, 1).value or ""))
+                      if "Concrete Slabs" in str(_xlsx_ws.cell(row, 1).value or ""))
 _xlsx_source_rows = [row for row in range(1, _xlsx_ws.max_row + 1)
                      if _xlsx_ws.cell(row, 1).value in ("Yard-A.pdf", "Yard-B.pdf")]
 _xlsx_area_total_row = next(row for row in range(1, _xlsx_ws.max_row + 1)
@@ -1068,11 +1074,32 @@ ck("xlsx keeps editable numeric per-unit source quantities and formula aggregate
    [float(_xlsx_ws.cell(row, 2).value) for row in _xlsx_source_rows] == [100.0, 150.0] and
    _xlsx_ws.cell(_xlsx_area_total_row, 2).value ==
    f"=SUM(B{_xlsx_source_rows[0]}:B{_xlsx_source_rows[-1]})")
-ck("xlsx priced qty references aggregate, rate is numeric, and value is direct qty*rate",
+ck("xlsx priced qty references aggregate, rate is numeric, and value is rounded qty*rate",
    _xlsx_ws.cell(_xlsx_item_row, 2).value == f"=B{_xlsx_area_total_row}" and
    isinstance(_xlsx_ws.cell(_xlsx_item_row, 4).value, (int, float)) and
    _xlsx_ws.cell(_xlsx_item_row, 5).data_type == "f" and
-   _xlsx_ws.cell(_xlsx_item_row, 5).value == f"=B{_xlsx_item_row}*D{_xlsx_item_row}")
+   _xlsx_ws.cell(_xlsx_item_row, 5).value ==
+   f"=ROUND(B{_xlsx_item_row}*D{_xlsx_item_row},2)")
+_yard_section_start = _xlsx_section_rows[_expected_xlsx_sections[0]]
+_footpath_section_start = _xlsx_section_rows[_expected_xlsx_sections[1]]
+_yard_rows_by_label = {
+    str(_xlsx_ws.cell(row, 1).value or "").splitlines()[0]: row
+    for row in range(_yard_section_start + 1, _footpath_section_start)
+    if str(_xlsx_ws.cell(row, 1).value or "").splitlines()
+}
+_included_labels = (
+    "A252 Mesh Fabric x Single Layer", "Curing Agent",
+    "DPM 1200G (Excl. tapes and seals to laps)", "Brush Finish",
+)
+ck("xlsx uses Fortel's Incl. convention without splitting or inventing component rates",
+   all(label in _yard_rows_by_label and
+       _xlsx_ws.cell(_yard_rows_by_label[label], 2).value == f"=B{_xlsx_area_total_row}" and
+       _xlsx_ws.cell(_yard_rows_by_label[label], 4).value is None and
+       _xlsx_ws.cell(_yard_rows_by_label[label], 5).value == "Incl."
+       for label in _included_labels),
+   {label:(_xlsx_ws.cell(_yard_rows_by_label.get(label, 1), 4).value,
+           _xlsx_ws.cell(_yard_rows_by_label.get(label, 1), 5).value)
+    for label in _included_labels})
 ck("xlsx quantity/unit display matches client template without forced .00",
    _xlsx_ws.cell(_xlsx_item_row, 2).number_format == "#,##0.##" and
    _xlsx_ws.cell(_xlsx_item_row, 3).value == "m2")
@@ -1093,6 +1120,27 @@ ck("xlsx visibly marks assumed quantity provisional",
 ck("xlsx visibly carries every unknown client checklist field",
    any("Bay sizes if joint layout available: ASSUMED / no details provided" in
        str(_xlsx_ws.cell(row, 1).value or "") for row in range(1, _xlsx_ws.max_row + 1)))
+_dock_foundation_row = next(
+    row for row in range(1, _xlsx_ws.max_row + 1)
+    if _xlsx_ws.cell(row, 1).value ==
+       "Foundation thickenings directly underneath Dock Slab region")
+ck("xlsx carries the Dock foundation-thickening subgroup without inventing a quantity or rate",
+   all(_xlsx_ws.cell(_dock_foundation_row, col).value is None for col in range(2, 6)))
+
+_bay_unit = _quotation_unit("Unit-1 Yard Joint Layout.pdf", "External yard slabs", 100)
+_bay_unit["brief_spec"] = _build_brief_spec(
+    "external_yard", effective_spec=_bay_unit["costing"]["spec"],
+    confirmed={"bay_sizes":_e7["bay_sizes"]}, source="engineer_drawing",
+    evidence={"bay_sizes":(_e7.get("_evidence") or {}).get("bay_sizes")},
+)
+_bay_quote = generate_quotation(_bay_unit, ref="TST-JOINT-BAYS")
+_bay_joint_row = next(
+    item for item in _bay_quote["line_items"]
+    if item["description"].startswith("Joints (Excl. Mastic)"))
+ck("extracted bay dimensions flow into the Fortel Joints row wording",
+   _bay_joint_row["description"] ==
+   "Joints (Excl. Mastic) - Based on 4.9m wide x 6.5m long bays",
+   _bay_joint_row)
 _q_status = generate_quotation(
     _quotation_unit("Status.pdf", "External yard slabs", 10),
     extras=[{"section": "Prelims", "description": "Commercial option", "qty": 1,
@@ -1118,7 +1166,7 @@ _channel_quote_unit["channel_proposal_decisions"] = {
 }
 _q_channel = generate_quotation(_channel_quote_unit, ref="CHANNEL-QUOTE-001")
 _channel_rows = [item for item in _q_channel["line_items"]
-                 if item["description"].startswith("Channel —")]
+                 if item["description"] == FORTEL_CHANNEL_ROW]
 ck("accepted/edited channel proposal becomes a provisional blank-rate Lm quote line",
    len(_channel_rows) == 1 and _channel_rows[0]["qty"] == 96.7 and
    _channel_rows[0]["unit"] == "Lm" and _channel_rows[0]["rate"] is None and
@@ -1126,7 +1174,8 @@ ck("accepted/edited channel proposal becomes a provisional blank-rate Lm quote l
    _channel_rows[0]["provisional"], _channel_rows)
 _channel_ws = _load_workbook(_BytesIO(quotation_xlsx(_q_channel)), data_only=False)["REV_01"]
 _channel_row = next(row for row in range(1, _channel_ws.max_row + 1)
-                    if str(_channel_ws.cell(row, 1).value or "").startswith("Channel —"))
+                    if str(_channel_ws.cell(row, 1).value or "").startswith(
+                        FORTEL_CHANNEL_ROW))
 ck("accepted channel quantity is exact in text/HTML/XLSX and is never auto-priced",
    "96.7" in quotation_text(_q_channel) and "96.7 Lm" in quotation_html(_q_channel) and
    _channel_ws.cell(_channel_row, 2).value == 96.7 and
@@ -1137,7 +1186,7 @@ _pending_channel_unit = _copy.deepcopy(_channel_quote_unit)
 _pending_channel_unit["channel_proposal_decisions"] = {}
 _q_pending_channel = generate_quotation(_pending_channel_unit, ref="CHANNEL-PENDING-001")
 ck("unactioned channel proposal is declared explicitly and never becomes a quote quantity",
-   not any(item["description"].startswith("Channel —")
+   not any(item["description"] == FORTEL_CHANNEL_ROW
            for item in _q_pending_channel["line_items"]) and
    any("has not been actioned" in note and "no channel quantity or price is included" in note
        for note in _q_pending_channel["declarations"]))
@@ -1157,7 +1206,7 @@ _q_transition_candidate = generate_quotation(
     _transition_quote_unit, ref="TRANSITION-QUOTE-001")
 _transition_candidate_rows = [
     item for item in _q_transition_candidate["line_items"]
-    if item["description"].startswith("Transition —")
+    if item["description"] == FORTEL_TRANSITION_ROW
 ]
 ck("accepted/edited Transition candidate becomes provisional blank-rate Lm quote line",
    len(_transition_candidate_rows) == 1 and
@@ -1174,12 +1223,72 @@ _pending_transition_unit["transition_candidate_decisions"] = {}
 _q_pending_transition = generate_quotation(
     _pending_transition_unit, ref="TRANSITION-PENDING-001")
 ck("unactioned Transition candidate stays outside totals and is declared explicitly",
-   not any(item["description"].startswith("Transition —")
+   not any(item["description"] == FORTEL_TRANSITION_ROW
            for item in _q_pending_transition["line_items"]) and
    any("has not been actioned" in note and
        "no Transition quantity or price is included" in note
        for note in _q_pending_transition["declarations"]),
    _q_pending_transition["declarations"])
+
+# Fortel's standard costing sheet has one visible extra-over row for each quantity class.
+# Exercise all three together, including two accepted channel runs, so the regression test
+# proves the final workbook shape rather than three isolated generator branches.
+_fortel_eo_unit = _quotation_unit("External Unit-3.pdf", "External yard slabs", 100)
+_fortel_eo_unit["perimeter_lm"] = 80.0
+_fortel_eo_unit["channel_proposals"] = [
+    {"proposal_id":"channel-dock", "component":"dock_retaining_wall",
+     "basis":"assessor-reviewed dock run"},
+    {"proposal_id":"channel-yard", "component":"yard_wall_adjacent_run",
+     "basis":"assessor-reviewed Yard run"},
+]
+_fortel_eo_unit["channel_proposal_decisions"] = {
+    "channel-dock":{"decision":"accepted", "length_lm":12.5},
+    "channel-yard":{"decision":"accepted", "length_lm":20.0},
+}
+_fortel_eo_unit["transition_candidates"] = [{
+    "candidate_id":"transition-yard-region-1", "region_id":"yard-region-1",
+    "basis":"assessor-reviewed Yard entrance",
+}]
+_fortel_eo_unit["transition_candidate_decisions"] = {
+    "transition-yard-region-1":{"decision":"accepted", "length_lm":8.25},
+}
+_q_fortel_eo = generate_quotation(
+    _fortel_eo_unit, ref="FORTEL-EO-ROWS",
+    extras=[{"section":"External yard slabs", "description":FORTEL_MH_ROW,
+             "qty":2, "unit":"Nr", "rate":None}],
+)
+_fortel_eo_lines = {
+    item["description"]:item for item in _q_fortel_eo["line_items"]
+    if item["description"] in {FORTEL_MH_ROW, FORTEL_CHANNEL_ROW, FORTEL_TRANSITION_ROW}
+}
+ck("channel, Transition and manhole quantities use exactly Fortel's three row labels",
+   set(_fortel_eo_lines) == {FORTEL_MH_ROW, FORTEL_CHANNEL_ROW, FORTEL_TRANSITION_ROW} and
+   _fortel_eo_lines[FORTEL_MH_ROW]["unit"] == "Nr" and
+   _fortel_eo_lines[FORTEL_CHANNEL_ROW]["unit"] == "Lm" and
+   _fortel_eo_lines[FORTEL_TRANSITION_ROW]["unit"] == "Lm" and
+   _fortel_eo_lines[FORTEL_CHANNEL_ROW]["qty"] == 32.5,
+   _fortel_eo_lines)
+_fortel_eo_ws = _load_workbook(
+    _BytesIO(quotation_xlsx(_q_fortel_eo)), data_only=False)["REV_01"]
+_fortel_eo_row_numbers = {
+    str(_fortel_eo_ws.cell(row, 1).value or "").splitlines()[0]:row
+    for row in range(1, _fortel_eo_ws.max_row + 1)
+    if str(_fortel_eo_ws.cell(row, 1).value or "").splitlines() and
+       str(_fortel_eo_ws.cell(row, 1).value or "").splitlines()[0] in
+       {"Slab perimeter", FORTEL_MH_ROW, FORTEL_CHANNEL_ROW, FORTEL_TRANSITION_ROW}
+}
+ck("xlsx writes perimeter then MH/channel/Transition with editable blank rates and formulas",
+   list(_fortel_eo_row_numbers) == [
+       "Slab perimeter", FORTEL_MH_ROW, FORTEL_CHANNEL_ROW, FORTEL_TRANSITION_ROW] and
+   [_fortel_eo_ws.cell(_fortel_eo_row_numbers[label], 3).value
+    for label in (FORTEL_MH_ROW, FORTEL_CHANNEL_ROW, FORTEL_TRANSITION_ROW)] ==
+       ["Nr", "Lm", "Lm"] and
+   all(_fortel_eo_ws.cell(_fortel_eo_row_numbers[label], 4).value is None and
+       _fortel_eo_ws.cell(_fortel_eo_row_numbers[label], 5).value ==
+       f'=IF(D{_fortel_eo_row_numbers[label]}="","",ROUND('
+       f'B{_fortel_eo_row_numbers[label]}*D{_fortel_eo_row_numbers[label]},2))'
+       for label in (FORTEL_MH_ROW, FORTEL_CHANNEL_ROW, FORTEL_TRANSITION_ROW)),
+   _fortel_eo_row_numbers)
 
 print("marked zone-aware measurement + multi-unit BOQ allocation")
 import fitz as _fitz_zones
@@ -1351,7 +1460,7 @@ _transition_quote = generate_quotation({
 }, project="Transition QA")
 _transition_measurement = next(
     item for item in _transition_quote["measurements"]
-    if item["description"] == "Transition length")
+    if item["description"] == FORTEL_TRANSITION_ROW)
 ck("measured Yard transitions reach the quotation as blank-rate Lm source rows",
    _transition_measurement["qty"] == 20.75 and
    _transition_measurement["assessor_rate_required"] and
@@ -1443,7 +1552,8 @@ _upper_scope_quote = generate_quotation({
                "assumed":True, "spec":{}, "breakdown":{}, "extras":[]},
 }, project="Upper Scope QA")
 _upper_scope_items = [item for item in _upper_scope_quote["line_items"]
-                      if item["section"] == "Upper floor slabs"]
+                      if item["section"] == "Upper floor slabs" and
+                      item.get("line_role") == "concrete_slab"]
 ck("Plant deck and POD are separate Upper-floor BOQ rows, never merged with main floor",
    len(_upper_scope_items) == 3 and
    any(item["description"].startswith("Plant deck —") for item in _upper_scope_items) and
@@ -1521,30 +1631,41 @@ for _unit_n in range(1, 5):
     _zone_quote_results.append(_unit)
 _q_zones = generate_quotation(_zone_quote_results, project="Castle", client="Winvic",
                               ref="ZONE-001")
+_zone_section_order = [
+    "External yard slabs", "Dock slabs", "Ground floor slabs", "Upper floor slabs",
+]
 ck("mixed marked files allocate into all four BOQ sections",
-   [spec["section"] for spec in _q_zones["specifications"]] == list(SECTION_ORDER[:4]))
+   [spec["section"] for spec in _q_zones["specifications"]] == _zone_section_order)
 ck("each BOQ section keeps four numeric Unit-N source rows",
    all([row["description"] for row in spec["area_rows"]] ==
        ["Unit-1", "Unit-2", "Unit-3", "Unit-4"]
        for spec in _q_zones["specifications"]), _q_zones["specifications"])
 ck("aggregate job rate is never copied onto mixed zones",
    all(item.get("rate") is None and item.get("value") is None
-       for item in _q_zones["line_items"] if "supply & lay" in item["description"]))
+       for item in _q_zones["line_items"]
+       if item.get("line_role") == "concrete_slab"))
 ck("channel, transition and zone perimeters remain unpriced Lm source quantities",
-   any(m["description"] == "Channel length" and m["qty"] == 70 for m in _q_zones["measurements"]) and
-   any(m["description"] == "Transition length" and m["qty"] == 20 for m in _q_zones["measurements"]) and
+   any(m["description"] == FORTEL_CHANNEL_ROW and m["qty"] == 70
+       for m in _q_zones["measurements"]) and
+   any(m["description"] == FORTEL_TRANSITION_ROW and m["qty"] == 20
+       for m in _q_zones["measurements"]) and
    all(m.get("assessor_rate_required") for m in _q_zones["measurements"]))
 _zone_ws = _load_workbook(_BytesIO(quotation_xlsx(_q_zones)), data_only=False)["REV_01"]
+_zone_xlsx_sections = [
+    _expected_xlsx_sections[0], _expected_xlsx_sections[2],
+    _expected_xlsx_sections[3], _expected_xlsx_sections[4],
+]
 _zone_section_labels = [
     _zone_ws.cell(row, 1).value for row in range(1, _zone_ws.max_row + 1)
-    if _zone_ws.cell(row, 1).value in _expected_xlsx_sections[:4]
+    if _zone_ws.cell(row, 1).value in _zone_xlsx_sections
 ]
 _channel_row = next(row for row in range(1, _zone_ws.max_row + 1)
-                    if _zone_ws.cell(row, 1).value == "Channel length")
+                    if _zone_ws.cell(row, 1).value == FORTEL_CHANNEL_ROW)
 ck("zone XLSX preserves section order with editable blank assessor rates",
-   _zone_section_labels == list(_expected_xlsx_sections[:4]) and
+   _zone_section_labels == _zone_xlsx_sections and
    _zone_ws.cell(_channel_row, 4).value is None and
-   _zone_ws.cell(_channel_row, 5).value == f'=IF(D{_channel_row}="","",B{_channel_row}*D{_channel_row})')
+   _zone_ws.cell(_channel_row, 5).value ==
+   f'=IF(D{_channel_row}="","",ROUND(B{_channel_row}*D{_channel_row},2))')
 
 _castle_dir = Path("drawings/castle_donington")
 _castle_names = [
@@ -3150,9 +3271,12 @@ try:
                ("Footpath",50,"m2",45.07),
                ("Duct slab",20,"m2",None),
            ] and isinstance(_named_xlsx_rows[0][4], str) and
-           _named_xlsx_rows[0][4].startswith("=B") and
+           _named_xlsx_rows[0][4].startswith("=ROUND(B") and
+           "*D" in _named_xlsx_rows[0][4] and
            isinstance(_named_xlsx_rows[1][4], str) and
-           _named_xlsx_rows[1][4].startswith('=IF(D'), _named_xlsx_rows)
+           _named_xlsx_rows[1][4].startswith('=IF(D') and
+           "ROUND(B" in _named_xlsx_rows[1][4] and
+           "*D" in _named_xlsx_rows[1][4], _named_xlsx_rows)
 
         _named_marked_response = _client_up.get(
             f"/marked-pdf/{_marked_route_job['id']}.pdf")
@@ -3463,7 +3587,7 @@ try:
             if _channel_quote_paths.get("json") and
             Path(_channel_quote_paths["json"]).exists() else {})
         _channel_saved_rows = [item for item in _channel_saved_quote.get("line_items", [])
-                               if str(item.get("description") or "").startswith("Channel —")]
+                               if item.get("description") == FORTEL_CHANNEL_ROW]
         ck("approved server quotation carries accepted channel Lm with blank assessor rate",
            _channel_approve.status_code == 200 and len(_channel_saved_rows) == 1 and
            _channel_saved_rows[0]["qty"] == 35.0 and
@@ -3542,8 +3666,7 @@ try:
                "provisional"] is True)
         _transition_quote = _AS._quotation_for_job(_transition_job_id)
         _transition_rows = [item for item in _transition_quote["line_items"]
-                            if str(item.get("description") or "").startswith(
-                                "Transition —")]
+                            if item.get("description") == FORTEL_TRANSITION_ROW]
         ck("persisted accepted Transition reaches server quotation with blank rate",
            len(_transition_rows) == 1 and _transition_rows[0]["qty"] == 15.25 and
            _transition_rows[0]["rate"] is None and
@@ -3656,14 +3779,14 @@ try:
         _cutout_job = _AS.load_jobs()[_money_cutout_id]
         _cutout_quote = _AS._quotation_for_job(_money_cutout_id)
         _cutout_slab = next(item for item in _cutout_quote["line_items"]
-                            if "supply & lay" in item["description"])
+                            if item.get("line_role") == "concrete_slab")
         _cutout_json = __import__("json").loads(quotation_json(_cutout_quote))
         _cutout_json_slab = next(item for item in _cutout_json["line_items"]
-                                 if "supply & lay" in item["description"])
+                                 if item.get("line_role") == "concrete_slab")
         _cutout_text = quotation_text(_cutout_quote)
         _cutout_html = quotation_html(_cutout_quote)
         _cutout_text_slab = next(line for line in _cutout_text.splitlines()
-                                  if "supply & lay" in line)
+                                  if "Concrete Slabs" in line)
         _cutout_wb = _load_workbook(_BytesIO(quotation_xlsx(_cutout_quote)), data_only=False)
         _cutout_ws = _cutout_wb["REV_01"]
         _cutout_xlsx_source_values = [
@@ -3695,7 +3818,7 @@ try:
         _approved_truth_job = _AS.load_jobs()[_money_approve_id]
         _approved_truth_quote = _AS._quotation_for_job(_money_approve_id)
         _approved_truth_slab = next(item for item in _approved_truth_quote["line_items"]
-                                    if "supply & lay" in item["description"])
+                                    if item.get("line_role") == "concrete_slab")
         ck("approval costs and quotes assessor-adjusted area instead of original AI area",
            _approve_response.status_code == 200 and
            _approve_response.get_json()["costing"]["area_m2"] == 190.0 and
@@ -3710,7 +3833,7 @@ try:
             _money_channel_id, channels=[[[100,250],[200,250]]])
         _channel_truth_quote = _AS._quotation_for_job(_money_channel_id)
         _channel_truth_row = next(item for item in _channel_truth_quote["line_items"]
-                                  if "assessor-drawn run" in item["description"])
+                                  if item["description"] == FORTEL_CHANNEL_ROW)
         ck("assessor channel quotation length uses assessor scale travelling with geometry",
            _channel_truth_row["qty"] == 10.0 and
            _AS._quotation_result_for_job(
@@ -3728,7 +3851,7 @@ try:
         _bend_job = _AS.load_jobs()[_money_bend_id]
         _bend_quote = _AS._quotation_for_job(_money_bend_id)
         _bend_row = next(item for item in _bend_quote["line_items"]
-                         if "assessor-drawn run" in item["description"])
+                         if item["description"] == FORTEL_CHANNEL_ROW)
         ck("assessor can persist a bending channel polyline instead of a forced straight chord",
            _bend_confirm.status_code == 200 and _bend_adjust.status_code == 200 and
            _bend_job["adjusted"]["user_channels"] ==
@@ -3749,7 +3872,7 @@ try:
         _plain_saved = _AS.load_jobs()[_money_plain_id]
         _plain_quote = _AS._quotation_for_job(_money_plain_id)
         _plain_slab = next(item for item in _plain_quote["line_items"]
-                           if "supply & lay" in item["description"])
+                           if item.get("line_role") == "concrete_slab")
         ck("unadjusted verified job keeps its original pricing path unchanged",
            _plain_approve.status_code == 200 and
            _plain_approve.get_json()["costing"]["area_m2"] == 125.0 and
@@ -3788,7 +3911,7 @@ try:
         _xlsx_route_ws = _xlsx_route_wb["REV_01"]
         _xlsx_route_slab_row = next(
             row for row in range(1, _xlsx_route_ws.max_row + 1)
-            if "supply & lay" in str(_xlsx_route_ws.cell(row, 1).value or ""))
+            if "Concrete Slabs" in str(_xlsx_route_ws.cell(row, 1).value or ""))
         ck("xlsx download route returns a valid attachment",
            _xlsx_route_resp.status_code == 200 and
            _xlsx_route_resp.mimetype ==
