@@ -114,7 +114,7 @@ header span{opacity:.7;font-size:12px}
 
 /* ── Canvas area ─────────────────────────── */
 .canvas-wrap{flex:1;overflow:hidden;position:relative;padding:16px;background:var(--bg)}
-canvas{display:block;border:1px solid var(--border);background:transparent;box-shadow:0 2px 8px rgba(0,0,0,.08);cursor:crosshair;position:absolute;transform-origin:0 0;z-index:2}
+canvas{display:block;border:1px solid var(--border);background:transparent;box-shadow:0 2px 8px rgba(0,0,0,.08);cursor:crosshair;position:absolute;left:0;top:0;transform-origin:0 0;z-index:2}
 .vector-surface{display:block;position:absolute;left:0;top:0;transform-origin:0 0;
   pointer-events:none;z-index:1;background:#fff}
 
@@ -2416,17 +2416,13 @@ function zoomFit() {
   if (!canvas || !img) return;
   const wrap = document.getElementById('canvasWrap');
   const wrapRect = wrap.getBoundingClientRect();
-  const pad = 32; // 16px padding each side
-  const availW = wrapRect.width - pad;
-  const availH = wrapRect.height - pad;
-  const scaleX = availW / img.width;
-  const scaleY = availH / img.height;
-  zoom = Math.min(scaleX, scaleY, 1); // never upscale beyond 100%
-  // Center the canvas
+  const scaleX = wrapRect.width / img.width;
+  const scaleY = wrapRect.height / img.height;
+  zoom = Math.min(scaleX, scaleY, 1);
   const scaledW = img.width * zoom;
   const scaledH = img.height * zoom;
-  panX = Math.max(0, (availW - scaledW) / 2);
-  panY = Math.max(0, (availH - scaledH) / 2);
+  panX = Math.max(0, (wrapRect.width - scaledW) / 2);
+  panY = Math.max(0, (wrapRect.height - scaledH) / 2);
   applyCanvasTransform();
   updateZoomDisplay();
   if (zoom > 1.1) ensureVectorSurface();
