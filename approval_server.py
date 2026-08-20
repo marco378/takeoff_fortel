@@ -41,7 +41,12 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_file, redirect, Response
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
+# Tender packs are routinely 100 MB-2 GB (Inderjit's CADIC pack was 2.4 GB). A 50 MB cap
+# silently 413'd every real zip, which the portal surfaced as a generic failure and the team
+# reasonably read as "zip upload does not work". Configurable so a constrained host can lower
+# it deliberately rather than by accident.
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "2048"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 # Railway's container filesystem is EPHEMERAL.  Resolve every resumable assessment artifact
 # from one volume-aware source so a deploy cannot preserve a job record while orphaning its
@@ -3147,6 +3152,20 @@ def n8n_webhook():
 
 
 # ── Health-check ─────────────────────────────────────────────────────────────
+
+@app.errorhandler(413)
+def _upload_too_large(_error):
+    """Answer JSON, not Flask's HTML page.
+
+    The portal parses JSON and shows `error`; an HTML 413 left it with an empty object and a
+    meaningless toast, so an oversized tender pack looked like "zip upload is broken".
+    """
+    return jsonify({
+        "error": f"upload exceeds the {MAX_UPLOAD_MB} MB limit for this server; "
+                 "split the pack or raise MAX_UPLOAD_MB",
+        "max_upload_mb": MAX_UPLOAD_MB,
+    }), 413
+
 
 @app.route("/status")
 def status():

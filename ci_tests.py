@@ -6341,5 +6341,30 @@ ck("...and each document keeps its own provenance row",
    len(_perims[0].get("quantity_rows") or []) == 2, _perims[0].get("quantity_rows"))
 
 
+
+
+# ── Tender-pack upload size (Aryan 20 Aug: "the zip upload is still not working") ──────
+# Root cause found by EXECUTION, not by reading: a real 118 MB pack returned HTTP 413 from
+# Flask's HTML error page, which the portal's `r.json().catch(()=>({}))` turned into an empty
+# object and a meaningless toast. Grepping for accept=".pdf,.zip" had "confirmed" zip support
+# and proved nothing — the cap, not the wiring, was the blocker.
+print("\n[tender-pack upload size]")
+import importlib as _il_up
+import approval_server as _AS_up
+ck("default upload cap fits a real tender pack (packs run 100 MB - 2.4 GB)",
+   _AS_up.MAX_UPLOAD_MB >= 1024, f"{_AS_up.MAX_UPLOAD_MB} MB")
+ck("cap is env-configurable so a small host lowers it deliberately, not by accident",
+   "MAX_UPLOAD_MB" in _AS_up.os.environ or _AS_up.MAX_UPLOAD_MB == 2048, _AS_up.MAX_UPLOAD_MB)
+_c_up = _AS_up.app.test_client()
+_r_up = _AS_up.app.response_class
+with _AS_up.app.test_request_context():
+    _resp_up = _AS_up._upload_too_large(None)
+_body_up, _code_up = _resp_up[0].get_json(), _resp_up[1]
+ck("oversized upload answers 413 with JSON the portal can display, not an HTML page",
+   _code_up == 413 and isinstance(_body_up, dict) and "error" in _body_up, _body_up)
+ck("...and the message tells the user what to do about it",
+   "limit" in _body_up.get("error", "") and _body_up.get("max_upload_mb"), _body_up.get("error"))
+
+
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)
