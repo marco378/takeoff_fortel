@@ -53,6 +53,8 @@ STANDARD_TERMS = (
     "Validity: 30 days from date of issue."
 )
 
+UNCLASSIFIED_SECTION = "Unclassified — assessor must classify"
+
 SECTION_ORDER = (
     "External yard slabs",
     "Footpath slabs",
@@ -62,6 +64,10 @@ SECTION_ORDER = (
     "Prelims",
 )
 _SECTION_RANK = {section: index for index, section in enumerate(SECTION_ORDER)}
+# Holding bucket for a section we could not classify. Deliberately NOT part of
+# SECTION_ORDER (that is the client's canonical BOQ order) but ranked last so it
+# sorts predictably and can never KeyError.
+_SECTION_RANK[UNCLASSIFIED_SECTION] = len(SECTION_ORDER)
 PROVISIONAL_LABEL = "PROVISIONAL — NO DETAILS PROVIDED"
 
 ZONE_SECTION = {
@@ -181,7 +187,26 @@ def quotation_section(result: dict) -> str:
 
 
 def _normalise_section(section, fallback="External yard slabs"):
-    probe = str(section or "").strip().casefold()
+    """Map a section name onto one of Fortel's BOQ sections.
+
+    An UNRECOGNISED name must never be silently re-filed into a different priced section.
+    On the 20 Aug call Inderjit classified a second area as dock slab on project 5.2 Longwell
+    and it surfaced under External yard slabs — "where did this second area come from" — with
+    the yard section's rows and none of the dock formulas ("it didn't pick up the correct
+    sheet to mount the values on").  The cause was this function answering with the yard
+    fallback for any spelling outside its alias table, e.g. "Dock Slab" or "dock_slab".
+
+    Recognised names map as before.  An unrecognised, non-empty name is now surfaced for
+    assessor classification instead of being mis-filed into a priced section: silently pricing
+    a dock area as yard is the sectioning form of a silent number.  A blank/absent section
+    still uses the caller's contextual fallback, which is a genuine default rather than a
+    misclassification.
+    """
+    raw = str(section or "").strip()
+    probe = raw.casefold().replace("_", " ").replace("-", " ")
+    probe = " ".join(probe.split())
+    if probe.endswith(" slab"):          # "dock slab" -> "dock slabs"
+        probe += "s"
     aliases = {
         "yard": "External yard slabs", "external": "External yard slabs",
         "external yard": "External yard slabs", "external yard slabs": "External yard slabs",
@@ -191,10 +216,19 @@ def _normalise_section(section, fallback="External yard slabs"):
         "ground": "Ground floor slabs", "ground floor": "Ground floor slabs",
         "ground floor slabs": "Ground floor slabs", "gf ancillary": "Ground floor slabs",
         "upper": "Upper floor slabs", "upper floors": "Upper floor slabs",
-        "upper floor slabs": "Upper floor slabs",
+        "upper floor": "Upper floor slabs", "upper floor slabs": "Upper floor slabs",
+        "upper floors slabs": "Upper floor slabs", "first floor": "Upper floor slabs",
+        "ground floors": "Ground floor slabs", "ground slab": "Ground floor slabs",
+        "external yard slab": "External yard slabs", "service yard": "External yard slabs",
+        "yard slabs": "External yard slabs", "dock slab": "Dock slabs",
+        "dock leveller": "Dock slabs", "footpaths": "Footpath slabs",
         "prelims": "Prelims", "preliminaries": "Prelims",
     }
-    return aliases.get(probe, fallback)
+    if probe in aliases:
+        return aliases[probe]
+    if not probe:
+        return fallback
+    return UNCLASSIFIED_SECTION
 
 
 def _spec_key(costing, brief_spec=None):

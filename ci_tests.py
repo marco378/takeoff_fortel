@@ -6366,5 +6366,46 @@ ck("...and the message tells the user what to do about it",
    "limit" in _body_up.get("error", "") and _body_up.get("max_upload_mb"), _body_up.get("error"))
 
 
+
+
+# ── Section misfiling: the 5.2 Longwell "second area" / "wrong excel sheet" bug ─────────
+# Inderjit, 20 Aug, sharing his screen: "I have approved this area only. Where did this second
+# area come from" — he had classified it "dock slab". Aryan, same call: "it didn't pick up the
+# correct sheet to mount the values on ... designed to use this as the fallback when the
+# current sheet it's unable to pick up." Root cause: _normalise_section answered with the
+# External-yard fallback for ANY spelling outside its alias table, so a dock area was priced
+# as yard, with the yard rows and none of the dock formulas. Two reported bugs, one defect.
+print("\n[BOQ section misfiling]")
+from quotation import _normalise_section as _ns, UNCLASSIFIED_SECTION as _UNCLS
+from quotation import generate_quotation as _gq_sec
+
+for _probe in ("Dock Slab", "dock_slab", "Dock-Slab", "DOCK", "dock slabs"):
+    ck(f"dock spelling {_probe!r} reaches Dock slabs, never the yard fallback",
+       _ns(_probe) == "Dock slabs", _ns(_probe))
+for _probe, _want in (("Upper floor", "Upper floor slabs"), ("upper_floor", "Upper floor slabs"),
+                      ("ground_floor", "Ground floor slabs"), ("footpaths", "Footpath slabs")):
+    ck(f"{_probe!r} maps to {_want}", _ns(_probe) == _want, _ns(_probe))
+ck("an UNRECOGNISED section is surfaced for classification, not silently priced as yard",
+   _ns("totally unknown thing") == _UNCLS, _ns("totally unknown thing"))
+ck("a blank section still uses the caller's contextual default (a real default, not a misfile)",
+   _ns("") == "External yard slabs" and _ns(None) == "External yard slabs")
+
+# End-to-end: the exact shape of Inderjit's job — one yard area he approved, plus a second
+# area he classified as dock. The dock quantity must never appear under External yard slabs.
+for _label in ("Dock Slab", "dock_slab", "dock"):
+    _doc_sec = {"file": "longwell.pdf", "area_m2": 500.0,
+                "costing": {"area_m2": 500.0, "rate": 50.0,
+                            "spec": {"depth_mm": 190, "mesh": "A393", "layers": 1},
+                            "assumed": False},
+                "zones": [{"category": "external_yard", "area_m2": 500.0}],
+                "area_elements": [{"element_id": "ae-1", "name": "Dock apron", "category": "dock",
+                                   "boq_scope": "main", "area_m2": 120.0, "section": _label}]}
+    _q_sec = _gq_sec([_doc_sec], project="5.2 Longwell", client="Fortel")
+    _yard_qtys = {li.get("qty") for li in _q_sec["line_items"]
+                  if li.get("section") == "External yard slabs" and li.get("unit") == "m²"}
+    ck(f"dock area classified {_label!r} does not surface under External yard slabs",
+       120.0 not in _yard_qtys, sorted(_yard_qtys))
+
+
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)
