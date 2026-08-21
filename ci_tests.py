@@ -6144,7 +6144,11 @@ try:
     _k_gate, _flags_gate = scale_consensus([(_k_sb270, 1), (25 / 40, 1)], tol=0.03)
     ck("scale_consensus still REFUSES when the (correctly-detected, rotation-fixed) bar "
        "disagrees with a second reference beyond tol — detection fix does not bypass the gate",
-       _k_gate is None and any("DISAGREE" in f for f in _flags_gate), _flags_gate)
+       # Assert BEHAVIOUR (refusal) plus the surviving diagnostic, not the exact copy — the
+       # assessor-facing sentence was rewritten into plain English after Inderjit could not
+       # read it, and a wording change must not be able to mask a bypassed gate.
+       _k_gate is None and any("MIXED-SCALE" in f for f in _flags_gate)
+       and any("disagree" in f.lower() for f in _flags_gate), _flags_gate)
 
     _k_agree, _flags_agree = scale_consensus([(_k_sb270, 1), (_k_sb270 * 1.01, 1)], tol=0.03)
     ck("scale_consensus VERIFIES the rotation-fixed bar reading when a second reference agrees "
@@ -6460,6 +6464,35 @@ _zb_mismatch = _zb_job([("z1", 100.0, "external_yard")], stale=False)
 _zb_mismatch["zone_reference_mismatch"] = True
 ck("a genuine zone-vs-BOQ mismatch still blocks approval",
    _AS_zb._zone_block_reason(_zb_mismatch) is not None)
+
+
+
+
+# ── Assessor-readable scale flags ──────────────────────────────────────────────────────
+# Inderjit read the old scale-disagreement flag aloud on 20 Aug and said "Nothing makes sense
+# to me, really". The gate was RIGHT (two references 3x apart, refused to auto-pick) — the copy
+# was unusable. The team's proposal was to hide yellow flags, which would turn a correct
+# refusal into silence. Instead the first line is now an instruction an estimator can act on,
+# with the technical detail retained behind a [detail] prefix.
+print("\n[assessor-readable scale flags]")
+from scale import scale_consensus as _sc_copy, calibrate_verified as _cal_copy
+_k_copy, _f_copy = _sc_copy([(25.0, 120.0), (25.0, 40.0)])
+ck("disagreeing references still REFUSE — copy change must not weaken the gate",
+   _k_copy is None, _k_copy)
+ck("the first flag tells the assessor what to DO, not what went wrong internally",
+   _f_copy[0].startswith("Two scale readings") and "Confirm the scale before approving" in _f_copy[0],
+   _f_copy[0][:90])
+ck("...and it names the ways to set it (scale bar / parking bay / printed dimension)",
+   all(t in _f_copy[0] for t in ("scale bar", "parking bay", "printed dimension")))
+ck("the technical detail is kept for us, marked [detail]",
+   any(f.startswith("[detail]") and "MIXED-SCALE" in f for f in _f_copy), _f_copy[-1][:80])
+ck("no assessor-facing line shouts in block capitals at the estimator",
+   not any(w.isupper() and len(w) > 4 for w in _f_copy[0].split()), _f_copy[0][:70])
+_f_unver = _cal_copy(title_denominator=250)[1]
+ck("title-block-only scale reads as an instruction, not a status code",
+   _f_unver[0].startswith("Scale taken from the title block only"), _f_unver[0][:70])
+ck("no-reference case tells the assessor to set it manually",
+   "set the scale manually" in _cal_copy()[1][0], _cal_copy()[1][0])
 
 
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")

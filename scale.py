@@ -238,9 +238,17 @@ def scale_consensus(refs, tol=0.10):
         return None, ["no usable scale reference"]
     lo, hi = min(ks), max(ks)
     if hi / lo - 1 > tol:
-        return None, [f"scale references DISAGREE ({lo:.4f}..{hi:.4f} m/unit, {hi/lo:.2f}x spread) -> "
-                      "MIXED-SCALE sheet; use the slab's OWN viewport (scale bar) or assessor confirms. "
-                      "DO NOT auto-pick a dimension."]
+        # Assessor-facing sentence first, diagnostics second. Inderjit read the old wording
+        # aloud on the 20 Aug call and said "Nothing makes sense to me, really" — a refusal an
+        # estimator cannot act on is barely better than no refusal, and hiding the flag (the
+        # other proposal) would make a CORRECT refusal silent.
+        return None, [
+            f"Two scale readings on this sheet disagree ({lo:.4f} vs {hi:.4f} m per unit, "
+            f"{hi/lo:.2f}x apart). Confirm the scale before approving — set it from a scale "
+            "bar, a parking bay (2.5 m wide) or a printed dimension in the slab's own viewport.",
+            f"[detail] MIXED-SCALE sheet: {len(ks)} references spanning {lo:.4f}..{hi:.4f} "
+            f"m/unit exceed the {int(tol*100)}% agreement tolerance; no scale was auto-picked.",
+        ]
     return sum(ks) / len(ks), [f"scale consensus k={sum(ks)/len(ks):.4f} ({len(ks)} refs agree within {int(tol*100)}%)"]
 
 
@@ -293,10 +301,16 @@ def calibrate_verified(title_denominator=None, bay_width_pt=None, dim_span_pt=No
     elif dim_span_pt and dim_m:
         k_feat, feat = dim_m / dim_span_pt, f"dimension {dim_m} m / {dim_span_pt:.0f} pt"
     if k_feat is None:
-        return k_title, (["scale from title block ONLY — UNVERIFIED; measure a parking bay (2.5 m) "
-                          "or a printed dimension before trusting the area"] if k_title else ["no scale reference"])
+        return k_title, ([
+            "Scale taken from the title block only and not yet verified against the drawing. "
+            "Measure a parking bay (2.5 m wide) or a printed dimension before trusting the area.",
+            f"[detail] title-block k={k_title:.4f}; no independent feature reference found.",
+        ] if k_title else ["No scale reference found on this sheet — set the scale manually."])
     flags = [f"scale VERIFIED from {feat}: k={k_feat:.4f}"]
     if k_title and abs(k_title - k_feat) / k_feat > 0.05:
-        flags.insert(0, f"title-block scale (k={k_title:.4f}) DISAGREES with the verified feature "
-                        f"(k={k_feat:.4f}) -> PDF not at its stated scale; using the feature scale")
+        flags.insert(0, "The printed drawing scale does not match the scale measured off the "
+                        "drawing itself. Using the measured scale, which is the reliable one "
+                        "— PDFs are often not plotted at their stated scale.")
+        flags.insert(1, f"[detail] title-block k={k_title:.4f} vs verified feature "
+                        f"k={k_feat:.4f} ({feat})")
     return k_feat, flags
