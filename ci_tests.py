@@ -6407,5 +6407,60 @@ for _label in ("Dock Slab", "dock_slab", "dock"):
        120.0 not in _yard_qtys, sorted(_yard_qtys))
 
 
+
+
+# ── Phantom approve block after zone classification ────────────────────────────────────
+# Inderjit, 20 Aug: "I just tried on one project today and tried adjusting the AI's markup but
+# it is not getting approved... Cannot approve zone classification." He hit it repeatedly; the
+# known workaround was Aryan's "you have to re submit the zone classification" — which is the
+# diagnosis, not a fix. /zones cleared zone_classification_required but left
+# zone_allocation_stale set, so approval still demanded "reclassify/remeasure" — the thing he
+# had just done. A gate with no route out is a dead end, and dead ends are the bug.
+print("\n[zone classification clears its own approve gate]")
+import approval_server as _AS_zb
+
+def _zb_job(zone_specs, stale=True):
+    zones = [{"zone_key": k, "area_m2": a, "category": c, "subjects": [k]}
+             for k, a, c in zone_specs]
+    return {
+        "id": "zb", "status": "adjusted", "decision": "adjusted", "scale_confirmed": True,
+        "zone_allocation_stale": stale,
+        "zone_classification_required": any(z["category"] == "unclassified" for z in zones),
+        "zones": zones,
+        "result": {"measurement_state": "MEASURED_VERIFIED", "area_m2": 100.0,
+                   "zone_allocation_stale": stale,
+                   "zone_classification_required": any(
+                       z["category"] == "unclassified" for z in zones),
+                   "zones": zones, "flags": []},
+    }
+
+_zb_unclassified = _zb_job([("z1", 100.0, "unclassified")])
+ck("stale allocation + an unclassified zone blocks approval (gate must still protect)",
+   _AS_zb._zone_block_reason(_zb_unclassified) is not None,
+   _AS_zb._zone_block_reason(_zb_unclassified))
+
+# Every zone classified: the staleness the gate complains about has been resolved by the very
+# act of classifying, so the block must lift without a second identical submission.
+_zb_done = _zb_job([("z1", 100.0, "external_yard")], stale=False)
+ck("once every zone is classified, approval is no longer blocked",
+   _AS_zb._zone_block_reason(_zb_done) is None, _AS_zb._zone_block_reason(_zb_done))
+
+# The gate must NOT be blanket-disabled: a partially classified job still blocks.
+_zb_partial = _zb_job([("z1", 100.0, "external_yard"), ("z2", 50.0, "unclassified")])
+ck("a PARTIALLY classified job still blocks — the gate is fixed, not removed",
+   _AS_zb._zone_block_reason(_zb_partial) is not None,
+   _AS_zb._zone_block_reason(_zb_partial))
+
+# And the other genuine gates are untouched.
+_zb_overlap = _zb_job([("z1", 100.0, "external_yard")], stale=False)
+_zb_overlap["zone_geometry_overlap"] = True
+ck("a genuine geometry overlap still blocks approval",
+   _AS_zb._zone_block_reason(_zb_overlap) is not None)
+_zb_mismatch = _zb_job([("z1", 100.0, "external_yard")], stale=False)
+_zb_mismatch["zone_reference_mismatch"] = True
+ck("a genuine zone-vs-BOQ mismatch still blocks approval",
+   _AS_zb._zone_block_reason(_zb_mismatch) is not None)
+
+
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)

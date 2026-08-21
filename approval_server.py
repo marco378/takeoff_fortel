@@ -1693,9 +1693,22 @@ def classify_zones(job_id):
             if category in {"external_yard", "dock", "ground_floor", "upper_floor"}:
                 brief_specs.setdefault(category, empty_brief_spec(category))
 
+        # Classifying every zone IS the remeasure/reclassify the staleness gate asks for, so it
+        # must clear its own block. Previously /zones cleared zone_classification_required but
+        # left zone_allocation_stale set, so approval still failed with "assessor must
+        # reclassify/remeasure" — telling Inderjit to do the thing he had just done. He hit this
+        # repeatedly (20 Aug: "it is not getting approved... Cannot approve zone classification")
+        # and the known workaround was to resubmit the adjustment, which is what actually cleared
+        # the flag. A phantom block is a dead end, and dead ends are the bug.
+        allocation_resolved = not still_unclassified
+        stale_after = bool(
+            (job.get("zone_allocation_stale") or result.get("zone_allocation_stale"))
+        ) and not allocation_resolved
+
         result.update({
             "zones": zones,
             "brief_specs": brief_specs,
+            "zone_allocation_stale": stale_after,
             "zone_classification_required": still_unclassified,
             "zone_reference_mismatch": False if acknowledge_mismatch else bool(
                 result.get("zone_reference_mismatch", False)),
@@ -1704,6 +1717,7 @@ def classify_zones(job_id):
         job.update({
             "zones": zones,
             "brief_specs": brief_specs,
+            "zone_allocation_stale": stale_after,
             "zone_classification_required": still_unclassified,
             "zone_reference_mismatch": False if acknowledge_mismatch else bool(
                 job.get("zone_reference_mismatch", result.get("zone_reference_mismatch", False))),
