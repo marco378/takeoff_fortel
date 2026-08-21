@@ -69,6 +69,9 @@ _SECTION_RANK = {section: index for index, section in enumerate(SECTION_ORDER)}
 # sorts predictably and can never KeyError.
 _SECTION_RANK[UNCLASSIFIED_SECTION] = len(SECTION_ORDER)
 PROVISIONAL_LABEL = "PROVISIONAL — NO DETAILS PROVIDED"
+# Column F, immediately right of VALUE — mirrors the REMEASURE caveat column in
+# Fortel's own costing sheet rather than crowding the DESCRIPTION cell.
+PROVISIONAL_COL = 6
 
 ZONE_SECTION = {
     "external_yard": "External yard slabs",
@@ -1343,9 +1346,13 @@ def quotation_xlsx(q: dict) -> bytes:
             nonlocal row
             description = (_fortel_eo_description(item.get("description"))
                            or item["description"])
-            if item.get("provisional"):
-                description += f"\n{PROVISIONAL_LABEL}"
+            # The marker used to be appended into DESCRIPTION with a newline, so every
+            # provisional row rendered as two lines and looked untidy beside Fortel's own
+            # template. Their sheet keeps tender caveats in a column to the right of VALUE, so
+            # the marker goes there: still impossible to miss, no longer wrapping the label.
             ws.cell(row, 1, _excel_text(description))
+            if item.get("provisional"):
+                ws.cell(row, PROVISIONAL_COL, _excel_text(PROVISIONAL_LABEL))
             ws.cell(row, 2, qty_formula or float(item["qty"]))
             ws.cell(row, 3, _excel_text(_excel_unit(item["unit"])))
             rate = item.get("rate")
@@ -1511,9 +1518,9 @@ def quotation_xlsx(q: dict) -> bytes:
         row += 1
         for measurement in measurements:
             description = f"{_excel_section_title(measurement['section'], [])} — {measurement['description']}"
-            if measurement.get("provisional"):
-                description += f"\n{PROVISIONAL_LABEL}"
             ws.cell(row, 1, description)
+            if measurement.get("provisional"):
+                ws.cell(row, PROVISIONAL_COL, _excel_text(PROVISIONAL_LABEL))
             ws.cell(row, 2, float(measurement["qty"]))
             ws.cell(row, 3, _excel_unit(measurement["unit"]))
             ws.cell(row, 2).number_format = '#,##0.##'

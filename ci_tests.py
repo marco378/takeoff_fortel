@@ -844,7 +844,7 @@ ck("a fabric callout confirms mesh but never silently confirms one reinforcement
 
 print("quotation generator")
 from quotation import (generate_quotation, quotation_text, quotation_html, quotation_json,
-                       quotation_xlsx, SECTION_ORDER, PROVISIONAL_LABEL,
+                       quotation_xlsx, SECTION_ORDER, PROVISIONAL_LABEL, PROVISIONAL_COL,
                        FORTEL_MH_ROW, FORTEL_CHANNEL_ROW, FORTEL_TRANSITION_ROW)
 from geometry import polygon_perimeter_lm
 from openpyxl import load_workbook as _load_workbook
@@ -1115,8 +1115,10 @@ ck("xlsx matches real BOQ widths, accounting display, and portrait layout",
    _xlsx_ws.page_setup.orientation == "portrait" and _xlsx_ws.freeze_panes is None and
    _xlsx_ws.auto_filter.ref is None)
 ck("xlsx visibly marks assumed quantity provisional",
-   any(PROVISIONAL_LABEL in str(_xlsx_ws.cell(row, 1).value or "")
-       for row in range(1, _xlsx_ws.max_row + 1)))
+   # Marker relocated out of DESCRIPTION into its own column; check either so the assertion is
+   # about the marker being VISIBLE, not about which cell holds it.
+   any(PROVISIONAL_LABEL in str(_xlsx_ws.cell(row, col).value or "")
+       for row in range(1, _xlsx_ws.max_row + 1) for col in (1, PROVISIONAL_COL)))
 ck("xlsx visibly carries every unknown client checklist field",
    any("Bay sizes if joint layout available: ASSUMED / no details provided" in
        str(_xlsx_ws.cell(row, 1).value or "") for row in range(1, _xlsx_ws.max_row + 1)))
@@ -1181,7 +1183,10 @@ ck("accepted channel quantity is exact in text/HTML/XLSX and is never auto-price
    _channel_ws.cell(_channel_row, 2).value == 96.7 and
    _channel_ws.cell(_channel_row, 4).value is None and
    _channel_ws.cell(_channel_row, 5).data_type == "f" and
-   PROVISIONAL_LABEL in str(_channel_ws.cell(_channel_row, 1).value))
+   # The provisional marker moved out of DESCRIPTION into its own column (right of VALUE,
+   # mirroring Fortel's REMEASURE caveat column) so rows stop wrapping onto two lines. The row
+   # must still be MARKED provisional — only where the marker sits changed.
+   PROVISIONAL_LABEL in str(_channel_ws.cell(_channel_row, PROVISIONAL_COL).value))
 _pending_channel_unit = _copy.deepcopy(_channel_quote_unit)
 _pending_channel_unit["channel_proposal_decisions"] = {}
 _q_pending_channel = generate_quotation(_pending_channel_unit, ref="CHANNEL-PENDING-001")
@@ -6493,6 +6498,35 @@ ck("title-block-only scale reads as an instruction, not a status code",
    _f_unver[0].startswith("Scale taken from the title block only"), _f_unver[0][:70])
 ck("no-reference case tells the assessor to set it manually",
    "set the scale manually" in _cal_copy()[1][0], _cal_copy()[1][0])
+
+
+
+
+# ── Provisional marker out of the DESCRIPTION cell ─────────────────────────────────────
+# It was appended with a newline, so every provisional row rendered as two lines and looked
+# untidy beside Fortel's own template. Their sheet keeps tender caveats in a column right of
+# VALUE, so the marker lives there now — still impossible to miss, no longer wrapping the label.
+print("\n[provisional marker placement]")
+import io as _io_pm, openpyxl as _ox_pm
+from quotation import (generate_quotation as _gq_pm, quotation_xlsx as _qx_pm,
+                       PROVISIONAL_LABEL as _PL_pm, PROVISIONAL_COL as _PC_pm)
+_doc_pm = {"file": "yard.pdf", "area_m2": 366.2,
+           "costing": {"area_m2": 366.2, "rate": None, "spec": {}, "assumed": True},
+           "zones": [{"category": "external_yard", "area_m2": 366.2}],
+           "manhole_count_assumed": 12}
+_ws_pm = _ox_pm.load_workbook(_io_pm.BytesIO(
+    _qx_pm(_gq_pm([_doc_pm], project="P", client="C")))).active
+_marked_pm = [r for r in range(1, _ws_pm.max_row + 1)
+              if _ws_pm.cell(r, _PC_pm).value == _PL_pm]
+ck("provisional rows still carry the marker (it was relocated, not dropped)",
+   len(_marked_pm) > 0, f"{len(_marked_pm)} marked rows")
+_line_rows_pm = [r for r in _marked_pm if "\n" in str(_ws_pm.cell(r, 1).value or "")]
+ck("no marked row wraps its DESCRIPTION onto a second line any more",
+   not _line_rows_pm, [str(_ws_pm.cell(r, 1).value)[:40] for r in _line_rows_pm])
+ck("the marker never appears inside a line-item DESCRIPTION cell",
+   not any(_PL_pm in str(_ws_pm.cell(r, 1).value or "") for r in _marked_pm))
+ck("it sits to the right of VALUE, mirroring Fortel's REMEASURE caveat column",
+   _PC_pm == 6, _PC_pm)
 
 
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
