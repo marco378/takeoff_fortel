@@ -2806,6 +2806,10 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
     from quotation import generate_quotation
 
     hot_jobs = load_jobs()
+    # Anchor lookup reaches into the archive (the job may have just been archived
+    # while the assessor was still reviewing it), but sibling discovery must stay
+    # within hot_jobs only — otherwise a new project that reuses the same
+    # project_ref would inherit measurements from archived drawings.
     all_jobs = dict(_load_archive())
     all_jobs.update(hot_jobs)
     anchor = all_jobs.get(job_id, {})
@@ -2820,7 +2824,7 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
         #     -> listed explicitly in the quotation as awaiting assessor measurement, so a
         #        document can never silently vanish from the case output.
         siblings, seen = [], set()
-        for sibling_id, sibling in all_jobs.items():
+        for sibling_id, sibling in hot_jobs.items():
             if sibling.get("project_ref") != project_ref or sibling_id in seen:
                 continue
             seen.add(sibling_id)
