@@ -1245,6 +1245,489 @@ def _excel_section_title(section, items):
     return title
 
 
+def _write_rate_buildup(ws, q: dict):
+    """Write the detailed rate buildup section in columns G onwards.
+
+    Mirrors the real Fortel costing sheet layout with Excel formulas (not hardcoded values)
+    so the assessor can edit inputs and see recalculated totals.
+
+    Section start rows (matching reference):
+        External Yard = 5   (rows 5-39)
+        Footpath      = 42  (rows 42-76)
+        Dock          = 79  (rows 79-113)
+        Ground Floor  = 116 (rows 116-150)
+        Upper Floor   = 153 (rows 153-187)
+
+    Internal layout within each section (relative offsets from sr):
+        sr+0:  Header (Slab Depth, Rate/m3, Mix/Spec, Supplier)
+        sr+2:  Concrete/m2
+        sr+3:  Wastage/m2
+        sr+4:  Total Concrete/m2
+        sr+7:  Steel Rate/T header
+        sr+8:  Mesh Type Rate/m2
+        sr+9:  Wastage Rate/m2
+        sr+10: Lap Rate/m2
+        sr+11: Total Steel Rate/m2
+        sr+13: DPM Rate/m2 (VLOOKUP)
+        sr+14: Wastage
+        sr+15: Total DPM Rate/m2
+        sr+17: Curing Agent Rate/m2
+        sr+18: (DPM Gauge in VLOOKUP table)
+        sr+19: Labour Rate/m2
+        sr+21: Total Trimming
+        sr+22: Area m2 weekly
+        sr+23: Dowel/Joint header
+        sr+24: LJ 12mm
+        sr+25: Joints/m2, DLJ 12mm
+        sr+26: Price Separate, CJ 25mm
+        sr+27: SCJ 25mm
+        sr+28: Decarbonisation Charge, EJ 25mm
+        sr+29: Timber
+        sr+30: Nett Total, 25mm x600mm
+        sr+31: Margin, 20mm x500mm
+        sr+32: TOTAL RATE/M2, 20mm x600mm
+        sr+33: E/O RATE/M2
+        sr+34: ALL INCL RATE/M2
+    """
+    thin = Side(style="thin")
+    medium = Side(style="medium")
+    no_side = Side(style=None)
+    font_s = Font(name="Arial", size=8)
+    font_sb = Font(name="Arial", size=8, bold=True)
+
+    # Color fills matching reference
+    fill_yellow = PatternFill("solid", fgColor="FFFF00")   # input cells
+    fill_green = PatternFill("solid", fgColor="FF92D050")  # formula/result cells
+    fill_red = PatternFill("solid", fgColor="FF0000")      # joints/m2 row
+    fill_green_dark = PatternFill("solid", fgColor="FF00B050")  # section total labels
+
+    def _cell(r, c, v, bold=False):
+        cell = ws.cell(r, c, v)
+        cell.font = font_sb if bold else font_s
+        return cell
+
+    def _border_gj(r):
+        """Medium borders on G-J columns (left side of rate buildup)."""
+        ws.cell(r, 7).border = Border(left=medium, right=no_side,
+                                       top=no_side, bottom=no_side)
+        ws.cell(r, 8).border = Border(left=no_side, right=medium,
+                                       top=no_side, bottom=no_side)
+        ws.cell(r, 9).border = Border(left=medium, right=no_side,
+                                       top=no_side, bottom=no_side)
+        ws.cell(r, 10).border = Border(left=no_side, right=medium,
+                                        top=no_side, bottom=no_side)
+
+    def _border_gj_header(r):
+        """Header row: medium top, thin bottom on G-J."""
+        for c in range(7, 11):
+            ws.cell(r, c).border = Border(
+                top=medium, bottom=thin,
+                left=medium if c in (7, 9) else no_side,
+                right=medium if c in (8, 10) else no_side)
+
+    def _border_gj_totals(r):
+        """Total rows: medium bottom on G-J."""
+        ws.cell(r, 7).border = Border(left=medium, bottom=medium)
+        ws.cell(r, 8).border = Border(right=medium, bottom=medium)
+        ws.cell(r, 9).border = Border(left=medium, bottom=medium)
+        ws.cell(r, 10).border = Border(right=medium, bottom=medium)
+
+    def _border_lq(r):
+        """Thin borders on L-Q columns (dowel/joint table)."""
+        for c in range(12, 18):
+            b_left = medium if c == 12 else thin
+            b_right = thin
+            ws.cell(r, c).border = Border(
+                top=thin, bottom=thin, left=b_left, right=b_right)
+
+    # Collect specs per section
+    specs = {}
+    for item in q.get("line_items", []):
+        s = item.get("section") or "External yard slabs"
+        if s not in specs:
+            specs[s] = item.get("spec") or {}
+    for se in q.get("specifications", []):
+        s = se.get("section") or "External yard slabs"
+        if s not in specs:
+            specs[s] = se.get("spec") or {}
+
+    # Section start rows matching reference layout (37 rows apart)
+    sections = [
+        ("External yard slabs",   5),
+        ("Footpath slabs",       42),
+        ("Dock slabs",           79),
+        ("Ground floor slabs",  116),
+        ("Upper floor slabs",   153),
+    ]
+
+    # BOQ Total Area Take Off B-rows
+    area_b_rows = {
+        "External yard slabs":  12,
+        "Footpath slabs":       29,
+        "Dock slabs":           44,
+        "Ground floor slabs":   71,
+        "Upper floor slabs":    91,
+    }
+
+    for section_name, sr in sections:
+        sp = specs.get(section_name, {})
+        depth = sp.get("depth_mm") or 190
+        rate_m3 = sp.get("conc_rate") or 120
+        mix = sp.get("conc_mix") or "C32/40"
+        mesh = sp.get("mesh") or "A252"
+        mesh_kg = sp.get("mesh_kg") or 3.95
+        layers = sp.get("layers") or 1
+        gauge = sp.get("dpm") or 1200
+        wastage = sp.get("conc_wastage") or 0.025
+        s_wastage = sp.get("steel_wastage") or 0.1
+        lap = sp.get("lap_acc") or 0.18
+        margin = sp.get("margin") or 0.1
+
+        is_dock = section_name == "Dock slabs"
+        conc_wastage_pct = 0.04 if is_dock else wastage
+        title = "Dock Slab Depth (mm)" if is_dock else "Slab Depth (mm)"
+
+        # ── sr+0: Header ──────────────────────────────────────────────
+        _cell(sr, 7, title, True)
+        _cell(sr, 8, depth)
+        ws.cell(sr, 8).fill = fill_yellow  # input
+        _cell(sr, 10, "Rate/m3")
+        _cell(sr, 12, "Mix/Spec")
+        _cell(sr, 14, "Supplier Name")
+        _cell(sr, 15, "Name/Backup ")
+        _border_gj_header(sr)
+        _border_lq(sr)
+
+        # ── sr+2: Concrete/m2 ─────────────────────────────────────────
+        _cell(sr+2, 7, "Concrete/m2")
+        _cell(sr+2, 8, f"=(J{sr+2}*H{sr}/1000)")
+        ws.cell(sr+2, 8).fill = fill_green  # formula
+        _cell(sr+2, 9, "Concrete Rate/m3")
+        _cell(sr+2, 10, rate_m3)
+        ws.cell(sr+2, 10).fill = fill_green  # input
+        _cell(sr+2, 12, mix)
+        _cell(sr+2, 13, rate_m3)
+        _cell(sr+2, 14, "Hanson")
+        _cell(sr+2, 15, "On Phone Will Parker")
+        _border_gj(sr+2)
+        _border_lq(sr+2)
+
+        # sr+3: Wastage/m2
+        _cell(sr+3, 7, "Wastage/m2")
+        _cell(sr+3, 8, f"=H{sr+2}*J{sr+3}")
+        ws.cell(sr+3, 8).fill = fill_green
+        _cell(sr+3, 9, "Wastage %")
+        _cell(sr+3, 10, conc_wastage_pct)
+        ws.cell(sr+3, 10).fill = fill_yellow
+        _border_gj(sr+3)
+        _border_lq(sr+3)
+
+        # sr+4: Total Concrete/m2
+        _cell(sr+4, 7, "Total Concrete/m2", True)
+        _cell(sr+4, 8, f"=SUM(H{sr+2}:H{sr+3})", True)
+        ws.cell(sr+4, 7).fill = fill_green_dark
+        ws.cell(sr+4, 8).fill = fill_green
+        _border_gj(sr+4)
+        _border_lq(sr+4)
+
+        # ── sr+7: Steel Rate/T header ─────────────────────────────────
+        _cell(sr+7, 9, "Steel Rate/T")
+        _cell(sr+7, 14, "Rom")
+        _cell(sr+7, 15, "B:S Wt/m2")
+        ws.cell(sr+7, 10).fill = fill_green
+        _border_gj(sr+7)
+        _border_lq(sr+7)
+
+        # sr+8: Mesh Type Rate/m2
+        _cell(sr+8, 7, "Mesh Type Rate/m2")
+        _cell(sr+8, 8, f"=J{sr+7}*(J{sr+10}*J{sr+11}/1000)")
+        ws.cell(sr+8, 8).fill = fill_green
+        _cell(sr+8, 9, "Wastage %")
+        _cell(sr+8, 10, s_wastage)
+        ws.cell(sr+8, 10).fill = fill_green
+        _cell(sr+8, 12, "Mesh Type")
+        _cell(sr+8, 14, "A142 - 2.22 KG")
+        _cell(sr+8, 15, 2.22)
+        _border_gj(sr+8)
+        _border_lq(sr+8)
+
+        # sr+9: Wastage Rate/m2
+        _cell(sr+9, 7, "Wastage  Rate/m2")
+        _cell(sr+9, 8, f"=H{sr+8}*J{sr+8}")
+        ws.cell(sr+9, 8).fill = fill_green
+        _cell(sr+9, 9, "Lap % + Accessories")
+        _cell(sr+9, 10, lap)
+        ws.cell(sr+9, 10).fill = fill_green
+        _cell(sr+9, 14, "A193 - 3.02 KG")
+        _cell(sr+9, 15, 3.02)
+        _border_gj(sr+9)
+        _border_lq(sr+9)
+
+        # sr+10: Lap Rate/m2
+        _cell(sr+10, 7, "Lap Rate/m2")
+        _cell(sr+10, 8, f"=H{sr+8}*J{sr+9}")
+        ws.cell(sr+10, 8).fill = fill_green
+        _cell(sr+10, 9, "Mesh Type")
+        _cell(sr+10, 10, mesh_kg)
+        ws.cell(sr+10, 10).fill = fill_yellow
+        _cell(sr+10, 14, f"{mesh} - {mesh_kg} KG")
+        _cell(sr+10, 15, mesh_kg)
+        _border_gj(sr+10)
+        _border_lq(sr+10)
+
+        # sr+11: Total Steel Rate/m2
+        _cell(sr+11, 7, "Total Steel Rate/m2", True)
+        _cell(sr+11, 8, f"=SUM(H{sr+8}:H{sr+10})", True)
+        ws.cell(sr+11, 7).fill = fill_green_dark
+        ws.cell(sr+11, 8).fill = fill_green
+        _cell(sr+11, 9, "Nr of Layer")
+        _cell(sr+11, 10, layers)
+        ws.cell(sr+11, 10).fill = fill_yellow
+        _cell(sr+11, 14, "A393 - 6.16 KG")
+        _cell(sr+11, 15, 6.16)
+        _border_gj(sr+11)
+        _border_lq(sr+11)
+
+        # sr+12: mesh type refs continued
+        _cell(sr+12, 14, "B785 - 8.14 KG")
+        _cell(sr+12, 15, 8.14)
+        _border_gj(sr+12)
+        _border_lq(sr+12)
+
+        # ── sr+13: DPM Rate/m2 ────────────────────────────────────────
+        _cell(sr+13, 7, "DPM Rate/m2")
+        _cell(sr+13, 8, f"=VLOOKUP(J{sr+14},$O$23:$P$24,2,FALSE)")
+        ws.cell(sr+13, 8).fill = fill_green
+        _cell(sr+13, 9, "DPM Rate")
+        _cell(sr+13, 10, 25.5)
+        ws.cell(sr+13, 10).fill = fill_green
+        _border_gj(sr+13)
+        _border_lq(sr+13)
+
+        # sr+14: Wastage
+        _cell(sr+14, 7, "Wastage")
+        _cell(sr+14, 8, f"=H{sr+13}*J{sr+15}")
+        ws.cell(sr+14, 8).fill = fill_green
+        _cell(sr+14, 9, "Gauge")
+        _cell(sr+14, 10, gauge)
+        ws.cell(sr+14, 10).fill = fill_yellow
+        _cell(sr+14, 12, "Bay Size - 4.9m x 6.5m")
+        _cell(sr+14, 14, "300mm Lap")
+        _cell(sr+14, 15, 0.15)
+        _border_gj(sr+14)
+        _border_lq(sr+14)
+
+        # sr+15: Total DPM Rate/m2
+        _cell(sr+15, 7, "Total DPM Rate/m2", True)
+        _cell(sr+15, 8, f"=SUM(H{sr+13}:H{sr+14})", True)
+        ws.cell(sr+15, 7).fill = fill_green_dark
+        ws.cell(sr+15, 8).fill = fill_green
+        _cell(sr+15, 9, "Lap %")
+        _cell(sr+15, 10, 0.15)
+        ws.cell(sr+15, 10).fill = fill_yellow
+        _cell(sr+15, 14, "400mm Lap")
+        _cell(sr+15, 15, 0.18)
+        _border_gj(sr+15)
+        _border_lq(sr+15)
+
+        # ── sr+17: Curing Agent Rate/m2 ──────────────────────────────
+        _cell(sr+17, 7, "Curing Agent Rate/m2")
+        _cell(sr+17, 8, f"=(J{sr+17}/32)")
+        ws.cell(sr+17, 8).fill = fill_green
+        _cell(sr+17, 9, "Sika Pro Seal Rate")
+        _cell(sr+17, 10, 7.5)
+        ws.cell(sr+17, 10).fill = fill_yellow
+        _cell(sr+17, 12, "£7.50/Litre covers 35m2 area")
+        _cell(sr+17, 15, "Roll")
+        _cell(sr+17, 16, "m2 cost")
+        _border_gj(sr+17)
+        _border_lq(sr+17)
+
+        # ── sr+18: DPM Gauge row in VLOOKUP table ────────────────────
+        _cell(sr+18, 14, "DPM Gauge")
+        _cell(sr+18, 15, gauge)
+        _cell(sr+18, 16, f"=AQ{sr+1}")
+        _border_gj(sr+18)
+        _border_lq(sr+18)
+
+        # ── sr+19: Labour Rate/m2 ─────────────────────────────────────
+        _cell(sr+19, 7, "Labour Rate/m2")
+        _cell(sr+19, 8, f"=J{sr+19}")
+        ws.cell(sr+19, 8).fill = fill_green
+        _cell(sr+19, 9, "Labour Rate")
+        _cell(sr+19, 10, 10)
+        ws.cell(sr+19, 10).fill = fill_green
+        _cell(sr+19, 15, 2000)
+        _cell(sr+19, 16, f"=AQ{sr+28}")
+        _border_gj(sr+19)
+        _border_lq(sr+19)
+
+        # ── sr+21: Total Trimming ─────────────────────────────────────
+        _cell(sr+21, 7, "Total Trimming")
+        _cell(sr+21, 8, f"=(J{sr+21}/J{sr+22})-D{sr+14}")
+        ws.cell(sr+21, 8).fill = fill_green
+        _cell(sr+21, 9, "Machine/Dump/Lab/Fuel Cost")
+        _cell(sr+21, 10, 3500)
+        ws.cell(sr+21, 10).fill = fill_yellow
+        _cell(sr+21, 12, "Trimming Costs")
+        _cell(sr+21, 13, 4085)
+        _cell(sr+21, 14, 1800)
+        _cell(sr+21, 15, f"=M{sr+21}/N{sr+21}")
+        _border_gj(sr+21)
+        _border_lq(sr+21)
+
+        # sr+22: Area m2 weekly
+        _cell(sr+22, 9, "Area m2 weekly @ 780 m2 a day")
+        _cell(sr+22, 10, 2200)
+        ws.cell(sr+22, 10).fill = fill_yellow
+        _border_gj(sr+22)
+        _border_lq(sr+22)
+
+        # ── sr+23: Dowel/Joint table header ───────────────────────────
+        _cell(sr+23, 12, "Bay Size - 4.9m x 6.5m")
+        _cell(sr+23, 14, "Lengths")
+        _cell(sr+23, 15, "Nr of Dowels")
+        _cell(sr+23, 16, "Unit price")
+        _border_gj(sr+23)
+        _border_lq(sr+23)
+
+        # sr+24: LJ 12mm
+        _cell(sr+24, 9, "Bay Size (4.9m x 6.5m)")
+        _cell(sr+24, 10, 32)
+        ws.cell(sr+24, 10).fill = fill_yellow
+        _cell(sr+24, 12, "LJ 12mm x 900mm @ 600c/c")
+        _cell(sr+24, 13, 600)
+        _cell(sr+24, 14, 6500)
+        _cell(sr+24, 15, f"=N{sr+24}/M{sr+24}")
+        ws.cell(sr+24, 15).fill = fill_green
+        _cell(sr+24, 16, 1.65)
+        ws.cell(sr+24, 16).fill = fill_yellow
+        _cell(sr+24, 17, f"=O{sr+24}*P{sr+24}")
+        ws.cell(sr+24, 17).fill = fill_green
+        _border_gj(sr+24)
+        _border_lq(sr+24)
+
+        # sr+25: Joints/m2, DLJ 12mm
+        _cell(sr+25, 7, "Joints/m2")
+        ws.cell(sr+25, 7).fill = fill_red
+        _cell(sr+25, 8, f"=J{sr+25}/J{sr+24}")
+        ws.cell(sr+25, 8).fill = fill_red
+        _cell(sr+25, 9, "Rate/Bay")
+        _cell(sr+25, 10, f"=SUM(Q{sr+24}:Q{sr+30})")
+        ws.cell(sr+25, 10).fill = fill_yellow
+        _cell(sr+25, 12, "DLJ 12mm x 900mm @ 600c/c")
+        _cell(sr+25, 13, 600)
+        _cell(sr+25, 14, 6500)
+        _cell(sr+25, 15, 0)
+        _cell(sr+25, 16, 1.65)
+        _cell(sr+25, 17, f"=O{sr+25}*P{sr+25}")
+        ws.cell(sr+25, 17).fill = fill_green
+        _border_gj(sr+25)
+        _border_lq(sr+25)
+
+        # sr+26: Price Separate, CJ 25mm
+        _cell(sr+26, 7, "Price Separate - Joints")
+        _cell(sr+26, 12, "CJ 25mm x 500mm @ 300c/c")
+        _cell(sr+26, 13, 300)
+        _cell(sr+26, 14, 4900)
+        _cell(sr+26, 15, f"=N{sr+26}/M{sr+26}")
+        ws.cell(sr+26, 15).fill = fill_green
+        _cell(sr+26, 16, 2.09)
+        ws.cell(sr+26, 16).fill = fill_yellow
+        _cell(sr+26, 17, f"=O{sr+26}*P{sr+26}")
+        ws.cell(sr+26, 17).fill = fill_green
+        _border_gj(sr+26)
+        _border_lq(sr+26)
+
+        # sr+27: SCJ 25mm
+        _cell(sr+27, 12, "SCJ 25mm x 500mm @ 300 c/c")
+        _cell(sr+27, 13, 300)
+        _cell(sr+27, 14, 4900)
+        _cell(sr+27, 15, 0)
+        _cell(sr+27, 16, 2.09)
+        _cell(sr+27, 17, f"=O{sr+27}*P{sr+27}")
+        ws.cell(sr+27, 17).fill = fill_green
+        _border_gj(sr+27)
+        _border_lq(sr+27)
+
+        # sr+28: Decarbonisation Charge, EJ 25mm
+        _cell(sr+28, 7, "Decarbonisation Charge")
+        _cell(sr+28, 8, f"=(((E{sr+28}*0.454)/1000)*25)/B{area_b_rows.get(section_name, 12)}")
+        ws.cell(sr+28, 8).fill = fill_green
+        _cell(sr+28, 12, "EJ - 25mm x 500mm @ 300c/c")
+        _cell(sr+28, 13, 300)
+        _cell(sr+28, 14, 38000)
+        _cell(sr+28, 15, f"=N{sr+28}/M{sr+28}")
+        ws.cell(sr+28, 15).fill = fill_green
+        _cell(sr+28, 16, 0)
+        _cell(sr+28, 17, f"=O{sr+28}*P{sr+28}")
+        ws.cell(sr+28, 17).fill = fill_green
+        _border_gj(sr+28)
+        _border_lq(sr+28)
+
+        # sr+29: Timber
+        _cell(sr+29, 12, "Timber (175mm x 25mm thick)")
+        _cell(sr+29, 14, 23)
+        _cell(sr+29, 15, 1)
+        _cell(sr+29, 16, 4.5)
+        _cell(sr+29, 17, f"=N{sr+29}*P{sr+29}")
+        ws.cell(sr+29, 17).fill = fill_green
+        _border_gj(sr+29)
+        _border_lq(sr+29)
+
+        # sr+30: Nett Total, 25mm x600mm
+        _cell(sr+30, 7, "Nett Total", True)
+        _cell(sr+30, 8, f"=SUM(H{sr+4},H{sr+11},H{sr+15},H{sr+17},H{sr+19},H{sr+21},H{sr+28})", True)
+        _cell(sr+30, 12, "25mm x600mm @ ")
+        _cell(sr+30, 16, 2.52)
+        _cell(sr+30, 17, f"=O{sr+30}*P{sr+30}")
+        ws.cell(sr+30, 17).fill = fill_green
+        _border_gj_totals(sr+30)
+        _border_lq(sr+30)
+
+        # sr+31: Margin, 20mm x500mm
+        _cell(sr+31, 7, "Margin")
+        _cell(sr+31, 8, f"=H{sr+30}*J{sr+31}")
+        ws.cell(sr+31, 8).fill = fill_green
+        _cell(sr+31, 9, "Margin ")
+        _cell(sr+31, 10, margin)
+        ws.cell(sr+31, 10).fill = fill_yellow
+        _cell(sr+31, 12, "20mm x 500mm @ ")
+        _cell(sr+31, 16, 1.35)
+        _border_gj(sr+31)
+        _border_lq(sr+31)
+
+        # sr+32: TOTAL RATE/M2, 20mm x600mm
+        _cell(sr+32, 7, "TOTAL RATE/M2", True)
+        _cell(sr+32, 8, f"=SUM(H{sr+30}:H{sr+31})", True)
+        _cell(sr+32, 12, "20mm x 600mm  @")
+        _cell(sr+32, 16, 1.51)
+        _border_gj_totals(sr+32)
+        _border_lq(sr+32)
+
+        # sr+33: E/O RATE/M2
+        _cell(sr+33, 7, "E/O RATE/M2", True)
+        _cell(sr+33, 8, f"=SUM(E{sr+14}:E{sr+19})/B{area_b_rows.get(section_name, 12)}", True)
+        _border_gj_totals(sr+33)
+        _border_lq(sr+33)
+
+        # sr+34: ALL INCL RATE/M2
+        _cell(sr+34, 7, "ALL INCL RATE/M2", True)
+        _cell(sr+34, 8, f"=SUM(H{sr+32}:H{sr+33})", True)
+        _cell(sr+34, 12, "Name/Person")
+        _border_gj_totals(sr+34)
+        _border_lq(sr+34)
+
+    # ── VLOOKUP table (O23:P24) ───────────────────────────────────────
+    ws.cell(23, 15, 1200)
+    ws.cell(23, 16, "=AQ9")
+    ws.cell(24, 15, 2000)
+    ws.cell(24, 16, "=AQ38")
+    for ri in (23, 24):
+        for ci in (15, 16):
+            ws.cell(ri, ci).font = font_s
+
+
 def quotation_xlsx(q: dict) -> bytes:
     """Editable one-sheet Excel quotation in Fortel's client-facing BOQ layout."""
     wb = Workbook()
@@ -1555,17 +2038,22 @@ def quotation_xlsx(q: dict) -> bytes:
         ws.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
         row += 1
 
-    widths = {"A": 82.43, "B": 19.43, "C": 10.29, "D": 12.71, "E": 21.14}
+    widths = {"A": 82.43, "B": 19.43, "C": 10.29, "D": 12.71, "E": 21.14,
+              "G": 22, "H": 14, "I": 18, "J": 12, "L": 30, "M": 12, "N": 22, "O": 14}
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
     ws.print_title_rows = "1:7"
-    ws.print_area = f"A1:E{row}"
+    ws.print_area = f"A1:O{row}"
     ws.page_setup.orientation = "portrait"
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.oddFooter.center.text = f"{FORTEL_NAME} · {FORTEL_EMAIL} · {FORTEL_TEL}"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.calculation.calcMode = "auto"
+
+    # ── Rate buildup section (columns G onwards) — mirrors the real Fortel costing sheet's
+    #    detailed cost breakdown that sits to the right of the BOQ columns.
+    _write_rate_buildup(ws, q)
 
     out = io.BytesIO()
     wb.save(out)

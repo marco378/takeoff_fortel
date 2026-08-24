@@ -1063,6 +1063,7 @@ def adjust(job_id):
     user_channels_in = data.get("user_channels") or []    # open polylines [[[x,y], ...], ...]
     area_elements_present = "area_elements" in data
     area_elements_in = data.get("area_elements") if area_elements_present else None
+    manhole_count_in = data.get("manhole_count")  # assessor-confirmed manhole count (int or None to clear)
 
     def _valid_region(region):
         return (
@@ -1197,6 +1198,19 @@ def adjust(job_id):
             if length_px <= 1e-6:
                 return jsonify({"error": "user_channels must have positive length"}), 400
         user_channels = user_channels_in
+
+    # Validate assessor-confirmed manhole count.  None means "clear / use AI detection".
+    # A non-negative integer overrides whatever the pipeline detected.
+    manhole_count = None
+    if manhole_count_in is not None:
+        if manhole_count_in is None:
+            manhole_count = None  # explicit clear
+        elif isinstance(manhole_count_in, bool) or not isinstance(manhole_count_in, int):
+            return jsonify({"error": "manhole_count must be a non-negative integer or null"}), 400
+        elif manhole_count_in < 0:
+            return jsonify({"error": "manhole_count must be non-negative"}), 400
+        else:
+            manhole_count = manhole_count_in
 
     # If assessor traced one or more polygons + scale, re-measure (heavy I/O — outside lock).
     # Legacy `vertices` remains exactly one region; Office GA candidates can now be combined.
@@ -1353,8 +1367,16 @@ def adjust(job_id):
                  else "main_upper_floor" if category == "upper_floor" else "main")
                 for category in effective_region_categories
             ]
+        # Whether the assessor supplied a category for every region is independent of whether
+        # the resulting area is plausible (`confirmed`) — conflating them used to wipe a fully
+        # categorized submission's zones to [] whenever the area tripped sanity.plausible()
+        # (e.g. a legitimately large yard over the 60,000 m^2 single-zone guard), leaving
+        # zone_allocation_stale=True with nothing left to classify: a dead end, since the
+        # assessor HAD just done the reclassification the gate demanded. An implausible area
+        # still blocks approval on its own via measurement_state/scale_confirmed below; it must
+        # not also destroy the categorization the assessor just gave it.
         categorized_remeasure = bool(
-            confirmed and regions and len(effective_region_categories) == len(regions)
+            regions and len(effective_region_categories) == len(regions)
             and len(effective_region_scopes) == len(regions)
             and len(region_areas) == len(regions)
         )
@@ -1457,6 +1479,15 @@ def adjust(job_id):
                 "flags": _without_zone_stale_flags(stored_result.get("flags")) + list(gflags),
                 "needs_assessor": bool(zone_classification_required or zone_geometry_overlap),
             })
+        # Carry assessor-confirmed manhole count into the result so costing uses it.
+        if manhole_count_in is not None:
+            if manhole_count is not None:
+                stored_result["manhole_count"] = manhole_count
+                stored_result.pop("manhole_count_estimate", None)
+                stored_result.pop("manhole_count_assumed", None)
+            else:
+                # Assessor cleared the count — fall back to AI detection
+                stored_result.pop("manhole_count", None)
         costing_result = ((job.get("costing") or stored_result.get("costing"))
                           if preserve_main_measurement
                           else _run_costing(area_m2, stored_result) if area_m2 else None)
@@ -1468,6 +1499,8 @@ def adjust(job_id):
             })
             if snapshot_scale_in is not None:
                 adjusted_payload["snapshot_scale"] = snapshot_scale_in
+            if manhole_count_in is not None:
+                adjusted_payload["manhole_count"] = manhole_count
         else:
             adjusted_payload = {
                 "vertices": regions[0] if len(regions) == 1 else [],
@@ -1487,6 +1520,7 @@ def adjust(job_id):
                 "cutout_regions": cutout_regions,
                 "user_channels": user_channels,
                 "area_elements": computed_area_elements,
+                "manhole_count": manhole_count,
             }
         persisted_cutout_regions = (
             copy.deepcopy(existing_adjusted.get("cutout_regions") or [])
@@ -2756,6 +2790,14 @@ def _quotation_result_for_job(job: dict, result_override=None, costing_override=
     if (not isinstance(job.get("area_elements"), list)
             and isinstance(adjusted.get("area_elements"), list)):
         result["area_elements"] = copy.deepcopy(adjusted["area_elements"])
+    # Carry assessor-confirmed manhole count into the quotation result.
+    if "manhole_count" in adjusted:
+        if adjusted["manhole_count"] is not None:
+            result["manhole_count"] = adjusted["manhole_count"]
+            result.pop("manhole_count_estimate", None)
+            result.pop("manhole_count_assumed", None)
+        else:
+            result.pop("manhole_count", None)
     return result
 
 
@@ -2785,6 +2827,20 @@ def _quotation_for_job(job_id: str, result_override=None, costing_override=None)
             res = sibling.get("result") or {}
             area = (sibling.get("adjusted") or {}).get("area_m2") or res.get("area_m2")
             if sibling.get("decision") in ("approved", "adjusted") or area:
+                # Filter out low-priority drawings (site plans, elevations, etc.) that
+                # shouldn't contribute measured area to the quote. Only include if the
+                # drawing has a reasonable priority score or is explicitly approved.
+                from router import drawing_priority
+                fname = res.get("file") or ""
+                priority = drawing_priority(fname)
+                if priority < -1 and sibling.get("decision") not in ("approved", "adjusted"):
+                    # Low-priority drawing with no assessor approval — list as unmeasured
+                    # instead of including its possibly-wrong measured area.
+                    state = res.get("measurement_state") or sibling.get("status") or "UNMEASURED"
+                    unmeasured.append({"file": fname, "state": state,
+                                       "reason": f"drawing priority too low ({priority}); "
+                                       "assessor must explicitly approve to include"})
+                    continue
                 siblings.append((sibling_id, sibling))
             else:
                 fname = res.get("file") or Path(str(sibling.get("pdf") or "")).name or sibling_id
@@ -4071,4 +4127,4 @@ if __name__ == "__main__":
           + (f"?token={_mask_token(APPROVAL_TOKEN)} (masked — see .env for the real value)"
              if APPROVAL_TOKEN else ""))
 
-    app.run(host=host, port=port, debug=False)
+    app.run(host=host, port=port, debug=False, threaded=True)

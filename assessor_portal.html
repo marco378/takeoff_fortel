@@ -1372,6 +1372,7 @@ function renderZoneSummary(job) {
   const zones = effectiveZones(job);
   const stale = !!(job.zone_allocation_stale || res.zone_allocation_stale);
   const mismatch = !!(job.zone_reference_mismatch || res.zone_reference_mismatch);
+  const yardRegionReview = !!(job.yard_region_review_required || res.yard_region_review_required);
   const classificationRequired = zoneReviewRequired(job);
   let warning = '';
   if (classificationRequired) {
@@ -1379,12 +1380,18 @@ function renderZoneSummary(job) {
       ? 'Aggregate adjustment invalidated the previous zone allocation. Reclassify or remeasure every zone before approval.'
       : mismatch
         ? 'Measured zone quantities differ from the client reference beyond tolerance. Assessor review is required before approval.'
-        : 'One or more markup subjects could not be classified. Classify every zone before approval.';
+        : yardRegionReview
+          ? 'Multiple same-tint Yard regions detected. Keep or exclude every region before approval.'
+          : 'One or more markup subjects could not be classified. Classify every zone before approval.';
     const reviewAction = mismatch
       ? `<button type="button" onclick="acknowledgeZoneReferenceMismatch()" style="margin-top:7px;font-size:10px;padding:4px 7px;cursor:pointer">I reviewed this mismatch — acknowledge</button>`
       : '';
+    const bannerTitle = stale ? 'ZONE REVIEW REQUIRED'
+      : mismatch ? 'ZONE REVIEW REQUIRED'
+      : yardRegionReview ? 'YARD REGION REVIEW REQUIRED'
+      : 'ZONE REVIEW REQUIRED';
     warning = `<div style="margin:8px 0;background:#fdecea;border:2px solid #c0392b;border-radius:6px;padding:9px 10px;color:#922b21;font-size:12px;line-height:1.4">
-      🚨 <strong>ZONE REVIEW REQUIRED</strong><br>${esc(reason)}${reviewAction}
+      🚨 <strong>${esc(bannerTitle)}</strong><br>${esc(reason)}${reviewAction}
     </div>`;
   }
   if (!zones.length) return warning;
@@ -1816,19 +1823,19 @@ function renderJobDetails(job) {
   const manholeCount = job.manhole_count ?? res.manhole_count;
   const manholeEstimate = job.manhole_count_estimate ?? res.manhole_count_estimate;
   const manholeAssumed = job.manhole_count_assumed ?? res.manhole_count_assumed;
-  const manholeRows = manholeCount != null
-    ? `<div class="kv"><span class="k">Marked manholes</span><span class="v">${esc(manholeCount)} Nr</span></div>`
-    : manholeEstimate != null
-      ? `<div class="kv assumption-item" style="padding:5px 6px"><span class="k">Detected manholes</span><span class="v">
-           ${esc(manholeEstimate)} Nr ${assumptionBadge('ESTIMATED', provenanceFlag(job,'manhole_count_estimate'))}
-           <span class="assumption-basis">${esc(provenanceFlag(job,'manhole_count_estimate'))}</span>
-         </span></div>`
-      : manholeAssumed != null
-        ? `<div class="kv assumption-item" style="padding:5px 6px"><span class="k">Manhole fallback</span><span class="v">
-             ${esc(manholeAssumed)} Nr ${assumptionBadge('ASSUMED', provenanceFlag(job,'manhole_count_assumed'))}
-             <span class="assumption-basis">${esc(provenanceFlag(job,'manhole_count_assumed'))}</span>
-           </span></div>`
-        : '';
+  const effectiveManholeCount = manholeCount ?? manholeEstimate ?? manholeAssumed ?? '';
+  const manholeSource = manholeCount != null ? 'marked' : manholeEstimate != null ? 'estimated' : manholeAssumed != null ? 'assumed' : 'none';
+  const manholeRows = (effectiveManholeCount !== '' || manholeSource !== 'none')
+    ? `<div class="kv" style="padding:5px 6px"><span class="k">Manholes</span><span class="v">
+         <input type="number" min="0" value="${esc(effectiveManholeCount)}" id="manholeCountInput"
+                style="width:60px;padding:2px 4px;border:1px solid #ccc;border-radius:3px;font-size:13px">
+         Nr
+         ${manholeSource === 'estimated' ? assumptionBadge('ESTIMATED', provenanceFlag(job,'manhole_count_estimate')) : ''}
+         ${manholeSource === 'assumed' ? assumptionBadge('ASSUMED', provenanceFlag(job,'manhole_count_assumed')) : ''}
+         <button onclick="updateManholeCount()" style="margin-left:6px;padding:2px 8px;background:#13294b;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:12px">Save</button>
+         <button onclick="clearManholeCount()" style="margin-left:3px;padding:2px 6px;background:#eee;color:#666;border:1px solid #ccc;border-radius:3px;cursor:pointer;font-size:12px" title="Clear assessor override, fall back to AI detection">Reset</button>
+       </span></div>`
+    : '';
   const assumptionLegend = jobHasAssumptions(job)
     ? `<div class="assumption-legend">${assumptionBadge('ASSUMED / PROPOSED', 'Amber values are not measured facts and require assessor confirmation')} Amber values are assumption-based, proposed or provisional. Confirm, edit or remove them before issue.</div>`
     : '';
@@ -3526,6 +3533,52 @@ function setupButtons() {
   document.getElementById('btnAdjust') .addEventListener('click', () => submitDecision('adjust'));
   document.getElementById('btnAddDrawings').addEventListener('click', () => beginAddDrawings(currentJob));
   document.getElementById('btnDelete') .addEventListener('click', deleteCurrentJob);
+}
+
+// ─────────────────────────────────────────────────
+// Editable manhole count
+// ─────────────────────────────────────────────────
+async function updateManholeCount() {
+  if (!selectedJobId) { toast('No job selected', 'warn'); return; }
+  const input = document.getElementById('manholeCountInput');
+  if (!input) return;
+  const raw = input.value.trim();
+  if (raw === '') { toast('Enter a number', 'warn'); return; }
+  const count = parseInt(raw, 10);
+  if (isNaN(count) || count < 0) { toast('Manhole count must be a non-negative integer', 'warn'); return; }
+  input.disabled = true;
+  try {
+    const r = await fetch(`${BASE}/adjust/${selectedJobId}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({manhole_count: count}),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    toast(`Manhole count set to ${count} Nr`);
+    await selectJob(selectedJobId);
+  } catch (e) {
+    toast(`Error: ${e.message}`, 'error');
+  } finally {
+    input.disabled = false;
+  }
+}
+
+async function clearManholeCount() {
+  if (!selectedJobId) { toast('No job selected', 'warn'); return; }
+  try {
+    const r = await fetch(`${BASE}/adjust/${selectedJobId}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({manhole_count: null}),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    toast('Manhole count cleared — falling back to AI detection');
+    await selectJob(selectedJobId);
+  } catch (e) {
+    toast(`Error: ${e.message}`, 'error');
+  }
 }
 
 // ─────────────────────────────────────────────────

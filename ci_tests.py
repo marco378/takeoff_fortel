@@ -4386,6 +4386,11 @@ try:
            all(marker in _portal_html_up for marker in (
                "Measured zones", "ZONE REVIEW REQUIRED", "classifyZone(",
                "acknowledgeZoneReferenceMismatch", "zone_category", "effectiveBriefSpecs")))
+        ck("portal shows correct banner for yard-region review vs zone classification",
+           all(marker in _portal_html_up for marker in (
+               "yardRegionReview", "YARD REGION REVIEW REQUIRED",
+               "Multiple same-tint Yard regions detected",
+               "yard_region_review_required")))
         ck("portal exposes assisted Office candidates without auto-submitting them",
            all(marker in _portal_html_up for marker in (
                "ASSISTED TRACE CANDIDATES", "candidate_polygons", "loadTraceCandidate(",
@@ -6469,6 +6474,56 @@ _zb_mismatch = _zb_job([("z1", 100.0, "external_yard")], stale=False)
 _zb_mismatch["zone_reference_mismatch"] = True
 ck("a genuine zone-vs-BOQ mismatch still blocks approval",
    _AS_zb._zone_block_reason(_zb_mismatch) is not None)
+
+# ── /adjust must not wipe a fully-categorized zone submission ──────────────────────────
+# Aryan, 24 Aug: "approval sometimes stays blocked even after submitting it". Root cause:
+# categorized_remeasure required `confirmed` (sanity.plausible() on the NEW area), so an
+# assessor who categorized every region got their zones silently reset to [] and
+# zone_allocation_stale=True whenever the resulting area tripped the plausibility guard (e.g.
+# a legitimately large yard over the 60,000 m^2 single-zone bound) — a dead end identical in
+# shape to the /zones phantom-block bug above, just reached through /adjust instead.
+print("\n[/adjust preserves categorized zones even when the area is implausible]")
+import tempfile as _zw_tempfile
+_zw_orig_jobs_file = _AS_zb.JOBS_FILE
+_zw_tmpdir = Path(_zw_tempfile.mkdtemp())
+_AS_zb.JOBS_FILE = _zw_tmpdir / "jobs.json"
+_zw_client = _AS_zb.app.test_client()
+_zw_job_id = "zw1"
+_zw_jobs = {_zw_job_id: {
+    "id": _zw_job_id, "status": "adjusted", "decision": "adjusted",
+    "scale_confirmed": False, "measurement_state": "MEASURED_UNVERIFIED",
+    "zones": [{"zone_key": "external_yard", "area_m2": 5000.0, "category": "external_yard",
+               "subjects": ["Yard"]},
+              {"zone_key": "dock", "area_m2": 200.0, "category": "dock", "subjects": ["Dock"]}],
+    "result": {"measurement_state": "MEASURED_UNVERIFIED", "area_m2": 5200.0,
+               "zones": [{"zone_key": "external_yard", "area_m2": 5000.0,
+                          "category": "external_yard", "subjects": ["Yard"]},
+                         {"zone_key": "dock", "area_m2": 200.0, "category": "dock",
+                          "subjects": ["Dock"]}], "flags": []},
+}}
+_AS_zb.save_jobs(_zw_jobs)
+_zw_big = [[0, 0], [300000, 0], [300000, 300000], [0, 300000]]  # trips the >60,000 m^2 guard
+_zw_small = [[0, 0], [10, 0], [10, 10], [0, 10]]
+_zw_resp = _zw_client.post(f"/adjust/{_zw_job_id}", json={
+    "regions": [_zw_big, _zw_small],
+    "region_categories": ["external_yard", "dock"],
+    "region_scopes": ["main", "main"],
+    "scale_k": 1.0,
+})
+ck("categorized /adjust with an implausible area is still accepted",
+   _zw_resp.status_code == 200, _zw_resp.status_code)
+_zw_after = _AS_zb.load_jobs()[_zw_job_id]
+_zw_categories = sorted(z.get("category") for z in (_zw_after.get("zones") or []))
+ck("...its regions keep the categories the assessor actually submitted, not []",
+   _zw_categories == ["dock", "external_yard"], _zw_categories)
+ck("...zone_allocation_stale is NOT set — a categorized submission is not a stale aggregate one",
+   _zw_after.get("zone_allocation_stale") is False, _zw_after.get("zone_allocation_stale"))
+_zw_reason = _AS_zb._approve_block_reason(_zw_after)
+ck("...the resulting block (if any) names the real problem (implausible/unverified area), "
+   "not a false 'reclassify zones' demand for zones the assessor just classified",
+   _zw_reason is not None and "reclassify/remeasure the drawing zones" not in _zw_reason,
+   _zw_reason)
+_AS_zb.JOBS_FILE = _zw_orig_jobs_file
 
 
 
