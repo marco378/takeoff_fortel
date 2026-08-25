@@ -6584,5 +6584,55 @@ ck("it sits to the right of VALUE, mirroring Fortel's REMEASURE caveat column",
    _PC_pm == 6, _PC_pm)
 
 
+
+
+# ── Standards citations must never be read as a drawing scale ──────────────────────────
+# Inderjit, 25 Aug call: "it took the wrong scale also it should have been like one is to five
+# hundred". Cause, found by running his real project-6 sheet: the spec note "75mm sand:cement
+# screed to BS 8204 Part 1: 2003" contains a literal "1: 2003", which beat the genuine 1:500 in
+# the title block. k became 0.70661 instead of 0.17639 — 4x out linearly, 16x out on AREA.
+# The guard is a standards-citation strip plus a four-digit scale SERIES whitelist; a year is in
+# no series. It deliberately does NOT ban large scales — 1:1500 and 1:2000 are real and in live
+# use on the CADIC site sheets, and banning them would silently break those instead.
+print("\n[standards citations are not scales]")
+from takeoff_unmarked import _title_scale_denominators as _tsd, FOUR_DIGIT_SCALE_SERIES as _series
+_bs_note = "75mm sand:cement screed to BS 8204 Part 1: 2003 on Rockwool RockFloor"
+_title_line = "Construction Thicknessess Plan Sheet 2 S2 1:500 A1 17.08.26"
+ck("a BS standard year is not accepted as a scale", _tsd(_bs_note) == [], _tsd(_bs_note))
+ck("the real title-block 1:500 wins over the BS year on the same sheet",
+   _tsd(f"{_bs_note} {_title_line}") == [500], _tsd(f"{_bs_note} {_title_line}"))
+ck("the hyphenated standard form is rejected too (BS 8204-1:2003)",
+   _tsd("to BS 8204-1:2003 on") == [], _tsd("to BS 8204-1:2003 on"))
+ck("BS EN / ISO variants are rejected",
+   _tsd("to BS EN 1234-1:2004 spec") == [] and _tsd("per ISO 9001 Part 2: 1999") == [])
+for _s, _want in (("Site plan 1:2000", 2000), ("Masterplan 1:1500", 1500),
+                  ("Layout 1:1250", 1250), ("Plan 1:1000", 1000), ("Detail 1:2500", 2500)):
+    ck(f"real large scale {_want} still parses — banning years must not ban these",
+       _tsd(_s) == [_want], _tsd(_s))
+for _s, _want in (("Yard 1:500", 500), ("Plan 1:200", 200), ("Detail 1:75", 75)):
+    ck(f"ordinary scale {_want} unaffected", _tsd(_s) == [_want], _tsd(_s))
+# 1:2000 is BOTH a real drawing scale and a plausible year, so the series whitelist alone
+# cannot separate them — the standards-citation strip has to carry that case. Assert the hard
+# one directly rather than assuming the whitelist covers it.
+ck("a standards citation quoting the year 2000 is still rejected, even though 1:2000 is a "
+   "real scale the whitelist allows",
+   _tsd("screed to BS 8204 Part 1: 2000 on insulation") == [],
+   _tsd("screed to BS 8204 Part 1: 2000 on insulation"))
+ck("...and a genuine 1:2000 site plan on the same sheet still wins",
+   _tsd("screed to BS 8204 Part 1: 2000 on insulation. Site plan 1:2000") == [2000],
+   _tsd("screed to BS 8204 Part 1: 2000 on insulation. Site plan 1:2000"))
+
+# The real client sheet, when present (drawings/ is gitignored — skip cleanly if absent).
+_p6 = Path("drawings/inderjit_p6/"
+           "6_31941-TTE-ZF-762-DR-C-0711-P01-Construction_Thicknessess_Plan.pdf")
+if _p6.exists():
+    import fitz as _fitz_p6
+    _txt_p6 = _fitz_p6.open(str(_p6))[0].get_text() or ""
+    ck("Inderjit's real project-6 sheet now yields 1:500, not the BS year 2003",
+       _tsd(_txt_p6)[:1] == [500], _tsd(_txt_p6)[:3])
+else:
+    print(f"  [SKIP] real project-6 sheet not present — {_p6}")
+
+
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)

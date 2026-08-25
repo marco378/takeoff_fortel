@@ -1699,6 +1699,15 @@ SCALE_BAR_AGREE_TOL = 0.03   # ±3 % — bar and title-block must agree within t
 # implying a ratio outside this band is not "a different but real scale" — it is a mis-paired
 # label/line (e.g. an unrelated "7016 m" dimension callout fused to a nearby 34pt line fragment)
 # and must be rejected as a false anchor rather than trusted over the title block.
+# Four-digit drawing scales come from a standard series.  A year such as 2003 is in none of
+# them, which is what lets us reject a standards citation without banning real large scales:
+# 1:1500 and 1:2000 are genuine (CADIC site sheets use them) and must keep parsing.
+FOUR_DIGIT_SCALE_SERIES = frozenset({1000, 1250, 1500, 2000, 2500, 5000})
+# "BS 8204 Part 1: 2003", "BS EN 1234-1:2004", "ISO 9001 Part 2: 1999" ...
+_STANDARD_CITATION_RX = re.compile(
+    r"\b(?:BS|BS\s*EN|EN|ISO|DIN|ASTM)\b[^\n]{0,40}?\d\s*[:：]\s*(?:19|20)\d{2}\b",
+    re.I)
+
 PLAUSIBLE_SCALE_RATIO_MIN = 20
 PLAUSIBLE_SCALE_RATIO_MAX = 5000
 # This is a review-risk trigger, not a scale/area tolerance. Inderjit specifically identified
@@ -1738,10 +1747,18 @@ def _title_scale_denominators(text):
     tie keeps PDF reading order (the long-established behaviour) and remains subject to the
     normal scale-consensus disagreement gate.
     """
+    # A drawing's spec notes cite standards, and "BS 8204 Part 1: 2003" contains a literal
+    # "1: 2003".  On Inderjit's project-6 Construction Thickness sheets that year beat the real
+    # 1:500 in the title block, giving k=0.70661 instead of 0.17639 — 4x out linearly, 16x on
+    # area.  He reported it as "it took the wrong scale, it should have been one is to five
+    # hundred".  Standards appear as "BS 8204 Part 1: 2003" and hyphenated "BS 8204-1:2003",
+    # so strip any 1:N that sits in a standards citation before ranking candidates.
+    text = _STANDARD_CITATION_RX.sub(" ", text)
     all_candidates = [int(value) for value in re.findall(
         r"\b1\s*:\s*(\d{2,4})\b", text)]
     plausible = [value for value in all_candidates
-                 if PLAUSIBLE_SCALE_RATIO_MIN <= value <= PLAUSIBLE_SCALE_RATIO_MAX]
+                 if PLAUSIBLE_SCALE_RATIO_MIN <= value <= PLAUSIBLE_SCALE_RATIO_MAX
+                 and (value < 1000 or value in FOUR_DIGIT_SCALE_SERIES)]
     first_seen = {value: plausible.index(value) for value in set(plausible)}
     return sorted(set(plausible), key=lambda value: (-plausible.count(value), first_seen[value]))
 
