@@ -2910,6 +2910,111 @@ try:
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] refuse-guard regression — missing dependency or file: {_e}")
 
+print("hatch-drawn surfaces (MJM 9000 class: slanted legend hatching, not a solid fill)")
+try:
+    import os as _os_hx
+    import json as _json_hx
+    import cv2 as _cv_hx
+    import fitz as _fitz_hx
+    import numpy as _np_hx
+    import takeoff_unmarked as _tu_hx
+
+    # ── Router guards. No fixture needed, so these run everywhere and pin the behaviour
+    # that protects the gold sheets: a solid fill must NEVER be routed to a wide kernel.
+    _hx_solid = _np_hx.zeros((700, 700), bool)
+    _hx_solid[50:650, 50:650] = True
+    _k_s, _i_s = _tu_hx._hatch_closing_kernel(_hx_solid, 6, 0.1, 2.0)
+    ck("hatch router: a solid filled block is NOT routed to the wide kernel",
+       _k_s is None, _i_s.get("reason"))
+
+    _hx_hatch = _np_hx.zeros((700, 700), bool)
+    _hx_hatch[50:650, 50:650:26] = True          # strokes 26 px apart, MJM's own spacing
+    _k_h, _i_h = _tu_hx._hatch_closing_kernel(_hx_hatch, 6, 0.1, 2.0)
+    ck("hatch router: 26 px-spaced strokes ARE routed to a wider kernel",
+       _k_h is not None and _k_h > 6, _i_h.get("reason"))
+
+    # The cap is in METRES, not pixels: the same 26 px spacing that is a legitimate hatch on a
+    # 1:500 sheet would bridge 13 m on a coarse one, which is fusing the drawing rather than
+    # reading it. Same mask as above, coarser scale, and it must refuse.
+    _k_w, _i_w = _tu_hx._hatch_closing_kernel(_hx_hatch, 6, 1.0, 2.0)
+    ck("hatch router: a kernel bridging too much REAL distance REFUSES, however it looks in px",
+       _k_w is None and "cap" in (_i_w.get("reason") or ""), _i_w.get("reason"))
+
+    _hx_sparse = _np_hx.zeros((700, 700), bool)
+    _hx_sparse[10:30, 10:30] = True              # far too little tint to classify
+    _k_sp, _i_sp = _tu_hx._hatch_closing_kernel(_hx_sparse, 6, 0.1, 2.0)
+    ck("hatch router: too little matching tint REFUSES to classify",
+       _k_sp is None, _i_sp.get("reason"))
+
+    # ── Real-sheet gold. Client drawings are gitignored, so skip VISIBLY when absent.
+    _hx_pdf = ("drawings/inderjit_p7/"
+               "7_25195-MJM-00-00-DR-C-9000-D2-P04-External_Works_Layout.pdf")
+    if not (_os_hx.path.exists(_hx_pdf) and _os_hx.path.exists("ground_truth_polygons.json")):
+        print(f"  [SKIP] MJM hatch gold — client fixture not present ({_hx_pdf})")
+    else:
+        _hx_gt = _json_hx.loads(Path("ground_truth_polygons.json").read_text())
+        _hx_entry = _hx_gt[_hx_pdf]
+        _hx_res = _tu_hx.takeoff(_hx_pdf, source="architect")
+        _hx_area = _hx_res.get("area_m2")
+        _hx_truth = _hx_entry["area_m2"]
+
+        # Area alone is not enough (CLAUDE.md rule 4: an agent once matched a gold area to
+        # 0.1% with the WRONG region), so the shape is scored too.
+        ck("MJM hatch gold: measures the area the hatch ENCLOSES, not its ink",
+           _hx_area is not None and abs(_hx_area - _hx_truth) / _hx_truth * 100 <= 2.0,
+           f"got {_hx_area} vs truth {_hx_truth}")
+        ck("MJM hatch gold: the widened-kernel path is FLAGGED, never silent",
+           any("HATCH-DRAWN SURFACE" in _f for _f in _hx_res.get("flags") or []))
+
+        _hx_doc = _fitz_hx.open(_hx_pdf)
+        _hx_pg = _hx_doc[0]
+        _hx_S = 2.0
+        _hx_pix = _hx_pg.get_pixmap(matrix=_fitz_hx.Matrix(_hx_S, _hx_S))
+        _hx_im = _np_hx.frombuffer(_hx_pix.samples, _np_hx.uint8).reshape(
+            _hx_pix.height, _hx_pix.width, _hx_pix.n)[:, :, :3].copy()
+        _hx_H, _hx_W = _hx_im.shape[:2]
+        _hx_R = _hx_pg.rotation_matrix
+        _hx_poly = _np_hx.array(
+            [[(_fitz_hx.Point(_x, _y) * _hx_R).x * _hx_S,
+              (_fitz_hx.Point(_x, _y) * _hx_R).y * _hx_S]
+             for _x, _y in _hx_entry["polygon_pts"]], _np_hx.int32)
+        _hx_truth_mask = _np_hx.zeros((_hx_H, _hx_W), _np_hx.uint8)
+        _cv_hx.fillPoly(_hx_truth_mask, [_hx_poly], 1)
+        _hx_truth_mask = _hx_truth_mask.astype(bool)
+
+        _hx_mask = _np_hx.all(
+            _np_hx.abs(_hx_im.astype(_np_hx.int16) - _np_hx.array([254, 0, 0], _np_hx.int16))
+            <= 14, axis=2).astype(_np_hx.uint8)
+        _hx_my = max(1, int(round(_hx_H * _tu_hx.MARGIN_FRAC)))
+        _hx_mx = max(1, int(round(_hx_W * _tu_hx.MARGIN_FRAC)))
+        _hx_mask[:_hx_my, :] = 0
+        _hx_mask[-_hx_my:, :] = 0
+        _hx_mask[:, :_hx_mx] = 0
+        _hx_mask[:, -_hx_mx:] = 0
+        _hx_lb = _tu_hx._legend_sample_bbox_for(_hx_pdf, _tu_hx.CONCRETE_LABELS)
+        if _hx_lb:
+            _a, _b, _c, _d = [int(round(_v * _hx_S)) for _v in _hx_lb]
+            _hx_mask[max(0, _b):min(_hx_H, _d), max(0, _a):min(_hx_W, _c)] = 0
+        _hx_closed = _cv_hx.morphologyEx(
+            _hx_mask, _cv_hx.MORPH_CLOSE, _np_hx.ones((51, 51), _np_hx.uint8))
+        _hx_n, _hx_lab, _hx_st, _ = _cv_hx.connectedComponentsWithStats(_hx_closed, 8)
+        _hx_i = 1 + int(_np_hx.argmax(_hx_st[1:, _cv_hx.CC_STAT_AREA]))
+        _hx_region = (_hx_lab == _hx_i)
+        _hx_iou = ((_hx_region & _hx_truth_mask).sum()
+                   / max((_hx_region | _hx_truth_mask).sum(), 1))
+        ck("MJM hatch gold: the closed region is the RIGHT region (IoU vs client markup)",
+           _hx_iou >= 0.90, f"IoU {_hx_iou:.3f}")
+
+        # The runtime acceptance gate, not a dev-time one: production sheets have no truth
+        # polygon, so a hatch is only measured when its outline corroborates a native CAD path.
+        _hx_native, _hx_reason = _tu_hx._native_boundary_for_mask(
+            _hx_pg, _hx_region, _hx_S, _hx_entry["k_m_per_pt"])
+        ck("MJM hatch gold: closed outline corroborates a native CAD boundary at IoU 0.90",
+           _hx_native is not None, _hx_reason)
+        _hx_doc.close()
+except (ImportError, FileNotFoundError, KeyError) as _e:
+    print(f"  [SKIP] hatch-drawn surface regression — missing dependency or file: {_e}")
+
 print("manhole E/O costing line (costing.py Winvic rate: £75.00/Nr)")
 try:
     from quotation import generate_quotation as _gen_q_mh

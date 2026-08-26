@@ -1,0 +1,59 @@
+{
+  "_comment": "Ground-truth surface boundaries for IoU scoring. Unlike gold.json (which pins an AREA), these pin the SHAPE, so a measurement can be scored on WHERE it looked and not only on how big the answer was. CLAUDE.md rule 4 exists because an agent once matched a gold area to 0.1% while outlining the WRONG region. Every entry needs a documented human source. polygon_pts are UNROTATED PDF points on the stated page, as returned by fitz get_drawings(); to raster-space: pt * page.rotation_matrix, then * S. The PDFs live under drawings/ and are gitignored, so consumers MUST skip visibly when the file is absent, never silently.",
+  "drawings/inderjit_p7/7_25195-MJM-00-00-DR-C-9000-D2-P04-External_Works_Layout.pdf": {
+    "surface": "EXTERNAL CONCRETE SERVICE YARD",
+    "area_m2": 9810.24,
+    "area_m2_independent_shoelace": 9810.12,
+    "min_iou": 0.9,
+    "page": 0,
+    "page_rotation": 270,
+    "k_m_per_pt": 0.176389,
+    "scale": "1:500",
+    "coord_space": "unrotated PDF points (fitz get_drawings space)",
+    "polygon_pts": [
+      [
+        1539.683,
+        650.917
+      ],
+      [
+        1640.151,
+        298.0
+      ],
+      [
+        1450.708,
+        242.657
+      ],
+      [
+        1426.443,
+        325.246
+      ],
+      [
+        581.826,
+        85.569
+      ],
+      [
+        503.92,
+        358.877
+      ],
+      [
+        949.643,
+        483.611
+      ],
+      [
+        970.928,
+        407.834
+      ],
+      [
+        1042.874,
+        428.694
+      ],
+      [
+        1021.163,
+        503.62
+      ]
+    ],
+    "source": "Bluebeam area markup drawn by Aryan (U0BCUEBAAFQ) and posted to #fortel on 2026-08-26, Slack ts 1787736005.186649, Google Drive id 1UMauqocw-rCw5_gA_RhUcWD0GDbmqu5Q. The marked PDF differs from the unmarked sheet by exactly two vector paths: this polygon and its label box reading 'Unclassified area - 9,810.24 m2'. The marked PDF itself is kept OUT of drawings/ (at ~/fortel-ground-truth/) because the robustness corpus scans that tree and would otherwise measure the markup as if it were a client drawing; nothing here depends on the PDF, the vertices below are the artefact.",
+    "corroboration": "Independent shoelace over the extracted vertices gives 9810.12 m2, 0.001% from the markup's own label, which also confirms the sheet's 1:500 / k=0.176389 is read correctly. 94.6% of the sheet's red-tint (254,0,0) ink falls inside this polygon, so it is the right region and not an area coincidence. Inderjit quoted 9,857 m2 for the same yard on the 5 Aug call.",
+    "note": "The yard is drawn as RED DIAGONAL HATCHING, not a solid fill: 1 px strokes, median inter-stroke gap 26 px (2.29 m at 1:500), inking only 2.8% of the area they enclose. This is the reference case for hatch-aware detection."
+  }
+}

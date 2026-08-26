@@ -1,28 +1,159 @@
 {
   "_comment": "Gold answers. synthetic_yard.pdf is generated & provable now (see ci_tests.py _gen_synthetic_yard) and also carries manhole_count 26 for the MARKED-path Circle-annot counter (robust_takeoff.count_manholes_marked), matching marker_count. The Winvic entries are REAL known quantities from the costing sheet, now activated against the real PDFs in drawings/winvic/. Keys are paths relative to the repo root. drawings/_int_d77.pdf is the colour-coded UNMARKED path with gold from Smita's Bluebeam measurement. drawings/_int_d77_borders.pdf proves the border/legend exclusion fix (segment_hatch exclude_border=True).",
-  "synthetic_yard.pdf": {"gross_m2": 26080, "void_m2": 160, "net_m2": 25920, "marker_count": 26, "manhole_count": 26, "tol_pct": 2},
-
-  "drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf":      {"net_m2": 26080, "channel_lm": 731, "tol_pct": 2},
-  "drawings/winvic/Dock_Slab_Area_Proposed_Site_Plan.pdf": {"net_m2": 930,   "base_count": 34, "perimeter_lm": 500, "tol_pct": 2},
-  "drawings/winvic/Area_Office_Floors_GA.pdf":             {"net_m2": 3479, "tol_pct": 2, "note": "whole marked sheet (README 'Office 3,479 exact'); 520 m2 is only the GF-ancillary sub-zone (column_count 22)"},
-  "drawings/winvic/Area_Hub_Office_Transport.pdf":         {"net_m2": 729,  "tol_pct": 2, "note": "README 'Transport 729 exact'; pipeline measures 728.6"},
-  "drawings/_int_d77.pdf":                                 {"net_m2": 3156, "tol_pct": 1, "note": "Smita's Bluebeam measurement; current pipeline gives ~3159 (~0.1%)"},
-  "drawings/_int_d77_borders.pdf":                         {"net_m2": 3159, "tol_pct": 1, "note": "Same yard as _int_d77 plus a grey sheet-frame border strip + legend swatch (Aryan field report: real SGP sheets over-measure by border/legend grey). With border/legend exclusion (segment_hatch exclude_border=True) this must match _int_d77's 3,159 m², not over-count."},
-  "drawings/_int_d77_footpath.pdf":                        {"net_m2": 3159, "tol_pct": 1, "note": "Same yard as _int_d77 plus a darker, adjacent 'Footpaths (ancillary): Concrete' legend-grey strip bridged into the yard by binary_closing (Aryan's real SGP sheet: 3,172 vs Smita's Bluebeam gold 3,156 — root cause of the +16 m2 was the generic 214+-14 band admitting the darker ancillary-concrete grey). Proves the swatch-locked band fix (takeoff_unmarked.py: rgb locked to the legend-confirmed swatch colour instead of the generic band) excludes the footpath strip and returns to gold; see ci_tests.py 'D77 swatch-locked grey band' block for the before/after repro (before-fix generic band = 3,177 m2)."},
-
-  "drawings/real_sgp/D77_Hard_Landscaping.pdf":            {"net_m2": 3156, "tol_pct": 1, "note": "THE REAL SGP sheet (105301-SGP-01-ZZ-DR-A-131002-P03, posted by Aryan in #fortel 4 Jul). Smita's Bluebeam gold 3,156. Swatch-locked band measures 3,164 (+0.25%); Aryan's pre-fix run read 3,172. Gitignored client drawing — harness includes it only where the file exists."},
-
-  "drawings/castle_donington/External Markup Unit-1.pdf": {"net_m2": 3185, "tol_pct": 1, "zones_m2": {"external_yard": 3080, "dock": 105}, "boq_reference_lm": {"channel": 96}, "zone_tol_pct": 1, "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"},
-  "drawings/castle_donington/External Markup Unit-2.pdf": {"net_m2": 6762, "tol_pct": 1, "zones_m2": {"external_yard": 6370, "dock": 392}, "boq_reference_lm": {"channel": 235}, "zone_tol_pct": 1, "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"},
-  "drawings/castle_donington/External Markup Unit-3.pdf": {"net_m2": 17139, "tol_pct": 1, "zones_m2": {"external_yard": 16115, "dock": 1024}, "boq_reference_lm": {"channel": 1025}, "zone_tol_pct": 1, "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"},
-  "drawings/castle_donington/External Markup Unit-4.pdf": {"net_m2": 7624, "tol_pct": 1, "zones_m2": {"external_yard": 7222, "dock": 402}, "boq_reference_lm": {"channel": 242}, "zone_tol_pct": 1, "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"},
-  "drawings/castle_donington/Office Floors Unit-1.pdf": {"net_m2": 761, "tol_pct": 1, "zones_m2": {"ground_floor": 105, "upper_floor": 656}, "zone_tol_pct": 1, "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"},
-  "drawings/castle_donington/Office Floors Unit-2.pdf": {"net_m2": 1102, "tol_pct": 1, "zones_m2": {"ground_floor": 105, "upper_floor": 997}, "zone_tol_pct": 1, "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"},
-  "drawings/castle_donington/Office Floors Unit-3.pdf": {"net_m2": 1111, "tol_pct": 1, "zones_m2": {"ground_floor": 115, "upper_floor": 996}, "zone_tol_pct": 1, "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"},
-  "drawings/castle_donington/Office Floors Unit-4.pdf": {"net_m2": 904, "tol_pct": 1, "zones_m2": {"ground_floor": 112, "upper_floor": 792}, "zone_tol_pct": 1, "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"},
-
+  "synthetic_yard.pdf": {
+    "gross_m2": 26080,
+    "void_m2": 160,
+    "net_m2": 25920,
+    "marker_count": 26,
+    "manhole_count": 26,
+    "tol_pct": 2
+  },
+  "drawings/winvic/Yard_Area_Proposed_Site_Plan.pdf": {
+    "net_m2": 26080,
+    "channel_lm": 731,
+    "tol_pct": 2
+  },
+  "drawings/winvic/Dock_Slab_Area_Proposed_Site_Plan.pdf": {
+    "net_m2": 930,
+    "base_count": 34,
+    "perimeter_lm": 500,
+    "tol_pct": 2
+  },
+  "drawings/winvic/Area_Office_Floors_GA.pdf": {
+    "net_m2": 3479,
+    "tol_pct": 2,
+    "note": "whole marked sheet (README 'Office 3,479 exact'); 520 m2 is only the GF-ancillary sub-zone (column_count 22)"
+  },
+  "drawings/winvic/Area_Hub_Office_Transport.pdf": {
+    "net_m2": 729,
+    "tol_pct": 2,
+    "note": "README 'Transport 729 exact'; pipeline measures 728.6"
+  },
+  "drawings/_int_d77.pdf": {
+    "net_m2": 3156,
+    "tol_pct": 1,
+    "note": "Smita's Bluebeam measurement; current pipeline gives ~3159 (~0.1%)"
+  },
+  "drawings/_int_d77_borders.pdf": {
+    "net_m2": 3159,
+    "tol_pct": 1,
+    "note": "Same yard as _int_d77 plus a grey sheet-frame border strip + legend swatch (Aryan field report: real SGP sheets over-measure by border/legend grey). With border/legend exclusion (segment_hatch exclude_border=True) this must match _int_d77's 3,159 m\u00b2, not over-count."
+  },
+  "drawings/_int_d77_footpath.pdf": {
+    "net_m2": 3159,
+    "tol_pct": 1,
+    "note": "Same yard as _int_d77 plus a darker, adjacent 'Footpaths (ancillary): Concrete' legend-grey strip bridged into the yard by binary_closing (Aryan's real SGP sheet: 3,172 vs Smita's Bluebeam gold 3,156 \u2014 root cause of the +16 m2 was the generic 214+-14 band admitting the darker ancillary-concrete grey). Proves the swatch-locked band fix (takeoff_unmarked.py: rgb locked to the legend-confirmed swatch colour instead of the generic band) excludes the footpath strip and returns to gold; see ci_tests.py 'D77 swatch-locked grey band' block for the before/after repro (before-fix generic band = 3,177 m2)."
+  },
+  "drawings/real_sgp/D77_Hard_Landscaping.pdf": {
+    "net_m2": 3156,
+    "tol_pct": 1,
+    "note": "THE REAL SGP sheet (105301-SGP-01-ZZ-DR-A-131002-P03, posted by Aryan in #fortel 4 Jul). Smita's Bluebeam gold 3,156. Swatch-locked band measures 3,164 (+0.25%); Aryan's pre-fix run read 3,172. Gitignored client drawing \u2014 harness includes it only where the file exists."
+  },
+  "drawings/castle_donington/External Markup Unit-1.pdf": {
+    "net_m2": 3185,
+    "tol_pct": 1,
+    "zones_m2": {
+      "external_yard": 3080,
+      "dock": 105
+    },
+    "boq_reference_lm": {
+      "channel": 96
+    },
+    "zone_tol_pct": 1,
+    "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"
+  },
+  "drawings/castle_donington/External Markup Unit-2.pdf": {
+    "net_m2": 6762,
+    "tol_pct": 1,
+    "zones_m2": {
+      "external_yard": 6370,
+      "dock": 392
+    },
+    "boq_reference_lm": {
+      "channel": 235
+    },
+    "zone_tol_pct": 1,
+    "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"
+  },
+  "drawings/castle_donington/External Markup Unit-3.pdf": {
+    "net_m2": 17139,
+    "tol_pct": 1,
+    "zones_m2": {
+      "external_yard": 16115,
+      "dock": 1024
+    },
+    "boq_reference_lm": {
+      "channel": 1025
+    },
+    "zone_tol_pct": 1,
+    "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"
+  },
+  "drawings/castle_donington/External Markup Unit-4.pdf": {
+    "net_m2": 7624,
+    "tol_pct": 1,
+    "zones_m2": {
+      "external_yard": 7222,
+      "dock": 402
+    },
+    "boq_reference_lm": {
+      "channel": 242
+    },
+    "zone_tol_pct": 1,
+    "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"
+  },
+  "drawings/castle_donington/Office Floors Unit-1.pdf": {
+    "net_m2": 761,
+    "tol_pct": 1,
+    "zones_m2": {
+      "ground_floor": 105,
+      "upper_floor": 656
+    },
+    "zone_tol_pct": 1,
+    "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"
+  },
+  "drawings/castle_donington/Office Floors Unit-2.pdf": {
+    "net_m2": 1102,
+    "tol_pct": 1,
+    "zones_m2": {
+      "ground_floor": 105,
+      "upper_floor": 997
+    },
+    "zone_tol_pct": 1,
+    "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"
+  },
+  "drawings/castle_donington/Office Floors Unit-3.pdf": {
+    "net_m2": 1111,
+    "tol_pct": 1,
+    "zones_m2": {
+      "ground_floor": 115,
+      "upper_floor": 996
+    },
+    "zone_tol_pct": 1,
+    "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"
+  },
+  "drawings/castle_donington/Office Floors Unit-4.pdf": {
+    "net_m2": 904,
+    "tol_pct": 1,
+    "zones_m2": {
+      "ground_floor": 112,
+      "upper_floor": 792
+    },
+    "zone_tol_pct": 1,
+    "source": "Quote_Winvic_Castle_Donington 07.07.26.xlsx (client BOQ, received via Smita 15 Jul)"
+  },
   "_winvic_gold_pending_real_pdfs": {
-    "Upper floors (multi-zone)":         {"net_m2": 3692, "note": "plant deck logged 1120 but ~149 — engine must flag the outlier; no matching real PDF downloaded yet"},
-    "Yard manhole_count":                {"manhole_count": 26, "note": "Winvic costing sheet 'E/O for MH details, 26 Nr, £75.00, £1,950.00' — the real Yard_Area_Proposed_Site_Plan.pdf in drawings/winvic/ as shipped in this repo carries NO Circle annots (confirmed by direct inspection; its 18 Square annots are AutoCAD SHX Text boxes for street names/numbers, not manhole markers), so count_manholes_marked() honestly returns 0 on it today. The mechanism is proven against drawings/synthetic_yard.pdf (manhole_count 26) instead; move this into the active gold block once Fortel places real Circle manhole markers on the Winvic PDF."}
+    "Upper floors (multi-zone)": {
+      "net_m2": 3692,
+      "note": "plant deck logged 1120 but ~149 \u2014 engine must flag the outlier; no matching real PDF downloaded yet"
+    },
+    "Yard manhole_count": {
+      "manhole_count": 26,
+      "note": "Winvic costing sheet 'E/O for MH details, 26 Nr, \u00a375.00, \u00a31,950.00' \u2014 the real Yard_Area_Proposed_Site_Plan.pdf in drawings/winvic/ as shipped in this repo carries NO Circle annots (confirmed by direct inspection; its 18 Square annots are AutoCAD SHX Text boxes for street names/numbers, not manhole markers), so count_manholes_marked() honestly returns 0 on it today. The mechanism is proven against drawings/synthetic_yard.pdf (manhole_count 26) instead; move this into the active gold block once Fortel places real Circle manhole markers on the Winvic PDF."
+    }
+  },
+  "drawings/inderjit_p7/7_25195-MJM-00-00-DR-C-9000-D2-P04-External_Works_Layout.pdf": {
+    "net_m2": 9810,
+    "tol_pct": 2,
+    "note": "Aryan's Bluebeam area markup, posted to #fortel 26 Aug 2026 (Slack ts 1787736005, Drive id 1UMauqocw-rCw5_gA_RhUcWD0GDbmqu5Q), labels the service yard 9,810.24 m2; an independent shoelace over the extracted polygon gives 9,810.12 (0.001%). Inderjit quoted 9,857 on the 5 Aug call. THE HATCH-DRAWN REFERENCE CASE: this yard is red diagonal hatching inking only 2.8% of what it encloses, so tint segmentation measured 245.0 m2 (2.5%) until the closing-growth router shipped. Shape truth (10-vertex polygon, for IoU rather than area scoring) lives in ground_truth_polygons.json. PDF is gitignored \u2014 checks skip visibly."
   }
 }

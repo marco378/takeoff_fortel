@@ -258,6 +258,35 @@ def _legend_sample_bbox_for(pdf, labels, page=0):
 # deliberately: real yards routinely run close to the page edge on tightly-cropped sheets,
 # so this must stay narrow enough to never clip genuine yard geometry (see MARGIN_FRAC note
 # below and the _int_d77 regression guard in ci_tests.py / robustness_tests.py).
+# ── Hatch-drawn surfaces ─────────────────────────────────────────────────────
+# Some engineers depict a surface with slanted legend hatching rather than a solid fill
+# (Aryan, 26 Aug: "instead of a solid hard filling the drawings used slanted lines to depict
+# the area that needs to be measured as shown in the legends").  Tint segmentation then finds
+# the STROKES and not what they enclose: the MJM 9000 service yard inks 2.8% of its own area
+# and measured 245 m² against a marked-up 9,810 m².
+#
+# Deciding "is this hatched?" from how the tint LOOKS does not work.  Two candidates died
+# against the real corpus before any of this shipped, both in the direction that costs a gold:
+#   ink coverage — MJM inks 0.6% of the area it encloses, but SOLID D77 reads 12.3%.  No
+#                  threshold separates them; D77 would be rerouted and gold 3,156 would break.
+#   median gap   — MJM 26 px against gold External Markup Unit-1 at 21 px.  A 5 px knife edge.
+# What does separate is what CLOSING DOES to the tint.  A solid fill barely grows when closed
+# wide; a hatch collapses from stroke fragments into the surface it encloses.  Measured across
+# every gold sheet that reaches this function:
+#   _int_d77_borders 1.0 · _int_d77_footpath 1.0 · D77_Hard_Landscaping 1.1 · MJM 1107.0
+#
+# THE RATIO IS A ROUTER, NOT AN ACCEPTOR.  It only chooses which kernel to try.  The result is
+# still accepted by the same native-CAD IoU-0.90 corroboration as any other region, so a false
+# positive on a solid sheet is near-harmless (closed ≈ raw, or it fails corroboration and
+# refuses) and a false negative is exactly today's behaviour.  That is what keeps the threshold
+# from being load-bearing, and it is why this may widen a kernel but can never invent a number.
+HATCH_GROWTH_RATIO = 100.0      # wide-close growth above which the tint reads as hatch strokes
+HATCH_PROBE_CLOSE = 51          # kernel used only to probe growth, never to measure
+HATCH_MIN_INK_PX = 5_000        # below this the ratio's denominator is noise; refuse to classify
+HATCH_MIN_GAP_SAMPLES = 200     # too few stroke gaps to size a kernel honestly
+HATCH_MAX_BRIDGE_M = 8.0        # a kernel may not bridge more real-world distance than this
+HATCH_MAX_KERNEL_PX = 120       # and never more than this many pixels, whatever the scale says
+
 MARGIN_FRAC = 0.025
 # A component smaller than this fraction of the largest plausible component's area is
 # treated as a legend swatch / title-block chip / stray glyph, not a second yard region.
@@ -1032,6 +1061,92 @@ def propose_channels(yard_polygon_pts, dock_zone, k, *, scale_verified=False,
     return proposals, flags
 
 
+def _hatch_gap_stats(mask, rows=200):
+    """Inter-stroke gap distribution (pixels) sampled along raster rows of the tint mask.
+
+    Gaps of 1 px are stroke interiors, not gaps; jumps ≥400 px are travel between unrelated
+    parts of the sheet rather than between strokes of one hatch, so both are excluded.
+    """
+    ys = np.where(mask.any(axis=1))[0]
+    if len(ys) < 10:
+        return None
+    gaps = []
+    for y in np.linspace(ys.min() + 5, ys.max() - 5, rows).astype(int):
+        idx = np.where(mask[y])[0]
+        if len(idx) < 4:
+            continue
+        gaps.extend(d for d in np.diff(idx) if 1 < d < 400)
+    if len(gaps) < HATCH_MIN_GAP_SAMPLES:
+        return None
+    gaps = np.asarray(gaps)
+    return {"gap_median_px": round(float(np.median(gaps)), 1),
+            "gap_p90_px": round(float(np.percentile(gaps, 90)), 1),
+            "gap_samples": int(len(gaps))}
+
+
+def _hatch_closing_kernel(mask, close, k, S):
+    """Route a hatch-drawn surface to a wider closing kernel.
+
+    Returns ``(kernel_px, info)`` when the tint reads as hatch strokes, else ``(None, info)``
+    which leaves the solid path completely untouched.  ``info`` is recorded for the assessor
+    either way, so a routed sheet is never silently different from an unrouted one.  Every
+    refusal below falls back to the existing behaviour rather than guessing — the widened
+    kernel is an opportunity to measure, never a licence to.
+    """
+    info = {"ink_px": int(mask.sum())}
+    if info["ink_px"] < HATCH_MIN_INK_PX:
+        info["reason"] = (f"{info['ink_px']} matching-tint px is too little to classify "
+                          f"reliably (< {HATCH_MIN_INK_PX}); measured as a solid fill")
+        return None, info
+
+    u8 = mask.astype(np.uint8)
+
+    def _largest_after(kernel):
+        closed = (cv2.morphologyEx(u8, cv2.MORPH_CLOSE, np.ones((kernel, kernel), np.uint8))
+                  if kernel > 1 else u8)
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(closed, 8)
+        return int(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0
+
+    base = _largest_after(close)
+    wide = _largest_after(HATCH_PROBE_CLOSE)
+    ratio = wide / max(base, 1)
+    info.update(base_px=base, wide_px=wide, growth_ratio=round(ratio, 1))
+    if ratio < HATCH_GROWTH_RATIO:
+        info["reason"] = (f"closing-growth {ratio:.1f}x is below {HATCH_GROWTH_RATIO:.0f}x, so "
+                          "the tint reads as a solid fill rather than hatch strokes")
+        return None, info
+
+    stats = _hatch_gap_stats(mask)
+    if not stats:
+        info["reason"] = ("tint grows like a hatch but carries too few stroke gaps to size a "
+                          "kernel from the drawing itself; measured as a solid fill")
+        return None, info
+    info.update(stats)
+
+    kernel = int(round(stats["gap_p90_px"]))
+    cap_px = HATCH_MAX_KERNEL_PX
+    if k:
+        cap_px = min(cap_px, int(round(HATCH_MAX_BRIDGE_M / (k / S))))
+    info["cap_px"] = cap_px
+    if kernel <= close:
+        info["reason"] = (f"stroke spacing implies a {kernel}px kernel, no wider than the "
+                          f"standard {close}px; measured as a solid fill")
+        return None, info
+    if kernel > cap_px:
+        info["reason"] = (f"stroke spacing implies a {kernel}px kernel, beyond the {cap_px}px "
+                          f"cap ({HATCH_MAX_BRIDGE_M:.0f} m bridge) — refusing to fuse "
+                          "the sheet; measured as a solid fill")
+        return None, info
+
+    info["kernel_px"] = kernel
+    info["reason"] = (f"HATCH-DRAWN SURFACE: closing-growth {ratio:.0f}x with stroke gaps at "
+                      f"{stats['gap_median_px']:.0f}px median / {stats['gap_p90_px']:.0f}px p90 "
+                      f"— bridging strokes with a {kernel}px kernel derived from this sheet's "
+                      "own spacing, so the measured area is what the hatch encloses rather "
+                      "than the ink itself")
+    return kernel, info
+
+
 def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
                   title_block_frac=0.0, exclude_border=True, full_rgb=False,
                   legend_exclusion_bbox=None, _diag=None):
@@ -1110,17 +1225,36 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
     # Closing is applied only to the active (non-title-block) rows so the kernel
     # cannot create boundary artefacts at the cutoff edge (fixes ~6 m² over-count
     # that was introduced when title-block masking was added in 512b982).
+    # ── Hatch-drawn surface routing (see HATCH_GROWTH_RATIO) ─────────────────
+    # Decided on the mask this function actually built — grey-fallback branch, border strip
+    # and legend exclusions all already applied — so the classifier sees what gets measured.
+    hatch_kernel, hatch_info = _hatch_closing_kernel(mask, close, k, S)
+    if _diag is not None:
+        _diag["hatch"] = hatch_info
+    if hatch_kernel:
+        close = hatch_kernel
+
+    def _close(binary):
+        # scipy is kept for the solid path so its results stay bit-for-bit unchanged: it and
+        # cv2 differ subtly at borders and on even-sized kernels, and a pixel-level shift there
+        # buys nothing while risking a gold.  cv2 is used only for the widened hatch kernel,
+        # where scipy takes MINUTES on a full-size raster and would land as a corpus HANG.
+        if hatch_kernel:
+            return cv2.morphologyEx(binary.astype(np.uint8), cv2.MORPH_CLOSE,
+                                    np.ones((close, close), np.uint8)).astype(bool)
+        return ndi.binary_closing(binary, structure=np.ones((close, close)))
+
     if title_block_frac > 0:
         cutoff = int(im_rgb.shape[0] * (1.0 - title_block_frac))
         active = mask[:cutoff, :]
         raw_mask = np.zeros_like(mask)
         raw_mask[:cutoff, :] = active
-        closed_active = ndi.binary_closing(active, structure=np.ones((close, close)))
+        closed_active = _close(active)
         mask = np.zeros_like(mask)
         mask[:cutoff, :] = closed_active
     else:
         raw_mask = mask.copy()
-        mask = ndi.binary_closing(mask, structure=np.ones((close, close)))
+        mask = _close(mask)
 
     if mask.sum() == 0:
         return None
@@ -1160,6 +1294,16 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
         # found nothing in the 200-50,000 m² band, fell back to the largest blob and emitted
         # 8 m² for a site-wide external works drawing. A number that small is not a yard.
         _diag["no_plausible_component"] = no_plausible_component
+        if hatch_kernel:
+            # A hatch-drawn region's BODY is paper by construction — the strokes are a few
+            # per cent of what they enclose — so takeoff's legend/body colour cross-check
+            # cannot be asked of the enclosure without failing every time.  Record the modal
+            # colour of the STROKES inside the chosen region instead: the same question, put
+            # to the pixels that actually carry the legend's colour.
+            chosen_ink = raw_mask & (lab == (best_idx + 1))
+            _diag["hatch"]["ink_px_in_region"] = int(chosen_ink.sum())
+            _diag["hatch"]["ink_rgb"] = (
+                _dominant_rgb(im_rgb, chosen_ink) if chosen_ink.any() else None)
         if k is not None:
             px_per_m2 = (S * S) / (k * k)
 
@@ -1992,12 +2136,18 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # segmentation band is intentionally wider than this agreement gate to tolerate rendering,
     # but a modal body colour more than five RGB levels away is not silently accepted.
     if swatch_locked and comp is not None and comp.sum() > 0:
-        body_rgb = _dominant_rgb(im, comp)
+        # On a hatch-drawn surface the body is paper, so asking the enclosure to be the
+        # legend colour would reject every correctly measured hatch. The strokes inside the
+        # region are asked instead — an equally independent confirmation, not a relaxation.
+        _hatch_diag = _seg_diag.get("hatch") or {}
+        _hatched = bool(_hatch_diag.get("kernel_px"))
+        _body_of = "hatch strokes within region" if _hatched else "selected component"
+        body_rgb = _hatch_diag.get("ink_rgb") if _hatched else _dominant_rgb(im, comp)
         body_diff = max(abs(int(body_rgb[i]) - int(swatch[i])) for i in range(3)) \
             if body_rgb else 256
         if not _swatch_body_agrees(swatch, body_rgb):
             flags.append(
-                f"legend/body colour DISAGREE: swatch {swatch}, selected component dominant "
+                f"legend/body colour DISAGREE: swatch {swatch}, {_body_of} dominant "
                 f"RGB {body_rgb}, max channel difference {body_diff} > "
                 f"{SWATCH_BODY_AGREE_TOL} — FELL BACK to validated SGP grey band "
                 f"{GREY_FALLBACK}±{GREY_TOL}; assessor confirm region colour"
@@ -2011,7 +2161,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 legend_exclusion_bbox=legend_exclusion_bbox, _diag=_seg_diag)
         else:
             flags.append(
-                f"legend/body colour cross-check PASSED: swatch {swatch}, selected component "
+                f"legend/body colour cross-check PASSED: swatch {swatch}, {_body_of} "
                 f"dominant RGB {body_rgb} (max channel difference {body_diff} ≤ "
                 f"{SWATCH_BODY_AGREE_TOL})"
             )
@@ -2133,6 +2283,18 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         region_confidence = "low"
 
     flags.append("dock-bay recesses & interior islands kept as DEDUCTIONS (not filled); thin paint bridged by closing")
+    _hatch = _seg_diag.get("hatch") or {}
+    if _hatch.get("kernel_px"):
+        # The assessor must be able to see that this sheet took the widened path, and on what
+        # evidence — a measurement that only exists because closing was widened is not the same
+        # claim as one read off a solid fill, even when both land in the same four states.
+        flags.append(
+            f"{_hatch['reason']} [detail] matching tint {_hatch['ink_px']} px; largest component "
+            f"{_hatch['base_px']} px at the standard kernel vs {_hatch['wide_px']} px closed wide; "
+            f"kernel {_hatch['kernel_px']}px capped at {_hatch['cap_px']}px; "
+            f"{_hatch['gap_samples']} stroke-gap samples")
+    elif _hatch.get("growth_ratio") is not None and _hatch["growth_ratio"] >= HATCH_GROWTH_RATIO:
+        flags.append(f"hatch-drawn surface SUSPECTED but NOT measured as one: {_hatch['reason']}")
     if _seg_diag.get('void_fill_m2', 0) > 0:
         flags.append(f"void-fill: +{_seg_diag['void_fill_m2']} m² from {_seg_diag['void_count']} "
                      f"paint/text hole(s) (each < 1.0 m²) — included in measured area")
