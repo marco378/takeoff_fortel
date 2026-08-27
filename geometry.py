@@ -101,6 +101,110 @@ def measure_regions(regions, k, holes=None):
     return round(u.area * k * k, 1), flags
 
 
+def measure_regions_with_cutouts(regions, cutouts, k):
+    """Measure regions with cutouts using proper geometric subtraction.
+    
+    The canonical calculation:
+        measured_geometry = union(all measured regions)
+        cutout_geometry = union(all cutout polygons)
+        removed_geometry = measured_geometry.intersection(cutout_geometry)
+        net_geometry = measured_geometry.difference(cutout_geometry)
+        
+        gross_area = measured_geometry.area
+        cutout_area = removed_geometry.area
+        net_area = net_geometry.area
+    
+    Args:
+        regions: list of outer vertex-lists (each is [[x,y], ...])
+        cutouts: list of cutout vertex-lists (each is [[x,y], ...])
+        k: per-viewport scale (m/pt); REQUIRED
+        
+    Returns:
+        (gross_area_m2, removed_area_m2, net_area_m2, flags)
+    """
+    if k is None:
+        raise ValueError("scale required — calibrate per viewport (scale bar / known dimension)")
+    
+    flags = []
+    
+    # Build region polygons
+    region_polys = []
+    for i, v in enumerate(regions):
+        if len(v) < 3:
+            flags.append(f"region {i}: <3 vertices — skipped (degenerate trace)")
+            continue
+        if any(not (math.isfinite(x) and math.isfinite(y)) for x, y in v):
+            flags.append(f"region {i}: non-finite coord (NaN/Inf) — skipped (bad trace)")
+            continue
+        p = Polygon(v)
+        if not p.is_valid:
+            p = make_valid(p)
+            flags.append(f"region {i}: invalid trace (self-intersection) repaired — verify by IoU")
+        if p.is_empty:
+            flags.append(f"region {i}: invalid outer trace — skipped")
+            continue
+        if p.area < 1:
+            flags.append(f"region {i}: near-zero area — likely a sliver/bad trace; flag for re-trace")
+        region_polys.append(p)
+    
+    # Build cutout polygons
+    cutout_polys = []
+    for i, v in enumerate(cutouts):
+        if len(v) < 3:
+            continue
+        if any(not (math.isfinite(x) and math.isfinite(y)) for x, y in v):
+            continue
+        p = Polygon(v)
+        if not p.is_valid:
+            p = make_valid(p)
+        if not p.is_empty:
+            cutout_polys.append(p)
+    
+    # Handle empty cases
+    if not region_polys:
+        return 0.0, 0.0, 0.0, flags + ["no valid regions"]
+    
+    if not cutout_polys:
+        # No cutouts — just measure regions
+        measured = unary_union(region_polys)
+        gross_m2 = round(measured.area * k * k, 1)
+        return gross_m2, 0.0, gross_m2, flags
+    
+    # Union all regions and all cutouts
+    measured_geometry = unary_union(region_polys)
+    cutout_geometry = unary_union(cutout_polys)
+    
+    # Compute intersection (what actually gets removed)
+    removed_geometry = measured_geometry.intersection(cutout_geometry)
+    
+    # Compute net (what remains)
+    net_geometry = measured_geometry.difference(cutout_geometry)
+    
+    # Convert to area in m2
+    gross_m2 = round(measured_geometry.area * k * k, 1)
+    removed_m2 = round(removed_geometry.area * k * k, 1)
+    net_m2 = round(net_geometry.area * k * k, 1)
+    
+    # Add informative flags
+    naive_cutout_m2 = round(sum(p.area for p in cutout_polys) * k * k, 1)
+    if removed_m2 < naive_cutout_m2 * 0.999:
+        flags.append(
+            f"cutouts partially outside measured region — removed {removed_m2:,.1f} m2, "
+            f"not full {naive_cutout_m2:,.1f} m2 polygon area"
+        )
+    
+    if len(cutout_polys) > 1:
+        # Check for overlapping cutouts
+        cutout_union_m2 = round(cutout_geometry.area * k * k, 1)
+        if cutout_union_m2 < naive_cutout_m2 * 0.999:
+            flags.append(
+                f"overlapping cutouts — union area {cutout_union_m2:,.1f} m2, "
+                f"not sum {naive_cutout_m2:,.1f} m2"
+            )
+    
+    return gross_m2, removed_m2, net_m2, flags
+
+
 if __name__ == "__main__":
     K = 0.1
     # A: voids
@@ -126,3 +230,94 @@ if __name__ == "__main__":
     outside_hole = [(2000, 2000), (3000, 2000), (3000, 3000), (2000, 3000)]
     a, f = measure_regions([outer_e], K, holes={0: [outside_hole]})
     print(f"E hole-outside:   {a:,.0f} m2 (true 10,000 — hole is outside ring)  flags={f}")
+    
+    # Tests for measure_regions_with_cutouts
+    print("\n--- Tests for measure_regions_with_cutouts ---")
+    
+    # Test 1: Normal internal cutout
+    # Region = 200 m2, Cutout = 10 m2, Expected net = 190 m2
+    # At k=0.1 m/pt, 1 sq pt = 0.01 m2
+    # So 200 m2 = 20,000 sq pt
+    region_200 = [(0, 0), (1000, 0), (1000, 20), (0, 20)]  # 1000x20 = 20,000 sq pt = 200 m2
+    cutout_10 = [(100, 5), (200, 5), (200, 10), (100, 10)]  # 100x5 = 500 sq pt = 5 m2
+    # Actually let me recalculate: 100x5 = 500 sq pt * 0.01 = 5 m2
+    # Let me use: 200x5 = 1000 sq pt = 10 m2
+    cutout_10 = [(100, 5), (300, 5), (300, 10), (100, 10)]  # 200x5 = 1000 sq pt = 10 m2
+    gross, removed, net, flags = measure_regions_with_cutouts([region_200], [cutout_10], K)
+    print(f"Test 1 (internal):    gross={gross}, removed={removed}, net={net} (expected: 200, 10, 190)")
+    assert abs(gross - 200.0) < 0.1, f"Test 1 failed: gross={gross}"
+    assert abs(removed - 10.0) < 0.1, f"Test 1 failed: removed={removed}"
+    assert abs(net - 190.0) < 0.1, f"Test 1 failed: net={net}"
+    
+    # Test 2: Cutout partially outside
+    # Region = 200 m2, Cutout polygon = 28 m2, Intersection = 7 m2, Expected net = 193 m2
+    cutout_partial = [(-50, 5), (200, 5), (200, 12), (-50, 12)]  # 250x7 = 1750 sq pt = 17.5 m2
+    # Intersection with region: 200x7 = 1400 sq pt = 14 m2
+    # Actually let me recalculate to get 7 m2 intersection
+    # 7 m2 = 700 sq pt = 200x3.5
+    cutout_partial = [(-50, 5), (200, 5), (200, 8.5), (-50, 8.5)]  # 250x3.5 = 875 sq pt = 8.75 m2
+    # Intersection: 200x3.5 = 700 sq pt = 7 m2
+    gross, removed, net, flags = measure_regions_with_cutouts([region_200], [cutout_partial], K)
+    print(f"Test 2 (partial):     gross={gross}, removed={removed}, net={net} (expected: 200, 7, 193)")
+    assert abs(gross - 200.0) < 0.1, f"Test 2 failed: gross={gross}"
+    assert abs(removed - 7.0) < 0.5, f"Test 2 failed: removed={removed}"
+    assert abs(net - 193.0) < 0.5, f"Test 2 failed: net={net}"
+    
+    # Test 3: Cutout completely outside
+    # Region = 200 m2, Cutout = 20 m2, Intersection = 0, Expected net = 200 m2
+    cutout_outside = [(3000, 3000), (4000, 3000), (4000, 4000), (3000, 4000)]
+    gross, removed, net, flags = measure_regions_with_cutouts([region_200], [cutout_outside], K)
+    print(f"Test 3 (outside):     gross={gross}, removed={removed}, net={net} (expected: 200, 0, 200)")
+    assert abs(gross - 200.0) < 0.1, f"Test 3 failed: gross={gross}"
+    assert abs(removed - 0.0) < 0.1, f"Test 3 failed: removed={removed}"
+    assert abs(net - 200.0) < 0.1, f"Test 3 failed: net={net}"
+    
+    # Test 4: Two overlapping cutouts
+    # A = 10 m2, B = 10 m2, Overlap = 2.5 m2, Expected removed = 17.5 m2
+    cutout_a = [(100, 5), (300, 5), (300, 10), (100, 10)]  # 200x5 = 1000 sq pt = 10 m2
+    cutout_b = [(200, 7.5), (400, 7.5), (400, 12.5), (200, 12.5)]  # 200x5 = 1000 sq pt = 10 m2
+    # Overlap: 100x2.5 = 250 sq pt = 2.5 m2
+    gross, removed, net, flags = measure_regions_with_cutouts([region_200], [cutout_a, cutout_b], K)
+    print(f"Test 4 (overlapping): gross={gross}, removed={removed}, net={net} (expected: 200, 17.5, 182.5)")
+    print(f"  Flags: {flags}")
+    assert abs(gross - 200.0) < 0.1, f"Test 4 failed: gross={gross}"
+    assert abs(removed - 17.5) < 0.5, f"Test 4 failed: removed={removed}"
+    assert abs(net - 182.5) < 0.5, f"Test 4 failed: net={net}"
+    
+    # Test 5: Multiple measured regions
+    # Region A = 100 m2, Region B = 100 m2, Cutout intersects A by 10 m2
+    region_a = [(0, 0), (500, 0), (500, 20), (0, 20)]  # 500x20 = 10,000 sq pt = 100 m2
+    region_b = [(750, 0), (1250, 0), (1250, 20), (750, 20)]  # 500x20 = 10,000 sq pt = 100 m2
+    cutout_in_a = [(50, 5), (150, 5), (150, 10), (50, 10)]  # 100x5 = 500 sq pt = 5 m2
+    # Actually I want 10 m2 = 1000 sq pt = 200x5
+    cutout_in_a = [(50, 5), (250, 5), (250, 10), (50, 10)]  # 200x5 = 1000 sq pt = 10 m2
+    gross, removed, net, flags = measure_regions_with_cutouts([region_a, region_b], [cutout_in_a], K)
+    print(f"Test 5 (multi-region): gross={gross}, removed={removed}, net={net} (expected: 200, 10, 190)")
+    assert abs(gross - 200.0) < 0.1, f"Test 5 failed: gross={gross}"
+    assert abs(removed - 10.0) < 0.1, f"Test 5 failed: removed={removed}"
+    assert abs(net - 190.0) < 0.1, f"Test 5 failed: net={net}"
+    
+    # Test 6: Cutout intersects multiple regions (should not double-count)
+    region_c = [(0, 0), (500, 0), (500, 20), (0, 20)]  # 100 m2
+    region_d = [(400, 0), (900, 0), (900, 20), (400, 20)]  # 100 m2
+    # Regions overlap by 100x20 = 2000 sq pt = 20 m2, so gross = 180 m2
+    # Cutout spans both regions: 300x10 = 3000 sq pt = 30 m2
+    cutout_spanning = [(350, 5), (650, 5), (650, 15), (350, 15)]
+    gross, removed, net, flags = measure_regions_with_cutouts([region_c, region_d], [cutout_spanning], K)
+    print(f"Test 6 (spanning):    gross={gross}, removed={removed}, net={net} (expected: 180, 30, 150)")
+    assert abs(gross - 180.0) < 0.1, f"Test 6 failed: gross={gross}"
+    assert abs(removed - 30.0) < 0.5, f"Test 6 failed: removed={removed}"
+    assert abs(net - (gross - removed)) < 0.1, f"Test 6 failed: net != gross - removed"
+    
+    # Test 7: Multiple overlapping measured regions
+    region_e = [(0, 0), (600, 0), (600, 20), (0, 20)]  # 600x20 = 12,000 sq pt = 120 m2
+    region_f = [(400, 0), (1000, 0), (1000, 20), (400, 20)]  # 600x20 = 12,000 sq pt = 120 m2
+    # Overlap: 200x20 = 4000 sq pt = 40 m2, so gross = 200 m2
+    cutout_in_overlap = [(450, 5), (550, 5), (550, 15), (450, 15)]  # 100x10 = 1000 sq pt = 10 m2
+    gross, removed, net, flags = measure_regions_with_cutouts([region_e, region_f], [cutout_in_overlap], K)
+    print(f"Test 7 (overlap+cutout): gross={gross}, removed={removed}, net={net} (expected: 200, 10, 190)")
+    assert abs(gross - 200.0) < 0.1, f"Test 7 failed: gross={gross}"
+    assert abs(removed - 10.0) < 0.1, f"Test 7 failed: removed={removed}"
+    assert abs(net - 190.0) < 0.1, f"Test 7 failed: net={net}"
+    
+    print("\nAll tests passed!")

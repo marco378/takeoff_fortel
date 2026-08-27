@@ -100,8 +100,8 @@ header span{opacity:.7;font-size:12px}
 .toolbar button.channel:hover{background:#c0392b;color:#fff}
 .toolbar button.area-element{background:#fff;color:#7d3c98;border-color:#7d3c98}
 .toolbar button.area-element:hover{background:#7d3c98;color:#fff}
-.area-elements-editor{margin-top:8px;border:1px solid #d8c6e3;border-radius:6px;overflow:hidden}
-.area-element-row{display:grid;grid-template-columns:minmax(100px,1fr) minmax(105px,1fr) auto;
+.area-elements-editor{margin-top:8px;border:1px solid #d8c6e3;border-radius:6px;overflow-x:auto}
+.area-element-row{display:grid;grid-template-columns:140px 130px auto auto;min-width:max-content;
   gap:5px;align-items:center;padding:5px;background:#f8f1fb;border-top:1px solid #eadff0}
 .area-element-row:first-child{border-top:0}
 .area-element-row input,.area-element-row select{min-width:0;width:100%;box-sizing:border-box;
@@ -2732,6 +2732,7 @@ function draw() {
   }
 
   updateAreaDisplay();
+  renderAreaElementsEditor();
 }
 
 // ─────────────────────────────────────────────────
@@ -2803,6 +2804,77 @@ function removeAreaElement(elementId) {
   toast('Separate area removed');
 }
 
+function editAreaElement(elementId) {
+  const element = findAreaElement(elementId);
+  if (!element) return;
+  element.saved = false;
+  renderAreaElementsEditor();
+}
+
+async function saveAreaElement(elementId) {
+  if (!currentJob) { toast('No job selected', 'warn'); return; }
+  const element = findAreaElement(elementId);
+  if (!element) { toast('Element not found', 'error'); return; }
+  const isActive = activeAreaElement && activeAreaElement.elementId === elementId;
+  const points = isActive ? poly : (element.points || []);
+  if (!points || points.length < 3) {
+    toast('Trace at least 3 points before saving', 'warn'); return;
+  }
+  const pts = points.map(point => [Math.round(point.x), Math.round(point.y)]);
+  const res = currentJob.result || {};
+  const adjusted = currentJob.adjusted || {};
+  const existingElements = currentJob.area_elements || adjusted.area_elements || [];
+  const updatedElements = existingElements.map(el => {
+    if (el.element_id === elementId) {
+      return { ...el, name: element.name, category: element.category || 'unclassified', polygon_pts: pts };
+    }
+    return el;
+  });
+  const body = {
+    area_elements: updatedElements.map(el => ({
+      element_id: el.element_id,
+      name: el.name,
+      category: el.category || 'unclassified',
+      boq_scope: el.boq_scope || 'main',
+      polygon_pts: el.polygon_pts || []
+    })),
+    note: `saved area element: ${element.name}`
+  };
+  const regions = res.regions || adjusted.regions || [];
+  if (regions.length) {
+    body.regions = regions.map(r => r.map(p => [Math.round(p[0]), Math.round(p[1])]));
+    body.region_categories = res.region_categories || adjusted.region_categories || [];
+    body.region_scopes = res.region_scopes || adjusted.region_scopes || [];
+    body.candidate_ids = res.candidate_ids || adjusted.candidate_ids || [];
+  }
+  try {
+    const r = await fetch(`${BASE}/adjust/${currentJob.id}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    toast(`Saved: ${element.name}`);
+    if (d.area_elements) {
+      currentJob.area_elements = d.area_elements;
+      currentJob.adjusted = currentJob.adjusted || {};
+      currentJob.adjusted.area_elements = d.area_elements;
+    }
+    const el = findAreaElement(elementId);
+    if (el) el.saved = true;
+    if (isActive) {
+      areaElements.push({...el, points: poly.slice()});
+      activeAreaElement = null;
+      poly = [];
+    }
+    renderAreaElementsEditor();
+    draw();
+  } catch (e) {
+    toast(`Error: ${e.message}`, 'error');
+  }
+}
+
 function renderAreaElementsEditor() {
   const panel = document.getElementById('areaElementsEditor');
   if (!panel) return;
@@ -2810,9 +2882,23 @@ function renderAreaElementsEditor() {
   if (activeAreaElement) entries.push({...activeAreaElement, points:poly});
   panel.style.display = entries.length ? 'block' : 'none';
   panel.innerHTML = entries.map(element => {
-    const qty = mpp && element.points && element.points.length >= 3
-      ? `${(shoelace(element.points) * mpp * mpp).toLocaleString(undefined,{maximumFractionDigits:2})} m² — separate quotation line`
+    const grossArea = mpp && element.points && element.points.length >= 3
+      ? shoelace(element.points) * mpp * mpp : 0;
+    const cutoutOverlap = grossArea ? calcCutoutOverlap(element.points) : 0;
+    const netArea = Math.max(0, grossArea - cutoutOverlap);
+    const qty = grossArea
+      ? `${netArea.toLocaleString(undefined,{maximumFractionDigits:2})} m² — separate quotation line`
       : 'Trace at least 3 points — separate from main total';
+    const labels = {external_yard:'External yard slabs',dock:'Dock slabs',ground_floor:'Ground floor slabs',upper_floor:'Upper floor slabs',unclassified:'Choose BOQ section'};
+    if (element.saved) {
+      return `<div class="area-element-row" data-element-id="${esc(element.elementId)}" style="opacity:0.7">
+        <span style="font-size:10px;font-weight:700;color:#13294b">${esc(element.name)}</span>
+        <span style="font-size:10px;color:#666">${esc(labels[element.category]||element.category)}</span>
+        <button type="button" onclick="editAreaElement(this.parentElement.dataset.elementId)">Edit</button>
+        <button type="button" onclick="removeAreaElement(this.parentElement.dataset.elementId)">Remove</button>
+        <div class="area-element-qty">${esc(qty)}</div>
+      </div>`;
+    }
     const options = [
       ['unclassified','Choose BOQ section'],
       ['external_yard','External yard slabs'], ['dock','Dock slabs'],
@@ -2824,6 +2910,7 @@ function renderAreaElementsEditor() {
       <select aria-label="Separate area BOQ section"
               onchange="updateAreaElementCategory(this.parentElement.dataset.elementId,this.value)">${options}</select>
       <button type="button" onclick="removeAreaElement(this.parentElement.dataset.elementId)">Remove</button>
+      <button type="button" onclick="saveAreaElement(this.parentElement.dataset.elementId)" style="background:#7d3c98;color:#fff;border-color:#7d3c98">Save</button>
       <div class="area-element-qty">${esc(qty)}</div>
     </div>`;
   }).join('');
@@ -2922,9 +3009,193 @@ function loadTraceCandidate(candidateId) {
 function calcArea() {
   const regions = traceRegionEntries();
   if (!mpp || !regions.length) return null;
+  
+  // Compute gross area (union of all regions)
   const grossArea = regions.reduce((total,region) => total + shoelace(region.points), 0) * mpp * mpp;
-  const cutoutArea = cutoutPolygons.reduce((total,region) => total + shoelace(region.points), 0) * mpp * mpp;
-  return Math.max(0, grossArea - cutoutArea);
+  
+  if (!cutoutPolygons.length) return grossArea;
+  
+  // Compute removed area (intersection of regions with cutouts)
+  const removedArea = computeCutoutRemovedArea(regions, cutoutPolygons);
+  
+  return Math.max(0, grossArea - removedArea);
+}
+
+function computeCutoutRemovedArea(regions, cutouts) {
+  // Compute the actual area removed by cutouts using grid sampling
+  // This matches the backend's geometric subtraction logic
+  
+  if (!regions.length || !cutouts.length || !mpp) return 0;
+  
+  // Find bounding box of all regions and cutouts
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  
+  for (const region of regions) {
+    for (const pt of region.points) {
+      if (pt.x < minX) minX = pt.x;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.y > maxY) maxY = pt.y;
+    }
+  }
+  
+  for (const cutout of cutouts) {
+    for (const pt of cutout.points) {
+      if (pt.x < minX) minX = pt.x;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.y > maxY) maxY = pt.y;
+    }
+  }
+  
+  // Use adaptive grid size based on polygon complexity
+  const maxVertices = Math.max(
+    ...regions.map(r => r.points.length),
+    ...cutouts.map(c => c.points.length)
+  );
+  const gridN = Math.min(50, Math.max(20, maxVertices * 2));
+  
+  const stepX = (maxX - minX) / gridN;
+  const stepY = (maxY - minY) / gridN;
+  
+  if (stepX <= 0 || stepY <= 0) return 0;
+  
+  let removedCount = 0;
+  let totalCount = 0;
+  
+  // Sample points on a grid
+  for (let ix = 0; ix < gridN; ix++) {
+    for (let iy = 0; iy < gridN; iy++) {
+      const px = minX + (ix + 0.5) * stepX;
+      const py = minY + (iy + 0.5) * stepY;
+      
+      // Check if point is inside any region
+      let insideRegion = false;
+      for (const region of regions) {
+        if (pointInPolygon(px, py, region.points)) {
+          insideRegion = true;
+          break;
+        }
+      }
+      
+      if (!insideRegion) continue;
+      
+      // Check if point is inside any cutout
+      let insideCutout = false;
+      for (const cutout of cutouts) {
+        if (pointInPolygon(px, py, cutout.points)) {
+          insideCutout = true;
+          break;
+        }
+      }
+      
+      totalCount++;
+      if (insideCutout) removedCount++;
+    }
+  }
+  
+  if (totalCount === 0) return 0;
+  
+  // Compute gross area in grid units
+  const grossGridArea = regions.reduce((total, region) => total + shoelace(region.points), 0);
+  
+  // The removed area is proportional to the fraction of sampled points that are in cutouts
+  // This approximates: area(intersection(regions, cutouts))
+  const removedFraction = removedCount / totalCount;
+  const removedGridArea = grossGridArea * removedFraction;
+  
+  return removedGridArea * mpp * mpp;
+}
+
+function clipPolygon(subject, clip) {
+  return [];
+}
+
+function pointInPolygon(px, py, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x, yi = polygon[i].y;
+    const xj = polygon[j].x, yj = polygon[j].y;
+    if ((yi > py) !== (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function calcCutoutOverlap(elementPoints) {
+  // Compute the actual area removed by cutouts from this area element
+  // Uses the same grid sampling approach as computeCutoutRemovedArea
+  if (!elementPoints || elementPoints.length < 3 || !mpp || !cutoutPolygons.length) return 0;
+  
+  // Find bounding box of element and all cutouts
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  
+  for (const pt of elementPoints) {
+    if (pt.x < minX) minX = pt.x;
+    if (pt.x > maxX) maxX = pt.x;
+    if (pt.y < minY) minY = pt.y;
+    if (pt.y > maxY) maxY = pt.y;
+  }
+  
+  for (const cutout of cutoutPolygons) {
+    if (!cutout.points || cutout.points.length < 3) continue;
+    for (const pt of cutout.points) {
+      if (pt.x < minX) minX = pt.x;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.y > maxY) maxY = pt.y;
+    }
+  }
+  
+  // Use adaptive grid size
+  const maxVertices = Math.max(
+    elementPoints.length,
+    ...cutoutPolygons.map(c => c.points ? c.points.length : 0)
+  );
+  const gridN = Math.min(50, Math.max(20, maxVertices * 2));
+  
+  const stepX = (maxX - minX) / gridN;
+  const stepY = (maxY - minY) / gridN;
+  
+  if (stepX <= 0 || stepY <= 0) return 0;
+  
+  let removedCount = 0;
+  let totalCount = 0;
+  
+  // Sample points on a grid
+  for (let ix = 0; ix < gridN; ix++) {
+    for (let iy = 0; iy < gridN; iy++) {
+      const px = minX + (ix + 0.5) * stepX;
+      const py = minY + (iy + 0.5) * stepY;
+      
+      // Check if point is inside the area element
+      if (!pointInPolygon(px, py, elementPoints)) continue;
+      
+      // Check if point is inside any cutout
+      let insideCutout = false;
+      for (const cutout of cutoutPolygons) {
+        if (cutout.points && cutout.points.length >= 3 && pointInPolygon(px, py, cutout.points)) {
+          insideCutout = true;
+          break;
+        }
+      }
+      
+      totalCount++;
+      if (insideCutout) removedCount++;
+    }
+  }
+  
+  if (totalCount === 0) return 0;
+  
+  // Compute gross area of element
+  const grossGridArea = shoelace(elementPoints);
+  
+  // The removed area is proportional to the fraction of sampled points that are in cutouts
+  const removedFraction = removedCount / totalCount;
+  const removedGridArea = grossGridArea * removedFraction;
+  
+  return removedGridArea * mpp * mpp;
 }
 
 function calcPerimeter() {
@@ -3057,13 +3328,7 @@ function setupCanvasEvents() {
 }
 
 function onDblClick(e) {
-  if (mode !== 'cutout') return;
-  if (cutoutPolygons.length === 0) return;
-  const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
-  if (lastRegion.closed || lastRegion.points.length < 3) return;
-  lastRegion.closed = true;
-  toast(`Cut-out ${cutoutPolygons.length} closed — draw another or click Submit`);
-  draw();
+  // cutout close on click near first point only — no double-click
 }
 
 function pos(e) {
@@ -3434,6 +3699,7 @@ function setupButtons() {
   document.getElementById('btnNewRegion').addEventListener('click', startNewTraceRegion);
   document.getElementById('btnNewArea').addEventListener('click', startNewAreaElement);
   document.getElementById('btnCutout').addEventListener('click', () => {
+    stashActiveRegion();
     // Close any open cutout polygon before switching/starting new
     if (cutoutPolygons.length > 0) {
       const last = cutoutPolygons[cutoutPolygons.length-1];

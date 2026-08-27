@@ -274,10 +274,25 @@ def _overlay_manifest(job: dict, source_path: Path, page_index: int,
                 "assessor_supplied": True,
             })
         for index, raw_points in enumerate(valid_cutouts):
+            # Compute the actual removed area (intersection with measured regions)
+            # rather than just the polygon area
+            cutout_removed_area = _polygon_area(raw_points, assessor_scale)
+            if adjusted_regions and assessor_scale:
+                try:
+                    from geometry import measure_regions_with_cutouts
+                    # Compute how much of this cutout actually intersects the measured regions
+                    _, removed_m2, _, _ = measure_regions_with_cutouts(
+                        adjusted_regions, [raw_points], assessor_scale)
+                    if removed_m2 > 0:
+                        cutout_removed_area = removed_m2
+                except Exception:
+                    # Fall back to polygon area if geometry fails
+                    pass
             geometry["cutouts"].append({
                 "cutout_id": f"assessor-cutout-{index + 1}",
                 "name": f"Cut-out {index + 1}",
-                "area_m2": _polygon_area(raw_points, assessor_scale),
+                "area_m2": cutout_removed_area,
+                "polygon_area_m2": _polygon_area(raw_points, assessor_scale),
                 "points": _normalise_points(raw_points, divisor),
                 "source_coordinate_space": "snapshot_pixels",
                 "source_snapshot_scale_px_per_pdf_point": divisor,

@@ -1216,26 +1216,25 @@ def adjust(job_id):
     # Legacy `vertices` remains exactly one region; Office GA candidates can now be combined.
     if regions and scale_k:
         try:
-            from geometry import measure_regions, polygon_perimeter_lm
-            gross_area_m2, gross_flags = measure_regions(regions, scale_k)
+            from geometry import measure_regions, measure_regions_with_cutouts, polygon_perimeter_lm
             if cutout_regions:
-                # Apply each cut-out as a true geometric hole in every traced region. A hole
-                # outside a region subtracts nothing (geometry._build_region uses difference),
-                # and each persisted per-zone quantity is now net on the same basis as the
-                # displayed aggregate. The old path subtracted only from area_m2 after these
-                # gross region_areas had already been captured, so quotations restored the
-                # cut-out through their zone rows.
-                holes = {index: cutout_regions for index in range(len(regions))}
-                area_m2, gflags = measure_regions(regions, scale_k, holes=holes)
-                region_areas = [
-                    measure_regions([region], scale_k, holes={0: cutout_regions})[0]
-                    for region in regions
-                ]
-                cutout_area = round(max(0.0, gross_area_m2 - area_m2), 1)
-                gflags = list(gross_flags) + list(gflags)
-                if cutout_area > 0:
-                    gflags.append(f"cut-out: {cutout_area:,.1f} m² subtracted")
+                # Use proper geometric subtraction: union of regions minus union of cutouts.
+                # This ensures:
+                # - Cutouts only remove geometry they actually intersect
+                # - Overlapping cutouts are only subtracted once
+                # - Cutouts outside the measured region remove nothing
+                gross_area_m2, cutout_removed_m2, area_m2, gflags = measure_regions_with_cutouts(
+                    regions, cutout_regions, scale_k)
+                # Compute per-region areas with cutouts applied
+                region_areas = []
+                for region in regions:
+                    _, _, region_net, _ = measure_regions_with_cutouts(
+                        [region], cutout_regions, scale_k)
+                    region_areas.append(region_net)
+                if cutout_removed_m2 > 0:
+                    gflags.append(f"cut-out: {cutout_removed_m2:,.1f} m² removed")
             else:
+                gross_area_m2, gross_flags = measure_regions(regions, scale_k)
                 area_m2, gflags = gross_area_m2, gross_flags
                 region_areas = [measure_regions([region], scale_k)[0]
                                 for region in regions]
@@ -1258,10 +1257,15 @@ def adjust(job_id):
                 "error": "a positive scale_k is required to measure named area elements"
             }), 400
         try:
-            from geometry import measure_regions, polygon_perimeter_lm
+            from geometry import measure_regions, measure_regions_with_cutouts, polygon_perimeter_lm
             for element in submitted_area_elements:
-                element_area, element_flags = measure_regions(
-                    [element["polygon_pts"]], scale_k)
+                # Measure area element, subtracting any overlapping cutouts
+                if cutout_regions:
+                    _, _, element_area, element_flags = measure_regions_with_cutouts(
+                        [element["polygon_pts"]], cutout_regions, scale_k)
+                else:
+                    element_area, element_flags = measure_regions(
+                        [element["polygon_pts"]], scale_k)
                 if not element_area or element_area <= 0:
                     return jsonify({
                         "error": f"named area element {element['name']!r} has no measurable area"
@@ -1323,21 +1327,48 @@ def adjust(job_id):
                             else job.get("perimeter_lm", stored_result.get("perimeter_lm")))
             confirmed = bool(job.get("scale_confirmed"))
             gflags = list(existing_adjusted.get("flags") or [])
-        # Cutout-only: subtract from existing measured area when no new trace regions
+        # Cutout-only: subtract from existing measured area when no new trace regions.
+        # We need the original measured geometry to perform proper geometric subtraction.
+        # The scalar path is unsafe because it subtracts the full cutout polygon area,
+        # not just the intersection with the measured region.
         if cutout_regions and scale_k and not regions:
-            existing_area = (job.get("adjusted") or {}).get("assessed_area_m2") or stored_result.get("area_m2")
-            if existing_area and existing_area > 0:
+            # Retrieve the original measured regions from the job
+            existing_regions = (
+                (job.get("adjusted") or {}).get("regions") or 
+                [job.get("adjusted", {}).get("vertices")] if(job.get("adjusted") or {}).get("vertices") else []
+            )
+            # Filter to valid regions
+            existing_regions = [r for r in existing_regions if isinstance(r, list) and len(r) >= 3]
+            
+            if existing_regions:
                 try:
-                    from geometry import measure_regions
-                    cutout_area, cutout_flags = measure_regions(cutout_regions, scale_k)
-                    if cutout_area > 0:
-                        area_m2 = round(max(0, existing_area - cutout_area), 1)
-                        gflags = [f"cut-out only: {cutout_area:,.1f} m² subtracted from {existing_area:,.1f} m²"] + cutout_flags
+                    from geometry import measure_regions_with_cutouts
+                    gross_area_m2, cutout_removed_m2, net_area_m2, cutout_flags = (
+                        measure_regions_with_cutouts(existing_regions, cutout_regions, scale_k))
+                    if cutout_removed_m2 > 0:
+                        area_m2 = net_area_m2
+                        gflags = [f"cut-out only: {cutout_removed_m2:,.1f} m² removed from {gross_area_m2:,.1f} m²"] + cutout_flags
                     else:
-                        area_m2 = existing_area
+                        area_m2 = gross_area_m2
                         gflags = []
                 except Exception as e:
                     area_m2, gflags = None, [f"geometry error: {e}"]
+            else:
+                # Fallback: if we can't retrieve original regions, use scalar subtraction
+                # but warn that this is less accurate
+                existing_area = (job.get("adjusted") or {}).get("assessed_area_m2") or stored_result.get("area_m2")
+                if existing_area and existing_area > 0:
+                    try:
+                        from geometry import measure_regions
+                        cutout_area, cutout_flags = measure_regions(cutout_regions, scale_k)
+                        if cutout_area > 0:
+                            area_m2 = round(max(0, existing_area - cutout_area), 1)
+                            gflags = [f"cut-out only (scalar fallback): {cutout_area:,.1f} m² subtracted from {existing_area:,.1f} m²"] + cutout_flags
+                        else:
+                            area_m2 = existing_area
+                            gflags = []
+                    except Exception as e:
+                        area_m2, gflags = None, [f"geometry error: {e}"]
         # Older clients supplied one candidate id per region but no category list.  Preserve
         # that flow by taking the detector's explicit category.  New clients send a category
         # for every region, including ``unclassified`` for a manual outline.
