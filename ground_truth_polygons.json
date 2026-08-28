@@ -55,5 +55,101 @@
     "source": "Bluebeam area markup drawn by Aryan (U0BCUEBAAFQ) and posted to #fortel on 2026-08-26, Slack ts 1787736005.186649, Google Drive id 1UMauqocw-rCw5_gA_RhUcWD0GDbmqu5Q. The marked PDF differs from the unmarked sheet by exactly two vector paths: this polygon and its label box reading 'Unclassified area - 9,810.24 m2'. The marked PDF itself is kept OUT of drawings/ (at ~/fortel-ground-truth/) because the robustness corpus scans that tree and would otherwise measure the markup as if it were a client drawing; nothing here depends on the PDF, the vertices below are the artefact.",
     "corroboration": "Independent shoelace over the extracted vertices gives 9810.12 m2, 0.001% from the markup's own label, which also confirms the sheet's 1:500 / k=0.176389 is read correctly. 94.6% of the sheet's red-tint (254,0,0) ink falls inside this polygon, so it is the right region and not an area coincidence. Inderjit quoted 9,857 m2 for the same yard on the 5 Aug call.",
     "note": "The yard is drawn as RED DIAGONAL HATCHING, not a solid fill: 1 px strokes, median inter-stroke gap 26 px (2.29 m at 1:500), inking only 2.8% of the area they enclose. This is the reference case for hatch-aware detection."
+  },
+  "092_25195-MJM-ZZ-ZZ-DR-S-2300-D2-P02-Mezzanine_Suspended_Slab_Layout.pdf": {
+    "surface": "MEZZANINE SUSPENDED SLAB",
+    "area_m2": 1202.4,
+    "cutouts_m2": [
+      8.47,
+      9.61
+    ],
+    "net_m2": 1184.32,
+    "min_iou": 0.9,
+    "page": 0,
+    "page_rotation": 90,
+    "k_m_per_pt": 0.070031,
+    "scale": "~1:200 (derived from the markup label, NOT read off the sheet)",
+    "coord_space": "unrotated PDF points (fitz get_drawings space)",
+    "polygon_pts": [
+      [
+        237.123,
+        696.894
+      ],
+      [
+        355.046,
+        696.894
+      ],
+      [
+        355.471,
+        2205.626
+      ],
+      [
+        271.18,
+        2205.626
+      ],
+      [
+        271.606,
+        2164.757
+      ],
+      [
+        189.017,
+        2164.331
+      ],
+      [
+        189.443,
+        2151.134
+      ],
+      [
+        187.314,
+        2151.134
+      ],
+      [
+        187.314,
+        2051.517
+      ],
+      [
+        189.443,
+        2051.091
+      ],
+      [
+        189.017,
+        2046.409
+      ],
+      [
+        187.314,
+        2046.834
+      ],
+      [
+        187.314,
+        1937.0
+      ],
+      [
+        188.591,
+        1937.0
+      ],
+      [
+        188.166,
+        1933.168
+      ],
+      [
+        187.74,
+        880.803
+      ],
+      [
+        194.126,
+        880.803
+      ],
+      [
+        193.7,
+        762.88
+      ],
+      [
+        236.697,
+        762.88
+      ]
+    ],
+    "source": "Reference markup posted by Aryan in #fortel 27 Aug 2026 01:06 IST, Drive id 1lSEIYvQnYSVmLsIU7GJi9B56iN2pfXBy, as 'it should be like' for the 092 Mezzanine sheet, which currently produces NO markups. Labels on it read 'Unclassified area - 1,202.40 m2', 'Cut-out 1 - 8.47 m2', 'Cut-out 2 - 9.61 m2'. Kept at ~/fortel-ground-truth/, OUT of drawings/, because the robustness corpus scans that tree.",
+    "corroboration": "geometry.measure_regions on these 19 vertices at k=0.070031 returns exactly 1202.40 m2, matching the markup label to +0.00%, which corroborates both the polygon and the derived scale. Driving Aryan's measure_regions_with_cutouts (53bd6b8) with cutouts of the labelled sizes returns net 1,184.30 against the label's 1,184.32.",
+    "note": "SOURCE SHEET NOT HELD LOCALLY \u2014 only this markup. Re-extract the unmarked sheet from the project-7 pack (Drive 17oWqg4aulX7dQUbtHtpEnSvfrsIsyZwR) before measuring; the markup overlay occludes what is beneath it, as proved on the MJM 9000 sheet."
   }
 }

@@ -26,8 +26,24 @@ with contextlib.redirect_stdout(io.StringIO()):
 # Default ASSUMED build-up for an architect drawing with no construction-details sheet
 # (Fortel's method: assume, state the assumption in the quote). 190 mm / A252 / typical rates.
 ASSUMED = dict(depth_mm=190, conc_rate=128, mesh="A252", layers=1, steel_rate_t=850, margin=0.11)
+# A joint-layout sheet names its slab by BUILD-UP rather than as a "service yard", so none of
+# the yard vocabulary appears on it.  Aryan, 27 Aug, on the 0720 Hardstanding Joint Layout:
+# "it did't have any specific legend for the slab or dork area for this we need to upgrade it
+# to include dork apron slabs too".  Confirmed by opening the sheet: its legend reads
+# "190mm dock apron slab c/w A393 mesh" against a real (218,218,218) swatch, and
+# _find_surface_swatch_rgb reads that swatch correctly the moment it is given the phrase.  So
+# the surface was always machine-readable; only the vocabulary was missing.  Without it the
+# sheet hit the `not legend_found and not verified` refuse gate and produced NOTHING —
+# UNMEASURED with a 48,543 m² candidate stranded in a flag.
+#
+# These are kept as their own tuple, not folded silently into the yard list, because a dock
+# apron is NOT a service yard: this sheet's own legend states 190mm/A393 where the yard default
+# assumes A252.  Matching one raises an explicit spec flag (see _dock_apron_spec_flag) so the
+# assessor classifies and prices it deliberately.  No rate is inferred here.
+DOCK_APRON_LABELS = ("dock apron slab", "dock apron")
+
 CONCRETE_LABELS = ("concrete service yard", "service yard", "external yard",
-                   "yard construction", "type c", "gv areas")
+                   "yard construction", "type c", "gv areas") + DOCK_APRON_LABELS
 MACADAM_LABELS = ("macadam surfacing", "tarmac surfacing", "asphalt surfacing")
 
 # Inderjit confirmed on 31 Jul that Fortel wants these assumptions offered.  This remains the
@@ -2083,6 +2099,17 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     else:
         region_confidence = "low"
         flags.append(f"no concrete-yard legend label — grey-hatch heuristic {GREY_FALLBACK} (LOW confidence; assessor confirm)")
+
+    # Runs AFTER the branch above, never inside it: identifying a surface is not the same as
+    # classifying it. A dock apron carries its own build-up on its own sheet, so say so rather
+    # than let it inherit the yard default silently downstream.
+    if label and any(term in label for term in DOCK_APRON_LABELS):
+        region_confidence = "low"
+        flags.append(
+            f"SURFACE CLASS: matched on '{label}', which is a DOCK APRON, not a service yard — "
+            "the sheet states its own build-up and it is not the assumed yard spec. Measured "
+            "area stands; ASSESSOR MUST CLASSIFY AND PRICE THIS DELIBERATELY rather than let it "
+            "inherit the external-yard default.")
     if use_api:
         try:
             import llm_client

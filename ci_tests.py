@@ -3015,6 +3015,55 @@ try:
 except (ImportError, FileNotFoundError, KeyError) as _e:
     print(f"  [SKIP] hatch-drawn surface regression — missing dependency or file: {_e}")
 
+print("dock apron slabs on a joint-layout sheet (0720 class: slab named by build-up, no yard label)")
+try:
+    import os as _os_da
+    import fitz as _fitz_da
+    import numpy as _np_da
+    import takeoff_unmarked as _tu_da
+
+    ck("dock apron vocabulary is part of the concrete legend lookup",
+       all(_t in _tu_da.CONCRETE_LABELS for _t in _tu_da.DOCK_APRON_LABELS),
+       _tu_da.DOCK_APRON_LABELS)
+    ck("the yard vocabulary is still intact alongside it",
+       "concrete service yard" in _tu_da.CONCRETE_LABELS
+       and "service yard" in _tu_da.CONCRETE_LABELS)
+
+    _da_pdf = ("drawings/inderjit_p6/"
+               "6_31941-TTE-ZF-762-DR-C-0720-P01-Hardstanding_Joint_Layout.pdf")
+    if not _os_da.path.exists(_da_pdf):
+        print(f"  [SKIP] 0720 dock-apron regression — client fixture not present ({_da_pdf})")
+    else:
+        _da_doc = _fitz_da.open(_da_pdf)
+        _da_pg = _da_doc[0]
+        _da_pix = _da_pg.get_pixmap(matrix=_fitz_da.Matrix(2.0, 2.0))
+        _da_im = _np_da.frombuffer(_da_pix.samples, _np_da.uint8).reshape(
+            _da_pix.height, _da_pix.width, _da_pix.n)[:, :, :3].copy()
+        _da_rgb, _da_label = _tu_da.find_concrete_swatch_rgb(_da_pdf, im=_da_im, S=2.0)
+        ck("0720: the dock-apron legend is now found (it never was before)",
+           _da_rgb is not None and "dock apron" in (_da_label or ""),
+           f"{_da_rgb} {_da_label!r}")
+        ck("0720: its swatch reads as a real surface tint, not near-black/white",
+           _da_rgb is not None and _tu_da._is_plausible_surface_tint(_da_rgb), _da_rgb)
+        # The scale is title-only on this sheet; that is exactly why naming the legend matters,
+        # since the refuse gate is `not legend_found AND not verified`.
+        _da_k, _da_verified, _da_note, _ = _tu_da.scale_for(_da_pdf)
+        ck("0720: scale reads 1:500 from the title block and is honestly UNVERIFIED",
+           abs(_da_k - 0.176389) < 1e-4 and _da_verified is False, f"{_da_k} verified={_da_verified}")
+
+        _da_res = _tu_da.takeoff(_da_pdf, source="engineer")
+        ck("0720: no longer refuses outright — it measures and routes to the assessor",
+           _da_res.get("area_m2") is not None
+           and _da_res.get("measurement_state") == "MEASURED_UNVERIFIED",
+           f"{_da_res.get('area_m2')} {_da_res.get('measurement_state')}")
+        ck("0720: a dock apron is NOT silently priced as a service yard — spec flag raised",
+           any("DOCK APRON, not a service yard" in _f for _f in _da_res.get("flags") or []))
+        ck("0720: it never claims a verified scale it does not have",
+           _da_res.get("scale_verified") is False)
+        _da_doc.close()
+except (ImportError, FileNotFoundError, AttributeError) as _e:
+    print(f"  [SKIP] dock-apron regression — missing dependency or file: {_e}")
+
 print("manhole E/O costing line (costing.py Winvic rate: £75.00/Nr)")
 try:
     from quotation import generate_quotation as _gen_q_mh
