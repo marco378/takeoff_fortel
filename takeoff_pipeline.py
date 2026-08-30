@@ -697,7 +697,7 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                 # ── Deterministic colour-segmentation path (takeoff_unmarked) ────────
                 import takeoff_unmarked as TU
                 tu = TU.takeoff(meas_pdf, source=discipline)
-                r["method"] = "colour-segmentation (takeoff_unmarked)"
+                r["method"] = tu.get("method") or "colour-segmentation (takeoff_unmarked)"
                 if tu.get("area_m2") is not None:
                     r.update({
                         "area_m2":        tu["area_m2"],
@@ -725,6 +725,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                         "exclusion_review_required": bool(
                             tu.get("exclusion_review_required", False)),
                         "boundary_precision_risk": tu.get("boundary_precision_risk"),
+                        "measurement_mode": tu.get("measurement_mode"),
+                        "light_fill_diagnostics": tu.get("light_fill_diagnostics"),
+                        "perimeter_measurement_allowed": tu.get(
+                            "perimeter_measurement_allowed", True),
                     })
                     r["flags"] = r["flags"] + tu.get("flags", []) + ["assessor: confirm extent + scale"]
                     # A region measured WITHOUT a legend label is a generic grey-hatch guess — its
@@ -763,13 +767,19 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     # A narrower, corroborated metal-deck hatch class may emit an assessor-gated
                     # MEASURED_UNVERIFIED estimate; all other office geometry stays quantity-free.
                     try:
-                        from office_candidates import detect_office_candidates
-                        office_k, office_verified, office_note, office_sources = TU.scale_for(meas_pdf)
-                        assisted = detect_office_candidates(
-                            meas_pdf,
-                            scale_k=office_k,
-                            scale_verified=office_verified,
-                        )
+                        assisted = {}
+                        if tu.get("terminal_measurement_refusal"):
+                            r["flags"].append(
+                                "STRUCTURAL LIGHT-FILL REFUSAL IS TERMINAL: automatic office "
+                                "reinterpretation disabled; assessor trace remains required")
+                        else:
+                            from office_candidates import detect_office_candidates
+                            office_k, office_verified, office_note, office_sources = TU.scale_for(meas_pdf)
+                            assisted = detect_office_candidates(
+                                meas_pdf,
+                                scale_k=office_k,
+                                scale_verified=office_verified,
+                            )
                         if assisted.get("candidate_polygons"):
                             r.update({
                                 "method": "assisted office vector trace",
@@ -823,7 +833,7 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
             except Exception as e:
                 r["flags"].append(f"raster fallback (colour-segmentation) unavailable: {e}")
             if tu and tu.get("area_m2") is not None:
-                r["method"] = "colour-segmentation on flattened/raster render"
+                r["method"] = tu.get("method") or "colour-segmentation on flattened/raster render"
                 r.update({
                     "area_m2":        tu["area_m2"],
                     "scale_k":        tu.get("scale_k"),
@@ -846,6 +856,10 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     "exclusion_review_required": bool(
                         tu.get("exclusion_review_required", False)),
                     "boundary_precision_risk": tu.get("boundary_precision_risk"),
+                    "measurement_mode": tu.get("measurement_mode"),
+                    "light_fill_diagnostics": tu.get("light_fill_diagnostics"),
+                    "perimeter_measurement_allowed": tu.get(
+                        "perimeter_measurement_allowed", True),
                 })
                 r["flags"] = r["flags"] + tu.get("flags", []) + [
                     "flattened/raster drawing measured from the RENDER (no vector geometry) — "
@@ -902,7 +916,8 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
 
     # Informational formwork quantity only: polygon_pts are PDF points and scale_k is m/pt,
     # so closed polygon length × scale_k gives linear metres.  This never enters pricing.
-    if (r.get("perimeter_lm") is None
+    if (r.get("perimeter_measurement_allowed", True)
+            and r.get("perimeter_lm") is None
             and r.get("polygon_pts") and r.get("scale_k")):
         from geometry import polygon_perimeter_lm
         perimeter_lm = polygon_perimeter_lm(r["polygon_pts"], r["scale_k"])

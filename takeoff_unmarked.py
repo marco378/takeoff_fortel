@@ -2046,6 +2046,36 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                     "measurement viewport. A matching colour legend cannot override drawing "
                     "identity; route the actual external-works/surfacing sheet to takeoff."]}
     if style == "line/hatch":
+        # A line/hatch classification still blocks the existing service-yard colour path.
+        # A separate structural-slab mode may apply when the sheet itself identifies both a
+        # suspended-slab plan and composite metal-deck construction.  It uses a local
+        # near-white component gate and is always assessor-gated; it never relaxes this guard.
+        try:
+            from structural_light_fill import detect_structural_light_fill
+            light_k, light_verified, light_note, light_sources = scale_for(pdf)
+            light_fill = detect_structural_light_fill(
+                im, pg.get_text(), light_k, scale_verified=light_verified, S=S)
+        except Exception as exc:
+            light_fill = {
+                "applicable": False,
+                "flags": [
+                    "STRUCTURAL LIGHT-FILL MODE unavailable "
+                    f"({type(exc).__name__}: {exc}); no number emitted, assessor must trace"
+                ],
+            }
+            light_k, light_verified, light_note, light_sources = None, False, "", {}
+        if light_fill.get("applicable"):
+            light_fill.update({
+                "pdf": os.path.basename(pdf),
+                "style": style,
+                "scale_k": round(light_k, 6) if light_k else None,
+                "scale_verified": bool(light_verified),
+                "scale_src": light_note,
+                "scale_sources": light_sources,
+            })
+            light_fill["flags"] = flags + ([light_note] if light_note else []) + list(
+                light_fill.get("flags") or [])
+            return light_fill
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "flags": flags + [

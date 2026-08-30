@@ -465,6 +465,104 @@ try:
     for _i in range(0, 300, 12):
         _lines[:, _i] = (80, 80, 80)
     ck("line/hatch sheet detected", drawing_style(_lines)[0] == "line/hatch")
+
+    print("separate structural light-fill slab measurement")
+    from structural_light_fill import detect_structural_light_fill as _detect_light_fill
+    _light_text = (
+        "MEZZANINE SUSPENDED SLAB LAYOUT\n"
+        "COMPOSITE METAL DECK CONSTRUCTION"
+    )
+    _light_im = _np.full((600, 1200, 3), 255, _np.uint8)
+    _light_im[100:400, 100:1000] = (235, 235, 235)
+    _light_result = _detect_light_fill(
+        _light_im, _light_text, scale_k=0.1, scale_verified=False, S=2.0)
+    ck("near-white structural fill stays line/hatch under the unchanged legacy guard",
+       drawing_style(_light_im)[0] == "line/hatch")
+    ck("separate structural mode measures one locally solid light-fill plate",
+       _light_result.get("area_m2") == 675.0 and
+       _light_result.get("measurement_state") == "MEASURED_UNVERIFIED" and
+       _light_result.get("needs_assessor") is True and
+       _light_result.get("perimeter_measurement_allowed") is False and
+       len(_light_result.get("polygon_pts") or []) >= 4,
+       {key:_light_result.get(key) for key in (
+           "area_m2", "measurement_state", "needs_assessor", "flags")})
+    ck("light-fill appearance alone cannot activate the structural path",
+       _detect_light_fill(
+           _light_im, "GENERAL ARRANGEMENT PLAN", scale_k=0.1,
+           scale_verified=False, S=2.0).get("applicable") is False)
+    _ambiguous_light = _np.full((800, 1200, 3), 255, _np.uint8)
+    _ambiguous_light[100:350, 100:500] = (235, 235, 235)
+    _ambiguous_light[450:700, 700:1100] = (235, 235, 235)
+    _ambiguous_result = _detect_light_fill(
+        _ambiguous_light, _light_text, scale_k=0.1,
+        scale_verified=False, S=2.0)
+    ck("competing structural light-fill plates refuse instead of guessing",
+       _ambiguous_result.get("area_m2") is None and
+       _ambiguous_result.get("measurement_state") == "UNMEASURED" and
+       _ambiguous_result.get("terminal_measurement_refusal") is True and
+       any("ambiguous" in flag.lower() or "compete" in flag.lower()
+           for flag in _ambiguous_result.get("flags", [])),
+       _ambiguous_result)
+    _no_scale_light = _detect_light_fill(
+        _light_im, _light_text, scale_k=None, scale_verified=False, S=2.0)
+    ck("resolved structural light-fill geometry emits no number without a scale",
+       _no_scale_light.get("area_m2") is None and
+       _no_scale_light.get("measurement_state") == "UNMEASURED" and
+       any("no usable scale" in flag for flag in _no_scale_light.get("flags", [])),
+       _no_scale_light)
+
+    try:
+        _mezz_pdf = (
+            "drawings/inderjit_p7/"
+            "7_25195-MJM-ZZ-ZZ-DR-S-2300-D2-P02-Mezzanine_Suspended_Slab_Layout.pdf"
+        )
+        _require_fixture(_mezz_pdf, "092 Mezzanine structural light-fill IoU test")
+        _require_fixture("ground_truth_polygons.json",
+                         "092 Mezzanine polygon ground truth")
+        import json as _json_light
+        from shapely.geometry import Polygon as _Polygon_light
+        from takeoff_unmarked import takeoff as _takeoff_light
+        _light_truth = _json_light.loads(
+            Path("ground_truth_polygons.json").read_text()
+        )["092_25195-MJM-ZZ-ZZ-DR-S-2300-D2-P02-Mezzanine_Suspended_Slab_Layout.pdf"]
+        _mezz_result = _takeoff_light(_mezz_pdf)
+        with _fitz_swatch.open(_mezz_pdf) as _mezz_doc:
+            _mezz_page = _mezz_doc[_light_truth["page"]]
+            _truth_rotated = [
+                tuple(_fitz_swatch.Point(*point) * _mezz_page.rotation_matrix)
+                for point in _light_truth["polygon_pts"]
+            ]
+        _truth_polygon = _Polygon_light(_truth_rotated)
+        _measured_polygon = _Polygon_light(_mezz_result.get("polygon_pts") or [])
+        _mezz_iou = (
+            _measured_polygon.intersection(_truth_polygon).area /
+            _measured_polygon.union(_truth_polygon).area
+            if _measured_polygon.is_valid and not _measured_polygon.is_empty else 0.0
+        )
+        _mezz_diff_pct = abs(
+            float(_mezz_result.get("area_m2") or 0) - _light_truth["area_m2"]
+        ) / _light_truth["area_m2"] * 100
+        ck("092 Mezzanine separate path finds the correct region by IoU",
+           _mezz_iou >= _light_truth["min_iou"], round(_mezz_iou, 4))
+        ck("092 Mezzanine gross area is within 2% without using truth in production code",
+           _mezz_diff_pct <= 2.0,
+           {"actual":_mezz_result.get("area_m2"),
+            "truth":_light_truth["area_m2"], "diff_pct":round(_mezz_diff_pct, 3)})
+        ck("092 Mezzanine is visibly separate and assessor-gated, never VERIFIED",
+           _mezz_result.get("method") == "structural light-fill segmentation" and
+           _mezz_result.get("measurement_state") == "MEASURED_UNVERIFIED" and
+           _mezz_result.get("needs_assessor") is True and
+           _mezz_result.get("scale_verified") is False and
+           any("MEASUREMENT MODE: structural light-fill" in flag
+               for flag in _mezz_result.get("flags", [])),
+           {key:_mezz_result.get(key) for key in (
+               "method", "area_m2", "measurement_state", "scale_verified")})
+    except _FixtureNotPresent as _e:
+        print(f"  [SKIP] {_e} — fixture not present")
+    except (FileNotFoundError, KeyError) as _e:
+        print(f"  [SKIP] 092 Mezzanine structural light-fill IoU test — "
+              f"missing fixture data: {_e} — fixture not present")
+
     # (b) dock-bay/void fix: a large interior void is kept as a DEDUCTION, not filled (team: D77 dock bays)
     _v = _np.full((400, 400, 3), 255, _np.uint8); _v[40:360, 40:360] = (214, 214, 214); _v[150:250, 150:250] = 255
     _kept = segment_hatch(_v, (214, 214, 214), k=0.05, S=2.0, max_void_m2=1.0)   # void=6.25 m² > 1 -> kept out
