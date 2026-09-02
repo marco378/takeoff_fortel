@@ -38,12 +38,31 @@ ASSUMED = dict(depth_mm=190, conc_rate=128, mesh="A252", layers=1, steel_rate_t=
 #
 # These are kept as their own tuple, not folded silently into the yard list, because a dock
 # apron is NOT a service yard: this sheet's own legend states 190mm/A393 where the yard default
-# assumes A252.  Matching one raises an explicit spec flag (see _dock_apron_spec_flag) so the
-# assessor classifies and prices it deliberately.  No rate is inferred here.
+# assumes A252.  Matching one raises an explicit spec flag so the assessor classifies and prices
+# it deliberately.  No rate is inferred here.
+#
+# *** THEY ARE A FALLBACK TIER, NOT PEERS OF THE YARD VOCABULARY. ***  When these were simply
+# appended to CONCRETE_LABELS they silently hijacked Inderjit's project-6 Construction Thickness
+# sheets, which carry BOTH a "service yard" legend AND a "dock apron construction (Cl. 5.1...)"
+# note.  _label_bbox_for returns the FIRST line in document order matching ANY label, the dock
+# apron note sits above the yard legend on those sheets, so segmentation locked onto the wrong
+# swatch — (185,185,185) instead of (217,217,217):
+#     0710   32,966 -> 9,872 m2        0711   5,445 -> 15,536 m2
+# 0711 was the sheet Aryan had just confirmed as "calculating the right area now".  The corpus
+# gate did not catch it because neither sheet has a gold entry, so nothing was watching their
+# numbers.  A sheet that names a service yard is measuring a service yard; the dock-apron
+# vocabulary exists only for sheets that name no yard at all (the 0720 Hardstanding case).
 DOCK_APRON_LABELS = ("dock apron slab", "dock apron")
 
-CONCRETE_LABELS = ("concrete service yard", "service yard", "external yard",
-                   "yard construction", "type c", "gv areas") + DOCK_APRON_LABELS
+YARD_LABELS = ("concrete service yard", "service yard", "external yard",
+               "yard construction", "type c", "gv areas")
+
+# Retained for consumers that legitimately want "any concrete surface vocabulary" (e.g. masking
+# a matched legend row out of a tint mask).  Lookups that CHOOSE a surface must go through the
+# two-tier helpers below instead, never through this flat tuple.
+CONCRETE_LABELS = YARD_LABELS + DOCK_APRON_LABELS
+
+
 MACADAM_LABELS = ("macadam surfacing", "tarmac surfacing", "asphalt surfacing")
 
 # Inderjit confirmed on 31 Jul that Fortel wants these assumptions offered.  This remains the
@@ -79,7 +98,10 @@ def _label_bbox_for(pdf, labels, page=0):
 
 def _label_bbox(pdf, page=0):
     """Backward-compatible concrete-Yard legend lookup."""
-    return _label_bbox_for(pdf, CONCRETE_LABELS, page)
+    # Two-tier: a sheet that names a service yard is measuring a service yard. Dock-apron
+    # vocabulary is consulted ONLY when no yard label exists anywhere on the sheet.
+    return (_label_bbox_for(pdf, YARD_LABELS, page)
+            or _label_bbox_for(pdf, DOCK_APRON_LABELS, page))
 
 
 def _is_plausible_surface_tint(rgb):
@@ -226,7 +248,11 @@ def _find_surface_swatch_rgb(pdf, labels, im=None, S=2.0, page=0):
 
 def find_concrete_swatch_rgb(pdf, im=None, S=2.0, page=0):
     """Read the on-sheet Concrete/Service Yard legend swatch."""
-    return _find_surface_swatch_rgb(pdf, CONCRETE_LABELS, im=im, S=S, page=page)
+    # Two-tier, same reason as _label_bbox: yard vocabulary wins outright when present.
+    rgb, label = _find_surface_swatch_rgb(pdf, YARD_LABELS, im=im, S=S, page=page)
+    if label:
+        return rgb, label
+    return _find_surface_swatch_rgb(pdf, DOCK_APRON_LABELS, im=im, S=S, page=page)
 
 
 def _legend_sample_bbox(pdf, page=0):

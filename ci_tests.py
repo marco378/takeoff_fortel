@@ -3126,6 +3126,33 @@ try:
     ck("the yard vocabulary is still intact alongside it",
        "concrete service yard" in _tu_da.CONCRETE_LABELS
        and "service yard" in _tu_da.CONCRETE_LABELS)
+    ck("dock-apron terms are a SEPARATE tier, not mixed into the yard vocabulary",
+       not any(_t in _tu_da.YARD_LABELS for _t in _tu_da.DOCK_APRON_LABELS),
+       _tu_da.YARD_LABELS)
+
+    # REGRESSION GUARD. Appending the dock-apron terms straight onto CONCRETE_LABELS silently
+    # hijacked Inderjit's project-6 Construction Thickness sheets, which carry BOTH a
+    # "service yard" legend AND a "dock apron construction (Cl. 5.1...)" note. _label_bbox_for
+    # returns the FIRST line in document order matching ANY label, and the dock-apron note sits
+    # above the yard legend there, so it locked onto (185,185,185) instead of (217,217,217):
+    # 0710 32,966 -> 9,872 and 0711 5,445 -> 15,536, the latter being the sheet Aryan had just
+    # confirmed as correct. No gold entry exists for either, so the corpus never saw it.
+    for _p6 in ("6_31941-TTE-ZF-762-DR-C-0710-P01-Construction_Thicknessess_Plan.pdf",
+                "6_31941-TTE-ZF-762-DR-C-0711-P01-Construction_Thicknessess_Plan.pdf"):
+        _p6path = f"drawings/inderjit_p6/{_p6}"
+        if not _os_da.path.exists(_p6path):
+            print(f"  [SKIP] project-6 yard-precedence guard — fixture not present ({_p6})")
+            continue
+        _p6doc = _fitz_da.open(_p6path)
+        _p6pix = _p6doc[0].get_pixmap(matrix=_fitz_da.Matrix(2.0, 2.0))
+        _p6im = _np_da.frombuffer(_p6pix.samples, _np_da.uint8).reshape(
+            _p6pix.height, _p6pix.width, _p6pix.n)[:, :, :3].copy()
+        _p6rgb, _p6label = _tu_da.find_concrete_swatch_rgb(_p6path, im=_p6im, S=2.0)
+        ck(f"{_p6[:28]}: a sheet naming a SERVICE YARD measures the yard, not the dock apron",
+           _p6label is not None and "service yard" in _p6label
+           and not any(_t in _p6label for _t in _tu_da.DOCK_APRON_LABELS),
+           f"matched {_p6label!r} swatch {_p6rgb}")
+        _p6doc.close()
 
     _da_pdf = ("drawings/inderjit_p6/"
                "6_31941-TTE-ZF-762-DR-C-0720-P01-Hardstanding_Joint_Layout.pdf")
