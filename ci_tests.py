@@ -6873,6 +6873,50 @@ ck("it sits to the right of VALUE, mirroring Fortel's REMEASURE caveat column",
 # The guard is a standards-citation strip plus a four-digit scale SERIES whitelist; a year is in
 # no series. It deliberately does NOT ban large scales — 1:1500 and 1:2000 are real and in live
 # use on the CADIC site sheets, and banning them would silently break those instead.
+print("\n[a metre token buried in prose is not a scale bar]")
+try:
+    import os as _os_pb
+    from scale import detect_scale_bar as _dsb_pb
+    import takeoff_unmarked as _tu_pb
+
+    # Three real sheets were being handed invented scale bars because detect_scale_bar paired a
+    # prose "Nm" token to whatever line ran past it:
+    #   0710/0711  "a 25m x 25m grid" in a construction note -> 25 m / 318 pt, 25 m / 43 pt
+    #   092        "SPEC. CLAUSE No. 130L 130M"              -> read as 130 METRES
+    # Each then disagreed with a good title block, so the sheet fell into MIXED/DISAGREE and
+    # Inderjit had to set the scale by hand on a drawing that never had a bar.
+    _pb_false = [
+        ("0710", "drawings/inderjit_p6/6_31941-TTE-ZF-762-DR-C-0710-P01-Construction_Thicknessess_Plan.pdf", 0.176389),
+        ("0711", "drawings/inderjit_p6/6_31941-TTE-ZF-762-DR-C-0711-P01-Construction_Thicknessess_Plan.pdf", 0.176389),
+        ("092",  "drawings/inderjit_p7/7_25195-MJM-ZZ-ZZ-DR-S-2300-D2-P02-Mezzanine_Suspended_Slab_Layout.pdf", 0.070556),
+    ]
+    for _nm, _pp, _expect_k in _pb_false:
+        if not _os_pb.path.exists(_pp):
+            print(f"  [SKIP] {_nm} false-scale-bar guard — client fixture not present")
+            continue
+        _kb, _ib = _dsb_pb(_pp)
+        ck(f"{_nm}: the prose 'Nm' token is no longer read as a scale bar",
+           _kb is None, f"got k={_kb} from {_ib!r}")
+        _tk, _tv, _tn, _ = _tu_pb.scale_for(_pp)
+        ck(f"{_nm}: falls back to its title block cleanly, no MIXED/DISAGREE",
+           abs(_tk - _expect_k) < 1e-4 and "DISAGREE" not in _tn, f"k={_tk} note={_tn[:80]}")
+        # INVARIANT 3: removing a false bar must never manufacture a verified scale.
+        ck(f"{_nm}: still UNVERIFIED — killing a false bar cannot verify a sheet",
+           _tv is False, _tv)
+
+    # Positive controls: a REAL bar must survive the prose filter untouched.
+    for _nm, _pp in (("real SGP D77", "drawings/D77-REAL_D77_Hard_Landscaping.pdf"),
+                     ("_int_d77", "drawings/_int_d77.pdf")):
+        if not _os_pb.path.exists(_pp):
+            print(f"  [SKIP] {_nm} real-scale-bar positive control — fixture not present")
+            continue
+        _kb, _ib = _dsb_pb(_pp)
+        ck(f"{_nm}: its genuine scale bar still detected", _kb is not None, _ib)
+        _tk, _tv, _tn, _ = _tu_pb.scale_for(_pp)
+        ck(f"{_nm}: still VERIFIED by bar/title agreement", _tv is True, _tn[:90])
+except (ImportError, FileNotFoundError) as _e:
+    print(f"  [SKIP] false-scale-bar regression — missing dependency or file: {_e}")
+
 print("\n[standards citations are not scales]")
 from takeoff_unmarked import _title_scale_denominators as _tsd, FOUR_DIGIT_SCALE_SERIES as _series
 _bs_note = "75mm sand:cement screed to BS 8204 Part 1: 2003 on Rockwool RockFloor"

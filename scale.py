@@ -67,8 +67,31 @@ def detect_scale_bar(pdf, page=0):
     # frequently an unrelated unit suffix on a dimension callout elsewhere on the sheet (e.g. "110m"
     # split into '110' + 'm' by the tokenizer) which can coincidentally have digit neighbours within
     # the proximity band and would otherwise out-rank the real bar by pure page position.
-    fused_cands = [(w[0], w[1], int(re.match(r"\d{1,4}", w[4]).group())) for w in fused_ms]
-    bare_cands = [(w[0], w[1], None) for w in bare_ms]
+    # A scale-bar label stands beside its bar, not inside a sentence. Real Fortel sheets carry
+    # "Nm" tokens in prose and in spec tables that have nothing to do with scale, and pairing one
+    # to whatever line happens to run past it invents a bar:
+    #   0710/0711  "a 25m x 25m grid" in a construction note  -> 25 m / 318 pt and 25 m / 43 pt
+    #   092        "SPEC. CLAUSE No. 130L 130M"               -> read as 130 METRES, 130 m/1063 pt
+    # All three then disagreed with a perfectly good title block and dumped the sheet into
+    # MIXED/DISAGREE, so Inderjit had to set the scale by hand on drawings that never had a bar.
+    # Measured on the real sheets: a genuine bar label has 0-2 word-like neighbours in its own
+    # text band (D77's reads "1:250 25m" and "To To 5m"), a prose one has 11-19. Reject at 3.
+    # This can only ever REMOVE a bar, never invent one, so a sheet losing its false bar falls
+    # back to title-only and stays UNVERIFIED — no path here can produce a verified scale.
+    PROSE_NEIGHBOUR_REJECT = 3
+    PROSE_BAND_PT = 12
+    PROSE_REACH_PT = 260
+
+    def _reads_as_prose(wx, wy):
+        neighbours = [q[4] for q in words
+                      if abs(q[1] - wy) < PROSE_BAND_PT and abs(q[0] - wx) < PROSE_REACH_PT]
+        wordlike = [t for t in neighbours if re.fullmatch(r"[A-Za-z]{2,}", t)]
+        return len(wordlike) >= PROSE_NEIGHBOUR_REJECT
+
+    fused_cands = [(w[0], w[1], int(re.match(r"\d{1,4}", w[4]).group())) for w in fused_ms
+                   if not _reads_as_prose(w[0], w[1])]
+    bare_cands = [(w[0], w[1], None) for w in bare_ms
+                  if not _reads_as_prose(w[0], w[1])]
     label_cand_tiers = [fused_cands, bare_cands]
     if not (fused_cands or bare_cands):
         return None, "no scale-bar label"
