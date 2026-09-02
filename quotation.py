@@ -107,11 +107,21 @@ def _expand_zone_results(results: list[dict]) -> list[dict]:
     """
     expanded = []
     for parent in results:
-        zones = [zone for zone in (parent.get("zones") or [])
-                 if zone.get("category") in ZONE_SECTION and zone.get("area_m2") is not None]
+        area_zones = [zone for zone in (parent.get("zones") or [])
+                      if zone.get("area_m2") is not None]
+        zones = [zone for zone in area_zones if zone.get("category") in ZONE_SECTION]
         if not zones:
+            # No recognised zone: the parent passes through whole, so its area is still counted.
             expanded.append(parent)
             continue
+        # But once ANY zone is recognised, expansion REPLACES the parent — so a measured zone
+        # whose category has no BOQ section used to be filtered out here and vanish from the
+        # quotation without a word. Reported on the 27 Aug call as an element "created with the
+        # wrong tool" that stopped contributing to the total and lost its thickness/mesh/finish;
+        # the portal's classification dropdown collapsing to "other region" is how an assessor
+        # lands here. Measured area must never disappear silently — that is the same contract as
+        # never emitting a silent number, in the other direction.
+        orphans = [zone for zone in area_zones if zone.get("category") not in ZONE_SECTION]
 
         categories = {zone["category"] for zone in zones}
         mixed = len(categories) > 1
@@ -155,6 +165,36 @@ def _expand_zone_results(results: list[dict]) -> list[dict]:
                 costing["extras"] = []
             virtual["costing"] = costing
             expanded.append(virtual)
+
+        # Carry the orphans through as their own unclassified, unpriced rows. No rate is
+        # inherited or invented: the assessor classifies them and the quantity is visible
+        # meanwhile, rather than the area quietly leaving the quotation.
+        for zone in orphans:
+            category = str(zone.get("category") or "").strip() or "unspecified"
+            orphan = dict(parent)
+            orphan["_zone_expanded"] = True
+            orphan["zones"] = []
+            orphan.pop("perimeter_lm", None)
+            orphan.pop("polygon_pts", None)
+            orphan["area_m2"] = float(zone["area_m2"])
+            orphan["quotation_section"] = UNCLASSIFIED_SECTION
+            orphan["unit_name"] = _unit_name(parent)
+            orphan["zone_category"] = None
+            orphan["boq_scope"] = zone.get("boq_scope") or "main"
+            orphan["area_label"] = (zone.get("scope_label") or zone.get("unit_label")
+                                    or ", ".join(zone.get("subjects") or []) or category)
+            orphan["brief_spec"] = {}
+            orphan["costing"] = {
+                "area_m2": float(zone["area_m2"]), "rate": None, "total_gbp": None,
+                "assumed": True, "spec": {}, "breakdown": {}, "extras": [],
+            }
+            orphan["flags"] = list(parent.get("flags") or []) + [
+                f"UNCLASSIFIED ZONE CARRIED: a measured zone categorised '{category}' has no BOQ "
+                f"section, so {float(zone['area_m2']):,.1f} m² is listed unpriced rather than "
+                "dropped. Assessor must classify it before approval; its build-up (thickness, "
+                "mesh, finish) cannot be stated until it is classified."
+            ]
+            expanded.append(orphan)
     return expanded
 
 
@@ -167,7 +207,10 @@ def quotation_section(result: dict) -> str:
         return ZONE_SECTION[zone_category]
     explicit = str(result.get("quotation_section") or "").strip()
     if explicit:
-        for section in SECTION_ORDER:
+        # UNCLASSIFIED_SECTION is deliberately outside SECTION_ORDER (it ranks last), but a
+        # carried orphan zone asks for it by name and must resolve, not fall through to the
+        # filename heuristics below and land in some unrelated section.
+        for section in (*SECTION_ORDER, UNCLASSIFIED_SECTION):
             if explicit.casefold() == section.casefold():
                 return section
 

@@ -6699,6 +6699,55 @@ for _label in ("Dock Slab", "dock_slab", "dock"):
     ck(f"dock area classified {_label!r} does not surface under External yard slabs",
        120.0 not in _yard_qtys, sorted(_yard_qtys))
 
+# ── A measured zone with no BOQ section must not vanish from the quotation ───────────────
+# 27 Aug call: an element "created with the wrong tool" stopped contributing to the total area
+# and lost its thickness/mesh/finish. _expand_zone_results filtered zones to the four known
+# categories, and because expansion REPLACES the parent result, anything left behind left the
+# quotation silently. The portal's classification dropdown collapsing to "other region" is
+# exactly how an assessor reaches that state. Losing measured area without a word is the same
+# contract breach as emitting a silent number, pointed the other way.
+_SPEC_ZC = {"depth_mm": 190, "mesh": "A252", "conc_mix": "C32/40", "layers": 1, "conc_rate": 128}
+
+
+def _zc_doc(category):
+    return {"file": "Yard.pdf", "type": "MARKED vector", "confidence": "high",
+            "source_discipline": "engineer",
+            "costing": {"area_m2": 1000, "rate": 44.89, "total_gbp": 44890.0,
+                        "assumed": False, "spec": dict(_SPEC_ZC)},
+            "zones": [{"zone_key": "external_yard", "category": "external_yard",
+                       "measurement_kind": "area", "area_m2": 1000.0,
+                       "spec": dict(_SPEC_ZC), "subjects": ["Yard"]},
+                      {"zone_key": "x", "category": category, "measurement_kind": "area",
+                       "area_m2": 250.0, "spec": dict(_SPEC_ZC),
+                       "subjects": ["Mis-tooled element"]}],
+            "flags": []}
+
+
+for _zc_cat in ("other region", "unclassified", "", "some tool the portal invented"):
+    _q_zc = _gq_sec(_zc_doc(_zc_cat), project="P", client="Fortel", ref="TST-ZC")
+    _zc_slabs = [li for li in _q_zc["line_items"] if li.get("line_role") == "concrete_slab"]
+    _zc_total = sum(li.get("qty") or 0 for li in _zc_slabs)
+    ck(f"zone categorised {_zc_cat!r}: its 250 m² is still in the quotation, not dropped",
+       _zc_total == 1250.0, f"slab total {_zc_total}")
+    _zc_row = [li for li in _zc_slabs if li.get("section") == _UNCLS]
+    ck(f"zone categorised {_zc_cat!r}: surfaced as unclassified for the assessor",
+       len(_zc_row) == 1 and _zc_row[0].get("qty") == 250.0, [li.get("section") for li in _zc_slabs])
+    ck(f"zone categorised {_zc_cat!r}: carries NO rate — none is inherited or invented",
+       _zc_row and _zc_row[0].get("rate") is None
+       and _zc_row[0].get("assessor_rate_required") is True, _zc_row)
+    ck(f"zone categorised {_zc_cat!r}: the assessor is told why it is unpriced",
+       any("UNCLASSIFIED ZONE CARRIED" in str(_f) for _f in _q_zc.get("pipeline_flags") or []))
+
+# A recognised category must be completely unaffected by the above.
+_q_zc_dock = _gq_sec(_zc_doc("dock"), project="P", client="Fortel", ref="TST-ZC-DOCK")
+_zc_dock_secs = {li.get("section") for li in _q_zc_dock["line_items"]
+                 if li.get("line_role") == "concrete_slab"}
+ck("a recognised 'dock' zone still lands in Dock slabs, unchanged",
+   _zc_dock_secs == {"External yard slabs", "Dock slabs"}, sorted(_zc_dock_secs))
+ck("...and nothing is marked unclassified when every zone is recognised",
+   not any("UNCLASSIFIED ZONE CARRIED" in str(_f)
+           for _f in _q_zc_dock.get("pipeline_flags") or []))
+
 
 
 
