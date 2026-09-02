@@ -1772,6 +1772,28 @@ def _transition_candidates_from_surface_mask(yard_regions, surface_mask, k, S=2.
     return candidates, reasons
 
 
+# Bituminous surfacing as real UK drawings spell it: asphalt concrete and stone mastic asphalt
+# designations from BS EN 13108, rather than the word "tarmac". Used ONLY to tell the assessor
+# the truth about what is on the sheet — never to locate a surface (see the note in
+# detect_raw_transition_candidates for why reading a swatch off these is wrong).
+BITUMINOUS_SPEC_TOKENS = (
+    ("AC20", r"\bAC\s?20\b"), ("AC32", r"\bAC\s?32\b"),
+    ("SMA", r"\bSMA\s?\d{0,2}\b"), ("dense bin", r"\bdense\s+bin\b"),
+    ("BS EN 13108", r"\bBS\s*EN\s*13108\b"),
+)
+
+
+def _sheet_names_bituminous_surfacing(pdf, page=0):
+    """Which BS EN 13108 bituminous designations this sheet's text actually carries."""
+    try:
+        with fitz.open(pdf) as doc:
+            text = doc[page].get_text()
+    except Exception:
+        return []
+    return [name for name, pattern in BITUMINOUS_SPEC_TOKENS
+            if re.search(pattern, text, re.I)]
+
+
 def detect_raw_transition_candidates(pdf, im, yard_regions, k, S=2.0, tol=14):
     """Return honest Yard-entrance Transition tracing prefills from on-sheet evidence.
 
@@ -1782,9 +1804,29 @@ def detect_raw_transition_candidates(pdf, im, yard_regions, k, S=2.0, tol=14):
     swatch, label = _find_surface_swatch_rgb(
         pdf, MACADAM_LABELS, im=im, S=S)
     if not label:
+        # Do not tell the assessor there is no tarmac on a sheet that is covered in it.
+        # MACADAM_LABELS holds three literal phrases; modern UK drawings name bituminous
+        # surfacing by its BS EN 13108 build-up instead ("60mm AC20 DENSE BIN", "30mm SMA 10
+        # (SURF)") under headings like HEAVY DUTY ACCESS. Inderjit's MJM sheet carries 1,813 m2
+        # of exactly that while this flag claimed none existed. Say which of the two it is.
+        #
+        # This is a TEXT check that reports; it deliberately does NOT feed segmentation. Those
+        # spec tokens sit in the build-up DETAIL diagrams, so looking a swatch up from them
+        # returns the detail's hatching — (33,33,33) for "ac20", (141,141,141) for "sma 10" —
+        # not a surface tint. Reading a surface off them would measure the wrong thing.
+        bituminous = _sheet_names_bituminous_surfacing(pdf)
+        if bituminous:
+            return [], [
+                "raw Yard-entrance Transition NOT ATTEMPTED: this sheet DOES carry bituminous "
+                f"surfacing ({', '.join(bituminous)}), but it is named by BS EN 13108 build-up "
+                "rather than by the tarmac/macadam/asphalt vocabulary this check matches on, so "
+                "the surface could not be located automatically; assessor must trace one run "
+                "per unit entrance"
+            ]
         return [], [
             "raw Yard-entrance Transition NOT ATTEMPTED: no tarmac/macadam/asphalt surface "
-            "legend was found; assessor must trace one run per unit entrance"
+            "legend was found, and no BS EN 13108 bituminous build-up either; assessor must "
+            "trace one run per unit entrance"
         ]
     if not swatch or not _is_plausible_surface_tint(swatch):
         return [], [

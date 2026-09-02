@@ -6873,6 +6873,48 @@ ck("it sits to the right of VALUE, mirroring Fortel's REMEASURE caveat column",
 # The guard is a standards-citation strip plus a four-digit scale SERIES whitelist; a year is in
 # no series. It deliberately does NOT ban large scales — 1:1500 and 1:2000 are real and in live
 # use on the CADIC site sheets, and banning them would silently break those instead.
+print("\n[the transition flag must not deny tarmac that is on the sheet]")
+try:
+    import os as _os_bt
+    import takeoff_unmarked as _tu_bt
+
+    ck("bituminous detector reads BS EN 13108 designations, not the word 'tarmac'",
+       [n for n, _ in _tu_bt.BITUMINOUS_SPEC_TOKENS] == ["AC20", "AC32", "SMA", "dense bin",
+                                                         "BS EN 13108"],
+       _tu_bt.BITUMINOUS_SPEC_TOKENS)
+
+    _bt_mjm = ("drawings/inderjit_p7/"
+               "7_25195-MJM-00-00-DR-C-9000-D2-P04-External_Works_Layout.pdf")
+    if not _os_bt.path.exists(_bt_mjm):
+        print(f"  [SKIP] MJM tarmac-honesty guard — client fixture not present")
+    else:
+        # That sheet carries 1,813 m2 of bituminous surfacing (HEAVY DUTY ACCESS = 40mm SMA 10
+        # / 60mm AC20 / 200mm AC32) while the flag claimed none existed. Zero transitions is
+        # still the right ANSWER there — tarmac and yard meet at a corner, 87 px of 233,102
+        # within 0.5 m — but the stated REASON was false.
+        ck("MJM: the sheet's bituminous surfacing is detected from its BS EN 13108 spec",
+           _tu_bt._sheet_names_bituminous_surfacing(_bt_mjm) == ["AC20", "AC32", "SMA",
+                                                                 "dense bin", "BS EN 13108"],
+           _tu_bt._sheet_names_bituminous_surfacing(_bt_mjm))
+        _bt_res = _tu_bt.takeoff(_bt_mjm, source="engineer")
+        _bt_flags = _bt_res.get("flags") or []
+        ck("MJM: the flag no longer claims there is no tarmac on it",
+           not any("no tarmac/macadam/asphalt surface legend was found" in _f
+                   for _f in _bt_flags))
+        ck("MJM: it says the tarmac IS there but is named by build-up",
+           any("DOES carry bituminous surfacing" in _f for _f in _bt_flags),
+           [_f[:120] for _f in _bt_flags if "Transition" in _f])
+        ck("MJM: still emits no transition, which remains the correct answer",
+           not _bt_res.get("transition_candidates"))
+
+    # A sheet with genuinely no bituminous surfacing must still say so plainly.
+    _bt_d77 = "drawings/D77-REAL_D77_Hard_Landscaping.pdf"
+    if _os_bt.path.exists(_bt_d77):
+        ck("D77: no bituminous build-up detected, because there is none",
+           _tu_bt._sheet_names_bituminous_surfacing(_bt_d77) == [])
+except (ImportError, FileNotFoundError, AttributeError) as _e:
+    print(f"  [SKIP] transition-flag honesty regression — missing dependency or file: {_e}")
+
 print("\n[a metre token buried in prose is not a scale bar]")
 try:
     import os as _os_pb
