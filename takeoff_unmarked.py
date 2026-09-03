@@ -2144,6 +2144,29 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             light_fill["flags"] = flags + ([light_note] if light_note else []) + list(
                 light_fill.get("flags") or [])
             return light_fill
+        # ANGLE R (scratch prototype): hatch-LEGEND raster line-opening path.  Runs only here,
+        # after the structural light-fill mode declined, and only when a legend chip is a
+        # STROKE PATTERN; every emitted number is an assessor-gated prefill (MEASURED_UNVERIFIED
+        # cap).  A decline falls through to the existing line/hatch refusal unchanged.
+        try:
+            import hatch_legend_raster
+            hatch_result = hatch_legend_raster.detect_hatch_legend_surfaces(
+                pdf, pg, im, light_k, scale_verified=light_verified, S=S, out_dir=out_dir)
+        except Exception as exc:
+            hatch_result = {"applicable": False, "flags": [
+                "HATCH-LEGEND MODE unavailable "
+                f"({type(exc).__name__}: {exc}); no number emitted, assessor must trace"]}
+        if hatch_result.get("applicable"):
+            hatch_result.update({
+                "pdf": os.path.basename(pdf), "style": style,
+                "scale_k": round(light_k, 6) if light_k else None,
+                "scale_verified": bool(light_verified), "scale_src": light_note,
+                "scale_sources": light_sources,
+            })
+            hatch_result["flags"] = flags + ([light_note] if light_note else []) + list(
+                hatch_result.get("flags") or [])
+            return hatch_result
+        flags = flags + list(hatch_result.get("flags") or [])
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "flags": flags + [

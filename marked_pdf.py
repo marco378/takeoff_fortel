@@ -334,24 +334,62 @@ def _overlay_manifest(job: dict, source_path: Path, page_index: int,
                 "assessor_approved": job.get("decision") in {"approved", "adjusted"},
             })
         for index, zone in enumerate(job.get("zones") or result.get("zones") or []):
-            points = zone.get("polygon_pts") if isinstance(zone, dict) else None
-            if not _valid_points(points, 3):
+            if not isinstance(zone, dict):
                 continue
-            normalised = _normalise_points(points)
-            key = tuple(tuple(point) for point in normalised)
-            if key in seen:
-                continue
-            seen.add(key)
-            geometry["regions"].append({
-                "region_id": str(zone.get("zone_key") or f"zone-region-{index + 1}"),
-                "name": _label_for_category(zone.get("category")),
-                "category": zone.get("category"),
-                "area_m2": zone.get("area_m2"),
-                "points": normalised,
-                "source_coordinate_space": "rotated_pdf_points",
-                "assessor_supplied": False,
-                "assessor_approved": job.get("decision") in {"approved", "adjusted"},
-            })
+            # A zone can be drawn in several separately-hatched parts (the hatch-legend path
+            # emits a yard or a road as its parts). Draw EVERY part, each labelled with its own
+            # quantity: one outline beside a number covering three parts is how an assessor is
+            # led to approve an extent nobody looked at.
+            polygons = list(zone.get("region_polygons") or [])
+            part_ids = list(zone.get("region_ids") or [])
+            part_areas = list(zone.get("region_areas_m2") or [])
+            part_holes = list(zone.get("region_holes") or [])
+            zone_id = str(zone.get("zone_key") or f"zone-region-{index + 1}")
+            if polygons:
+                parts = [(polygons[i],
+                          str(part_ids[i]) if i < len(part_ids) else f"{zone_id}-part-{i + 1}",
+                          part_areas[i] if i < len(part_areas) else None,
+                          part_holes[i] if i < len(part_holes) else [])
+                         for i in range(len(polygons))]
+            else:
+                parts = [(zone.get("polygon_pts"), zone_id, zone.get("area_m2"), [])]
+            for points, region_id, part_area, holes in parts:
+                if not _valid_points(points, 3):
+                    continue
+                normalised = _normalise_points(points)
+                key = tuple(tuple(point) for point in normalised)
+                if key in seen:
+                    continue
+                seen.add(key)
+                geometry["regions"].append({
+                    "region_id": region_id,
+                    "name": _label_for_category(zone.get("category")),
+                    "category": zone.get("category"),
+                    "area_m2": part_area,
+                    "points": normalised,
+                    "source_coordinate_space": "rotated_pdf_points",
+                    "assessor_supplied": False,
+                    "assessor_approved": job.get("decision") in {"approved", "adjusted"},
+                })
+                # A surface drawn as a loop (a road around a yard) has holes. Draw them, or the
+                # outline claims everything it encircles and the picture contradicts the number
+                # printed on it. These are already excluded from the measured quantity.
+                for hole_index, hole in enumerate(holes or []):
+                    if not _valid_points(hole, 3):
+                        continue
+                    hole_points = _normalise_points(hole)
+                    hole_key = tuple(tuple(point) for point in hole_points)
+                    if hole_key in seen:
+                        continue
+                    seen.add(hole_key)
+                    geometry["cutouts"].append({
+                        "cutout_id": f"{region_id}-void-{hole_index + 1}",
+                        "name": "Not in this surface",
+                        "area_m2": None,
+                        "points": hole_points,
+                        "source_coordinate_space": "rotated_pdf_points",
+                        "assessor_supplied": False,
+                    })
         top_points = result.get("polygon_pts")
         if not geometry["regions"] and _valid_points(top_points, 3):
             geometry["regions"].append({

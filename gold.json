@@ -155,5 +155,10 @@
     "net_m2": 9810,
     "tol_pct": 2,
     "note": "Aryan's Bluebeam area markup, posted to #fortel 26 Aug 2026 (Slack ts 1787736005, Drive id 1UMauqocw-rCw5_gA_RhUcWD0GDbmqu5Q), labels the service yard 9,810.24 m2; an independent shoelace over the extracted polygon gives 9,810.12 (0.001%). Inderjit quoted 9,857 on the 5 Aug call. THE HATCH-DRAWN REFERENCE CASE: this yard is red diagonal hatching inking only 2.8% of what it encloses, so tint segmentation measured 245.0 m2 (2.5%) until the closing-growth router shipped. Shape truth (10-vertex polygon, for IoU rather than area scoring) lives in ground_truth_polygons.json. PDF is gitignored \u2014 checks skip visibly."
+  },
+  "drawings/inderjit_p8/8_14173-TCG-XX_XX-XX-SK-C-0003_CONCRETE_SLAB_MSA.pdf": {
+    "zones_sum_m2": 60426,
+    "zones_sum_tol_pct": 5,
+    "note": "Aryan's Bluebeam markup, #fortel thread 1788346982 (2 Sep 2026), Drive id 1uaiPOcpL_DZmxpCFPJTfraYWMfUt_Yw9: 'Unclassified area - 60,426.30 m2' with one cut-out 35,373.10 (the building). Independent shoelace at the title's 1:1000 (k=0.352778) reproduces 60,426.4, confirming the title scale. By ink this figure is ROAD + YARD combined (road proxy 23,806 + black-45deg yard 33,277, union IoU 0.942 vs the net polygon); the legend gives them different specs (A393 @11 MSA yard vs @6 MSA road) so the pipeline keeps TWO zones and this gold checks their SUM. The sheet has no scale bar and no closed CAD boundaries, so it lands MEASURED_UNVERIFIED as assessor-confirm prefills; tol 5% reflects that the raster line-opening loses a ~3% boundary rim. Shape truth (163-vertex gross + 106-vertex cut-out) in ground_truth_polygons.json. PDF is gitignored; checks skip visibly when absent."
   }
 }

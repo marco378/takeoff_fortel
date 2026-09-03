@@ -236,6 +236,31 @@ def run_one(filepath):
         result["gold_verdict"] = "GOLD_FAIL"
         result["notes"] += " (gold expects an area but none was produced)"
 
+    # Sum-of-zones gold: for a sheet whose only documented human figure is one COMBINED number
+    # over several surfaces (project 8: Aryan's Bluebeam markup gives road + yard together, while
+    # the pipeline keeps them as two zones with two specs), compare the sum of every zone's area
+    # against that figure. The aggregate gold cannot express this (payload area_m2 is the primary
+    # zone only) and per-zone gold needs per-zone human figures that do not exist.
+    if entry and "zones_sum_m2" in entry:
+        zone_sum = 0.0
+        n_zones = 0
+        for zone in payload.get("zones", []) or []:
+            zone_area = zone.get("area_m2") if isinstance(zone, dict) else None
+            if isinstance(zone_area, (int, float)) and not isinstance(zone_area, bool):
+                zone_sum += float(zone_area)
+                n_zones += 1
+        gold_sum = entry["zones_sum_m2"]
+        sum_tol = entry.get("zones_sum_tol_pct", entry.get("tol_pct", 2))
+        if n_zones and gold_sum:
+            delta_pct = abs(zone_sum - gold_sum) / gold_sum * 100
+            result["gold_delta_pct"] = round(delta_pct, 2)
+            result["gold_area_m2"] = gold_sum
+            result["gold_verdict"] = "GOLD_PASS" if delta_pct <= sum_tol else "GOLD_FAIL"
+            result["notes"] += f" (sum of {n_zones} zones {zone_sum:,.1f} vs combined gold {gold_sum:,.1f})"
+        else:
+            result["gold_verdict"] = "GOLD_FAIL"
+            result["notes"] += " (combined gold expects zones but none were produced)"
+
     # Per-zone gold is independent from the backward-compatible aggregate area gold.
     # Multiple annotation records can map to one category, so compare category sums.
     if entry and "zones_m2" in entry:
