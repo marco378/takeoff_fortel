@@ -4761,7 +4761,9 @@ try:
            all(marker in _portal_html_up for marker in (
                'id="btnNewArea"', "startNewAreaElement",
                "Separate area name", "area_elements: namedAreaEntries.map",
-               "main area:")))
+               # the summary line now names what it is summing: the primary surface on a
+               # single-zone drawing, every measured zone on a multi-surface one
+               "'main area'", "'all measured zones'")))
         ck("portal accumulates folder selections and can target an existing project anchor",
            all(marker in _portal_html_up for marker in (
                "selectedUploadFiles.push(...Array.from(fileList || []))",
@@ -4917,6 +4919,18 @@ try:
     ck("the portal blocks approve ONLY when a lock is configured, and never on a hard-coded 200000",
        "escalationLockGbp !== null && c && c.assumed" in _portal_html_esc
        and "c.total_gbp > 200000)" not in _portal_html_esc)
+    # Aryan, 4 Sep: "even after confirming the second zone the total measurement area remains
+    # calculated for the first primary region only". The pipeline's top-level area_m2 is the
+    # PRIMARY surface on purpose (so a road/dock can never inherit the Yard rate), so the fix is
+    # in the display: sum the measured zones and show the split.
+    ck("the portal headline sums every measured zone instead of showing the primary one",
+       "function zoneAreaBreakdown(job)" in _portal_html_esc
+       and "const aiArea = zoneBreakdown ? zoneBreakdown.total" in _portal_html_esc)
+    ck("...and it names the split, so a two-surface drawing is legible at a glance",
+       "AI measurement · ${zoneBreakdown.parts.map" in _portal_html_esc
+       and "all measured zones" in _portal_html_esc)
+    ck("...while a single-zone drawing is untouched (breakdown needs 2+ measured zones)",
+       "if (zones.length < 2) return null;" in _portal_html_esc)
     ck("...and a large assumed-spec quotation still shows a visible notice with the number",
        "Large quotation on an assumed build-up" in _portal_html_esc
        and "confirm the commercial basis" in _portal_html_esc)

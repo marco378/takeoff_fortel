@@ -864,7 +864,12 @@ function renderJobList(jobs) {
         const badge  = `<span class="badge ${j.status||'pending'}">${j.status||'pending'}</span>`;
         const mstate = j.measurement_state || (j.result && j.result.measurement_state);
         const mbadge = mstate ? `<span class="badge mstate ${esc(mstate)}">${esc(mstate.replace('_',' '))}</span>` : '';
-        const area   = j.result && j.result.area_m2 ? `${(+j.result.area_m2).toLocaleString()} m²` : '—';
+        // Same rule as the headline: a drawing with several measured surfaces is listed by
+        // what it measures in total, not by its primary surface alone.
+        const listBreakdown = zoneAreaBreakdown(j);
+        const listArea = listBreakdown ? listBreakdown.total
+          : (j.result && j.result.area_m2 ? +j.result.area_m2 : null);
+        const area   = listArea ? `${listArea.toLocaleString(undefined,{maximumFractionDigits:1})} m²` : '—';
         const ts      = j.created_at ? j.created_at.substring(0,16).replace('T',' ') : '';
         const ref     = j.project_ref  ? `<span style="opacity:.8;font-size:10px">#${esc(j.project_ref)} · </span>` : '';
         const pname   = !grouped && j.project_name ? `<div style="font-size:12px;font-weight:700;color:#d0dff5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px">${ref}${esc(j.project_name)}</div>` : '';
@@ -3365,13 +3370,38 @@ function calcPerimeter() {
   return length * mpp;
 }
 
+const ZONE_LABELS = {external_yard:'yard', dock:'dock', ground_floor:'ground floor',
+                    upper_floor:'upper floor', unclassified:'unclassified', other:'other'};
+
+// A drawing can carry several measured surfaces with different build-ups (project-8: a yard and
+// a road, each with its own legend spec). The pipeline's top-level area_m2 is deliberately the
+// PRIMARY surface only, so that a Dock or a road can never inherit the Yard rate — but the
+// headline on this screen then reads as the whole drawing and understates it. Aryan, 4 Sep:
+// "even after confirming the second zone the total measurement area remains calculated for the
+// first primary region only". So the display sums the measured zones and shows the split; the
+// stored measurement, the golds and the per-zone rates are untouched.
+function zoneAreaBreakdown(job) {
+  const zones = effectiveZones(job).filter(zone =>
+    zone && typeof zone.area_m2 === 'number' && isFinite(zone.area_m2));
+  if (zones.length < 2) return null;
+  return {
+    total: zones.reduce((sum, zone) => sum + zone.area_m2, 0),
+    parts: zones.map(zone => ({
+      label: ZONE_LABELS[String(zone.category || '').trim().toLowerCase()]
+             || String(zone.category || 'zone'),
+      area: zone.area_m2
+    }))
+  };
+}
+
 function updateAreaDisplay() {
   const tracedArea = calcArea();
   const tracedPerimeter = calcPerimeter();
   const adjustedArea = Number(currentJob && currentJob.adjusted && currentJob.adjusted.area_m2) || null;
-  const aiArea = Number(currentJob && (
+  const zoneBreakdown = zoneAreaBreakdown(currentJob);
+  const aiArea = zoneBreakdown ? zoneBreakdown.total : (Number(currentJob && (
     (currentJob.result && currentJob.result.area_m2) || currentJob.area_m2
-  )) || null;
+  )) || null);
   const displayedArea = tracedArea || adjustedArea || aiArea;
   const displayedPerimeter = tracedPerimeter || effectiveStoredPerimeter(currentJob);
   const aStr = displayedArea
@@ -3419,12 +3449,15 @@ function updateAreaDisplay() {
   } else if (adjustedArea) {
     document.getElementById('areaSource').textContent = 'Assessor adjustment';
   } else if (aiArea) {
-    document.getElementById('areaSource').textContent = 'AI measurement';
+    document.getElementById('areaSource').textContent = zoneBreakdown
+      ? `AI measurement · ${zoneBreakdown.parts.map(part =>
+          `${part.label} ${part.area.toLocaleString(undefined,{maximumFractionDigits:0})} m²`).join(' + ')}`
+      : 'AI measurement';
   } else {
     document.getElementById('areaSource').textContent = 'No polygon traced yet';
   }
   document.getElementById('readout').textContent =
-    `main area: ${aStr}  ·  ${areaElementEntries().length} separate area(s)  ·  ${cutoutPolygons.length} cut-out(s)  ·  ${userChannels.length} channel(s)  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
+    `${zoneBreakdown && !tracedArea ? 'all measured zones' : 'main area'}: ${aStr}  ·  ${areaElementEntries().length} separate area(s)  ·  ${cutoutPolygons.length} cut-out(s)  ·  ${userChannels.length} channel(s)  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
   renderAreaElementsEditor();
 }
 
