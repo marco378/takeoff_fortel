@@ -3044,6 +3044,55 @@ try:
     ck("hatch router: too little matching tint REFUSES to classify",
        _k_sp is None, _i_sp.get("reason"))
 
+    # ── The bridging limit is DISCLOSED, not detected ───────────────────────────────────
+    # A kernel wide enough to bridge this sheet's stroke gaps also bridges a real corridor of
+    # clean paper between two separately drafted surfaces of the same tint, and nothing on this
+    # path can tell the two apart. The fixture below reproduces it on the SHIPPED path: two
+    # 45-degree hatched rectangles with a 15 pt corridor come back as ONE region. The sheet must
+    # therefore state the width it can bridge, in metres, on every drawing that uses the kernel.
+    import math as _math_fu, tempfile as _tmp_fu, fitz as _fitz_fu
+    def _fuse_fixture(path, corridor_pt, spacing=13.0, tint=(1, 0, 0)):
+        doc = _fitz_fu.open(); pg = doc.new_page(width=2384, height=1684); sh = pg.new_shape()
+        # solid block: the hatch router lives inside the colour path, which needs solid fill
+        sh.draw_rect(_fitz_fu.Rect(120, 1050, 1500, 1560))
+        sh.finish(color=(0.55, 0.78, 0.55), fill=(0.55, 0.78, 0.55))
+        def hatch(x0, y0, x1, y1):
+            c = y0 - x1
+            while c < y1 - x0:
+                pts = []
+                for (X, Y) in ((x0, x0 + c), (x1, x1 + c), (y0 - c, y0), (y1 - c, y1)):
+                    if x0 - 1e-6 <= X <= x1 + 1e-6 and y0 - 1e-6 <= Y <= y1 + 1e-6: pts.append((X, Y))
+                if len(pts) >= 2:
+                    a, b = sorted(set(pts))[0], sorted(set(pts))[-1]
+                    sh.draw_line(_fitz_fu.Point(*a), _fitz_fu.Point(*b))
+                    sh.finish(color=tint, width=1.0)
+                c += spacing * _math_fu.sqrt(2)
+        hatch(300, 300, 900, 900); hatch(900 + corridor_pt, 300, 1400, 900)
+        sh.draw_rect(_fitz_fu.Rect(1700, 300, 1740, 318)); sh.finish(color=tint, fill=tint)
+        pg.insert_text((1750, 315), "CONCRETE SERVICE YARD", fontsize=9)
+        pg.insert_text((1900, 1600), "Scale: 1:250", fontsize=10)
+        pg.insert_text((1900, 1620), "EXTERNAL WORKS LAYOUT", fontsize=10)
+        sh.commit(); doc.save(path); doc.close()
+    _fu_dir = _tmp_fu.mkdtemp(prefix="hatch_fusion_")
+    _fu_near = _os_hx.path.join(_fu_dir, "corridor_15pt.pdf"); _fuse_fixture(_fu_near, 15)
+    _fu_far = _os_hx.path.join(_fu_dir, "corridor_60pt.pdf"); _fuse_fixture(_fu_far, 60)
+    _fu_near_res = _tu_hx.takeoff(_fu_near, source="engineer")
+    _fu_far_res = _tu_hx.takeoff(_fu_far, source="engineer")
+    _fu_disc = [f for f in (_fu_near_res.get("flags") or []) if "LIMIT OF THIS METHOD" in f]
+    ck("a corridor narrower than the kernel really does fuse two surfaces on the shipped path",
+       len(_fu_near_res.get("yard_regions") or []) == 1,
+       f"{_fu_near_res.get('area_m2')} m² in {len(_fu_near_res.get('yard_regions') or [])} region(s)")
+    ck("...and the sheet says so, in metres, instead of leaving it silent",
+       bool(_fu_disc) and "corridor narrower than about 1." in _fu_disc[0],
+       (_fu_disc[0][_fu_disc[0].index("LIMIT OF THIS METHOD"):][:120] if _fu_disc else "no disclosure"))
+    ck("...the disclosure is about the kernel, so a WIDER corridor keeps two regions and still says it",
+       len(_fu_far_res.get("yard_regions") or []) == 2
+       and any("LIMIT OF THIS METHOD" in f for f in _fu_far_res.get("flags") or []),
+       [round(r.get("area_m2") or 0) for r in _fu_far_res.get("yard_regions") or []])
+    ck("...and it never claims to have checked: it states a limit, not a clean bill of health",
+       bool(_fu_disc) and "cannot tell such a corridor from a stroke gap" in _fu_disc[0]
+       and "no fusion" not in _fu_disc[0].lower())
+
     # ── Real-sheet gold. Client drawings are gitignored, so skip VISIBLY when absent.
     _hx_pdf = ("drawings/inderjit_p7/"
                "7_25195-MJM-00-00-DR-C-9000-D2-P04-External_Works_Layout.pdf")
@@ -3053,6 +3102,10 @@ try:
         _hx_gt = _json_hx.loads(Path("ground_truth_polygons.json").read_text())
         _hx_entry = _hx_gt[_hx_pdf]
         _hx_res = _tu_hx.takeoff(_hx_pdf, source="architect")
+        _hx_disc = [f for f in (_hx_res.get("flags") or []) if "LIMIT OF THIS METHOD" in f]
+        ck("MJM gold states the real-world width its kernel can bridge (51px at 1:250 = ~4.5 m)",
+           bool(_hx_disc) and "corridor narrower than about 4.5 m" in _hx_disc[0],
+           (_hx_disc[0][_hx_disc[0].index("LIMIT OF THIS METHOD"):][:110] if _hx_disc else "none"))
         _hx_area = _hx_res.get("area_m2")
         _hx_truth = _hx_entry["area_m2"]
 

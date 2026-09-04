@@ -1181,11 +1181,28 @@ def _hatch_closing_kernel(mask, close, k, S):
         return None, info
 
     info["kernel_px"] = kernel
+    # STATED LIMITATION, not a detection. A kernel wide enough to bridge this sheet's stroke
+    # gaps is also wide enough to bridge a real corridor of clean paper between two separately
+    # drafted surfaces of the SAME tint, and this path cannot tell that corridor from a stroke
+    # gap: both are blank paper of comparable width. Reproduced on a fixture (two 45-degree
+    # hatched rectangles, 1.3 m corridor, 37px kernel) which measures as ONE region of
+    # 5,124 m². Two discriminators were tried and refuted on the MJM gold sheet first --
+    # eroding the closed region to find a neck (the weld is a full-height seam, not a neck:
+    # MJM stays one part even eroded 40px) and the stroke-lattice partition from the
+    # hatch-legend path (it needs a legend chip's spacing; estimated from the ink alone it
+    # returned 0 parts on the fixture and one 275 m² part on MJM's 9,762 m²). So the sheet
+    # states the width it can bridge and asks the assessor, instead of implying it checked.
+    bridge = (f"about {kernel * k / S:.1f} m" if k else f"{kernel}px on this render")
+    info["bridge_m"] = round(kernel * k / S, 2) if k else None
     info["reason"] = (f"HATCH-DRAWN SURFACE: closing-growth {ratio:.0f}x with stroke gaps at "
                       f"{stats['gap_median_px']:.0f}px median / {stats['gap_p90_px']:.0f}px p90 "
                       f"— bridging strokes with a {kernel}px kernel derived from this sheet's "
                       "own spacing, so the measured area is what the hatch encloses rather "
-                      "than the ink itself")
+                      f"than the ink itself. LIMIT OF THIS METHOD: a clean corridor narrower "
+                      f"than {bridge} between two separately drafted surfaces of this tint is "
+                      "bridged and measured as ONE — this path cannot tell such a corridor from "
+                      "a stroke gap, so if the drawing carries two differently specified slabs "
+                      "of the same tint that close together, the assessor must split them")
     return kernel, info
 
 

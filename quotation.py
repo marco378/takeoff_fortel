@@ -855,6 +855,10 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                     scope_label=name,
                     area_element_id=element.get("element_id") or name,
                     area_element_name=name,
+                    # The element carries its OWN BOQ scope. Inheriting the parent's would put
+                    # a footpath under "Plant deck — " and into the wrong scoped section purely
+                    # because the main slab happened to be a plant deck.
+                    boq_scope=str(element.get("boq_scope") or "main"),
                 )
                 element_units.append(element_unit)
                 declarations.append(
