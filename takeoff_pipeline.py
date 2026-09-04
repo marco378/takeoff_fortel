@@ -56,6 +56,15 @@ _WRITTEN_DOCUMENT_TEXT_RX = __import__("re").compile(
     __import__("re").I,
 )
 
+# ISO 19650 / BS 1192 document-type field: "...-DR-C-2105..." — DR = DRAWING, followed by the
+# discipline letter and the sheet number. Aryan, 4 Sep: a real construction drawing,
+# 9_25010-RLL-26-XX-DR-C-2105_P01_External_Construction_Specification.pdf, was never recognised
+# on prod — its title ends in "Specification", so the written-document rule below refused it
+# before a single page was rasterised. The sheet's own reference says it is a drawing.
+_DRAWING_CODE_RX = __import__("re").compile(
+    r"(?:^|[ _-])DR[ _-][A-Z]{1,2}[ _-]?\d",
+)
+
 _DEDICATED_BOUNDARY_TREATMENT_RX = __import__("re").compile(
     r"\bboundary[ _-]+treatments?[ _-]+plan\b",
     __import__("re").I,
@@ -115,6 +124,14 @@ def _fast_report_refusal(pdf_path: str, doc) -> str | None:
     # with an incidental word such as "schedule" in its notes continues through the router.
     written_evidence = written_filename_evidence or (
         written_text_evidence if doc.page_count >= 4 else None)
+    # A drawing-coded reference overrides a written-document TITLE. The override is deliberately
+    # narrow: it applies only when the sole evidence is the filename, so a multi-page document
+    # whose first page also reads as a specification still refuses, whatever its reference says.
+    # It flips no file in the 613-file corpus (51 written-document refusals, none drawing-coded)
+    # and exists for the class Aryan hit: an ordinary sheet titled "... Specification".
+    drawing_code_evidence = _DRAWING_CODE_RX.search(Path(pdf_path).stem)
+    if written_evidence and drawing_code_evidence and not written_text_evidence:
+        written_evidence = None
     if written_evidence:
         sources = []
         if written_filename_evidence:
@@ -277,11 +294,46 @@ def find_engineer_spec(pdf_path: str, project_ref: str | None = None,
             }
     if conflicts:
         merged["_conflicts"] = conflicts
+        # The checklist an assessor reads must not say "ASSUMED / no details provided" about a
+        # field the drawing states twice. Inderjit, 4 Sep: "the spec is given on this drawing,
+        # but AI is saying spec is not given on engineering drawing." Reuse the field-note
+        # channel the joint-layout case already uses: the value stays blank and unpriced, and
+        # the line says what the sheet actually says and that the choice is his.
+        for field, records in conflicts.items():
+            listed = ", ".join(sorted({str(record.get("value")) for record in records},
+                                      key=lambda item: (len(item), item)))
+            unit = " mm" if field == "depth_mm" else ""
+            merged.setdefault("_field_notes", {})[field] = {
+                "source": "drawing_states_more_than_one",
+                "note": (f"STATED ON THE DRAWING as {listed}{unit} for different surfaces — "
+                         "assessor must confirm which applies here (nothing assumed, nothing priced)"),
+            }
+        # Quote the drawing. Inderjit, 4 Sep: "the spec is given on this drawing, but AI is
+        # saying spec is not given on engineering drawing." It IS given — twice, for two
+        # different surfaces — so the honest report is what each value says and where, not a
+        # bare list of numbers the assessor then has to go and find on the sheet themselves.
+        labels = {"depth_mm": "slab thickness", "mesh": "mesh", "layers": "mesh layers",
+                  "conc_mix": "concrete mix", "bay_sizes": "bay sizes",
+                  "joint_details": "joint details"}
         for field, records in sorted(conflicts.items()):
-            values = ", ".join(sorted({str(record.get('value')) for record in records}))
+            seen, parts = set(), []
+            for record in records:
+                value = record.get("value")
+                if value in seen:
+                    continue
+                seen.add(value)
+                quote = " ".join(str(record.get("text") or "").split())
+                where = Path(str(record.get("file") or "")).name
+                unit = " mm" if field == "depth_mm" else ""
+                detail = f"\u201c{quote[:90]}\u2026\u201d" if quote else ""
+                if where:
+                    detail = f"{detail} [{where}]" if detail else f"[{where}]"
+                parts.append(f"{value}{unit}" + (f" {detail}" if detail else ""))
             flags.append(
-                f"SPEC CONFLICT: {field} has competing drawing values ({values}); no value "
-                "was confirmed — assessor must select the applicable detail."
+                f"SPEC CONFLICT — {labels.get(field, field)}: the drawing states "
+                + "; and ".join(parts)
+                + ". Both are on the sheet, so nothing is assumed for pricing — the assessor "
+                  "must select the one that applies to this surface."
             )
     if evidence:
         merged["_evidence"] = evidence
@@ -606,10 +658,17 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
     # ── Drawing source discipline (engineer vs architect)
     from router import source_discipline
     discipline = source_discipline(pdf)
-    if discipline == "architect" and not engineer_spec:
+    if discipline == "architect" and not engineer_spec and not r.get("spec_conflicts"):
         r["flags"].append(
             "ARCHITECT drawing — build-up ASSUMED; no construction-detail sheet found. "
             "State assumptions in quotation (5% area tolerance applies)."
+        )
+    elif discipline == "architect" and not engineer_spec:
+        # Do not tell an assessor nothing was found when the sheet states several values and
+        # the choice flag above is already asking them to pick.
+        r["flags"].append(
+            "ARCHITECT drawing — build-up NOT assumed silently: the pack states more than one "
+            "value for a pricing field (see the spec-choice flag). Pricing waits on that choice."
         )
         r["source_discipline"] = "architect"
     else:

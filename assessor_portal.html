@@ -363,11 +363,11 @@ canvas{display:block;border:1px solid var(--border);background:transparent;box-s
       <button id="btnTrace" class="on" title="Click to add/move polygon vertices">✏️ Trace</button>
       <button id="btnUndo">↩ Undo</button>
       <button id="btnClear">🗑 Clear</button>
-      <button id="btnNewRegion" title="Finish this outline and start another slab/core region">＋ Region</button>
-      <button id="btnNewArea" class="area-element" title="Trace a separately named and separately priced area">＋ Area</button>
+      <button id="btnNewRegion" title="Another outline of the SAME surface — its area is ADDED to the main measured total, under the same BOQ section">＋ Region</button>
+      <button id="btnNewArea" class="area-element" title="A SEPARATE element with its own name, its own BOQ section and its own quotation line — kept out of the main total (use this for a footpath, duct slab or margin)">＋ Area</button>
       <button id="btnCutout" class="cutout" title="Draw a polygon over unwanted area to subtract it">✂️ Cut-out</button>
       <button id="btnChannel" class="channel" title="Draw a bending channel polyline; click again to finish">📏 Channel</button>
-      <select id="traceScope" title="BOQ scope for the active trace" style="max-width:150px">
+      <select id="traceScope" title="Which part of the works the active outline belongs to" style="max-width:150px">
         <option value="main">Main slab</option>
         <option value="ground_floor_core">Ground-floor core</option>
         <option value="main_upper_floor">Main upper floor</option>
@@ -458,8 +458,8 @@ canvas{display:block;border:1px solid var(--border);background:transparent;box-s
 
     <div class="info-section">
       <h3>Scale Calibration</h3>
-      <div class="kv"><span class="k">Current k (m/px)</span><span class="v" id="scaleDisplay">—</span></div>
-      <div class="kv"><span class="k">Drawing scale ratio</span><span class="v" id="scaleRatioDisplay">—</span></div>
+      <div class="kv"><span class="k" title="How many real metres one pixel of this drawing is worth">Metres per pixel</span><span class="v" id="scaleDisplay">—</span></div>
+      <div class="kv"><span class="k">Drawing scale</span><span class="v" id="scaleRatioDisplay">—</span></div>
       <div class="cal-row" style="margin-top:8px">
         <span style="font-size:12px;color:var(--muted)">Real length:</span>
         <input type="number" id="calMetres" value="50" step="any" min="0.1" placeholder="metres">
@@ -469,7 +469,7 @@ canvas{display:block;border:1px solid var(--border);background:transparent;box-s
       <div class="area-sub" id="calLineDisplay" style="margin-top:6px">Draw a calibration line to check its length.</div>
       <div class="kv" style="margin-top:6px"><span class="k">Line length</span><span class="v" id="calLengthDisplay">—</span></div>
       <div class="scale-row">
-        <input type="text" id="manualScale" inputmode="text" placeholder="Override 1:500 or 0.0751 m/px">
+        <input type="text" id="manualScale" inputmode="text" placeholder="Set the scale — type 1:500, or metres per pixel">
         <button id="btnScaleSet">Apply</button>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-top:6px">
@@ -3110,7 +3110,11 @@ function stashActiveRegion() {
 function startNewTraceRegion() {
   stashActiveRegion();
   draw();
-  toast('Previous outline kept — trace the next slab/core region');
+  // Inderjit traced an L-shaped footpath with + Region on 4 Sep and it went into the main slab:
+  // "when I did the plus region, it added this area to the [main] areas... but it should be added
+  // in the main footpath really." The two buttons do different things to the total; say which.
+  toast('Previous outline kept — the next one ADDS to the main measured total. For a separately '
+        + 'priced element (footpath, margin, duct slab) use + Area instead.');
 }
 
 function startNewAreaElement() {

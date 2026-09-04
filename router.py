@@ -38,6 +38,12 @@ AREA_KEYWORDS = ("external surfacing", "external pavements", "external pavement"
                  "external construction thickness", "construction thickness layout",
                  "construction thickness", "surfacing", "hardstanding", "hard landscaping",
                  "kerb", "pavement", "external construction")
+# HELD BACK, deliberately: adding specification-named sheets here (the real one is Inderjit's
+# "...External_Construction_Specification.pdf") makes them build-up sources — and the one we hold
+# is a TABLE of six different build-ups (yard, margins, car park, grasscrete...). Feeding it in
+# added A142 and a 450mm CBR figure as competing values to a drawing whose own legend states a
+# clean 190mm/A393, i.e. it made the spec WORSE, not better. It needs a table-aware extractor
+# that reads a row against the surface being priced; until then this list stays as it was.
 DETAIL_KEYWORDS = ("external construction details", "construction details", "build-up", "buildup",
                    "typical detail", "slab detail")
 DEPRIORITISE = ("proposed site plan", "site plan", "location plan", "site layout",
@@ -82,6 +88,11 @@ def buildup_source(name, text="", source=None):
     """Is there a construction-details sheet (engineer) giving thickness/mesh, or must we ASSUME
     (architect)?  Returns ('detail'|'assume', note)."""
     s = (str(name) + " " + str(text)).lower()
+    # Real filenames separate words with underscores and hyphens ("..._External_Construction_
+    # Specification.pdf"), and every keyword here is spelled with spaces — so this test has been
+    # missing underscore-named detail sheets, including the one Inderjit raised on 4 Sep. The
+    # pipeline's own candidate discovery already normalises separators; match the same way.
+    s = __import__("re").sub(r"[-_]+", " ", s)
     if any(w in s for w in DETAIL_KEYWORDS) and (source or source_discipline(name)) != "architect":
         return "detail", "construction-details sheet present — read thickness/mesh for costing"
     return "assume", ("architect/no construction details — ASSUME build-up (e.g. 190mm/A252) and state "
