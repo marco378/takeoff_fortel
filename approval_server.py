@@ -83,6 +83,32 @@ _learned_patterns_lock = threading.Lock()
 # back, so an unauthenticated visitor sees an empty, non-functional page — not a 404, since a
 # 404 here would be more confusing than useful).
 APPROVAL_TOKEN = os.getenv("PORTAL_TOKEN") or os.getenv("APPROVAL_TOKEN", "")
+
+
+def _escalation_lock_gbp():
+    """Value above which an assumed-spec quotation cannot be approved in the portal.
+
+    The gate was built for a pipeline that uploads and prices without a person in the loop.
+    Today every upload is done by hand, so the gate blocks an assessor who is already the
+    human review it was asking for — Aryan, 4 Sep 2026: "remove the greater than 200K flag /
+    manual review lock, since the uploads are getting done manually it makes the flow lengthy
+    and slow, will add it later if we go all auto".
+
+    So it is CONFIG, not a deletion: unset (the default) means no block and a visible notice
+    instead; setting ESCALATION_LOCK_GBP=200000 restores the hard block in one env var, with
+    no code change, on the day the pipeline goes automatic.
+    """
+    raw = os.getenv("ESCALATION_LOCK_GBP", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+ESCALATION_LOCK_GBP = _escalation_lock_gbp()
 _TOKEN_COOKIE  = "approval_token"
 
 
@@ -3315,9 +3341,10 @@ def _upload_too_large(_error):
 
 @app.route("/status")
 def status():
-    """Health-check for deploy tests."""
+    """Health-check for deploy tests, plus the portal's own runtime config."""
     jobs = load_jobs()
-    return jsonify({"status": "ok", "job_count": len(jobs), "build": BUILD_INFO})
+    return jsonify({"status": "ok", "job_count": len(jobs), "build": BUILD_INFO,
+                    "escalation_lock_gbp": ESCALATION_LOCK_GBP})
 
 
 # ── Admin file download ──────────────────────────────────────────────────────

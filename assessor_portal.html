@@ -695,11 +695,20 @@ window.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('keyup', onKeyUp);
 });
 
+// Above this quotation value, an assumed-spec job cannot be approved. null = no block, only
+// a notice: every upload is done by hand today, so the assessor at this screen IS the human
+// review the gate was asking for, and blocking them only lengthens the flow (Aryan, 4 Sep).
+// Server-configured via ESCALATION_LOCK_GBP, so the block comes back with one env var the day
+// the pipeline goes automatic.
+let escalationLockGbp = null;
+
 async function loadBuild() {
   try {
     const response = await fetch(`${BASE}/status`);
     if (!response.ok) throw new Error(`status fetch failed: HTTP ${response.status}`);
     const status = await response.json();
+    escalationLockGbp = (typeof status.escalation_lock_gbp === 'number'
+                         && status.escalation_lock_gbp > 0) ? status.escalation_lock_gbp : null;
     const build = status.build || {};
     const sha = build.sha && build.sha !== 'unknown' ? String(build.sha).slice(0,7) : 'unknown';
     document.getElementById('buildFooter').textContent = `Build ${sha} · ${build.date || 'unknown'}`;
@@ -2141,10 +2150,18 @@ function renderCosting(c, jobStatus, job={}) {
   const assumedBanner = assumed
     ? `<div class="flag warn assumption-item" style="margin-top:6px;font-size:11px">${assumptionBadge('ASSUMED',costingBasis)} Build-up assumed — no engineer spec<span class="assumption-basis">${esc(costingBasis)}</span></div>` : '';
 
-  const escalationBanner = (assumed && c.total_gbp > 200000)
+  const escalationValue = Number(c.total_gbp);
+  const escalationLocked = escalationLockGbp !== null && assumed && escalationValue > escalationLockGbp;
+  const escalationNotice = assumed && escalationValue > 200000 && !escalationLocked;
+  const escalationBanner = escalationLocked
     ? `<div style="background:#fdecea;border:1px solid #e74c3c;border-radius:5px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:#c0392b;line-height:1.4">
-         🚨 <strong>ESCALATION — do not approve.</strong> Quotation &gt; £200k with assumed spec requires human review before this job can be actioned. See L3 QA report in #fortel.
-       </div>` : '';
+         🚨 <strong>ESCALATION — do not approve.</strong> Quotation &gt; £${Number(escalationLockGbp).toLocaleString()} with assumed spec requires human review before this job can be actioned. See L3 QA report in #fortel.
+       </div>`
+    : escalationNotice
+    ? `<div style="background:#fff6e5;border:1px solid #e0a800;border-radius:5px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:#7a5200;line-height:1.4">
+         ⚠️ <strong>Large quotation on an assumed build-up.</strong> £${escalationValue.toLocaleString(undefined,{maximumFractionDigits:0})} with no engineer spec on the drawing. You are the human review here — confirm the commercial basis before this is issued.
+       </div>`
+    : '';
   const specPricingBanner = job.spec_pricing_warning
     ? `<div style="background:#fdecea;border:1px solid #e74c3c;border-radius:5px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:#c0392b;line-height:1.4">
          🚨 <strong>Specification saved; pricing review required.</strong> ${esc(job.spec_pricing_warning)}
@@ -4034,8 +4051,8 @@ async function submitDecision(action) {
       toast('Cannot approve: zone classification/reference review is still required. Review the red zone warning first.', 'error');
       return;
     }
-    if (c && c.assumed && c.total_gbp > 200000) {
-      toast('Cannot approve: quotation > £200k with assumed spec — human escalation required. See L3 QA report in #fortel.', 'error');
+    if (escalationLockGbp !== null && c && c.assumed && Number(c.total_gbp) > escalationLockGbp) {
+      toast(`Cannot approve: quotation > £${Number(escalationLockGbp).toLocaleString()} with assumed spec — human escalation required. See L3 QA report in #fortel.`, 'error');
       return;
     }
     // Mirrors the server-side hard-block in approval_server.py (_approve_block_reason):

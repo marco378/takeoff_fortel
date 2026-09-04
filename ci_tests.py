@@ -4887,6 +4887,40 @@ try:
        _AS._approve_block_reason({"measurement_state": "UNMEASURED", "scale_confirmed": True}) is None)
     ck("REJECTED job blocks approve", _AS._approve_block_reason({"measurement_state": "REJECTED"}) is not None)
 
+    # The >£200k approve lock is CONFIG, not code. It was written for an automatic pipeline;
+    # every upload is done by hand today, so it blocked the assessor who was already the human
+    # review it demanded (Aryan, 4 Sep). Default: no block, and the portal shows a notice
+    # instead. One env var restores the hard block when the pipeline goes automatic.
+    _esc_env = os.environ.get("ESCALATION_LOCK_GBP")
+    try:
+        os.environ.pop("ESCALATION_LOCK_GBP", None)
+        ck("escalation lock is OFF by default, so a manual assessor is never blocked by it",
+           _AS._escalation_lock_gbp() is None)
+        os.environ["ESCALATION_LOCK_GBP"] = "200000"
+        ck("...and one env var brings the £200k lock back, with no code change",
+           _AS._escalation_lock_gbp() == 200000.0, _AS._escalation_lock_gbp())
+        os.environ["ESCALATION_LOCK_GBP"] = "not-a-number"
+        ck("...a malformed value disables the lock rather than crashing the server",
+           _AS._escalation_lock_gbp() is None)
+        os.environ["ESCALATION_LOCK_GBP"] = "0"
+        ck("...and zero means off, not block-everything",
+           _AS._escalation_lock_gbp() is None)
+    finally:
+        os.environ.pop("ESCALATION_LOCK_GBP", None)
+        if _esc_env is not None:
+            os.environ["ESCALATION_LOCK_GBP"] = _esc_env
+    _esc_status = _client_up.get("/status").get_json()
+    ck("the portal is told the lock value by /status, so client and server cannot disagree",
+       "escalation_lock_gbp" in _esc_status and _esc_status["escalation_lock_gbp"] is None,
+       _esc_status)
+    _portal_html_esc = _client_up.get("/portal").data.decode("utf-8", "replace")
+    ck("the portal blocks approve ONLY when a lock is configured, and never on a hard-coded 200000",
+       "escalationLockGbp !== null && c && c.assumed" in _portal_html_esc
+       and "c.total_gbp > 200000)" not in _portal_html_esc)
+    ck("...and a large assumed-spec quotation still shows a visible notice with the number",
+       "Large quotation on an assumed build-up" in _portal_html_esc
+       and "confirm the commercial basis" in _portal_html_esc)
+
     shutil.rmtree(_tmpdir, ignore_errors=True)
 except ImportError as _e:
     print(f"  [SKIP] approval_server upload/approve tests — missing dependency: {_e}")
