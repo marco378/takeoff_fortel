@@ -3549,11 +3549,16 @@ try:
             for element in _named_area_saved["area_elements"]] ==
                [("Footpath",50.0),("Duct slab",20.0)],
            _named_area_adjust.get_json())
+        _unclassified_block = _AS._area_element_block_reason({
+            "area_elements":[{"name":"Unknown separate slab", "category":"unclassified"}]}) or ""
         ck("unclassified +Area is approval-blocked instead of silently filename-bucketed",
-           "explicit BOQ section" in (_AS._area_element_block_reason({
-               "area_elements":[{"name":"Unknown separate slab",
-                                 "category":"unclassified"}]
-           }) or ""))
+           "no BOQ section" in _unclassified_block, _unclassified_block)
+        ck("...and the block names the control the assessor has to use, not the concept",
+           "dropdown" in _unclassified_block and "Unknown separate slab" in _unclassified_block
+           and "Other / out of scope" in _unclassified_block, _unclassified_block)
+        ck("'Other / out of scope' is a real answer, so a non-slab area can clear the gate",
+           _AS._area_element_block_reason({
+               "area_elements":[{"name":"Landscaping strip", "category":"other"}]}) is None)
         _named_area_approve = _client_up.post(
             f"/approve/{_marked_route_job['id']}", json={"note":"named areas confirmed"})
         ck("classified +Area elements complete the real approval flow",
@@ -3568,12 +3573,37 @@ try:
         _main_slab_rows = [item for item in _named_q["line_items"]
                            if "slab" in item.get("description", "").lower()
                            and not item.get("assessor_named_area")]
-        ck("each +Area name is one distinct quotation row in its assessor-selected section",
-           [(item["section"],item["description"],item["qty"],item["rate"])
-            for item in _named_rows] == [
-                ("External yard slabs","Footpath",50.0,45.07),
-                ("Dock slabs","Duct slab",20.0,None),
-            ], _named_rows)
+        # Inderjit, 27 Aug: a classified +Area element came back as "just as a one row" with no
+        # thickness/mesh/finish. It now gets its own specification block and build-up rows —
+        # keyed by element id so it cannot merge into the main slab — while its concrete row
+        # keeps EXACTLY the rate the single row carried before.
+        _named_specs = [spec for spec in _named_q["specifications"]
+                        if any(row.get("description") in {"Footpath", "Duct slab"}
+                               for row in spec.get("area_rows") or [])]
+        ck("a classified +Area element gets its own specification block, not one bare row",
+           sorted((spec["section"], spec["area_m2"]) for spec in _named_specs)
+           == [("Dock slabs", 20.0), ("External yard slabs", 50.0)],
+           [(spec["section"], spec["area_m2"], len(spec.get("display_lines") or []))
+            for spec in _named_specs])
+        _named_spec_ids = {spec["id"] for spec in _named_specs}
+        _named_element_rows = [item for item in _named_q["line_items"]
+                               if item.get("specification_id") in _named_spec_ids]
+        ck("...with the assessor's own name on its concrete row and the SAME rate as before",
+           [(item["section"], item["qty"], item["rate"]) for item in _named_element_rows
+            if item.get("line_role") == "concrete_slab"] == [
+               ("External yard slabs", 50.0, 45.07), ("Dock slabs", 20.0, None)]
+           and all(name in " | ".join(item["description"] for item in _named_element_rows)
+                   for name in ("Footpath", "Duct slab")),
+           [(item["description"], item["qty"], item["rate"]) for item in _named_element_rows])
+        ck("...and the build-up rows carry NO invented rate: trim and joints stay for the assessor",
+           all(item["rate"] is None for item in _named_element_rows
+               if item.get("line_role") != "concrete_slab"),
+           [(item["description"], item["rate"]) for item in _named_element_rows
+            if item.get("line_role") != "concrete_slab"])
+        ck("...so the quotation total is exactly what the single row produced before",
+           round(sum(item.get("value") or 0 for item in _named_element_rows), 2)
+           == round(50.0 * 45.07, 2),
+           sum(item.get("value") or 0 for item in _named_element_rows))
         ck("+Area rows do not merge into or inflate the 384m2 main slab row",
            any(item.get("qty") == 384.0 for item in _main_slab_rows) and
            not any(item.get("qty") == 454.0 for item in _named_q["line_items"]),
@@ -3591,20 +3621,26 @@ try:
              _named_ws.cell(cell.row,5).value)
             for row in _named_ws.iter_rows() for cell in row if cell.column == 1
             and isinstance(cell.value, str)
-            and cell.value.split("\n",1)[0] in {"Footpath","Duct slab"}
+            and cell.value.split("\n",1)[0].split(" \u2014 ")[0] in {"Footpath","Duct slab"}
         ]
-        ck("same-workbook xlsx keeps named quantities numeric and values as live formulas",
-           len(_named_wb.sheetnames) == 1 and
-           [(row[0],row[1],row[2],row[3]) for row in _named_xlsx_rows] == [
-               ("Footpath",50,"m2",45.07),
-               ("Duct slab",20,"m2",None),
-           ] and isinstance(_named_xlsx_rows[0][4], str) and
-           _named_xlsx_rows[0][4].startswith("=ROUND(B") and
-           "*D" in _named_xlsx_rows[0][4] and
-           isinstance(_named_xlsx_rows[1][4], str) and
-           _named_xlsx_rows[1][4].startswith('=IF(D') and
-           "ROUND(B" in _named_xlsx_rows[1][4] and
-           "*D" in _named_xlsx_rows[1][4], _named_xlsx_rows)
+        # The workbook now carries each named element twice, the way a slab group is carried:
+        # the assessor's own quantity row, then its priced concrete row with a live formula.
+        _named_qty_rows = [row for row in _named_xlsx_rows if row[0] in {"Footpath", "Duct slab"}]
+        _named_priced_rows = [row for row in _named_xlsx_rows if row[0] not in {"Footpath", "Duct slab"}]
+        ck("same-workbook xlsx keeps named quantities numeric",
+           len(_named_wb.sheetnames) == 1
+           and [(row[0], row[1], row[2]) for row in _named_qty_rows] == [
+               ("Footpath", 50, "m2"), ("Duct slab", 20, "m2")],
+           _named_qty_rows)
+        ck("...and each named element's own priced row keeps its rate and a live formula",
+           [row[3] for row in _named_priced_rows] == [45.07, None]
+           and isinstance(_named_priced_rows[0][4], str)
+           and _named_priced_rows[0][4].startswith("=ROUND(B")
+           and "*D" in _named_priced_rows[0][4]
+           and isinstance(_named_priced_rows[1][4], str)
+           and _named_priced_rows[1][4].startswith('=IF(D')
+           and "ROUND(B" in _named_priced_rows[1][4],
+           _named_priced_rows)
 
         _named_marked_response = _client_up.get(
             f"/marked-pdf/{_marked_route_job['id']}.pdf")

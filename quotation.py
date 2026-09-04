@@ -437,6 +437,46 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             existing["drawings"].append(drawing)
         return existing
 
+    def accumulate_group(unit, costing, spec, rate, section, drawing, brief_spec, area,
+                         assumed):
+        """Fold one measured quantity into its BOQ group.
+
+        Shared by the main results loop and by separately named +Area elements, so an element
+        an assessor classified gets the same specification block and build-up rows a zone
+        does. Existing rate is part of the key, so stale/different priced results can never be
+        silently collapsed under one arbitrary rate; matching specs/rates aggregate. The
+        element id is in the key as well, so a separate area never merges into the main slab.
+        """
+        group_provisional = assumed or any(
+            field.get("provisional", True)
+            for field in (brief_spec.get("fields") or {}).values()
+            if isinstance(field, dict)
+        )
+        boq_scope = str(unit.get("boq_scope") or "main")
+        key = (section, _spec_key(costing, brief_spec), rate,
+               group_provisional, boq_scope, unit.get("area_element_id"))
+        group = groups.setdefault(key, {
+            "section": section, "spec": spec, "brief_spec": brief_spec,
+            "rate": rate, "assumed": group_provisional,
+            "area_element_id": unit.get("area_element_id"),
+            "area_element_name": unit.get("area_element_name"),
+            "area": 0.0, "drawings": [], "area_rows": [],
+            "breakdown": costing.get("breakdown") or {},
+            "boq_scope": boq_scope,
+            "scope_label": unit.get("scope_label"),
+        })
+        group["area"] += float(area)
+        if drawing and drawing not in group["drawings"]:
+            group["drawings"].append(drawing)
+        area_label = (unit.get("unit_name") or unit.get("area_label")
+                      or _unit_label_from_filename(drawing) or drawing
+                      or f"Measured area {len(group['area_rows']) + 1}")
+        group["area_rows"].append({
+            "description": str(area_label), "qty": float(area), "unit": "m²",
+            "drawing": drawing,
+        })
+
+    element_units = []
     for unit in results:
         costing = unit.get("costing") or {}
         if costing.get("client_rates_applied"):
@@ -467,34 +507,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             )
 
         if area:
-            # Existing rate is part of the key so stale/different priced results can never be
-            # silently collapsed under one arbitrary rate. Matching specs/rates aggregate.
-            group_provisional = assumed or any(
-                field.get("provisional", True)
-                for field in (brief_spec.get("fields") or {}).values()
-                if isinstance(field, dict)
-            )
-            boq_scope = str(unit.get("boq_scope") or "main")
-            key = (section, _spec_key(costing, brief_spec), rate,
-                   group_provisional, boq_scope)
-            group = groups.setdefault(key, {
-                "section": section, "spec": spec, "brief_spec": brief_spec,
-                "rate": rate, "assumed": group_provisional,
-                "area": 0.0, "drawings": [], "area_rows": [],
-                "breakdown": costing.get("breakdown") or {},
-                "boq_scope": boq_scope,
-                "scope_label": unit.get("scope_label"),
-            })
-            group["area"] += float(area)
-            if drawing and drawing not in group["drawings"]:
-                group["drawings"].append(drawing)
-            area_label = (unit.get("unit_name") or unit.get("area_label")
-                          or _unit_label_from_filename(drawing) or drawing
-                          or f"Measured area {len(group['area_rows']) + 1}")
-            group["area_rows"].append({
-                "description": str(area_label), "qty": float(area), "unit": "m²",
-                "drawing": drawing,
-            })
+            accumulate_group(unit, costing, spec, rate, section, drawing, brief_spec, area,
+                             assumed)
 
         if assumed:
             if all(spec.get(key) is not None for key in ("depth_mm", "mesh")):
@@ -811,6 +825,53 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             provisional = bool(effective_costing.get(
                 "assumed", parent_costing.get("assumed", True))) or section_unresolved
             quantity = round(float(element["area_m2"]), 3)
+            if not section_unresolved and category != "other":
+                # Inderjit, 27 Aug: "It just extracted the figure and give me here just as a
+                # one row... the other elements — what the thickness of this will be, what the
+                # mesh will be in it, what would be the finish — all these sections here should
+                # also come under this section as a completely separate element." A classified
+                # +Area element now gets its own specification block and its own build-up rows,
+                # keyed by element id so it can never merge into the main slab group.
+                #
+                # Its concrete row keeps EXACTLY the rate the single row carried before, and
+                # the priced adders (trim, joints) are left for the assessor rather than
+                # applied to a quantity nobody priced them against: no rate is created,
+                # changed, or applied to new quantity by this change.
+                element_brief_spec = (
+                    (unit.get("brief_specs") or {}).get(category)
+                    or build_brief_spec(normalise_slab_type(section, text=drawing),
+                                        effective_spec=effective_costing.get("spec") or {})
+                )
+                element_unit = dict(
+                    unit,
+                    area_m2=quantity,
+                    costing=dict(effective_costing, area_m2=quantity),
+                    zones=[],
+                    area_elements=[],
+                    brief_spec=element_brief_spec,
+                    quotation_section=section,
+                    unit_name=name,
+                    area_label=name,
+                    scope_label=name,
+                    area_element_id=element.get("element_id") or name,
+                    area_element_name=name,
+                )
+                element_units.append(element_unit)
+                declarations.append(
+                    f"ASSESSOR-NAMED AREA — {name}: {quantity:g} m² measured separately from "
+                    f"the main region on {drawing or 'the drawing'}, priced as its own "
+                    f"{section.lower()} element."
+                )
+                continue
+            if category == "other":
+                # "Other / out of scope" is the escape hatch for an area that is genuinely not
+                # a slab. It must not appear as a priced or provisional row at all — it is a
+                # declared exclusion, the same shape the pipeline's own exclusions use.
+                declarations.append(
+                    f"EXCLUDED FROM SLAB: separately named area {name!r} "
+                    f"({quantity:g} m²) — assessor classified it as out of scope."
+                )
+                continue
             extra_rows.append({
                 "section": section,
                 "description": name,
@@ -830,6 +891,16 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 f"ASSESSOR-NAMED AREA — {name}: {quantity:g} m² measured separately from "
                 f"the main region on {drawing or 'the drawing'}."
             )
+
+    for element_unit in element_units:
+        element_costing = element_unit.get("costing") or {}
+        accumulate_group(
+            element_unit, element_costing, element_costing.get("spec") or {},
+            element_costing.get("rate"), element_unit["quotation_section"],
+            element_unit.get("file") or Path(str(element_unit.get("pdf_path") or "")).name,
+            element_unit["brief_spec"], float(element_unit["area_m2"]),
+            bool(element_costing.get("assumed", True)),
+        )
 
     line_items = []
     specifications = []
@@ -863,6 +934,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "plant_deck": "Plant deck — ",
             "pod_first_floor": "POD first floor — ",
         }.get(group.get("boq_scope"), "")
+        if group.get("area_element_name"):
+            scope_prefix = f"{group['area_element_name']} — " 
         slab_desc = scope_prefix + _fortel_concrete_description(spec)
         line_items.append({
             **common, "description": slab_desc, "rate": group["rate"],
@@ -896,7 +969,12 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
 
         # Existing quotation adders are preserved unchanged; only their section/aggregated
         # quantity changes so all units share the client's requested one-tab structure.
-        priced_group = isinstance(group.get("rate"), (int, float))
+        # A separately named area keeps the concrete rate it already had, but trim and joints
+        # are NOT auto-applied to it: those are existing rates meeting a quantity nobody has
+        # priced them against, so the assessor decides. The quotation total is unchanged by
+        # giving the element its own group.
+        priced_group = (isinstance(group.get("rate"), (int, float))
+                        and not group.get("area_element_id"))
         adders = [
             ("Final Trimm +/-50mm dp. LP Only", area, "m²",
              1.40 if priced_group else None),

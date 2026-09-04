@@ -3018,7 +3018,7 @@ function renderAreaElementsEditor() {
     const qty = grossArea
       ? `${netArea.toLocaleString(undefined,{maximumFractionDigits:2})} m² — separate quotation line`
       : 'Trace at least 3 points — separate from main total';
-    const labels = {external_yard:'External yard slabs',dock:'Dock slabs',ground_floor:'Ground floor slabs',upper_floor:'Upper floor slabs',unclassified:'Choose BOQ section'};
+    const labels = {external_yard:'External yard slabs',dock:'Dock slabs',ground_floor:'Ground floor slabs',upper_floor:'Upper floor slabs',other:'Other / out of scope',unclassified:'Choose BOQ section'};
     if (element.saved) {
       // Delete is FIRST and red: in this row the last slot is where Save sat while the row was
       // being edited, and a saved markup was deleted by muscle memory (27 Aug call).
@@ -3035,7 +3035,8 @@ function renderAreaElementsEditor() {
     const options = [
       ['unclassified','Choose BOQ section'],
       ['external_yard','External yard slabs'], ['dock','Dock slabs'],
-      ['ground_floor','Ground floor slabs'], ['upper_floor','Upper floor slabs']
+      ['ground_floor','Ground floor slabs'], ['upper_floor','Upper floor slabs'],
+      ['other','Other / out of scope']
     ].map(([value,label]) => `<option value="${value}" ${element.category===value?'selected':''}>${label}</option>`).join('');
     return `<div class="area-element-row" data-element-id="${esc(element.elementId)}">
       <input aria-label="Separate area name" maxlength="120" value="${esc(element.name)}"

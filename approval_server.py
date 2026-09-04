@@ -684,15 +684,22 @@ def _area_element_block_reason(job: dict) -> str | None:
     if not isinstance(elements, list):
         elements = adjusted.get("area_elements") if isinstance(
             adjusted.get("area_elements"), list) else []
+    # "other" is a real answer: an area that genuinely is not slab work is carried as a
+    # declared exclusion in the quotation, priced nowhere. Without it the only way past this
+    # gate was to label a footpath as a yard, which is worse than an unpriced line.
     unresolved = [
         str(element.get("name") or "Unnamed area")
         for element in elements if isinstance(element, dict)
         and str(element.get("category") or "").strip().lower()
-        not in {"external_yard", "dock", "ground_floor", "upper_floor"}
+        not in {"external_yard", "dock", "ground_floor", "upper_floor", "other"}
     ]
     if unresolved:
-        return (f"{len(unresolved)} separately named area element(s) require an explicit "
-                "BOQ section: " + ", ".join(unresolved[:3]))
+        # Name the control, not the concept. Aryan read the old wording back on 27 Aug as
+        # "it says one external point is needed" and could not act on it.
+        listed = ", ".join(f"\u201c{name}\u201d" for name in unresolved[:3])
+        return (f"{len(unresolved)} separately named area(s) still have no BOQ section: {listed}. "
+                "Pick one in the dropdown beside each name in the separate-areas list under the "
+                "drawing (or mark it 'Other / out of scope'), then Submit Adjustment again.")
     return None
 
 
