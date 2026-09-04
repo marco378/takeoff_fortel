@@ -606,6 +606,65 @@ let snapScale = 0.5;      // snapshot px per PDF point (from /snapshot X-Snapsho
                           // Pipeline scale_k is m/pt, hence mpp = scale_k / snapScale. Default 0.5 is a
                           // fallback; the header overrides it for the actual render (now 2.0 by default).
 let dragIdx = -1;
+// Hit radii are SCREEN pixels, converted to canvas pixels by dividing by zoom. They used to
+// be canvas-pixel constants, so at 8x zoom a 10 px vertex-grab radius covered 80 screen px.
+// Inderjit, 27 Aug: "when you have completely zoomed in, you clicked here and when you go
+// click here, it won't let you click here" (the grab radius swallowed his placement click)
+// and "when I try two, three times clicking here, it has finished the cutout" (a click 160
+// screen px from the first point closed the region). Constant SCREEN distance fixes both.
+const HIT_VERTEX_PX = 10;    // grab an existing vertex to drag it
+const HIT_CHANNEL_PX = 12;   // grab a channel endpoint
+const CLOSE_CUTOUT_PX = 20;  // click near the first point to close a cut-out
+const CLOSE_TRACE_PX = 14;   // click near the first point to close a traced region
+function hitRadius(screenPx) { return screenPx / (zoom > 0 ? zoom : 1); }
+
+// ── Undo history ───────────────────────────────────────────────────────────────────────
+// Undo used to be `poly.pop()`, so it did nothing at all while a cut-out was being drawn —
+// Inderjit, 27 Aug: "I think Undo is not working here"; Smita: "undo button is not working
+// and cutout is cut out". It also could not take back a closed region, a saved +Area element
+// or a Remove — Inderjit asked "is there any option you can recover the older version... when
+// I have finished the markup here before deleting it". So undo is a snapshot stack over every
+// piece of editable geometry, and every destructive control pushes onto it first.
+const HISTORY_LIMIT = 60;
+let undoStack = [];   // NOT `history` — a top-level let would shadow window.history
+function editableState() {
+  return JSON.stringify({
+    poly, traceRegions, areaElements, activeAreaElement, activeCandidateId,
+    cutoutPolygons, userChannels, cal, mpp
+  });
+}
+function pushHistory(label) {
+  undoStack.push({label: String(label || 'change'), state: editableState()});
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+}
+function undoLast() {
+  const entry = undoStack.pop();
+  if (!entry) { toast('Nothing left to undo', 'warn'); return; }
+  let restored;
+  try { restored = JSON.parse(entry.state); } catch (err) { toast('Could not undo that step', 'error'); return; }
+  poly = restored.poly || [];
+  traceRegions = restored.traceRegions || [];
+  areaElements = restored.areaElements || [];
+  activeAreaElement = restored.activeAreaElement || null;
+  activeCandidateId = restored.activeCandidateId || null;
+  cutoutPolygons = restored.cutoutPolygons || [];
+  userChannels = restored.userChannels || [];
+  cal = restored.cal || [];
+  // The second calibration click sets mpp. Undoing back past it must take the scale with it,
+  // or the canvas shows one calibration point beside a scale the assessor thinks they undid.
+  mpp = (restored.mpp === undefined ? mpp : restored.mpp);
+  dragIdx = -1; cutoutDrag = null; userChannelDrag = null;
+  draw();
+  if (typeof renderAreaElementsEditor === 'function') renderAreaElementsEditor();
+  if (typeof updateAreaDisplay === 'function') updateAreaDisplay();
+  toast(`Undone: ${entry.label}`);
+}
+let aiRegions = [];       // every measured surface part: [{points:[[x,y]], holes:[[[x,y]]], category, label, area_m2}]
+                          // in CANVAS pixels. A sheet can carry several surfaces with different
+                          // build-ups (project-8: a yard in three parts and a road in two, the
+                          // road drawn as a LOOP around the yard) and aiPoly can hold only one
+                          // outline with no hole — the assessor would confirm an extent they
+                          // were never shown. Holes are filled evenodd so a ring reads as a ring.
 let aiPoly = null;        // AI's proposed polygon (pre-loaded), already converted to CANVAS pixels
                           // (res.polygon_pts arrive in PDF points; renderJobUI scales them × snapScale)
 let zoom = 1;             // current zoom level (1 = 100%)
@@ -928,7 +987,7 @@ async function selectJob(jobId) {
   channelProposals = []; transitionCandidates = [];
   cutoutPolygons = []; userChannels = [];
   cutoutDrag = null; userChannelDrag = null;
-  cal = []; aiPoly = null; dragIdx = -1; channelDrag = null;
+  cal = []; aiPoly = null; aiRegions = []; undoStack = []; dragIdx = -1; channelDrag = null;
   mpp = null; snapScale = 0.5;
 
   try {
@@ -1203,7 +1262,42 @@ function effectiveYardRegions(job) {
   return Array.isArray(nested) ? nested : [];
 }
 
+// Measured surfaces -> canvas outlines. Zone geometry (region_polygons/region_holes) is used
+// when the pipeline provides it; otherwise this falls back to the single top-level polygon so
+// every existing path renders exactly as before.
+const AI_REGION_COLOURS = {
+  external_yard: [224, 0, 122], dock: [0, 122, 204], ground_floor: [39, 128, 87],
+  upper_floor: [125, 60, 152], unclassified: [214, 122, 0]
+};
+function buildAiRegions(res) {
+  const out = [];
+  const zones = (res && Array.isArray(res.zones)) ? res.zones : [];
+  zones.forEach(zone => {
+    if (!zone || typeof zone !== 'object') return;
+    const polys = Array.isArray(zone.region_polygons) && zone.region_polygons.length
+      ? zone.region_polygons
+      : (Array.isArray(zone.polygon_pts) && zone.polygon_pts.length >= 3 ? [zone.polygon_pts] : []);
+    const holes = Array.isArray(zone.region_holes) ? zone.region_holes : [];
+    const areas = Array.isArray(zone.region_areas_m2) ? zone.region_areas_m2 : [];
+    const ids = Array.isArray(zone.region_ids) ? zone.region_ids : [];
+    polys.forEach((poly, index) => {
+      if (!Array.isArray(poly) || poly.length < 3) return;
+      out.push({
+        category: String(zone.category || 'unclassified').trim().toLowerCase(),
+        label: ids[index] || zone.zone_key || 'measured region',
+        area_m2: areas.length > index ? areas[index] : (polys.length === 1 ? zone.area_m2 : null),
+        points: poly.map(pt => [pt[0] * snapScale, pt[1] * snapScale]),
+        holes: (Array.isArray(holes[index]) ? holes[index] : [])
+          .filter(hole => Array.isArray(hole) && hole.length >= 3)
+          .map(hole => hole.map(pt => [pt[0] * snapScale, pt[1] * snapScale]))
+      });
+    });
+  });
+  return out;
+}
+
 function initialiseTraceState(job, res) {
+  aiRegions = buildAiRegions(res);
   candidatePolygons = effectiveCandidatePolygons(job).map(candidate => ({
     ...candidate,
     regions: (
@@ -2504,8 +2598,31 @@ function draw() {
   const lwThin = Math.max(0.5, 1.5 / zoom);
   const dotR = Math.max(3, 5 / zoom);
 
-  // AI proposal (lighter, dashed)
-  if (aiPoly && aiPoly.length >= 3) {
+  // Measured surfaces: one outline per part, holes cut out (evenodd), each labelled with the
+  // quantity that belongs to THAT part.
+  aiRegions.forEach(region => {
+    const rgb = AI_REGION_COLOURS[region.category] || AI_REGION_COLOURS.unclassified;
+    ctx.save();
+    ctx.setLineDash([6,4]);
+    ctx.beginPath();
+    region.points.forEach((pt,i)=> i ? ctx.lineTo(pt[0],pt[1]) : ctx.moveTo(pt[0],pt[1]));
+    ctx.closePath();
+    region.holes.forEach(hole => {
+      ctx.moveTo(hole[0][0], hole[0][1]);
+      hole.forEach((pt,i)=> i ? ctx.lineTo(pt[0],pt[1]) : null);
+      ctx.closePath();
+    });
+    ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.10)`;
+    ctx.fill('evenodd');
+    ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.55)`;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+    ctx.restore();
+  });
+
+  // AI proposal (lighter, dashed). Skipped when the per-surface outlines above already carry
+  // the geometry, so a ring-shaped surface is not overdrawn by its own hole-less outline.
+  if (aiPoly && aiPoly.length >= 3 && !aiRegions.length) {
     ctx.save();
     ctx.setLineDash([6,4]);
     ctx.beginPath();
@@ -2794,6 +2911,17 @@ function updateAreaElementCategory(elementId, value) {
 }
 
 function removeAreaElement(elementId) {
+  // Inderjit deleted a finished markup with this control on 27 Aug because in the SAVED row it
+  // sat exactly where Save sits in the unsaved row: "I thought it is to save... but it is
+  // actually to delete it", then asked whether the pre-delete version could be recovered.
+  // It is now labelled Delete, sits at the far left of the row, asks first, and is undoable.
+  const element = findAreaElement(elementId);
+  const label = (element && element.name) || 'this separate area';
+  if (element && element.saved
+      && !window.confirm(`Delete "${label}"?\n\nThe outline and its quantity are removed from this drawing. Undo (\u21a9) restores it.`)) {
+    return;
+  }
+  pushHistory(`delete separate area "${label}"`);
   if (activeAreaElement && activeAreaElement.elementId === elementId) {
     activeAreaElement = null;
     poly = [];
@@ -2801,7 +2929,8 @@ function removeAreaElement(elementId) {
     areaElements = areaElements.filter(element => element.elementId !== elementId);
   }
   draw();
-  toast('Separate area removed');
+  renderAreaElementsEditor();
+  toast('Separate area deleted — press Undo to restore it');
 }
 
 function editAreaElement(elementId) {
@@ -2891,11 +3020,15 @@ function renderAreaElementsEditor() {
       : 'Trace at least 3 points — separate from main total';
     const labels = {external_yard:'External yard slabs',dock:'Dock slabs',ground_floor:'Ground floor slabs',upper_floor:'Upper floor slabs',unclassified:'Choose BOQ section'};
     if (element.saved) {
+      // Delete is FIRST and red: in this row the last slot is where Save sat while the row was
+      // being edited, and a saved markup was deleted by muscle memory (27 Aug call).
       return `<div class="area-element-row" data-element-id="${esc(element.elementId)}" style="opacity:0.7">
+        <button type="button" title="Delete this separate area (undoable)"
+                onclick="removeAreaElement(this.parentElement.dataset.elementId)"
+                style="background:#fdecea;color:#a52a2a;border-color:#e8b4b8">🗑 Delete</button>
         <span style="font-size:10px;font-weight:700;color:#13294b">${esc(element.name)}</span>
         <span style="font-size:10px;color:#666">${esc(labels[element.category]||element.category)}</span>
         <button type="button" onclick="editAreaElement(this.parentElement.dataset.elementId)">Edit</button>
-        <button type="button" onclick="removeAreaElement(this.parentElement.dataset.elementId)">Remove</button>
         <div class="area-element-qty">${esc(qty)}</div>
       </div>`;
     }
@@ -2909,7 +3042,9 @@ function renderAreaElementsEditor() {
              onchange="updateAreaElementName(this.parentElement.dataset.elementId,this.value)">
       <select aria-label="Separate area BOQ section"
               onchange="updateAreaElementCategory(this.parentElement.dataset.elementId,this.value)">${options}</select>
-      <button type="button" onclick="removeAreaElement(this.parentElement.dataset.elementId)">Remove</button>
+      <button type="button" title="Discard this separate area (undoable)"
+              onclick="removeAreaElement(this.parentElement.dataset.elementId)"
+              style="background:#fdecea;color:#a52a2a;border-color:#e8b4b8">🗑 Delete</button>
       <button type="button" onclick="saveAreaElement(this.parentElement.dataset.elementId)" style="background:#7d3c98;color:#fff;border-color:#7d3c98">Save</button>
       <div class="area-element-qty">${esc(qty)}</div>
     </div>`;
@@ -2930,6 +3065,7 @@ function candidateScope(candidateId) {
 
 function stashActiveRegion() {
   if (poly.length >= 3) {
+    pushHistory('finish outline');
     const savedPoints = poly.map(point => ({x:point.x, y:point.y}));
     if (activeAreaElement) {
       areaElements.push({...activeAreaElement, points:savedPoints});
@@ -3484,7 +3620,7 @@ function onDown(e) {
       const region = cutoutPolygons[ci];
       if (!region.points) continue;
       for (let pi = 0; pi < region.points.length; pi++) {
-        if (Math.hypot(region.points[pi].x - p.x, region.points[pi].y - p.y) < 10) {
+        if (Math.hypot(region.points[pi].x - p.x, region.points[pi].y - p.y) < hitRadius(HIT_VERTEX_PX)) {
           cutoutDrag = {polygonIndex: ci, pointIndex: pi};
           if (canvas) canvas.style.cursor = 'move';
           return;
@@ -3496,7 +3632,7 @@ function onDown(e) {
       const ch = userChannels[ci];
       if (!ch.points) continue;
       for (let pi = 0; pi < ch.points.length; pi++) {
-        if (Math.hypot(ch.points[pi].x - p.x, ch.points[pi].y - p.y) < 10) {
+        if (Math.hypot(ch.points[pi].x - p.x, ch.points[pi].y - p.y) < hitRadius(HIT_VERTEX_PX)) {
           userChannelDrag = {channelIndex: ci, pointIndex: pi};
           if (canvas) canvas.style.cursor = 'move';
           return;
@@ -3508,7 +3644,7 @@ function onDown(e) {
     channelProposals.forEach((proposal, proposalIndex) => {
       (proposal.points || []).forEach((point, pointIndex) => {
         const distance = Math.hypot(point.x - p.x, point.y - p.y);
-        if (distance < 12 && (!nearest || distance < nearest.distance)) {
+        if (distance < hitRadius(HIT_CHANNEL_PX) && (!nearest || distance < nearest.distance)) {
           nearest = {proposalIndex, pointIndex, distance};
         }
       });
@@ -3524,7 +3660,7 @@ function onDown(e) {
       return;
     }
     // Active trace polygon vertex drag
-    dragIdx = poly.findIndex(q => Math.hypot(q.x - p.x, q.y - p.y) < 10);
+    dragIdx = poly.findIndex(q => Math.hypot(q.x - p.x, q.y - p.y) < hitRadius(HIT_VERTEX_PX));
   }
 
   // ── Mode-specific drawing (only if no vertex was grabbed) ──
@@ -3534,6 +3670,7 @@ function onDown(e) {
   }
 
   if (mode === 'cal') {
+    pushHistory('calibration point');
     if (cal.length >= 2) cal = [];
     cal.push(p);
     if (cal.length === 2) {
@@ -3567,16 +3704,19 @@ function onDown(e) {
     if (cutoutPolygons.length > 0 && !cutoutPolygons[cutoutPolygons.length-1].closed
         && cutoutPolygons[cutoutPolygons.length-1].points.length >= 3) {
       const lastRegion = cutoutPolygons[cutoutPolygons.length-1];
-      if (Math.hypot(lastRegion.points[0].x-p.x, lastRegion.points[0].y-p.y) < 20) {
+      if (Math.hypot(lastRegion.points[0].x-p.x, lastRegion.points[0].y-p.y) < hitRadius(CLOSE_CUTOUT_PX)) {
+        pushHistory('close cut-out');
         lastRegion.closed = true;
         toast(`Cut-out region ${cutoutPolygons.length} closed — draw another or click Submit`);
         draw(); return;
       }
     }
     if (cutoutPolygons.length === 0 || cutoutPolygons[cutoutPolygons.length-1].closed) {
+      pushHistory('start cut-out');
       cutoutPolygons.push({points: [p], closed: false});
       toast(`Cut-out ${cutoutPolygons.length} started — click points, then close near first point`);
     } else {
+      pushHistory('cut-out point');
       cutoutPolygons[cutoutPolygons.length-1].points.push(p);
     }
     draw(); return;
@@ -3587,10 +3727,12 @@ function onDown(e) {
   if (mode === 'channel') {
     let active = userChannels.length ? userChannels[userChannels.length - 1] : null;
     if (!active || active.complete) {
+      pushHistory('start channel');
       active = {points:[p], complete:false};
       userChannels.push(active);
       toast(`Channel ${userChannels.length} started — click each bend, then Channel again to finish`);
     } else {
+      pushHistory('channel point');
       active.points.push(p);
       toast(`Channel ${userChannels.length}: ${active.points.length} vertices — click Channel again to finish`);
     }
@@ -3598,9 +3740,10 @@ function onDown(e) {
   }
 
   // Trace mode: snap to start or add new vertex
-  if (poly.length >= 3 && Math.hypot(poly[0].x - p.x, poly[0].y - p.y) < 14) {
+  if (poly.length >= 3 && Math.hypot(poly[0].x - p.x, poly[0].y - p.y) < hitRadius(CLOSE_TRACE_PX)) {
     // Already closed — do nothing
   } else {
+    pushHistory('trace point');
     poly.push(p);
   }
   draw();
@@ -3682,17 +3825,9 @@ function setupButtons() {
     document.getElementById('btnCutout').classList.remove('on');
     document.getElementById('btnChannel').classList.remove('on');
   });
-  document.getElementById('btnUndo').addEventListener('click', () => {
-    const activeChannel = userChannels.length ? userChannels[userChannels.length - 1] : null;
-    if (mode === 'channel' && activeChannel && !activeChannel.complete) {
-      activeChannel.points.pop();
-      if (!activeChannel.points.length) userChannels.pop();
-    } else {
-      poly.pop();
-    }
-    draw();
-  });
+  document.getElementById('btnUndo').addEventListener('click', undoLast);
   document.getElementById('btnClear').addEventListener('click', () => {
+    pushHistory('clear all markup');
     poly=[]; traceRegions=[]; areaElements=[]; activeAreaElement=null;
     activeCandidateId=null; cal=[]; cutoutPolygons=[]; userChannels=[]; draw();
   });
@@ -3752,7 +3887,7 @@ function setupButtons() {
     draw(); toast('AI polygon loaded — nudge as needed');
   });
   document.getElementById('btnClearAi').addEventListener('click', () => {
-    aiPoly = null; draw(); toast('AI polygon cleared');
+    aiPoly = null; aiRegions = []; draw(); toast('AI polygon cleared');
   });
   document.getElementById('btnCalSet').addEventListener('click', () => {
     calAction = 'scale';
@@ -3919,6 +4054,33 @@ async function submitDecision(action) {
   if (action === 'adjust' && !regionEntries.length && !namedAreaEntries.length && !a && !hasCutouts) {
     toast('Trace or add at least one polygon, then Submit Adjustment', 'warn'); return;
   }
+  // Say WHICH limit was hit, here, before the round trip. The server answers every shape
+  // problem with one message about fifty polygons, which is what Inderjit hit on 27 Aug:
+  // "it was telling me it needs to be fifty polygon, something like that" — while what he had
+  // was a shape problem, not fifty of anything.
+  const shapeProblem = (() => {
+    const groups = [
+      ['traced region', regionEntries.map(entry => entry.points)],
+      ['cut-out', cutoutPolygons.filter(r => r.points && r.points.length).map(r => r.points)],
+      ['separate area', namedAreaEntries.map(entry => entry.points)]
+    ];
+    for (const [what, polys] of groups) {
+      if (polys.length > 50) {
+        return `${polys.length} ${what}s on this drawing — the limit is 50. Merge or remove some, then Submit Adjustment.`;
+      }
+      for (let i = 0; i < polys.length; i++) {
+        const count = (polys[i] || []).length;
+        if (count && count < 3) {
+          return `${what} ${i + 1} has only ${count} point${count === 1 ? '' : 's'} — an outline needs at least 3. Add points or delete it.`;
+        }
+        if (count > 500) {
+          return `${what} ${i + 1} has ${count} points — the limit is 500. Trace it with fewer points, or split it into two.`;
+        }
+      }
+    }
+    return null;
+  })();
+  if (action === 'adjust' && shapeProblem) { toast(shapeProblem, 'error'); return; }
   const regionPayload = regionEntries.map(entry =>
     entry.points.map(point => [Math.round(point.x), Math.round(point.y)]));
   const body = {

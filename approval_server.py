@@ -1075,10 +1075,36 @@ def adjust(job_id):
                     for point in region)
         )
 
+    def _region_shape_error(items, what, *, minimum=1):
+        """Name the limit that was actually hit.
+
+        One message covered three different failures — too many polygons, too few vertices,
+        too many vertices — and blamed the count in all three. Inderjit hit it on 27 Aug with
+        a shape problem and read back "it needs to be fifty polygon, something like that";
+        he could not act on it because it did not describe what he had done."""
+        if not isinstance(items, list):
+            return f"{what} must be a list of polygons"
+        if len(items) < minimum:
+            return f"at least {minimum} {what} polygon is required"
+        if len(items) > 50:
+            return f"{len(items)} {what} polygons submitted; the limit is 50"
+        for index, region in enumerate(items, 1):
+            if not isinstance(region, list) or not all(
+                    isinstance(point, (list, tuple)) and len(point) == 2
+                    and all(isinstance(value, (int, float)) and math.isfinite(value)
+                            and abs(value) <= 10_000_000 for value in point)
+                    for point in region):
+                return f"{what} polygon {index} contains a point that is not a finite [x, y] pair"
+            if len(region) < 3:
+                return f"{what} polygon {index} has {len(region)} point(s); an outline needs at least 3"
+            if len(region) > 500:
+                return f"{what} polygon {index} has {len(region)} points; the limit is 500"
+        return None
+
     if regions_in is not None:
-        if (not isinstance(regions_in, list) or not 1 <= len(regions_in) <= 50
-                or not all(_valid_region(region) for region in regions_in)):
-            return jsonify({"error": "regions must contain 1-50 valid polygons"}), 400
+        shape_error = _region_shape_error(regions_in, "region", minimum=1)
+        if shape_error:
+            return jsonify({"error": shape_error}), 400
         regions = regions_in
     elif vertices:
         if not _valid_region(vertices):
@@ -1131,8 +1157,12 @@ def adjust(job_id):
     # control-character free) and escape only at presentation boundaries.
     submitted_area_elements = []
     if area_elements_present:
-        if not isinstance(area_elements_in, list) or len(area_elements_in) > 50:
-            return jsonify({"error": "area_elements must contain 0-50 named polygons"}), 400
+        if not isinstance(area_elements_in, list):
+            return jsonify({"error": "area_elements must be a list"}), 400
+        if len(area_elements_in) > 50:
+            return jsonify({
+                "error": f"{len(area_elements_in)} separate area elements submitted; the limit is 50"
+            }), 400
         for index, element in enumerate(area_elements_in, 1):
             if not isinstance(element, dict):
                 return jsonify({"error": "each area element must be an object"}), 400
@@ -1147,8 +1177,12 @@ def adjust(job_id):
                 }), 400
             if not element_id or len(element_id) > 120:
                 return jsonify({"error": "area element_id must be 1-120 characters"}), 400
-            if not _valid_region(points):
-                return jsonify({"error": "each area element needs a valid polygon"}), 400
+            element_shape_error = _region_shape_error([points], "separate area", minimum=1)
+            if element_shape_error:
+                return jsonify({
+                    "error": element_shape_error.replace("separate area polygon 1",
+                                                         f"separate area {index} ({name})")
+                }), 400
             if category not in area_categories:
                 return jsonify({"error": "area element category is invalid"}), 400
             if scope not in allowed_region_scopes:
@@ -1164,9 +1198,9 @@ def adjust(job_id):
     # Validate cut-out regions (polygons to subtract from the measured area)
     cutout_regions = []
     if cutout_regions_in:
-        if (not isinstance(cutout_regions_in, list) or len(cutout_regions_in) > 50
-                or not all(_valid_region(region) for region in cutout_regions_in)):
-            return jsonify({"error": "cutout_regions must contain 0-50 valid polygons"}), 400
+        cutout_error = _region_shape_error(cutout_regions_in, "cut-out", minimum=0)
+        if cutout_error:
+            return jsonify({"error": cutout_error}), 400
         cutout_regions = cutout_regions_in
 
     if snapshot_scale_in is not None:

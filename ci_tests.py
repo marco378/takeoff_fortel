@@ -3456,6 +3456,50 @@ try:
            _marked_saved["adjusted"]["snapshot_scale"] == 2.0 and
            _marked_saved["adjusted"]["area_m2"] == 384.0,
            _marked_adjust.get_json())
+        # Shape errors used to come back as one message about fifty polygons whatever the
+        # actual problem was. Inderjit hit it at Submit Adjustment on 27 Aug — "it was telling
+        # me it needs to be fifty polygon, something like that" — with a shape problem, not
+        # fifty of anything. Same 400s, distinct strings.
+        _shape_cases = [
+            ("a 501-vertex outline names the vertex limit",
+             {"regions": [[[i, i] for i in range(501)]]}, ["501", "limit is 500"]),
+            ("51 outlines name the polygon limit",
+             {"regions": [[[0, 0], [10, 0], [10, 10]] for _ in range(51)]}, ["51", "limit is 50"]),
+            ("a 2-point outline says an outline needs three points",
+             {"regions": [[[0, 0], [10, 0]]]}, ["2 point", "at least 3"]),
+            ("a non-finite coordinate says the point is not a finite pair",
+             {"regions": [[[0, 0], [10, 0], [1e99, 1]]]}, ["finite"]),
+        ]
+        for _label, _payload, _expect in _shape_cases:
+            _resp = _client_up.post(f"/adjust/{_marked_route_job['id']}",
+                                    json=dict(_payload, scale_k=0.1, snapshot_scale=2.0))
+            _msg = (_resp.get_json() or {}).get("error", "")
+            ck(f"adjust rejection: {_label}",
+               _resp.status_code == 400 and all(token in _msg for token in _expect), f"{_resp.status_code} {_msg}")
+        _cutout_shape = _client_up.post(f"/adjust/{_marked_route_job['id']}", json={
+            "regions": [[[40, 40], [240, 40], [240, 240], [40, 240]]],
+            "cutout_regions": [[[0, 0], [10, 0]]], "scale_k": 0.1, "snapshot_scale": 2.0})
+        ck("adjust rejection: a broken cut-out is named as a cut-out, not as a region",
+           _cutout_shape.status_code == 400
+           and "cut-out" in (_cutout_shape.get_json() or {}).get("error", ""),
+           (_cutout_shape.get_json() or {}).get("error"))
+        _area_shape = _client_up.post(f"/adjust/{_marked_route_job['id']}", json={
+            "regions": [[[40, 40], [240, 40], [240, 240], [40, 240]]],
+            "area_elements": [{"element_id": "a1", "name": "Footpath", "category": "external_yard",
+                               "polygon_pts": [[i, i] for i in range(501)]}],
+            "scale_k": 0.1, "snapshot_scale": 2.0})
+        ck("adjust rejection: a broken separate area names the element, not a polygon index",
+           _area_shape.status_code == 400
+           and "separate area 1 (Footpath)" in (_area_shape.get_json() or {}).get("error", ""),
+           (_area_shape.get_json() or {}).get("error"))
+        # Put the good geometry back so the marked-PDF assertions below still see it.
+        _client_up.post(f"/adjust/{_marked_route_job['id']}", json={
+            "regions":[[[40,40],[240,40],[240,240],[40,240]]],
+            "region_categories":["external_yard"], "region_scopes":["main"],
+            "scale_k":0.1, "snapshot_scale":2.0,
+            "cutout_regions":[[[80,80],[120,80],[120,120],[80,120]]],
+            "user_channels":[[[40,300],[140,300],[140,380]]],
+        })
         _marked_route_response = _client_up.get(
             f"/marked-pdf/{_marked_route_job['id']}.pdf")
         with _fitz_marked.open(
