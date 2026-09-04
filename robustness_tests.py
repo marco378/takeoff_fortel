@@ -34,17 +34,22 @@ The harness process itself always exits 0 (it is a report generator, not a
 pass/fail gate) and its last stdout line is a compact summary like:
     "N files: X ok, Y refused, Z CRASH, ..."
 """
+import argparse
+import concurrent.futures
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 DRAWINGS = os.path.join(REPO, "drawings")
 GOLD_PATH = os.path.join(REPO, "gold.json")
 REPORT_PATH = os.path.join(REPO, "ROBUSTNESS_REPORT.md")
+FAST_REPORT_PATH = os.path.join(REPO, "ROBUSTNESS_REPORT.fast.md")
 PYTHON = os.path.join(REPO, ".venv", "bin", "python")
 
 TIMEOUT_S = 180
@@ -316,8 +321,104 @@ def run_one(filepath):
 _GOLD_CACHE = {}
 
 
-def main():
+def default_jobs():
+    """Half the cores, at least 2. Each worker is a whole rendering pipeline in its own
+    subprocess, so this is bounded by memory as much as by CPU; --jobs raises it."""
+    return max(2, (os.cpu_count() or 4) // 2)
+
+
+def previously_interesting(report_path=REPORT_PATH):
+    """Files worth re-running during iteration: everything with a gold entry, plus everything
+    the last full sweep actually measured. Read from the report so the subset follows the
+    corpus instead of being a hand-maintained list that silently rots."""
+    interesting = set(_GOLD_CACHE)
+    try:
+        with open(report_path, encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("| drawings/"):
+                    continue
+                cells = [cell.strip() for cell in line.split("|")]
+                if len(cells) > 2 and cells[2] in ("MEASURED_OK", "SILENT_NUMBER", "CRASH", "HANG"):
+                    interesting.add(cells[1])
+    except FileNotFoundError:
+        pass
+    return interesting
+
+
+def run_all(files, jobs):
+    """Run every file, up to `jobs` at a time, and return results in INPUT ORDER.
+
+    Each file already runs in its own subprocess, so the parent only waits on I/O — threads
+    are the right pool here and the ordering guarantee keeps the report diffable against a
+    sequential run.
+    """
+    results = [None] * len(files)
+    done = 0
+    lock = threading.Lock()
+
+    def work(index_and_path):
+        index, path = index_and_path
+        return index, run_one(path)
+
+    if jobs == 1:
+        for index, path in enumerate(files):
+            results[index] = run_one(path)
+            print(f"[{index + 1}/{len(files)}] {results[index]['file']} ... "
+                  f"{results[index]['class']} ({results[index]['elapsed_s']}s)", flush=True)
+        return results
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        # as_completed, not map: map yields in SUBMISSION order, so one slow early file makes
+        # the progress line look frozen while five workers are actually busy behind it. The
+        # report still comes out in input order because results are stored by index.
+        futures = [pool.submit(work, item) for item in enumerate(files)]
+        for future in concurrent.futures.as_completed(futures):
+            index, result = future.result()
+            results[index] = result
+            with lock:
+                done += 1
+                print(f"[{done}/{len(files)}] {result['file']} ... {result['class']} "
+                      f"({result['elapsed_s']}s)"
+                      + (f" area={result['area_m2']}m2" if result["area_m2"] is not None else "")
+                      + (f" {result.get('gold_verdict')}" if result.get("gold_verdict") else "")
+                      + (f" zone={result.get('gold_zone_verdict')}"
+                         if result.get("gold_zone_verdict") else ""), flush=True)
+
+    # A HANG under contention is not a HANG. Six workers on eight cores turned two ~70s files
+    # into "exceeded 180s" on the first parallel run, which would have reported a pipeline
+    # failure that does not exist. Any file that hits the watchdog in parallel is re-run ALONE
+    # and judged on that; only a file that still exceeds the timeout with the machine to itself
+    # is a real hang.
+    hung = [i for i, result in enumerate(results) if result["class"] == "HANG"]
+    if hung:
+        print(f"\n{len(hung)} file(s) hit the {TIMEOUT_S}s watchdog while {jobs} ran at once — "
+              f"re-running each one ALONE before believing it:", flush=True)
+        for index in hung:
+            confirmed = run_one(files[index])
+            if confirmed["class"] != "HANG":
+                confirmed["notes"] = (f"{confirmed['notes']} (re-confirmed alone after a "
+                                      f"parallel-run watchdog trip)").strip()
+                print(f"    {confirmed['file']} -> {confirmed['class']} "
+                      f"({confirmed['elapsed_s']}s) — not a hang, it was contention", flush=True)
+            else:
+                print(f"    {confirmed['file']} -> STILL HANGS alone "
+                      f"({confirmed['elapsed_s']}s)", flush=True)
+            results[index] = confirmed
+    return results
+
+
+def main(argv=None):
     global _GOLD_CACHE
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--jobs", "-j", type=int, default=default_jobs(),
+                        help="files to run at once (default: half the cores)")
+    parser.add_argument("--fast", action="store_true",
+                        help="only gold files and files the last sweep measured; writes a "
+                             "SEPARATE report and never overwrites the full one")
+    parser.add_argument("--check", action="store_true",
+                        help="exit non-zero on CRASH/HANG/SILENT_NUMBER or any GOLD_FAIL")
+    args = parser.parse_args(argv)
+
     _GOLD_CACHE = load_gold()
 
     files = find_all_files()
@@ -325,20 +426,22 @@ def main():
         print("No files found under drawings/ — nothing to test.")
         return 0
 
-    print(f"robustness_tests.py: running pipeline against {len(files)} files "
-          f"(timeout {TIMEOUT_S}s each)\n")
+    report_path = REPORT_PATH
+    if args.fast:
+        wanted = previously_interesting()
+        subset = [f for f in files if os.path.relpath(f, REPO) in wanted]
+        skipped = len(files) - len(subset)
+        files = subset
+        report_path = FAST_REPORT_PATH
+        print(f"FAST MODE: {len(files)} files (every gold file + everything the last full sweep "
+              f"measured); {skipped} files skipped and NOT re-verified. "
+              f"Run without --fast before committing or deploying.")
 
-    results = []
-    for i, fp in enumerate(files, 1):
-        rel = os.path.relpath(fp, REPO)
-        print(f"[{i}/{len(files)}] {rel} ...", end=" ", flush=True)
-        r = run_one(fp)
-        print(f"{r['class']} ({r['elapsed_s']}s)"
-              + (f" area={r['area_m2']}m2" if r["area_m2"] is not None else "")
-              + (f" {r.get('gold_verdict')}" if r.get("gold_verdict") else "")
-              + (f" zone={r.get('gold_zone_verdict')}"
-                 if r.get("gold_zone_verdict") else ""))
-        results.append(r)
+    jobs = max(1, args.jobs)
+    print(f"robustness_tests.py: running pipeline against {len(files)} files "
+          f"(timeout {TIMEOUT_S}s each, {jobs} at a time)\n")
+
+    results = run_all(files, jobs)
 
     # ── Tally ──────────────────────────────────────────────────────────
     tally = {}
@@ -399,15 +502,32 @@ def main():
     lines.append("- REFUSED_CLEANLY: no area_m2, pipeline returned cleanly with explanatory flags.")
     lines.append("- Non-PDF adversarial inputs (.zip/.eml/.docx/etc.) are handed to takeoff() directly to see how intake reacts; a clean refusal or classify()-level error is not itself a bug.")
 
-    with open(REPORT_PATH, "w") as f:
+    if args.fast:
+        lines.insert(1, "\n> PARTIAL RUN (`--fast`): gold files and previously-measured files "
+                        "only. This is an iteration aid, not the gate.\n")
+
+    with open(report_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
     print("\n" + "=" * 100)
     print(summary_line)
-    print(f"Full report written to {os.path.relpath(REPORT_PATH, REPO)}")
+    print(f"Full report written to {os.path.relpath(report_path, REPO)}")
     print("=" * 100)
 
-    return 0  # reporting tool: always exit 0
+    if args.check:
+        bad_classes = {"CRASH", "HANG", "SILENT_NUMBER"}
+        failures = [r for r in results if r["class"] in bad_classes]
+        gold_failures = [r for r in results
+                         if "GOLD_FAIL" in (r.get("gold_verdict"), r.get("gold_zone_verdict"),
+                                            r.get("gold_manhole_verdict"))]
+        if failures or gold_failures:
+            for r in failures:
+                print(f"FAIL {r['class']}: {r['file']}")
+            for r in gold_failures:
+                print(f"FAIL GOLD: {r['file']} ({r.get('gold_delta_pct')}% vs gold)")
+            return 1
+
+    return 0  # reporting tool: exit 0 unless --check asked it to gate
 
 
 if __name__ == "__main__":

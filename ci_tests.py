@@ -53,6 +53,61 @@ ck("scale bar uses terminal 10m tick, not intermediate 1m",
    _tick_k is not None and abs(_tick_k - 10 / 283.44) < 1e-5 and "10 m" in _tick_info,
    (_tick_k, _tick_info))
 
+print("the gate picks the checks a change actually needs")
+# CLAUDE.md wants both suites green before a commit. Run literally that made a button label wait
+# on a 617-file sweep, which on 4 Sep cost most of an afternoon. The corpus is parallel now and
+# gate.py picks from the diff — conservatively: anything unrecognised still pulls the corpus.
+import gate as _gate
+for _paths, _must, _mustnt, _why in (
+    (["assessor_portal.html"], {"ci", "portal"}, {"corpus"}, "a portal-only change"),
+    (["quotation.py"], {"ci", "portal"}, {"corpus"}, "a quotation-only change"),
+    (["takeoff_unmarked.py"], {"ci", "corpus"}, set(), "measurement code"),
+    (["router.py", "assessor_portal.html"], {"ci", "corpus", "portal"}, set(), "both at once"),
+    (["gold.json"], {"ci", "corpus"}, set(), "a gold change"),
+    (["README.md", "ROBUSTNESS_REPORT.md"], {"ci"}, {"corpus", "portal"}, "documentation"),
+    (["some_new_module.py"], {"ci", "corpus"}, set(), "an unrecognised module (fail safe)"),
+    (["gate.py"], {"ci"}, {"corpus"}, "the gate script itself"),
+):
+    _gates, _ = _gate.decide(_paths)
+    ck(f"gate: {_why} -> {sorted(_must)}",
+       _must <= _gates and not (_mustnt & _gates), f"{_paths} -> {sorted(_gates)}")
+
+print("a sheet that carries the build-up is a detail sheet, whatever it calls itself")
+# Inderjit, 4 Sep call: "the spec is given on this drawing, but AI is saying spec is not given on
+# engineering drawing... I think this is the major problem with this portal, it is not picking the
+# correct details from the drawing." His sheet is named "External Construction Specification" and
+# the vocabulary only knew "external construction DETAILS", so it was never read for a build-up —
+# the same shape as the legend-vocabulary miss on the project-6 sheets.
+import re as _re_spec
+from router import DETAIL_KEYWORDS as _DETAIL_KW, buildup_source as _buildup_source
+_spec_terms = tuple(_re_spec.sub(r"[-_]+", " ", term.casefold()) for term in
+                    tuple(_DETAIL_KW) + ("external works details", "joint layout",
+                                         "construction thickness", "slab specification",
+                                         "pavement details"))
+def _is_detail_candidate(name):
+    normalised = _re_spec.sub(r"[-_]+", " ", name.casefold())
+    return any(term in normalised for term in _spec_terms)
+# HELD BACK, with evidence, and pinned so it is not re-added casually: treating a sheet named
+# "... External Construction Specification" as a build-up source made the spec WORSE on the real
+# pack. That sheet is a TABLE of six build-ups (yard, margins, car park, grasscrete, ...), and
+# feeding it in added A142 and a 450 mm CBR figure as competing values against the Pro-Max
+# drawing's own clean legend (190 mm / A393 / C32/40). It needs a table-aware extractor that
+# reads the row matching the surface being priced.
+ck("a specification TABLE is still not treated as a build-up source (held back deliberately)",
+   not _is_detail_candidate(
+       "9_25010-RLL-26-XX-DR-C-2105_P01_External_Construction_Specification.pdf"))
+for _not_a_detail in ("Please_use_for_information_only_-_Development_Specification_0.0_DRAFT.pdf",
+                      "0101-Employers-Requirements-(ERs)_Rev_1.pdf",
+                      "Tender_Query_Schedule.pdf",
+                      "Document_Log.pdf"):
+    ck(f"...while a written tender document is still not a build-up source: {_not_a_detail[:40]}",
+       not _is_detail_candidate(_not_a_detail))
+ck("...and an underscore-named details sheet is finally seen as one (it never was)",
+   _buildup_source("RBVE_construction_details.pdf", source="engineer")[0] == "detail")
+ck("...and the existing detail vocabulary still matches what it always did",
+   _is_detail_candidate("6_31941-TTE-ZF-762-DR-C-0710-P01-Construction_Thicknessess_Plan.pdf")
+   and _is_detail_candidate("RBVE_construction_details.pdf"))
+
 print("fast refusal for obvious multi-page reports")
 _das_pdf = "/tmp/_synthetic_heavy_das_report.pdf"
 _das_canvas = canvas.Canvas(_das_pdf, pagesize=(1400, 900))
@@ -115,6 +170,50 @@ with _fitz_fast_refusal.open(_incidental_pdf) as _incidental_doc:
         _incidental_pdf, _incidental_doc)
 ck("incidental schedule note on a one-sheet drawing is not fast-refused",
    _incidental_reason is None, _incidental_reason)
+
+# A drawing whose TITLE ends in "Specification" is still a drawing. Aryan, 4 Sep: the real sheet
+# 9_25010-RLL-26-XX-DR-C-2105_P01_External_Construction_Specification.pdf was never recognised on
+# prod — this rule refused it on the word "Specification" before a page was rendered, so the hatch
+# detector and the legend reader never saw it. Its own reference says DR: ISO 19650 for DRAWING.
+_drawing_coded_pdf = "/tmp/9_25010-RLL-26-XX-DR-C-2105_P01_External_Construction_Specification.pdf"
+_drawing_coded_canvas = canvas.Canvas(_drawing_coded_pdf, pagesize=(1400, 900))
+_drawing_coded_canvas.drawString(60, 850, "EXTERNAL CONSTRUCTION SPECIFICATION")
+_drawing_coded_canvas.drawString(60, 820, "CONCRETE SERVICE YARD")
+_drawing_coded_canvas.save()
+with _fitz_fast_refusal.open(_drawing_coded_pdf) as _drawing_coded_doc:
+    _drawing_coded_reason = __import__("takeoff_pipeline")._fast_report_refusal(
+        _drawing_coded_pdf, _drawing_coded_doc)
+ck("a DRAWING-coded sheet titled '... Specification' is no longer thrown away unread",
+   _drawing_coded_reason is None, _drawing_coded_reason)
+
+# The override is narrow on purpose, in three directions.
+_spec_coded_pdf = "/tmp/2154-SGP-XX-XX-SP-C-0001_External_Works_Specification.pdf"
+_spec_coded_canvas = canvas.Canvas(_spec_coded_pdf, pagesize=(900, 700))
+_spec_coded_canvas.drawString(60, 650, "External works specification")
+_spec_coded_canvas.save()
+with _fitz_fast_refusal.open(_spec_coded_pdf) as _spec_coded_doc:
+    _spec_coded_reason = __import__("takeoff_pipeline")._fast_report_refusal(
+        _spec_coded_pdf, _spec_coded_doc)
+ck("...an SP-coded specification is still refused: SP is not DR",
+   _spec_coded_reason is not None and "Specification" in _spec_coded_reason, _spec_coded_reason)
+
+_drawing_coded_text_pdf = "/tmp/25010-RLL-26-XX-DR-C-9999_Specification.pdf"
+_dct_canvas = canvas.Canvas(_drawing_coded_text_pdf, pagesize=(900, 700))
+for _dct_page in range(5):
+    _dct_canvas.drawString(60, 650, "DEVELOPMENT SPECIFICATION")
+    _dct_canvas.drawString(60, 620, f"Written requirements page {_dct_page + 1}")
+    _dct_canvas.showPage()
+_dct_canvas.save()
+with _fitz_fast_refusal.open(_drawing_coded_text_pdf) as _dct_doc:
+    _dct_reason = __import__("takeoff_pipeline")._fast_report_refusal(
+        _drawing_coded_text_pdf, _dct_doc)
+ck("...a drawing-coded file whose PAGES read as a specification is still refused",
+   _dct_reason is not None, _dct_reason)
+
+with _fitz_fast_refusal.open(_schedule_pdf) as _sched_doc:
+    _sched_reason = __import__("takeoff_pipeline")._fast_report_refusal(_schedule_pdf, _sched_doc)
+ck("...and an uncoded written document is untouched by the override",
+   _sched_reason is not None, _sched_reason)
 
 _boundary_pdf = "/tmp/Standalone_Boundary_Treatment_Plan.pdf"
 _boundary_canvas = canvas.Canvas(_boundary_pdf, pagesize=(900, 700))
@@ -4792,10 +4891,19 @@ try:
            all(marker in _portal_html_up for marker in (
                "Correct approved specification", "Save as new quotation revision",
                "post_approval_correction", "CORRECTED AFTER APPROVAL", "quotation_revision")))
-        ck("portal presents the measurement scale as both internal m/px and conventional 1:N",
+        # Both are still shown; the labels are now plain English. Inderjit, 4 Sep call: "I'm not
+        # sure what scale K is" — the panel called it "Current k (m/px)".
+        ck("portal presents the measurement scale as both metres-per-pixel and conventional 1:N",
            all(marker in _portal_html_up for marker in (
-               'id="scaleDisplay"', 'id="scaleRatioDisplay"', "Drawing scale ratio",
+               'id="scaleDisplay"', 'id="scaleRatioDisplay"', "Metres per pixel", "Drawing scale",
                "(mpp * snapScale) * 72 / 0.0254")))
+        ck("...and it no longer calls the scale 'k' at the assessor",
+           "Current k (m/px)" not in _portal_html_up)
+        # Inderjit traced a footpath with + Region and it landed in the main slab total.
+        ck("the two trace buttons say what they do to the total",
+           "its area is ADDED to the main measured total" in _portal_html_up
+           and "kept out of the main total" in _portal_html_up
+           and "use + Area instead" in _portal_html_up)
         ck("portal renders and captures per-zone quantities/classifications/specs",
            all(marker in _portal_html_up for marker in (
                "Measured zones", "ZONE REVIEW REQUIRED", "classifyZone(",
