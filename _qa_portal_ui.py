@@ -1,0 +1,186 @@
+"""QA the portal UI fixes on a REAL Fortel drawing (project-8 hatch sheet), headless.
+
+Isolated jobs file so nothing lands in approval_jobs.json.
+"""
+import asyncio, os, json, time, uuid, urllib.request, sys
+
+PORT = os.environ.get("QA_PORT", "5111")
+BASE = f"http://127.0.0.1:{PORT}"
+OUT  = os.environ["QA_OUT"]
+P8   = "drawings/inderjit_p8/8_14173-TCG-XX_XX-XX-SK-C-0003_CONCRETE_SLAB_MSA.pdf"
+
+def upload(path, name, ref, client):
+    boundary = "----qa" + uuid.uuid4().hex
+    fields = {"project_name": name, "project_ref": ref, "client_name": client}
+    body = b""
+    for k, v in fields.items():
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").encode()
+    body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"pdf\"; "
+             f"filename=\"{os.path.basename(path)}\"\r\nContent-Type: application/pdf\r\n\r\n").encode()
+    body += open(path, "rb").read() + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(f"{BASE}/upload", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    return json.load(urllib.request.urlopen(req))["job_id"]
+
+def wait_done(jid):
+    for _ in range(90):
+        jobs = json.load(urllib.request.urlopen(f"{BASE}/jobs"))
+        if jobs.get(jid, {}).get("status") not in ("processing", None):
+            return jobs[jid]
+        time.sleep(2)
+    return jobs.get(jid, {})
+
+RESULTS = []
+def ck(name, ok, detail=""):
+    RESULTS.append((name, bool(ok), detail))
+    print(("  [PASS] " if ok else "  [FAIL] ") + name + ("" if detail == "" else f"  {detail}"))
+
+async def main():
+    os.makedirs(OUT, exist_ok=True)
+    jid = upload(P8, "P8 TCG hatch QA", "QA-P8", "Knauf")
+    job = wait_done(jid)
+    print("p8 ->", job.get("measurement_state"), job.get("area_m2"))
+
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = await browser.new_context(viewport={"width": 1600, "height": 950})
+        page = await ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.on("dialog", lambda d: asyncio.ensure_future(d.accept()))
+        await page.goto(f"{BASE}/portal?job={jid}", wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(6000)
+        await page.screenshot(path=f"{OUT}/01_p8_canvas.png")
+
+        # ── multi-region rendering ──────────────────────────────────────────────────────
+        regions = await page.evaluate("aiRegions.map(r => ({cat:r.category, pts:r.points.length, holes:r.holes.length, area:r.area_m2}))")
+        ck("canvas carries every measured part, not one polygon", len(regions) >= 5, json.dumps(regions))
+        ck("the ring-shaped road part carries its hole", any(r["holes"] >= 1 for r in regions),
+           json.dumps([r["holes"] for r in regions]))
+        ck("both surfaces are represented", {r["cat"] for r in regions} >= {"external_yard", "unclassified"},
+           json.dumps(sorted({r["cat"] for r in regions})))
+
+        # ── the headline area covers every measured zone, not just the primary ──────────
+        headline = await page.evaluate("""(() => ({
+          area: document.getElementById('areaDisplay').textContent.trim(),
+          source: document.getElementById('areaSource').textContent.trim(),
+          summary: (document.getElementById('summaryLine') || {textContent:''}).textContent.trim(),
+          zones: (currentJob.result.zones || []).map(z => [z.category, z.area_m2])
+        }))()""")
+        total = sum(a for _, a in headline["zones"])
+        ck("headline area is the sum of the measured zones, not the primary one only",
+           headline["area"].startswith(f"{round(total):,}"), f"{headline['area']} vs {total:,.1f}")
+        ck("...and it shows the split, so nobody has to guess what it is made of",
+           "yard" in headline["source"] and "unclassified" in headline["source"], headline["source"])
+
+        # ── the hole is actually CUT on the canvas, not just present in the data ────────
+        # I told Aryan the canvas could not draw holes. Prove it either way by sampling the
+        # rendered pixels: a point inside the ring's hole must not carry the surface tint that
+        # a point inside the ring band does.
+        hole_probe = await page.evaluate("""(() => {
+          const ring = aiRegions.find(r => r.holes && r.holes.length);
+          if (!ring) return {ok:false, why:'no ring region'};
+          const hole = ring.holes[0];
+          const cx = hole.reduce((s,p)=>s+p[0],0)/hole.length;
+          const cy = hole.reduce((s,p)=>s+p[1],0)/hole.length;
+          // a point on the ring band itself: midway between the outer ring and its hole
+          const ox = ring.points.reduce((s,p)=>s+p[0],0)/ring.points.length;
+          const oy = ring.points.reduce((s,p)=>s+p[1],0)/ring.points.length;
+          const bx = Math.round(cx + (ring.points[0][0]-cx)*0.85);
+          const by = Math.round(cy + (ring.points[0][1]-cy)*0.85);
+          const px = (x,y) => Array.from(ctx.getImageData(Math.round(x), Math.round(y), 1, 1).data);
+          return {ok:true, inHole: px(cx,cy), onBand: px(bx,by), cx, cy, bx, by};
+        })()""")
+        if hole_probe.get("ok"):
+            in_hole, on_band = hole_probe["inHole"], hole_probe["onBand"]
+            ck("the ring's hole is CUT on the canvas — the tint stops at the hole",
+               in_hole != on_band, f"inside hole {in_hole} vs on band {on_band}")
+        else:
+            ck("the ring's hole is CUT on the canvas — the tint stops at the hole",
+               False, hole_probe.get("why"))
+
+        # ── zoom-aware hit radii ────────────────────────────────────────────────────────
+        r1 = await page.evaluate("(() => { zoom = 1; return hitRadius(10); })()")
+        r8 = await page.evaluate("(() => { zoom = 8; return hitRadius(10); })()")
+        await page.evaluate("zoom = 1; applyCanvasTransform();")
+        ck("vertex grab radius is constant on SCREEN, not in canvas pixels",
+           abs(r1 - 10) < 1e-9 and abs(r8 - 1.25) < 1e-9, f"zoom1={r1} zoom8={r8}")
+
+        # ── undo during cut-out drawing (the reported defect) ───────────────────────────
+        state = await page.evaluate("""(() => {
+          mode = 'cutout'; cutoutPolygons = []; undoStack = [];
+          pushHistory('start cut-out'); cutoutPolygons.push({points:[{x:100,y:100}], closed:false});
+          pushHistory('cut-out point');  cutoutPolygons[0].points.push({x:200,y:100});
+          pushHistory('cut-out point');  cutoutPolygons[0].points.push({x:200,y:200});
+          const before = cutoutPolygons[0].points.length;
+          undoLast();
+          const after = cutoutPolygons.length ? cutoutPolygons[0].points.length : 0;
+          undoLast(); undoLast();
+          return {before, after, finally_: cutoutPolygons.length};
+        })()""")
+        ck("Undo takes back a cut-out point (it used to do nothing in cut-out mode)",
+           state["before"] == 3 and state["after"] == 2, json.dumps(state))
+        ck("Undo all the way back removes the cut-out entirely", state["finally_"] == 0, json.dumps(state))
+
+        # ── undo restores a deleted separate area (Inderjit's lost markup) ──────────────
+        restored = await page.evaluate("""(() => {
+          areaElements = []; activeAreaElement = null; undoStack = [];
+          areaElements.push({elementId:'qa-1', name:'Footpath', category:'external_yard',
+                             saved:true, points:[{x:10,y:10},{x:90,y:10},{x:90,y:90}]});
+          removeAreaElement('qa-1');
+          const afterDelete = areaElements.length;
+          undoLast();
+          return {afterDelete, afterUndo: areaElements.length, name: (areaElements[0]||{}).name};
+        })()""")
+        ck("a deleted separate area comes back with Undo", restored["afterDelete"] == 0
+           and restored["afterUndo"] == 1 and restored["name"] == "Footpath", json.dumps(restored))
+
+        # ── delete affordance: destructive control is not in Save's slot ────────────────
+        markup = await page.evaluate("""(() => {
+          areaElements = [{elementId:'qa-2', name:'Duct slab', category:'dock', saved:true,
+                           points:[{x:10,y:10},{x:90,y:10},{x:90,y:90}]}];
+          renderAreaElementsEditor();
+          const row = document.querySelector('#areaElementsEditor .area-element-row');
+          const buttons = Array.from(row.querySelectorAll('button')).map(b => b.textContent.trim());
+          return {buttons, firstIsDelete: /Delete/.test(buttons[0] || ''), lastIsDelete: /Delete/.test(buttons[buttons.length-1] || '')};
+        })()""")
+        ck("the destructive control reads 'Delete' and sits first, not where Save sat",
+           markup["firstIsDelete"] and not markup["lastIsDelete"], json.dumps(markup))
+        await page.screenshot(path=f"{OUT}/02_area_element_row.png")
+
+        # ── area-elements list scrolls horizontally (Aryan's 2 Sep fix — verify only) ───
+        scrollable = await page.evaluate("""(() => {
+          areaElements = ['a','b','c','d','e'].map((n,i) => ({elementId:'qa-s'+i, name:'Separate area '+n,
+            category:'external_yard', saved:true, points:[{x:10,y:10},{x:90,y:10},{x:90,y:90}]}));
+          renderAreaElementsEditor();
+          const el = document.getElementById('areaElementsEditor');
+          const style = getComputedStyle(el);
+          return {overflowX: style.overflowX, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth};
+        })()""")
+        ck("the separate-areas list can scroll left/right", scrollable["overflowX"] in ("auto", "scroll"),
+           json.dumps(scrollable))
+
+        # ── submit pre-validation names the real limit ──────────────────────────────────
+        msg = await page.evaluate("""(() => {
+          const seen = [];
+          const realToast = window.toast;
+          window.toast = (m, kind) => seen.push(String(m));
+          areaElements = []; activeAreaElement = null; traceRegions = [];
+          poly = Array.from({length: 501}, (_, i) => ({x: i, y: i}));
+          cutoutPolygons = []; userChannels = [];
+          try { submitDecision("adjust"); } catch (e) {}
+          window.toast = realToast;
+          return seen;
+        })()""")
+        await page.wait_for_timeout(400)
+        await page.screenshot(path=f"{OUT}/03_after_ui_checks.png")
+        ck("the 500-vertex limit is named, not reported as a fifty-polygon error",
+           any("500" in m and "points" in m for m in msg), json.dumps(msg[-2:]))
+        ck("no uncaught page errors during the whole pass", not errors, "; ".join(errors[:3]))
+        await browser.close()
+
+    print(f"\n==== {sum(1 for _,ok,_ in RESULTS if ok)}/{len(RESULTS)} PASS ====")
+    return 0 if all(ok for _,ok,_ in RESULTS) else 1
+
+sys.exit(asyncio.run(main()))

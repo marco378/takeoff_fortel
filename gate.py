@@ -115,10 +115,15 @@ def main(argv=None):
         if run(cmd, "robustness corpus"):
             failures.append("robustness")
     if "portal" in gates:
-        print("\n=== portal: run the playwright pass against a REAL drawing before shipping:")
-        print("    JOBS_FILE=<scratch>/approval_jobs.qa.json APPROVAL_PORT=5111 PORTAL_TOKEN= "
+        # The blank-screen bug lived only in the browser; unit tests never saw it (CLAUDE.md).
+        # _qa_portal_ui.py drives the real portal on a REAL client drawing and asserts what the
+        # assessor actually sees — including that a ring-shaped surface has its hole cut on the
+        # canvas, which is a claim no unit test can make.
+        print("\n=== portal: drive the real portal before shipping (14 checks, ~2 min):")
+        print(f"    JOBS_FILE=/tmp/approval_jobs.qa.json APPROVAL_PORT=5111 PORTAL_TOKEN= "
               f"{PYTHON} approval_server.py &")
-        print(f"    QA_PORT=5111 QA_OUT=<scratch>/qa {PYTHON} <scratch>/_qa_portal_ui.py")
+        print(f"    QA_PORT=5111 QA_OUT=/tmp/qa {PYTHON} _qa_portal_ui.py")
+        print("    then: pkill -f approval_server.py; rm -f /tmp/approval_jobs.qa*.json")
 
     print("\n" + ("ALL GATES PASSED" if not failures else f"FAILED: {', '.join(failures)}"))
     return 1 if failures else 0
