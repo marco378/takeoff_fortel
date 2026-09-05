@@ -8,6 +8,16 @@ PORT = os.environ.get("QA_PORT", "5111")
 BASE = f"http://127.0.0.1:{PORT}"
 OUT  = os.environ["QA_OUT"]
 P8   = "drawings/inderjit_p8/8_14173-TCG-XX_XX-XX-SK-C-0003_CONCRETE_SLAB_MSA.pdf"
+INDURENT = ("drawings/inderjit_p9p10/11_Indurent_Park_Newport_22513-RLL-25-00-DR-C-3151"
+            "_P02_Proposed_Pavement_Construction.pdf")
+# The other three sheets Inderjit sent on 4 Sep. All three are correctly UNMEASURED; what was
+# wrong was that the portal never said so where he could see it.
+REFUSED_SHEETS = [
+    ("mimms",  "drawings/inderjit_p9p10/12_South_Mimms.pdf"),
+    ("roscoe", "drawings/inderjit_p9p10/10_26051-ROS-00-XX-DR-C-05101.pdf"),
+    ("spec2105", "drawings/inderjit_p9p10/9_25010-RLL-26-XX-DR-C-2105"
+                 "_P01_External_Construction_Specification.pdf"),
+]
 
 def upload(path, name, ref, client):
     boundary = "----qa" + uuid.uuid4().hex
@@ -178,6 +188,106 @@ async def main():
         ck("the 500-vertex limit is named, not reported as a fifty-polygon error",
            any("500" in m and "points" in m for m in msg), json.dumps(msg[-2:]))
         ck("no uncaught page errors during the whole pass", not errors, "; ".join(errors[:3]))
+
+        # ── Aryan's own test, on the sheet he tested (5 Sep) ────────────────────────────
+        # Indurent Park has three unit yards in one tint. The pipeline hands each its own
+        # polygon in yard_regions, but the zone carries no geometry, so the canvas fell back
+        # to the single top-level polygon: ONE 2,520 m2 strip under a 6,510 m2 headline.
+        # That is what "the patterns are not getting recognised for the area that needs to be
+        # calculated" looks like from the assessor's chair. Drive it in the browser.
+        jid2 = upload(INDURENT, "Indurent Park QA", "QA-IND", "Indurent")
+        job2 = wait_done(jid2)
+        print("indurent ->", job2.get("measurement_state"), job2.get("area_m2"))
+        page2 = await ctx.new_page()
+        errors2 = []
+        page2.on("pageerror", lambda e: errors2.append(str(e)))
+        page2.on("dialog", lambda d: asyncio.ensure_future(d.accept()))
+        await page2.goto(f"{BASE}/portal?job={jid2}", wait_until="networkidle", timeout=60000)
+        await page2.wait_for_timeout(6000)
+        await page2.screenshot(path=f"{OUT}/04_indurent_canvas.png")
+
+        ind = await page2.evaluate("""(() => ({
+          regions: aiRegions.map(r => ({cat:r.category, pts:r.points.length, area:r.area_m2})),
+          headline: document.getElementById('areaDisplay').textContent.trim(),
+          yard: (currentJob.result.yard_regions || []).map(r => [r.region_id, r.area_m2, r.included])
+        }))()""")
+        included = [r for r in ind["yard"] if r[2]]
+        ck("every included yard region is outlined on the canvas, not just the primary one",
+           len(ind["regions"]) == len(included) and len(included) == 3,
+           f"{len(ind['regions'])} outlines vs {len(included)} included regions")
+        ck("the outlines carry the same areas the headline is made of",
+           abs(sum(r["area"] or 0 for r in ind["regions"]) - sum(r[1] for r in included)) < 1.0,
+           f"{sum(r['area'] or 0 for r in ind['regions']):,.1f} vs headline {ind['headline']}")
+        ck("the region the colour gate excluded is NOT drawn as measured",
+           len(ind["yard"]) == 4 and len(ind["regions"]) == 3, json.dumps(ind["yard"]))
+
+        # Pixel proof: the tint over the SECOND yard is put there by that region and nothing
+        # else. Sample it, redraw with only the primary, sample again — the pixel must change.
+        probe = await page2.evaluate("""(() => {
+          if (aiRegions.length < 2) return {ok:false, why:'fewer than two regions'};
+          const r = aiRegions[1];
+          const path = new Path2D();
+          r.points.forEach((p,i) => i ? path.lineTo(p[0],p[1]) : path.moveTo(p[0],p[1]));
+          path.closePath();
+          const xs = r.points.map(p=>p[0]), ys = r.points.map(p=>p[1]);
+          let hit = null;
+          for (let gx = 0; gx < 40 && !hit; gx++) for (let gy = 0; gy < 40 && !hit; gy++) {
+            const x = Math.min(...xs) + (Math.max(...xs)-Math.min(...xs)) * (gx+0.5)/40;
+            const y = Math.min(...ys) + (Math.max(...ys)-Math.min(...ys)) * (gy+0.5)/40;
+            if (ctx.isPointInPath(path, x, y)) hit = [Math.round(x), Math.round(y)];
+          }
+          if (!hit) return {ok:false, why:'no interior point found'};
+          const px = () => Array.from(ctx.getImageData(hit[0], hit[1], 1, 1).data);
+          const withAll = px();
+          const keep = aiRegions;
+          aiRegions = [keep[0]]; draw();
+          const primaryOnly = px();
+          aiRegions = keep; draw();
+          return {ok:true, hit, withAll, primaryOnly};
+        })()""")
+        ck("the second yard is actually painted on the canvas (pixel proof)",
+           probe.get("ok") and probe["withAll"] != probe["primaryOnly"], json.dumps(probe))
+        ck("no uncaught page errors on the Indurent sheet", not errors2, "; ".join(errors2[:3]))
+
+        # ── the three sheets we refuse: is the REASON on the screen? ────────────────────
+        # All three of Inderjit's other sheets end UNMEASURED, which is the right answer for
+        # them. But the reason lived only in the flag list at y~1200-1330 on a 950 px screen —
+        # below the fold. What he saw was an empty canvas, "No polygon traced yet", and no
+        # explanation: "I haven't got any response at all". The contract says a refusal is
+        # visible; visible means in the viewport.
+        for tag, path in REFUSED_SHEETS:
+            jid3 = upload(path, f"Inderjit {tag} QA", "QA-091", "Indurent")
+            job3 = wait_done(jid3)
+            pg = await ctx.new_page()
+            errs3 = []
+            pg.on("pageerror", lambda e: errs3.append(str(e)))
+            await pg.goto(f"{BASE}/portal?job={jid3}", wait_until="networkidle", timeout=90000)
+            await pg.wait_for_timeout(5000)
+            await pg.screenshot(path=f"{OUT}/05_refused_{tag}.png")
+            seen = await pg.evaluate("""(() => {
+              const el = document.getElementById('refusalBanner');
+              if (!el || el.hidden) return {shown:false};
+              const r = el.getBoundingClientRect();
+              return {shown:true, text: el.innerText.trim(),
+                      inViewport: r.top >= 0 && r.top < window.innerHeight,
+                      state: (currentJob.measurement_state || (currentJob.result||{}).measurement_state)};
+            })()""")
+            ck(f"{tag}: the reason we did not measure is ON SCREEN, not below the fold",
+               seen.get("shown") and seen.get("inViewport"), json.dumps(seen)[:400])
+            ck(f"{tag}: it says what to do next, in the assessor's words",
+               "Calibrate" in (seen.get("text") or "") and "Trace" in (seen.get("text") or ""),
+               (seen.get("text") or "")[:200])
+            ck(f"{tag}: still UNMEASURED — the banner explains the refusal, it does not undo it",
+               seen.get("state") == "UNMEASURED", str(seen.get("state")))
+            ck(f"{tag}: no uncaught page errors", not errs3, "; ".join(errs3[:2]))
+            await pg.close()
+
+        # A measured job must NOT carry the banner: it would tell the assessor there is no
+        # measurement while the headline shows one.
+        await page2.reload(wait_until="networkidle", timeout=60000)
+        await page2.wait_for_timeout(4000)
+        hidden = await page2.evaluate("(() => { const el = document.getElementById('refusalBanner'); return !el || el.hidden; })()")
+        ck("a measured sheet shows no refusal banner", hidden, str(hidden))
         await browser.close()
 
     print(f"\n==== {sum(1 for _,ok,_ in RESULTS if ok)}/{len(RESULTS)} PASS ====")

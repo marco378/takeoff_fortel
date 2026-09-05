@@ -62,6 +62,11 @@ header span{opacity:.7;font-size:12px}
 .badge.mstate.MEASURED_VERIFIED{background:#27ae60;color:#fff}
 .badge.mstate.MEASURED_UNVERIFIED{background:#e67e22;color:#fff}
 .badge.mstate.UNMEASURED{background:#8e44ad;color:#fff}
+#refusalBanner{margin:0 12px 8px;padding:9px 12px;border-radius:6px;font-size:13px;line-height:1.5;
+  background:#f4ecff;border:1px solid #8e44ad;color:#3d1e57}
+#refusalBanner.rejected{background:#fdecea;border-color:#c0392b;color:#63160d}
+#refusalBanner .rb-head{font-weight:700;display:block;margin-bottom:2px}
+#refusalBanner .rb-next{display:block;margin-top:4px;color:#4a4a4a}
 .badge.mstate.REJECTED{background:#c0392b;color:#fff}
 .assumption-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:10px;
   background:#8a3f00;color:#fff;font-size:9px;font-weight:900;letter-spacing:.45px;
@@ -388,6 +393,16 @@ canvas{display:block;border:1px solid var(--border);background:transparent;box-s
       <button id="btnDelete"  class="delete" title="Soft delete — archives the job, recoverable, does not erase data">🗑️ Delete</button>
       <span id="readout">area: —</span>
     </div>
+
+    <!--
+      Why there is no number. UNMEASURED/REJECTED explained themselves only in the flag list,
+      which sits ~250 px BELOW THE FOLD on a 950 px screen: on all three of Inderjit's refused
+      sheets the assessor saw an empty canvas and "No polygon traced yet" with no reason in
+      sight, and reasonably concluded the AI had not responded. The four-state contract says
+      UNMEASURED gets an assessor trace and REJECTED gets a VISIBLE reason — visible means on
+      the screen he is looking at, not in the JSON.
+    -->
+    <div id="refusalBanner" hidden></div>
 
     <!--
       emptyState lives OUTSIDE canvasWrap on purpose. loadImage()/loadImagePlaceholder()/
@@ -1003,6 +1018,10 @@ async function selectJob(jobId) {
   cutoutDrag = null; userChannelDrag = null;
   cal = []; aiPoly = null; aiRegions = []; undoStack = []; dragIdx = -1; channelDrag = null;
   mpp = null; snapScale = 0.5;
+  // The refusal banner belongs to the job being left; a 'processing' or 404 branch returns
+  // before renderRefusalBanner runs, and a stale "no AI measurement" over the next job's
+  // drawing would be a lie about that drawing.
+  { const _rb = document.getElementById('refusalBanner'); if (_rb) _rb.hidden = true; }
 
   try {
     const r = await fetch(`${BASE}/job/${jobId}`);
@@ -1099,7 +1118,9 @@ async function renderJobUI(job, gen) {
   // #1211 previously hid the canvas entirely even when the PDF was on disk and renderable.)
   if (job.status === 'error') {
     renderErrorDetail(job);
-    renderFlags(res.flags || (job.flags ? job.flags : []));
+    const _errFlags = res.flags || (job.flags ? job.flags : []);
+    renderFlags(_errFlags);
+    renderRefusalBanner(job, res, _errFlags);
     renderDecision(job);
     snapScale = 0.5;
     await loadSnapshot(job, /*errorState=*/true);
@@ -1149,6 +1170,7 @@ async function renderJobUI(job, gen) {
   updateAreaDisplay();
   renderJobDetails(job);
   renderFlags(res.flags || []);
+  renderRefusalBanner(job, res, res.flags || []);
   renderDecision(job);
   loadLineItems(job);   // fetch + render line items (no-op if not yet approved)
   _lastRenderedStatus = job.status;  // BUG 5: record status after full render
@@ -1283,7 +1305,7 @@ const AI_REGION_COLOURS = {
   external_yard: [224, 0, 122], dock: [0, 122, 204], ground_floor: [39, 128, 87],
   upper_floor: [125, 60, 152], unclassified: [214, 122, 0]
 };
-function buildAiRegions(res) {
+function buildAiRegions(res, job) {
   const out = [];
   const zones = (res && Array.isArray(res.zones)) ? res.zones : [];
   zones.forEach(zone => {
@@ -1307,11 +1329,31 @@ function buildAiRegions(res) {
       });
     });
   });
+  if (out.length) return out;
+  // Same-tint path: the pipeline gives every retained region its own polygon in yard_regions,
+  // but the zone itself carries no geometry, so the block above finds nothing and the canvas
+  // used to fall back to the single top-level polygon — the PRIMARY region alone. On Indurent
+  // Park that drew one 2,520 m2 strip under a 6,510 m2 headline: a number without its shape,
+  // which is exactly what Aryan reported as the area not being recognised. Regions the
+  // assessor (or the colour gate) has excluded are not drawn, because they are not measured.
+  const zoneCategory = zones.length ? String(zones[0].category || '').trim().toLowerCase() : '';
+  effectiveYardRegions(job).forEach(region => {
+    if (!region || typeof region !== 'object' || region.included === false) return;
+    const poly = region.polygon_pts;
+    if (!Array.isArray(poly) || poly.length < 3) return;
+    out.push({
+      category: zoneCategory || 'external_yard',
+      label: region.region_id || 'measured region',
+      area_m2: typeof region.area_m2 === 'number' ? region.area_m2 : null,
+      points: poly.map(pt => [pt[0] * snapScale, pt[1] * snapScale]),
+      holes: []
+    });
+  });
   return out;
 }
 
 function initialiseTraceState(job, res) {
-  aiRegions = buildAiRegions(res);
+  aiRegions = buildAiRegions(res, job);
   candidatePolygons = effectiveCandidatePolygons(job).map(candidate => ({
     ...candidate,
     regions: (
@@ -2301,6 +2343,46 @@ async function submitSpecOverride(e) {
     msg.textContent = `❌ ${err.message}`;
     msg.style.display = 'block';
   }
+}
+
+// Plain-English reason for a sheet we did not measure, mapped from the flags the pipeline
+// already emits. Nothing here invents a reason the flags do not carry: an unmatched refusal
+// points at the flag list rather than making something up. Most specific marker first — a
+// sheet whose legend chip was read and rejected says so, rather than falling back to the
+// generic line/hatch sentence that is also true of it.
+const REFUSAL_REASONS = [
+  [/chip is not a stroke pattern/i,
+   "we found this surface in the legend, but its swatch is not a stroke pattern the reader can match to the drawing"],
+  [/no graphical legend|leader line/i,
+   "the surfaces on this sheet are named by notes with leader lines, not by a legend swatch"],
+  [/NON-COLOUR-CODED|line\/hatch\) drawing/i,
+   "the surfaces here are drawn as line work rather than colour fills — the AI measures colour fills and stroke-pattern legends, and will not guess at the rest"],
+  [/scale.*(?:refus|disagree|consensus)/i,
+   "the scale could not be verified on this sheet, and we do not measure from a scale we cannot check"],
+  [/scan|raster/i, "this page is a scan, so there is no geometry to measure"]
+];
+function refusalReason(flags) {
+  for (const [rx, text] of REFUSAL_REASONS) {
+    if (flags.some(f => rx.test(String(f)))) return text;
+  }
+  return null;
+}
+function renderRefusalBanner(job, res, flags) {
+  const el = document.getElementById('refusalBanner');
+  if (!el) return;
+  const mstate = (job && job.measurement_state) || (res && res.measurement_state);
+  if (mstate !== 'UNMEASURED' && mstate !== 'REJECTED') { el.hidden = true; return; }
+  const rejected = mstate === 'REJECTED';
+  const reason = refusalReason(Array.isArray(flags) ? flags : []);
+  el.className = rejected ? 'rejected' : '';
+  el.innerHTML =
+    `<span class="rb-head">${rejected ? 'This drawing was rejected — no measurement.'
+                                      : 'No AI measurement on this sheet.'}</span>` +
+    esc(reason || 'See the flags below for the reason recorded by the pipeline.') +
+    (rejected ? '' : `<span class="rb-next">What to do: set the scale with <strong>Calibrate</strong>` +
+                     ` (draw a line over a scale bar or a 2.5 m parking bay), then draw the surface` +
+                     ` with <strong>Trace</strong>. Your trace is measured exactly like an AI one.</span>`);
+  el.hidden = false;
 }
 
 function renderFlags(flags) {
