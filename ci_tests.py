@@ -4997,6 +4997,64 @@ try:
        _AS._approve_block_reason({"measurement_state": "UNMEASURED", "scale_confirmed": True}) is None)
     ck("REJECTED job blocks approve", _AS._approve_block_reason({"measurement_state": "REJECTED"}) is not None)
 
+    # A restart must RESUME what it only delayed. On 4 Sep 2026 an assessor uploaded 92 files;
+    # with two workers at ~90s a drawing that batch drains for over an hour, and a deploy landed
+    # ten minutes before his review call. Every still-queued job was swept to UNMEASURED with
+    # "PIPELINE INTERRUPTED" — his exact words were "all that runs remain unmeasured... I haven't
+    # got any response at all". A queued job has lost nothing: the PDF is on the volume.
+    _resume_pdf = Path(_tmpdir) / "resume_me.pdf"
+    _resume_doc = _fitz_fast_refusal.open(); _resume_doc.new_page(width=300, height=300)
+    _resume_doc.save(str(_resume_pdf)); _resume_doc.close()
+    _submitted = []
+    _real_submit = _AS._TAKEOFF_DISPATCHER.submit
+    _AS._TAKEOFF_DISPATCHER.submit = lambda *args: _submitted.append(args)
+    try:
+        _AS.save_jobs({
+            "queued-job": {"id": "queued-job", "status": "processing", "takeoff_phase": "queued",
+                           "pdf_path": str(_resume_pdf), "project_name": "P", "project_ref": "R",
+                           "flags": [], "result": {}},
+            "measuring-job": {"id": "measuring-job", "status": "processing",
+                              "takeoff_phase": "measuring", "pdf_path": str(_resume_pdf),
+                              "flags": [], "result": {}},
+            "queued-but-file-gone": {"id": "queued-but-file-gone", "status": "processing",
+                                     "takeoff_phase": "queued", "pdf_path": "/nonexistent.pdf",
+                                     "flags": [], "result": {}},
+        })
+        _AS._sweep_stranded_processing_jobs()
+        _swept = _AS.load_jobs()
+    finally:
+        _AS._TAKEOFF_DISPATCHER.submit = _real_submit
+    ck("a job still QUEUED at a restart is put back on the queue, not marked unmeasurable",
+       [args[0] for args in _submitted] == ["queued-job"]
+       and _swept["queued-job"]["status"] == "processing"
+       and _swept["queued-job"]["measurement_state"] != "UNMEASURED"
+       if "measurement_state" in _swept["queued-job"] else True,
+       {"submitted": [args[0] for args in _submitted],
+        "state": _swept["queued-job"].get("measurement_state")})
+    ck("...and it says so, rather than looking like nothing happened",
+       any("QUEUED WORK RESUMED" in flag for flag in _swept["queued-job"]["flags"]),
+       _swept["queued-job"]["flags"])
+    ck("a job that was MID-MEASUREMENT still routes to the assessor — that work is really gone",
+       _swept["measuring-job"]["measurement_state"] == "UNMEASURED"
+       and any("PIPELINE INTERRUPTED" in flag for flag in _swept["measuring-job"]["flags"]),
+       _swept["measuring-job"].get("flags"))
+    ck("a queued job whose file has vanished is NOT silently re-queued forever",
+       _swept["queued-but-file-gone"]["measurement_state"] == "UNMEASURED"
+       and "queued-but-file-gone" not in [args[0] for args in _submitted],
+       _swept["queued-but-file-gone"].get("measurement_state"))
+    _AS.save_jobs({})
+
+    # /status must say what a deploy decision needs: not just how many jobs exist, but how many
+    # are IN FLIGHT and would be interrupted by the restart a push causes.
+    _AS.save_jobs({"a": {"status": "processing", "takeoff_phase": "queued"},
+                   "b": {"status": "processing", "takeoff_phase": "measuring"},
+                   "c": {"status": "done"}})
+    _inflight = _client_up.get("/status").get_json()
+    ck("/status reports what a deploy would interrupt: in-flight and queued counts",
+       _inflight["job_count"] == 3 and _inflight["processing_count"] == 2
+       and _inflight["queued_count"] == 1, _inflight)
+    _AS.save_jobs({})
+
     # The >£200k approve lock is CONFIG, not code. It was written for an automatic pipeline;
     # every upload is done by hand today, so it blocked the assessor who was already the human
     # review it demanded (Aryan, 4 Sep). Default: no block, and the portal shows a notice

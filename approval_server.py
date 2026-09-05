@@ -3343,8 +3343,16 @@ def _upload_too_large(_error):
 def status():
     """Health-check for deploy tests, plus the portal's own runtime config."""
     jobs = load_jobs()
+    # A deploy restarts the process and empties the in-memory queue. job_count alone cannot
+    # tell you whether that is safe: what matters is whether anything is IN FLIGHT. Read these
+    # in the same breath as the push (4 Sep 2026: a deploy landed ten minutes before a client
+    # review, on a 92-file batch that was still draining).
+    processing = [job for job in jobs.values()
+                  if isinstance(job, dict) and job.get("status") == "processing"]
+    queued = [job for job in processing if (job.get("takeoff_phase") or "") == "queued"]
     return jsonify({"status": "ok", "job_count": len(jobs), "build": BUILD_INFO,
-                    "escalation_lock_gbp": ESCALATION_LOCK_GBP})
+                    "escalation_lock_gbp": ESCALATION_LOCK_GBP,
+                    "processing_count": len(processing), "queued_count": len(queued)})
 
 
 # ── Admin file download ──────────────────────────────────────────────────────
@@ -4149,15 +4157,44 @@ def upload():
 # ── Startup sweep ─────────────────────────────────────────────────────────────
 
 def _sweep_stranded_processing_jobs():
-    """Route queued/measuring jobs orphaned by a prior process to assessor review.
+    """Resume what a restart only DELAYED; route to the assessor only what it destroyed.
 
-    Both fixed workers and their in-memory queue are daemon/process-local, so neither can
-    survive a restart. No processing record can legitimately still be active at boot.
+    Both fixed workers and their in-memory queue are daemon/process-local, so nothing survives
+    a restart — but a job that was still QUEUED lost nothing: its PDF is on the volume and its
+    record is intact, so the honest recovery is to put it back on the queue, not to declare it
+    unmeasurable. A job that was mid-measurement is different: its partial work is gone and the
+    assessor has to see that.
+
+    This distinction is not academic. On 4 Sep 2026 an assessor uploaded a 92-file batch; with
+    two workers at ~90 s a drawing that batch takes over an hour to drain, and a deploy landed
+    ten minutes before his review call. Every job still in the queue was swept to UNMEASURED
+    with "PIPELINE INTERRUPTED", which is exactly what he reported: "all that runs remain
+    unmeasured... I haven't got any response at all."
     """
     with _jobs_lock:
         jobs = load_jobs()
         changed = False
+        requeue = []
         for job_id, job in jobs.items():
+            if job.get("status") != "processing":
+                continue
+            if (job.get("takeoff_phase") or "measuring") == "queued":
+                pdf_path = job.get("pdf_path") or (job.get("result") or {}).get("pdf_path")
+                if pdf_path and Path(str(pdf_path)).exists():
+                    flags = list(job.get("flags") or [])
+                    note = ("QUEUED WORK RESUMED: the server restarted before this drawing "
+                            "reached a worker, so it was put back on the queue rather than "
+                            "discarded; no measurement was lost")
+                    if note not in flags:
+                        flags.append(note)
+                    job.update({"flags": flags, "takeoff_phase": "queued",
+                                "takeoff_requeued_at": now_iso()})
+                    requeue.append((job_id, str(pdf_path), job.get("project_name") or "",
+                                    job.get("project_ref") or ""))
+                    changed = True
+                    print(f"[startup-sweep] job {job_id} was still QUEUED at the restart — "
+                          "re-queued, not discarded.")
+                    continue
             if job.get("status") == "processing":
                 flags = list(job.get("flags") or [])
                 old_phase = job.get("takeoff_phase") or "measuring"
@@ -4178,10 +4215,12 @@ def _sweep_stranded_processing_jobs():
                 res.setdefault("measurement_state", "UNMEASURED")
                 job["result"] = res
                 changed = True
-                print(f"[startup-sweep] job {job_id} was stranded on 'processing' at a prior "
+                print(f"[startup-sweep] job {job_id} was stranded mid-measurement at a prior "
                       "restart — marked UNMEASURED, routed to assessor.")
         if changed:
             save_jobs(jobs)
+    for job_id, pdf_path, project_name, project_ref in requeue:
+        _TAKEOFF_DISPATCHER.submit(job_id, pdf_path, project_name, project_ref)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
