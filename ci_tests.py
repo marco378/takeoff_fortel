@@ -3143,6 +3143,75 @@ try:
     ck("hatch router: too little matching tint REFUSES to classify",
        _k_sp is None, _i_sp.get("reason"))
 
+    # ── May several same-tint regions be summed? ────────────────────────────────────────
+    # The old test was "do their bounding boxes overlap", which lies on diagonal strips: three
+    # unit yards on the St Modwen Newport sheet sit 2.2-3.8 m apart with overlapping boxes and
+    # disjoint ink, so two of the three were dropped from the total (2,520 of ~6,486 m²). The
+    # same bug was silently doing it on the Tanro site plan the code comment itself cites.
+    import glob as _glob_hx
+    _amb = _tu_hx.same_tint_regions_ambiguous
+    _px_per_m2 = 4.0  # 2 px per metre: keeps the fixtures small and the maths obvious
+
+    def _rect(h, w, y0, x0, y1, x1):
+        mask = _np_hx.zeros((h, w), bool)
+        mask[y0:y1, x0:x1] = True
+        return mask
+    # Three diagonal strips: boxes overlap, ink does not — separate unit yards.
+    _diagonal = [_rect(400, 400, 0, 0, 120, 160), _rect(400, 400, 140, 150, 260, 310),
+                 _rect(400, 400, 280, 40, 399, 200)]
+    ck("three separate extents with overlapping boxes are summed, not held out",
+       _amb(_diagonal, px_per_m2=_px_per_m2) is False)
+    # One region wrapping another: the same tint used for interleaved surfaces.
+    _wrapper = _np_hx.zeros((400, 400), bool); _wrapper[0:400, 0:400] = True
+    _inner = _rect(400, 400, 120, 120, 280, 280)
+    _wrapper &= ~_inner
+    ck("a region that wraps another IS ambiguous — one tint, interleaved surfaces",
+       _amb([_wrapper, _inner], px_per_m2=_px_per_m2) is True)
+    # A small satellite inside a big region's box must not make the set ambiguous by itself.
+    _big = _rect(400, 400, 0, 0, 200, 400)
+    _satellite = _rect(400, 400, 20, 20, 40, 40)   # 400 px = 100 m², under PLAUSIBLE_MIN_M2
+    ck("a sub-plausible satellite inside another region's box does not block summing",
+       _amb([_big, _satellite], px_per_m2=_px_per_m2) is False)
+    ck("...and with no scale to judge plausibility, it stays with the blunt, safer bbox test",
+       _amb([_big, _satellite], px_per_m2=None) is True)
+    ck("an empty region is treated as ambiguous rather than assumed safe",
+       _amb([_big, _np_hx.zeros((400, 400), bool)], px_per_m2=_px_per_m2) is True)
+
+    # Geometry says "separate extents"; colour says whether they are the same SURFACE. The
+    # segmentation band is wider than the agreement gate, so a kerb line or footpath a few RGB
+    # levels off the swatch can sit inside it — on the SGP masterplan three such regions
+    # (199,199,199 against a 208 swatch) were being added to a dock-apron total.
+    _sgp_master = _glob_hx.glob("drawings/**/*131003-Phase-1-Masterplan*", recursive=True)
+    if not _sgp_master:
+        print("  [SKIP] SGP masterplan colour gate — client fixture not present")
+    else:
+        _sgp_res = _tu_hx.takeoff(_sgp_master[0], source="architect")
+        _sgp_regions = sorted((r.get("area_m2") or 0) for r in (_sgp_res.get("yard_regions") or []))[::-1]
+        ck("a same-band region that is NOT the legend's paint is left out of the total",
+           abs((_sgp_res.get("area_m2") or 0) - sum(_sgp_regions[:3])) <= 1.0
+           and len(_sgp_regions) > 3,
+           f"total {_sgp_res.get('area_m2')} vs same-paint regions {[round(a, 1) for a in _sgp_regions[:3]]}")
+        ck("...and the assessor is told which region was left out and why",
+           any("not the legend's" in f or "not the measured surface's" in f
+               for f in _sgp_res.get("flags") or []),
+           [f[:120] for f in (_sgp_res.get("flags") or []) if "same-band region" in f][:1])
+
+    _newport = ("drawings/inderjit_p9p10/11_Indurent_Park_Newport_"
+                "22513-RLL-25-00-DR-C-3151_P02_Proposed_Pavement_Construction.pdf")
+    if not _os_hx.path.exists(_newport):
+        print(f"  [SKIP] Newport multi-unit gold — client fixture not present ({_newport})")
+    else:
+        _np_res = _tu_hx.takeoff(_newport, source="engineer")
+        # Three unit yards measured individually: 2,505.3 + 2,070.8 + 1,909.7 = 6,485.8 m².
+        ck("the three-unit Newport sheet totals all three yards, not just the biggest",
+           abs((_np_res.get("area_m2") or 0) - 6485.8) / 6485.8 <= 0.05,
+           f"{_np_res.get('area_m2')} vs 6,485.8")
+        ck("...and it stays assessor-gated, with every region listed for keep/exclude",
+           _np_res.get("measurement_state") == "MEASURED_UNVERIFIED"
+           and len(_np_res.get("yard_regions") or []) >= 3
+           and any("keep or exclude every region" in f for f in _np_res.get("flags") or []),
+           _np_res.get("measurement_state"))
+
     # ── The bridging limit is DISCLOSED, not detected ───────────────────────────────────
     # A kernel wide enough to bridge this sheet's stroke gaps also bridges a real corridor of
     # clean paper between two separately drafted surfaces of the same tint, and nothing on this

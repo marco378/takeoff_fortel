@@ -337,6 +337,20 @@ SATELLITE_FRAC = 0.015
 # Plausible single service-yard area range (m²) — shared by segment_hatch's best-component
 # selection AND the swatch-lock fallback gate below (same magic numbers, one place).
 PLAUSIBLE_MIN_M2 = 200
+# Two same-tint regions are AMBIGUOUS when the tint is doing double duty in one viewport
+# (yard/building/road all in one grey), and merely SEPARATE when they are distinct extents
+# (one service yard per unit on a multi-unit sheet). Bounding-box intersection was standing in
+# for that distinction and it lies on diagonal strips: on the St Modwen Newport sheet three unit
+# yards 2.2-3.8 m apart have overlapping boxes and disjoint ink, so only one of the three was
+# counted. What actually separates the two populations, measured across every multi-region sheet
+# in the corpus, is how much of a region falls INSIDE the shared box:
+#     separate extents   2.36%  (Newport)   0.49%  (Tanro site plan)
+#     one tint, many classes   32%, 93%, 100%, 100%  (AEW external works, Tanro setting-out)
+# A >13x margin, so the exact threshold is not delicate. Minimum mask-to-mask distance was tried
+# first and fails: legitimate neighbouring units sit 0.08 m apart, closer than the ambiguous
+# pairs. Only pairs where BOTH regions clear PLAUSIBLE_MIN_M2 are judged — a small satellite is
+# wholly inside a bigger region's box by construction and is handled as a satellite elsewhere.
+REGION_CONTAINMENT_AMBIGUOUS = 0.20
 PLAUSIBLE_MAX_M2 = 50_000
 
 
@@ -1204,6 +1218,53 @@ def _hatch_closing_kernel(mask, close, k, S):
                       "a stroke gap, so if the drawing carries two differently specified slabs "
                       "of the same tint that close together, the assessor must split them")
     return kernel, info
+
+
+def same_tint_regions_ambiguous(masks, px_per_m2=None):
+    """May several same-tint regions be summed into one candidate total?
+
+    NO (ambiguous) when the tint is doing double duty inside one viewport — yard, building and
+    road all drawn in the same grey. YES (separate extents) when they are distinct surfaces,
+    such as one service yard per unit on a multi-unit sheet.
+
+    The test is how much of a region lies inside the box it shares with another: interleaved
+    classes sit largely inside each other's boxes, separate extents barely do. See
+    REGION_CONTAINMENT_AMBIGUOUS for the measured populations. Only pairs where BOTH regions
+    clear PLAUSIBLE_MIN_M2 are judged, and anything that cannot be measured counts as ambiguous.
+    """
+    boxes, areas = [], []
+    for mask in masks:
+        ys, xs = np.where(mask)
+        if not len(xs):
+            return True
+        boxes.append((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+        areas.append(float(mask.sum()) / px_per_m2 if px_per_m2 else None)
+
+    def containment(i, j):
+        a, b = boxes[i], boxes[j]
+        x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+        x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        shares = []
+        for index in (i, j):
+            total = float(masks[index].sum())
+            if total <= 0:
+                return 1.0
+            shares.append(float(masks[index][y0:y1, x0:x1].sum()) / total)
+        return max(shares)
+
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if areas[i] is None or areas[j] is None:
+                # No scale to judge plausibility with: keep the older, blunter bbox-only test.
+                a, b = boxes[i], boxes[j]
+                if min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1]):
+                    return True
+            elif (areas[i] >= PLAUSIBLE_MIN_M2 and areas[j] >= PLAUSIBLE_MIN_M2
+                    and containment(i, j) > REGION_CONTAINMENT_AMBIGUOUS):
+                return True
+    return False
 
 
 def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
@@ -2372,17 +2433,47 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         # keep the primary region as the backward-compatible candidate total and surface all
         # co-components unchecked.  Distinct non-overlapping extents (Tanro's separate unit
         # Yards) can safely form the candidate total, still with mandatory human review.
-        component_bboxes = []
-        for _, region_mask in adjusted_component_masks:
-            ys, xs = np.where(region_mask)
-            component_bboxes.append((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
-        bbox_overlap_ambiguous = any(
-            min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
-            for pos, a in enumerate(component_bboxes)
-            for b in component_bboxes[pos + 1:]
-        )
+        bbox_overlap_ambiguous = same_tint_regions_ambiguous(
+            [mask for _, mask in adjusted_component_masks],
+            px_per_m2=((S * S) / (k * k) if k else None))
         included_positions = ({0} if bbox_overlap_ambiguous
                               else set(range(len(adjusted_component_masks))))
+        # Geometry says these are separate extents; colour says whether they are the same
+        # SURFACE. The segmentation band is deliberately wider than the agreement gate, so a
+        # kerb line or a footpath nine RGB levels off the swatch can sit inside it — and on the
+        # SGP masterplan three such regions (199,199,199 against a 208 swatch) were being added
+        # to a dock-apron total. A region that is not the legend's own paint is left for the
+        # assessor as a co-component instead of being summed. Hatch-drawn surfaces are exempt:
+        # there the body IS paper, which is why the cross-check above asks the strokes instead.
+        _hatched_surface = bool((_seg_diag.get("hatch") or {}).get("kernel_px"))
+        # Reference paint: the legend swatch when one was locked, otherwise the PRIMARY region's
+        # own colour. A sheet that fell back to the grey band has no trusted swatch, but "every
+        # region summed into one quantity is the same paint as the biggest one" still holds, and
+        # without it the fallback path would keep summing regions of visibly different greys.
+        _reference_rgb = swatch if swatch_locked else _dominant_rgb(
+            im, adjusted_component_masks[0][1])
+        if (not bbox_overlap_ambiguous and not _hatched_surface
+                and _reference_rgb and len(adjusted_component_masks) > 1):
+            off_colour = []
+            for position, (_, adjusted) in enumerate(adjusted_component_masks):
+                if position == 0 or not adjusted.any():
+                    continue
+                region_rgb = _dominant_rgb(im, adjusted)
+                if not _swatch_body_agrees(_reference_rgb, region_rgb):
+                    off_colour.append((position, region_rgb))
+                    included_positions.discard(position)
+            if off_colour:
+                flags.append(
+                    "assessor: "
+                    + "; ".join(
+                        f"a same-band region of "
+                        f"{float(adjusted_component_masks[position][1].sum()) / ((S * S) / (k * k)):,.1f} m² "
+                        f"is {region_rgb}, not the measured surface's {_reference_rgb}"
+                        for position, region_rgb in off_colour[:4])
+                    + f" — outside the ±{SWATCH_BODY_AGREE_TOL} agreement gate, so it is NOT in "
+                      "the candidate total; include it only if it is the same surface"
+                )
+                region_confidence = "low"
         for position, (_, adjusted) in enumerate(adjusted_component_masks):
             if position in included_positions:
                 yard_comp |= adjusted
@@ -2416,9 +2507,10 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         )
         flags.append(
             "assessor: multiple retained regions match the legend tint; "
-            + ("overlapping bboxes make the set ambiguous, so only the primary feeds the "
-               "candidate total; " if bbox_overlap_ambiguous else
-               "their disjoint extents feed the candidate total; ")
+            + ("the same tint is used for interleaved surfaces here, so only the primary "
+               "feeds the candidate total; " if bbox_overlap_ambiguous else
+               "they are separate extents (each sits outside the others' shared area), so all "
+               "of them feed the candidate total; ")
             + f"keep or exclude every region before approval — {component_text}"
         )
         region_confidence = "low"
