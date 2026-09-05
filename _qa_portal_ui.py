@@ -280,6 +280,7 @@ async def main():
             ck(f"{tag}: still UNMEASURED — the banner explains the refusal, it does not undo it",
                seen.get("state") == "UNMEASURED", str(seen.get("state")))
             ck(f"{tag}: no uncaught page errors", not errs3, "; ".join(errs3[:2]))
+            refused_jid = jid3
             await pg.close()
 
         # A measured job must NOT carry the banner: it would tell the assessor there is no
@@ -288,6 +289,129 @@ async def main():
         await page2.wait_for_timeout(4000)
         hidden = await page2.evaluate("(() => { const el = document.getElementById('refusalBanner'); return !el || el.hidden; })()")
         ck("a measured sheet shows no refusal banner", hidden, str(hidden))
+
+        # ── "Load AI polygon" must load the MEASUREMENT, not the primary region ─────────
+        # Found by an adversarial pass, 5 Sep: on Indurent this button loaded the single
+        # top-level polygon and Submit Adjustment then stored 3,270 m2 as the assessor-verified
+        # number — under a 6,510 m2 measurement, with all three yards still outlined. An
+        # approvable wrong number, and the same root cause as the canvas bug.
+        loaded = await page2.evaluate("""(() => {
+          const seen = [];
+          const realToast = window.toast;
+          window.toast = (m, kind) => seen.push(String(m));
+          document.getElementById('btnLoad').click();
+          window.toast = realToast;
+          const entries = traceRegionEntries();
+          return {regions: entries.length, area: calcArea(), toasts: seen,
+                  aiRegions: aiRegions.length, loose: aiLoadLoose.map(l => [l.label, Math.round(l.drawn), Math.round(l.stated)]),
+                  cutouts: cutoutPolygons.filter(c => c.fromAiRegion).length};
+        })()""")
+        ck("Load AI polygon loads every measured surface, not just the primary one",
+           loaded["regions"] == 3 and loaded["aiRegions"] == 3, json.dumps(loaded["regions"]))
+
+        # KNOWN PIPELINE DEFECT, pinned here so it cannot be forgotten or silently spread:
+        # a tint-path region's stored outline can enclose more than the region measures.
+        # yard-region-1 is C-shaped and its contour swallows the notch — 3,270 m2 enclosed for a
+        # 2,520 m2 measurement (+29.8%); regions 2 and 3 are within 4%. The hatch path already
+        # guards this (_outline_for, 15%); the tint path does not. Fixing it is a measurement
+        # change and needs the full corpus. Until then the portal must SAY so, not hide it.
+        # This check fails the moment another region goes loose, or region 1 is fixed.
+        ck("the one loose outline is still exactly the known one, and no others",
+           [l[0] for l in loaded["loose"]] == ["yard-region-1"], json.dumps(loaded["loose"]))
+        ck("loading says WHICH outline is loose and by how much, not 'inspect every edge'",
+           any("yard-region-1" in t and "3,270" in t and "2,520" in t for t in loaded["toasts"]),
+           json.dumps(loaded["toasts"]))
+
+        # ...and submitting those outlines UNTOUCHED must be refused: it would replace a 6,510 m2
+        # measurement with the 7,401 m2 its outlines happen to enclose.
+        blocked = await page2.evaluate("""(() => {
+          const seen = [];
+          const realToast = window.toast;
+          window.toast = (m, kind) => seen.push(String(m));
+          try { submitDecision('adjust'); } catch (e) { seen.push('THREW ' + e); }
+          window.toast = realToast;
+          return seen;
+        })()""")
+        ck("submitting the AI's own outlines untouched is refused, with both numbers named",
+           any("7,401" in m and "6,510" in m for m in blocked), json.dumps(blocked[-2:]))
+        # Pressing it twice must not double the cut-outs it brought with it.
+        twice = await page2.evaluate("""(() => {
+          document.getElementById('btnLoad').click();
+          return {regions: traceRegionEntries().length,
+                  cutouts: cutoutPolygons.filter(c => c.fromAiRegion).length};
+        })()""")
+        ck("pressing it twice does not stack duplicate regions or cut-outs",
+           twice["regions"] == loaded["regions"] and twice["cutouts"] == loaded["cutouts"],
+           json.dumps(twice))
+        await page2.screenshot(path=f"{OUT}/06_indurent_load_ai.png")
+
+        # The ring on p8 must come back with its hole as a cut-out, or the loaded outline
+        # overstates the road by the whole yard it loops around.
+        ring = await page.evaluate("""(() => {
+          document.getElementById('btnLoad').click();
+          return {regions: traceRegionEntries().length,
+                  cutouts: cutoutPolygons.filter(c => c.fromAiRegion).length,
+                  holes: aiRegions.filter(r => r.holes.length).length};
+        })()""")
+        ck("a ring-shaped surface loads with its hole as a cut-out",
+           ring["holes"] >= 1 and ring["cutouts"] >= ring["holes"], json.dumps(ring))
+
+        # ── a job still being measured must not wear the last job's numbers ────────────
+        jid4 = upload(INDURENT, "Processing QA", "QA-PROC", "Indurent")
+        pg = await ctx.new_page()
+        pg.on("pageerror", lambda e: errors2.append(str(e)))
+        await pg.goto(f"{BASE}/portal?job={jid4}", wait_until="networkidle", timeout=60000)
+        await pg.wait_for_timeout(3000)
+        proc = await pg.evaluate("""(() => ({
+          status: currentJob.status,
+          area: document.getElementById('areaDisplay').textContent.trim(),
+          readout: document.getElementById('readout').textContent.trim(),
+          zoomControls: !!document.getElementById('zoomControls')
+        }))()""")
+        if proc["status"] == "processing":
+            ck("a job still being measured shows no area at all, not the last job's",
+               proc["area"] == "\u2014" and "\u2014" in proc["readout"], json.dumps(proc))
+            # Then open a measured job: the zoom controls must have survived. innerHTML='' on
+            # canvasWrap used to delete them for the rest of the session.
+            await pg.goto(f"{BASE}/portal?job={jid}", wait_until="networkidle", timeout=60000)
+            await pg.wait_for_timeout(5000)
+            zoom = await pg.evaluate("""(() => ({
+              controls: !!document.getElementById('zoomControls'),
+              zoomIn: !!document.getElementById('btnZoomIn'),
+              empty: (document.getElementById('emptyState')||{}).innerText || ''
+            }))()""")
+            ck("opening a processing job does not delete the zoom controls for the session",
+               zoom["controls"] and zoom["zoomIn"], json.dumps(zoom))
+            ck("...and the empty state gets its own words back",
+               "Takeoff running" not in zoom["empty"], zoom["empty"][:80])
+        else:
+            ck("a job still being measured shows no area at all, not the last job's",
+               False, f"could not observe a processing job (status={proc['status']})")
+        await pg.close()
+
+        # ── a REJECTED sheet must not be told to go and measure itself ─────────────────
+        pg = await ctx.new_page()
+        pg.on("pageerror", lambda e: errors2.append(str(e)))
+        await pg.goto(f"{BASE}/portal?job={refused_jid}", wait_until="networkidle", timeout=60000)
+        await pg.wait_for_timeout(4000)
+        await pg.click("#btnReject")
+        await pg.wait_for_timeout(6000)
+        rej = await pg.evaluate("""(() => {
+          const el = document.getElementById('refusalBanner');
+          return {hidden: !el || el.hidden, text: el ? el.innerText.trim() : null,
+                  decision: currentJob.decision};
+        })()""")
+        await pg.screenshot(path=f"{OUT}/07_rejected_banner.png")
+        if rej.get("decision") == "rejected":
+            ck("a rejected sheet is not told to calibrate and trace itself",
+               (rej["text"] or "") and "rejected" in rej["text"].lower()
+               and "Calibrate" not in (rej["text"] or ""), json.dumps(rej)[:300])
+        else:
+            ck("a rejected sheet is not told to calibrate and trace itself", False,
+               json.dumps(rej)[:300])
+        await pg.close()
+        ck("no uncaught page errors across the whole second half", not errors2,
+           "; ".join(errors2[:3]))
         await browser.close()
 
     print(f"\n==== {sum(1 for _,ok,_ in RESULTS if ok)}/{len(RESULTS)} PASS ====")

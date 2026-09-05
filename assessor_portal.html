@@ -675,6 +675,18 @@ function undoLast() {
   toast(`Undone: ${entry.label}`);
 }
 let aiRegions = [];       // every measured surface part: [{points:[[x,y]], holes:[[[x,y]]], category, label, area_m2}]
+// Set when "Load AI polygon" puts the AI's own outlines into the editable trace. Submitting
+// those UNTOUCHED is not the same as agreeing with the measurement: an outline can enclose more
+// than the surface it represents (Indurent yard-region-1 encloses 3,270 m2 for a 2,520 m2
+// measurement — a tint-path defect the hatch path already guards with a fidelity check). The
+// snapshot lets Submit tell "the assessor adjusted this" from "the assessor touched nothing".
+let aiLoadSnapshot = null, aiLoadTotalM2 = null, aiLoadLoose = [];
+const AI_OUTLINE_FIDELITY_TOL = 0.15;   // matches _outline_for in hatch_legend_raster.py
+const AI_LOAD_SUBMIT_TOL = 0.05;
+function traceGeometryFingerprint() {
+  return JSON.stringify(traceRegionEntries().map(entry =>
+    entry.points.map(pt => [Math.round(pt.x), Math.round(pt.y)])));
+}
                           // in CANVAS pixels. A sheet can carry several surfaces with different
                           // build-ups (project-8: a yard in three parts and a road in two, the
                           // road drawn as a LOOP around the yard) and aiPoly can hold only one
@@ -1017,6 +1029,7 @@ async function selectJob(jobId) {
   cutoutPolygons = []; userChannels = [];
   cutoutDrag = null; userChannelDrag = null;
   cal = []; aiPoly = null; aiRegions = []; undoStack = []; dragIdx = -1; channelDrag = null;
+  aiLoadSnapshot = null; aiLoadTotalM2 = null; aiLoadLoose = [];
   mpp = null; snapScale = 0.5;
   // The refusal banner belongs to the job being left; a 'processing' or 404 branch returns
   // before renderRefusalBanner runs, and a stale "no AI measurement" over the next job's
@@ -1059,6 +1072,7 @@ async function renderJobUI(job, gen) {
   // emptyState/canvasWrap are now siblings (see the HTML comment above canvasWrap) — swap
   // visibility explicitly instead of relying on canvasWrap innerHTML swaps to implicitly
   // hide emptyState (that was the bug: those swaps DELETED it instead).
+  setEmptyState(null);          // undo any "Takeoff running…" left by the processing branch
   document.getElementById('emptyState').style.display = 'none';
   document.getElementById('canvasWrap').style.display = 'flex';
 
@@ -1101,10 +1115,26 @@ async function renderJobUI(job, gen) {
     document.getElementById('toolbar').appendChild(msgDiv);
   }
 
-  // For processing jobs, show a loading state instead of fetching the snapshot
+  // For processing jobs, show a loading state instead of fetching the snapshot.
   if (job.status === 'processing') {
-    const wrap = document.getElementById('canvasWrap');
-    wrap.innerHTML = '<div class="empty"><div class="icon">⏳</div><div style="font-size:15px;font-weight:600;color:#555">Takeoff running…</div><div>The drawing will appear once processing is complete.</div></div>';
+    // Do NOT wipe canvasWrap. #zoomControls is a CHILD of it, so innerHTML='' deleted the zoom
+    // buttons for the rest of the session — loadImage() only rebuilds the canvas, not them.
+    // Exactly the bug the comment above canvasWrap warns about for emptyState. Show the
+    // waiting message in emptyState, which lives outside canvasWrap for that reason.
+    document.getElementById('canvasWrap').style.display = 'none';
+    setEmptyState('<div class="icon">⏳</div><div style="font-size:15px;font-weight:600;color:#555">'
+      + 'Takeoff running…</div><div>The drawing will appear once processing is complete.</div>');
+    document.getElementById('emptyState').style.display = '';
+    // ...and this branch returns before updateAreaDisplay()/renderJobDetails(), so the PREVIOUS
+    // job's measurement stayed on screen under this job's name — 58,411 m2 shown for a job that
+    // has not been measured at all. Clear what we cannot yet know.
+    document.getElementById('areaDisplay').textContent = '—';
+    document.getElementById('areaSource').textContent = 'Takeoff running…';
+    document.getElementById('readout').textContent = 'main area: — · takeoff running';
+    document.getElementById('jobDetails').innerHTML =
+      '<div class="kv"><span class="k">Measurement</span><span class="v">Takeoff running…</span></div>';
+    document.getElementById('flagList').innerHTML =
+      '<div class="flag">⏳ Flags appear once the takeoff finishes</div>';
     document.getElementById('errorSection').style.display = 'none';
     hideThumb();
     _lastRenderedStatus = job.status;
@@ -2367,12 +2397,24 @@ function refusalReason(flags) {
   }
   return null;
 }
+// emptyState carries the "Select a job to review" copy in the HTML; the processing branch
+// borrows it. Capture the original once so it can be given back, instead of overwriting it
+// permanently the first time a processing job is opened.
+function setEmptyState(html) {
+  const el = document.getElementById('emptyState');
+  if (el._defaultHtml === undefined) el._defaultHtml = el.innerHTML;
+  el.innerHTML = (html === null || html === undefined) ? el._defaultHtml : html;
+}
+
 function renderRefusalBanner(job, res, flags) {
   const el = document.getElementById('refusalBanner');
   if (!el) return;
   const mstate = (job && job.measurement_state) || (res && res.measurement_state);
+  // A sheet the ASSESSOR rejected keeps measurement_state UNMEASURED — only `decision` changes —
+  // so without this the banner kept telling them to calibrate and trace a drawing they had just
+  // thrown out.
+  const rejected = mstate === 'REJECTED' || job.decision === 'rejected';
   if (mstate !== 'UNMEASURED' && mstate !== 'REJECTED') { el.hidden = true; return; }
-  const rejected = mstate === 'REJECTED';
   const reason = refusalReason(Array.isArray(flags) ? flags : []);
   el.className = rejected ? 'rejected' : '';
   el.innerHTML =
@@ -4017,11 +4059,64 @@ function setupButtons() {
       toast('Proposed assisted polygon loaded — inspect every edge before submitting');
       return;
     }
-    if (!aiPoly) { toast('No AI or assisted polygon for this job', 'warn'); return; }
+    // The AI's measurement can be SEVERAL separate surfaces — three unit yards in one tint on
+    // Indurent Park, a yard plus a ring-shaped road on project 8. This button used to load the
+    // single top-level polygon, which is the PRIMARY region only: pressing it on Indurent and
+    // submitting wrote 3,270 m2 as the assessor-verified number against a 6,510 m2 measurement,
+    // with the other two yards still outlined on the canvas. An approvable wrong number, and
+    // the same root cause as the canvas bug — the top-level polygon is not the measurement.
+    // A ring's holes are loaded as cut-outs, which is how the area maths already subtracts them
+    // (calcArea -> computeCutoutRemovedArea), so the loaded outline reproduces the quantity.
+    const aiParts = aiRegions.length ? aiRegions
+                  : (aiPoly && aiPoly.length >= 3 ? [{points: aiPoly, holes: []}] : []);
+    if (!aiParts.length) { toast('No AI or assisted polygon for this job', 'warn'); return; }
     traceRegions = [];
     activeCandidateId = null;
-    poly = aiPoly.map(p => ({x: p[0], y: p[1]}));
-    draw(); toast('AI polygon loaded — nudge as needed');
+    // Drop cut-outs a previous press of this button loaded; keep the assessor's own.
+    cutoutPolygons = cutoutPolygons.filter(cut => !cut.fromAiRegion);
+    poly = aiParts[0].points.map(p => ({x: p[0], y: p[1]}));
+    aiParts.slice(1).forEach(part => traceRegions.push({
+      points: part.points.map(p => ({x: p[0], y: p[1]})),
+      candidateId: null, candidateGroupId: null, category: part.category || null,
+      boqScope: document.getElementById('traceScope').value || 'main'
+    }));
+    aiParts.forEach(part => (part.holes || []).forEach(hole => {
+      if (Array.isArray(hole) && hole.length >= 3) cutoutPolygons.push({
+        points: hole.map(p => ({x: p[0], y: p[1]})), closed: true, fromAiRegion: true
+      });
+    }));
+    draw();
+    const cutCount = cutoutPolygons.filter(cut => cut.fromAiRegion).length;
+    // Does each outline actually reproduce the quantity it stands for? "Inspect every edge" is
+    // useless advice if we already know WHICH edge is wrong, and by how much.
+    aiLoadLoose = [];
+    aiLoadTotalM2 = null;
+    if (mpp > 0) {
+      let stated = 0;
+      aiParts.forEach(part => {
+        if (typeof part.area_m2 !== 'number' || !(part.area_m2 > 0)) return;
+        stated += part.area_m2;
+        const drawn = shoelace(part.points.map(p => ({x: p[0], y: p[1]}))) * mpp * mpp;
+        const off = (drawn - part.area_m2) / part.area_m2;
+        if (Math.abs(off) > AI_OUTLINE_FIDELITY_TOL) {
+          aiLoadLoose.push({label: part.label || 'region', drawn, stated: part.area_m2, off});
+        }
+      });
+      if (stated > 0) aiLoadTotalM2 = stated;
+    }
+    aiLoadSnapshot = traceGeometryFingerprint();
+    if (aiLoadLoose.length) {
+      const worst = aiLoadLoose.slice().sort((a, b) => Math.abs(b.off) - Math.abs(a.off))[0];
+      toast(`${worst.label}'s outline encloses ${Math.round(worst.drawn).toLocaleString()} m² ` +
+            `against its ${Math.round(worst.stated).toLocaleString()} m² measurement ` +
+            `(${worst.off > 0 ? '+' : ''}${(worst.off * 100).toFixed(0)}%) — tighten it before submitting`,
+            'warn');
+    } else {
+      toast(aiParts.length === 1 && !cutCount
+        ? 'AI polygon loaded — nudge as needed'
+        : `AI measurement loaded — ${aiParts.length} surface${aiParts.length === 1 ? '' : 's'}` +
+          `${cutCount ? ` and ${cutCount} cut-out${cutCount === 1 ? '' : 's'}` : ''}; inspect every edge before submitting`);
+    }
   });
   document.getElementById('btnClearAi').addEventListener('click', () => {
     aiPoly = null; aiRegions = []; draw(); toast('AI polygon cleared');
@@ -4218,6 +4313,18 @@ async function submitDecision(action) {
     return null;
   })();
   if (action === 'adjust' && shapeProblem) { toast(shapeProblem, 'error'); return; }
+  // Loading the AI's outlines and submitting them untouched is not agreement — it silently
+  // replaces the measured quantity with whatever those outlines happen to enclose. On Indurent
+  // that is +13.7%, all of it from one loose region. Refuse, with both numbers named.
+  if (action === 'adjust' && aiLoadSnapshot && aiLoadTotalM2 > 0 && a > 0 &&
+      traceGeometryFingerprint() === aiLoadSnapshot &&
+      Math.abs(a - aiLoadTotalM2) / aiLoadTotalM2 > AI_LOAD_SUBMIT_TOL) {
+    toast(`These are the AI's own outlines, unedited, and they enclose ${Math.round(a).toLocaleString()} m² ` +
+          `against its ${Math.round(aiLoadTotalM2).toLocaleString()} m² measurement. ` +
+          `Tighten the outline (or use Confirm scale + extent to accept the measurement as it stands) ` +
+          `before submitting.`, 'error');
+    return;
+  }
   const regionPayload = regionEntries.map(entry =>
     entry.points.map(point => [Math.round(point.x), Math.round(point.y)]));
   const body = {
