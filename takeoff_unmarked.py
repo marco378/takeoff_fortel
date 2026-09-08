@@ -116,6 +116,53 @@ def _is_plausible_surface_tint(rgb):
 SWATCH_BODY_AGREE_TOL = 5
 
 
+# ── WHICH TINT IS THE PRICED SURFACE ──────────────────────────────────────────────────────
+# Every route to that decision, in one place, because they used to be four scattered branches
+# that each reached for the same constant in slightly different words — and a fifth did it
+# fourteen lines further down, AFTER the legend had been read and contradicted. That fifth one
+# is how Indurent Park (22513-RLL-3151) came to report its P2 car parking as a service yard:
+# 98.6% of that sheet's own `RL_Surfacing_Service Yard` CAD items lie inside the client's
+# markup and 0.2% inside what we measured. It now refuses instead (see the DISAGREE gate).
+#
+# Read the outcomes below as a hierarchy of confidence. Exactly ONE of them is evidence from
+# the drawing in front of us; the other three are conventions borrowed from other drawings,
+# and they are named as guesses so that nobody has to read the branch to know it.
+GREY_FALLBACK = (214, 214, 214)   # validated SGP convention; band [200,228] with tol=14
+GREY_TOL = 14
+
+BAND_LOCKED_TO_LEGEND = "locked to this sheet's own legend swatch"
+BAND_GUESS_SWATCH_IMPLAUSIBLE = "guess: legend swatch is near-black/near-white"
+BAND_GUESS_SWATCH_UNREADABLE = "guess: legend found but its swatch could not be read"
+BAND_GUESS_NO_LEGEND = "guess: no legend label on the sheet at all"
+BAND_GUESSES = (BAND_GUESS_SWATCH_IMPLAUSIBLE, BAND_GUESS_SWATCH_UNREADABLE, BAND_GUESS_NO_LEGEND)
+
+
+def _choose_surface_band(pdf, im, S, flags):
+    """Pick the RGB band to segment the priced surface from, and say how sure we are.
+
+    Returns (rgb, swatch, label, outcome, swatch_locked, region_confidence). `outcome` is one
+    of the BAND_* constants; anything in BAND_GUESSES means the band came from convention
+    rather than from this drawing. Appends its reasoning to `flags` exactly as before.
+    """
+    swatch, label = find_concrete_swatch_rgb(pdf, im=im, S=S)
+    if label and swatch:
+        if _is_plausible_surface_tint(swatch):
+            # LOCK the full RGB band to the legend-confirmed tint. Other surfaces on the sheet
+            # that render at a different tint fall outside the locked band and are excluded.
+            flags.append(f"legend '{label}': plausible surface swatch {swatch} — full RGB band "
+                         f"LOCKED to swatch centre ±{GREY_TOL}")
+            return swatch, swatch, label, BAND_LOCKED_TO_LEGEND, True, None
+        flags.append(f"legend '{label}' found but swatch {swatch} is near-black/near-white, "
+                     f"not a plausible surface tint — using SGP grey convention {GREY_FALLBACK} "
+                     "(lower confidence; assessor confirm)")
+        return GREY_FALLBACK, swatch, label, BAND_GUESS_SWATCH_IMPLAUSIBLE, False, "low"
+    if label:
+        flags.append(f"legend '{label}' found (swatch unreadable) — using SGP grey convention {GREY_FALLBACK}")
+        return GREY_FALLBACK, swatch, label, BAND_GUESS_SWATCH_UNREADABLE, False, None
+    flags.append(f"no concrete-yard legend label — grey-hatch heuristic {GREY_FALLBACK} (LOW confidence; assessor confirm)")
+    return GREY_FALLBACK, swatch, label, BAND_GUESS_NO_LEGEND, False, "low"
+
+
 def _swatch_body_agrees(swatch_rgb, body_rgb, tol=SWATCH_BODY_AGREE_TOL):
     """Require the legend proposal and selected surface to agree channel-by-channel."""
     if not swatch_rgb or not body_rgb:
@@ -2273,31 +2320,9 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # while the real hatch is 214 → a naive lock would produce area=None on a perfectly measurable
     # sheet). Synthetic gold fixtures (_int_d77*.pdf) have unreadable swatches, so they always take
     # the fallback path unchanged — their golds (3,159 / 3,159) are untouched by this change.
-    GREY_FALLBACK = (214, 214, 214)   # validated SGP convention; band [200,228] with tol=14
-    GREY_TOL = 14
-    rgb = GREY_FALLBACK
-    swatch_locked = False
-    region_confidence = None
-    swatch, label = find_concrete_swatch_rgb(pdf, im=im, S=S)
-    legend_found = bool(label)   # True in both label branches below; False only in the no-legend else
-    if label and swatch:
-        if _is_plausible_surface_tint(swatch):
-            # LOCK the full RGB band to the legend-confirmed tint. Other surfaces on the sheet
-            # that render at a different tint fall outside the locked band and are excluded.
-            rgb = swatch
-            swatch_locked = True
-            flags.append(f"legend '{label}': plausible surface swatch {swatch} — full RGB band "
-                         f"LOCKED to swatch centre ±{GREY_TOL}")
-        else:
-            region_confidence = "low"
-            flags.append(f"legend '{label}' found but swatch {swatch} is near-black/near-white, "
-                         f"not a plausible surface tint — using SGP grey convention {GREY_FALLBACK} "
-                         "(lower confidence; assessor confirm)")
-    elif label:
-        flags.append(f"legend '{label}' found (swatch unreadable) — using SGP grey convention {GREY_FALLBACK}")
-    else:
-        region_confidence = "low"
-        flags.append(f"no concrete-yard legend label — grey-hatch heuristic {GREY_FALLBACK} (LOW confidence; assessor confirm)")
+    rgb, swatch, label, band_outcome, swatch_locked, region_confidence = \
+        _choose_surface_band(pdf, im, S, flags)
+    legend_found = bool(label)
 
     # Runs AFTER the branch above, never inside it: identifying a surface is not the same as
     # classifying it. A dock apron carries its own build-up on its own sheet, so say so rather
