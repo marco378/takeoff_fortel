@@ -36,6 +36,8 @@ Modules, in execution order:
   tests/test_scale_citations.py — prose metre tokens and BS standards citations are not scales
 """
 import sys
+from pathlib import Path
+
 from tests import P
 
 # Importing a module RUNS its checks. An import that raises must therefore be a FAILURE, not a
@@ -73,11 +75,15 @@ MODULES = [
     "tests.test_scale_citations",
 ]
 
-# The suite runs 873 checks with drawings/ present; client sheets are gitignored, so a clean
-# checkout legitimately runs fewer. The floor catches a module going missing, which is a much
-# bigger drop than any skip. Raise both numbers deliberately when you add checks.
-EXPECTED_CHECKS = 873
-MIN_CHECKS = 820
+# How many checks SHOULD run here. Client drawings are gitignored, so ~160 checks skip on a
+# clean checkout — which is exactly what .github/workflows/tests.yml runs. Both numbers below
+# were MEASURED on 8 Sep 2026, not estimated: 873 in this repo, 713 from a fresh `git clone`.
+# The first version of this guard hardcoded a single floor of 820, which would have failed
+# every push — the same mistake as the (214,214,214) constant it was written alongside: a
+# number that looked reasonable and was never checked against the case it governs.
+CLIENT_DRAWINGS = (Path(__file__).resolve().parent / "drawings").is_dir()
+EXPECTED_CHECKS = 873 if CLIENT_DRAWINGS else 713
+MIN_CHECKS = 860 if CLIENT_DRAWINGS else 700
 
 broken = []
 for _name in MODULES:
@@ -91,10 +97,10 @@ for _name in MODULES:
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 if broken:
     print(f"!! {len(broken)} test module(s) never ran: " + "; ".join(broken))
+_where = "with client drawings" if CLIENT_DRAWINGS else "on a clean checkout (no drawings/)"
 if len(P) < MIN_CHECKS:
-    print(f"!! only {len(P)} checks ran, floor is {MIN_CHECKS} (expected {EXPECTED_CHECKS} with "
-          f"drawings/ present) — a whole module is missing, not merely skipped")
+    print(f"!! only {len(P)} checks ran {_where}; floor is {MIN_CHECKS}, expected "
+          f"{EXPECTED_CHECKS} — a whole module is missing, not merely skipped")
 elif len(P) < EXPECTED_CHECKS:
-    print(f"   ({EXPECTED_CHECKS - len(P)} checks skipped — client drawings absent, expected on a "
-          f"clean checkout)")
+    print(f"   ({EXPECTED_CHECKS - len(P)} fewer than the {EXPECTED_CHECKS} expected {_where})")
 sys.exit(0 if (all(P) and not broken and len(P) >= MIN_CHECKS) else 1)
