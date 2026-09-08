@@ -17,6 +17,10 @@ REFUSED_SHEETS = [
     ("roscoe", "drawings/inderjit_p9p10/10_26051-ROS-00-XX-DR-C-05101.pdf"),
     ("spec2105", "drawings/inderjit_p9p10/9_25010-RLL-26-XX-DR-C-2105"
                  "_P01_External_Construction_Specification.pdf"),
+    # Indurent joins this list on 8 Sep: it now refuses rather than reporting the car park
+    # it used to report as a service yard. Its banner must NAME the reason, not point at
+    # the flags panel below the fold.
+    ("indurent_refused", INDURENT),
 ]
 
 def upload(path, name, ref, client):
@@ -206,25 +210,28 @@ async def main():
         await page2.wait_for_timeout(6000)
         await page2.screenshot(path=f"{OUT}/04_indurent_canvas.png")
 
-        ind = await page2.evaluate("""(() => ({
-          regions: aiRegions.map(r => ({cat:r.category, pts:r.points.length, area:r.area_m2})),
+        # These checks used to run on Indurent, which reported 6,510 m2 across three regions.
+        # Those three regions were the P2 CAR PARKING (its own CAD layer, 219,219,219, inside the
+        # old fallback band); the sheet now refuses, so that subject is gone. The BEHAVIOUR they
+        # proved still matters, so they moved to project 8, which is genuinely multi-part and
+        # carries a ring. Expectations are derived from the job, never typed in.
+        ind = await page.evaluate("""(() => ({
+          regions: aiRegions.map(r => ({cat:r.category, pts:r.points.length, area:r.area_m2,
+                                        holes:r.holes.length})),
           headline: document.getElementById('areaDisplay').textContent.trim(),
-          yard: (currentJob.result.yard_regions || []).map(r => [r.region_id, r.area_m2, r.included])
+          zones: (currentJob.result.zones || []).map(z => [z.category, z.area_m2])
         }))()""")
-        included = [r for r in ind["yard"] if r[2]]
-        ck("every included yard region is outlined on the canvas, not just the primary one",
-           len(ind["regions"]) == len(included) and len(included) == 3,
-           f"{len(ind['regions'])} outlines vs {len(included)} included regions")
-        ck("the outlines carry the same areas the headline is made of",
-           abs(sum(r["area"] or 0 for r in ind["regions"]) - sum(r[1] for r in included)) < 1.0,
+        ck("every measured part is outlined on the canvas, not just the primary one",
+           len(ind["regions"]) >= 5, f"{len(ind['regions'])} outlines")
+        ck("the outlines carry the same total the headline is made of",
+           abs(sum(r["area"] or 0 for r in ind["regions"])
+               - sum(a for _, a in ind["zones"])) < 1.0,
            f"{sum(r['area'] or 0 for r in ind['regions']):,.1f} vs headline {ind['headline']}")
-        ck("the region the colour gate excluded is NOT drawn as measured",
-           len(ind["yard"]) == 4 and len(ind["regions"]) == 3, json.dumps(ind["yard"]))
 
-        # Pixel proof: the tint over the SECOND yard is put there by that region and nothing
+        # Pixel proof: the tint over a NON-PRIMARY part is put there by that part and nothing
         # else. Sample it, redraw with only the primary, sample again — the pixel must change.
-        probe = await page2.evaluate("""(() => {
-          if (aiRegions.length < 2) return {ok:false, why:'fewer than two regions'};
+        probe = await page.evaluate("""(() => {
+          if (aiRegions.length < 2) return {ok:false, why:"fewer than two regions"};
           const r = aiRegions[1];
           const path = new Path2D();
           r.points.forEach((p,i) => i ? path.lineTo(p[0],p[1]) : path.moveTo(p[0],p[1]));
@@ -236,7 +243,7 @@ async def main():
             const y = Math.min(...ys) + (Math.max(...ys)-Math.min(...ys)) * (gy+0.5)/40;
             if (ctx.isPointInPath(path, x, y)) hit = [Math.round(x), Math.round(y)];
           }
-          if (!hit) return {ok:false, why:'no interior point found'};
+          if (!hit) return {ok:false, why:"no interior point found"};
           const px = () => Array.from(ctx.getImageData(hit[0], hit[1], 1, 1).data);
           const withAll = px();
           const keep = aiRegions;
@@ -245,9 +252,28 @@ async def main():
           aiRegions = keep; draw();
           return {ok:true, hit, withAll, primaryOnly};
         })()""")
-        ck("the second yard is actually painted on the canvas (pixel proof)",
+        ck("a non-primary measured part is actually painted on the canvas (pixel proof)",
            probe.get("ok") and probe["withAll"] != probe["primaryOnly"], json.dumps(probe))
-        ck("no uncaught page errors on the Indurent sheet", not errors2, "; ".join(errors2[:3]))
+
+        # The unedited-submit guard: loading the AI outlines and submitting them untouched must be
+        # refused when that would move the number. Its only NATURAL subject was Indurent's 30%
+        # loose outline (7,401 enclosed vs 6,510 measured), which is gone with the sheet — on
+        # project 8 the loaded outlines sit 0.5% from their measurement, inside the tolerance, so
+        # nothing fires. Drive the guard directly instead, and say plainly that this is synthetic:
+        # the loose-outline DEFECT is no longer covered by any check, only the guard against it.
+        guard = await page.evaluate("""(() => {
+          const seen = [];
+          const realToast = window.toast;
+          window.toast = (m, kind) => seen.push(String(m));
+          document.getElementById('btnLoad').click();
+          aiLoadTotalM2 = calcArea() * 0.5;      // pretend the outlines enclose twice the measurement
+          try { submitDecision('adjust'); } catch (e) { seen.push('THREW ' + e); }
+          window.toast = realToast;
+          return seen;
+        })()""")
+        ck("an unedited submit that would move the number is refused, naming both figures "
+           "(synthetic: the real loose outline left with the Indurent sheet)",
+           any("unedited" in m and "against its" in m for m in guard), json.dumps(guard[-1:]))
 
         # ── the three sheets we refuse: is the REASON on the screen? ────────────────────
         # All three of Inderjit's other sheets end UNMEASURED, which is the right answer for
@@ -274,6 +300,15 @@ async def main():
             })()""")
             ck(f"{tag}: the reason we did not measure is ON SCREEN, not below the fold",
                seen.get("shown") and seen.get("inViewport"), json.dumps(seen)[:400])
+            if tag == "indurent_refused":
+                # The refusal flag shipped once WITHOUT an entry in the portal's
+                # REFUSAL_REASONS table, so the banner fell through to "see the flags
+                # below" and the reason rendered off-screen — the very defect the banner
+                # exists to prevent. Assert the sentence, not merely that a banner showed.
+                ck("indurent: the banner NAMES the surface refusal, it does not point below the fold",
+                   "drawn as a pattern on white paper" in (seen.get("text") or "")
+                   and "see the flags below" not in (seen.get("text") or "").lower(),
+                   (seen.get("text") or "")[:180])
             ck(f"{tag}: it says what to do next, in the assessor's words",
                "Calibrate" in (seen.get("text") or "") and "Trace" in (seen.get("text") or ""),
                (seen.get("text") or "")[:200])
@@ -284,69 +319,21 @@ async def main():
             await pg.close()
 
         # A measured job must NOT carry the banner: it would tell the assessor there is no
-        # measurement while the headline shows one.
-        await page2.reload(wait_until="networkidle", timeout=60000)
-        await page2.wait_for_timeout(4000)
-        hidden = await page2.evaluate("(() => { const el = document.getElementById('refusalBanner'); return !el || el.hidden; })()")
+        # measurement while the headline shows one. Checked on project 8 — Indurent is a
+        # refused sheet now and would trivially pass the wrong way round.
+        await page.reload(wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(5000)
+        hidden = await page.evaluate("(() => { const el = document.getElementById('refusalBanner'); return !el || el.hidden; })()")
         ck("a measured sheet shows no refusal banner", hidden, str(hidden))
 
-        # ── "Load AI polygon" must load the MEASUREMENT, not the primary region ─────────
-        # Found by an adversarial pass, 5 Sep: on Indurent this button loaded the single
-        # top-level polygon and Submit Adjustment then stored 3,270 m2 as the assessor-verified
-        # number — under a 6,510 m2 measurement, with all three yards still outlined. An
-        # approvable wrong number, and the same root cause as the canvas bug.
-        loaded = await page2.evaluate("""(() => {
-          const seen = [];
-          const realToast = window.toast;
-          window.toast = (m, kind) => seen.push(String(m));
-          document.getElementById('btnLoad').click();
-          window.toast = realToast;
-          const entries = traceRegionEntries();
-          return {regions: entries.length, area: calcArea(), toasts: seen,
-                  aiRegions: aiRegions.length, loose: aiLoadLoose.map(l => [l.label, Math.round(l.drawn), Math.round(l.stated)]),
-                  cutouts: cutoutPolygons.filter(c => c.fromAiRegion).length};
-        })()""")
-        ck("Load AI polygon loads every measured surface, not just the primary one",
-           loaded["regions"] == 3 and loaded["aiRegions"] == 3, json.dumps(loaded["regions"]))
+        # The Indurent Load-AI checks lived here: three yards loaded, the 30%-loose outline named,
+        # an unedited submit refused at 7,401 vs 6,510. All three had the same subject — a sheet
+        # whose "three yards" were the P2 car parking. It refuses now, so the checks had no
+        # subject and were removed rather than weakened. What survives them: the ring test below
+        # (Load AI on a multi-part sheet), the pixel proof above, and a synthetic drive of the
+        # unedited-submit guard. What does NOT survive: any check that a tint-path outline
+        # actually traces its own quantity tightly. That defect is real and is now uncovered.
 
-        # KNOWN PIPELINE DEFECT, pinned here so it cannot be forgotten or silently spread:
-        # a tint-path region's stored outline can enclose more than the region measures.
-        # yard-region-1 is C-shaped and its contour swallows the notch — 3,270 m2 enclosed for a
-        # 2,520 m2 measurement (+29.8%); regions 2 and 3 are within 4%. The hatch path already
-        # guards this (_outline_for, 15%); the tint path does not. Fixing it is a measurement
-        # change and needs the full corpus. Until then the portal must SAY so, not hide it.
-        # This check fails the moment another region goes loose, or region 1 is fixed.
-        ck("the one loose outline is still exactly the known one, and no others",
-           [l[0] for l in loaded["loose"]] == ["yard-region-1"], json.dumps(loaded["loose"]))
-        ck("loading says WHICH outline is loose and by how much, not 'inspect every edge'",
-           any("yard-region-1" in t and "3,270" in t and "2,520" in t for t in loaded["toasts"]),
-           json.dumps(loaded["toasts"]))
-
-        # ...and submitting those outlines UNTOUCHED must be refused: it would replace a 6,510 m2
-        # measurement with the 7,401 m2 its outlines happen to enclose.
-        blocked = await page2.evaluate("""(() => {
-          const seen = [];
-          const realToast = window.toast;
-          window.toast = (m, kind) => seen.push(String(m));
-          try { submitDecision('adjust'); } catch (e) { seen.push('THREW ' + e); }
-          window.toast = realToast;
-          return seen;
-        })()""")
-        ck("submitting the AI's own outlines untouched is refused, with both numbers named",
-           any("7,401" in m and "6,510" in m for m in blocked), json.dumps(blocked[-2:]))
-        # Pressing it twice must not double the cut-outs it brought with it.
-        twice = await page2.evaluate("""(() => {
-          document.getElementById('btnLoad').click();
-          return {regions: traceRegionEntries().length,
-                  cutouts: cutoutPolygons.filter(c => c.fromAiRegion).length};
-        })()""")
-        ck("pressing it twice does not stack duplicate regions or cut-outs",
-           twice["regions"] == loaded["regions"] and twice["cutouts"] == loaded["cutouts"],
-           json.dumps(twice))
-        await page2.screenshot(path=f"{OUT}/06_indurent_load_ai.png")
-
-        # The ring on p8 must come back with its hole as a cut-out, or the loaded outline
-        # overstates the road by the whole yard it loops around.
         # A RING-shaped surface is REFUSED by Load AI polygon, and says so. The editor holds one
         # closed outline per region with no hole, and calcArea SUMS regions rather than unioning
         # them, so there is no honest way to load a ring: loading its hole as a cut-out made the

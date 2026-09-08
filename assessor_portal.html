@@ -2389,6 +2389,13 @@ async function submitSpecOverride(e) {
 // sheet whose legend chip was read and rejected says so, rather than falling back to the
 // generic line/hatch sentence that is also true of it.
 const REFUSAL_REASONS = [
+  // Added with the flag itself. The first version of this refusal shipped WITHOUT its mapping,
+  // so the banner fell through to "see the flags below" and the reason rendered at y~1231 on a
+  // 950px screen — the exact below-the-fold defect this banner was built to fix, reintroduced
+  // by adding a flag in one file and not its translation in the other. If you add a refusal
+  // flag, add its sentence here in the same commit.
+  [/SURFACE NOT IDENTIFIED/i,
+   "the legend names this surface as a solid colour, but no area of that colour exists on the drawing — it is drawn as a pattern on white paper. We did NOT substitute another colour, because measuring the wrong surface is worse than measuring none"],
   [/chip is not a stroke pattern/i,
    "we found this surface in the legend, but its swatch is not a stroke pattern the reader can match to the drawing"],
   [/no graphical legend|leader line/i,
