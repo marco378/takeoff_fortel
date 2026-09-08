@@ -473,14 +473,51 @@ try:
         # P2 car parking, reached by substituting another client's grey for a legend tint we
         # could not find. The sheet now refuses. A test that pins a number nobody checked
         # against the client is not a gate — it is a way of not noticing.
-        ck("the Newport sheet refuses rather than reporting the car park as a service yard",
-           _np_res.get("area_m2") is None
-           and _np_res.get("measurement_state") == "UNMEASURED"
-           and _np_res.get("needs_assessor") is True,
-           f"area={_np_res.get('area_m2')} state={_np_res.get('measurement_state')}")
-        ck("...and the refusal names the surface, not a colour to nod at",
-           any("SURFACE NOT IDENTIFIED" in f for f in _np_res.get("flags") or []),
-           [f[:90] for f in (_np_res.get("flags") or [])][-1:])
+        # ...and it is now measured, from the CAD layer rather than from any tint. Scored by
+        # IoU against Aryan's three polygons, one region at a time: an area that matches
+        # while outlining the wrong ground is the exact failure this sheet already produced
+        # once, and only shape scoring can see it.
+        ck("the Newport sheet measures the three service yards instead of the car park",
+           _np_res.get("area_m2") is not None
+           and _np_res.get("measurement_state") == "MEASURED_UNVERIFIED"
+           and _np_res.get("needs_assessor") is True
+           and len(_np_res.get("yard_regions") or []) == 3,
+           f"area={_np_res.get('area_m2')} state={_np_res.get('measurement_state')} "
+           f"regions={len(_np_res.get('yard_regions') or [])}")
+        _np_gt = _json_hx.loads(Path("ground_truth_polygons.json").read_text()).get(_newport)
+        if not _np_gt:
+            print("  [SKIP] no ground-truth polygons recorded for the Newport sheet")
+        else:
+            import numpy as _np_np, cv2 as _np_cv
+
+            def _np_iou(poly_a, poly_b):
+                _a = _np_np.asarray(poly_a, dtype=float)
+                _b = _np_np.asarray(poly_b, dtype=float)
+                _o = _np_np.minimum(_a.min(0), _b.min(0))
+                _s = _np_np.maximum(_a.max(0), _b.max(0)) - _o
+                _w, _h = int(_s[0]) + 2, int(_s[1]) + 2
+                _ma = _np_np.zeros((_h, _w), _np_np.uint8)
+                _mb = _np_np.zeros((_h, _w), _np_np.uint8)
+                _np_cv.fillPoly(_ma, [_np_np.round(_a - _o).astype(_np_np.int32)], 1)
+                _np_cv.fillPoly(_mb, [_np_np.round(_b - _o).astype(_np_np.int32)], 1)
+                _u = int((_ma | _mb).sum())
+                return (int((_ma & _mb).sum()) / _u) if _u else 0.0
+
+            _np_measured = [r["polygon_pts"] for r in _np_res["yard_regions"]]
+            _np_floor = _np_gt["min_iou"]
+            for _np_region in _np_gt["regions"]:
+                _np_best = max((_np_iou(_np_region["polygon_pts"], _m) for _m in _np_measured),
+                               default=0.0)
+                ck(f"...{_np_region['region']} is outlined where Aryan outlined it "
+                   f"(IoU >= {_np_floor})",
+                   _np_best >= _np_floor,
+                   f"best IoU {_np_best:.3f} vs {_np_floor}")
+            # A stipple closed into an outline sits inside the true edge. Under-measuring is
+            # survivable and disclosed; over-measuring would quote ground nobody is paving.
+            ck("...and the total never exceeds the client's own markup",
+               _np_res["area_m2"] <= _np_gt["area_m2"],
+               f"measured {_np_res['area_m2']} vs markup {_np_gt['area_m2']} "
+               f"({100 * _np_res['area_m2'] / _np_gt['area_m2'] - 100:+.1f}%)")
 
     # ── The bridging limit is DISCLOSED, not detected ───────────────────────────────────
     # A kernel wide enough to bridge this sheet's stroke gaps also bridges a real corridor of

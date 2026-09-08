@@ -82,8 +82,8 @@ MODULES = [
 # every push — the same mistake as the (214,214,214) constant it was written alongside: a
 # number that looked reasonable and was never checked against the case it governs.
 CLIENT_DRAWINGS = (Path(__file__).resolve().parent / "drawings").is_dir()
-EXPECTED_CHECKS = 873 if CLIENT_DRAWINGS else 713
-MIN_CHECKS = 860 if CLIENT_DRAWINGS else 700
+EXPECTED_CHECKS = 878 if CLIENT_DRAWINGS else 713
+MIN_CHECKS = 865 if CLIENT_DRAWINGS else 700
 
 broken = []
 for _name in MODULES:

@@ -19,6 +19,7 @@ from scipy import ndimage as ndi
 import cv2
 
 import scale as SC
+import layer_surfaces
 import sanity
 with contextlib.redirect_stdout(io.StringIO()):
     from pricing import slab_rate
@@ -2411,16 +2412,41 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             # two other paths onto GREY_FALLBACK (swatch unreadable, no plausible region) are
             # untouched — both gold sheets that depend on the grey convention, D77_Hard_
             # Landscaping 3138/3156 and _int_d77 3159/3156, arrive by those and land correctly.
-            return {"pdf": pdf, "area_m2": None,
+            # Colour has failed here, and on this class of sheet it CANNOT succeed: on
+            # Indurent Park the C1 Service Yard and the F1 Footway (Vehicle Overrun) are
+            # the same ink, (118,118,118). Before refusing, ask the drawing what the
+            # engineer NAMED this surface. A CAD layer is evidence of a different kind
+            # from a tint — the draughtsman's own declaration, carried through the export
+            # — and Aryan's "keep the c1 only" is a layer, not a colour. If no layer names
+            # the surface, nothing has changed and the refusal stands exactly as before.
+            _layer = layer_surfaces.measure(pg.parent, pg, label, k, S=S)
+            if _layer.get("ok"):
+                flags.append(
+                    f"legend/body colour DISAGREED (swatch {swatch}, {_body_of} reads "
+                    f"{body_rgb}, {body_diff} levels apart, tolerance "
+                    f"{SWATCH_BODY_AGREE_TOL}) — colour could not identify this surface and "
+                    f"no substitute colour was assumed. The measurement below is from the "
+                    f"CAD layer the engineer drew it on, not from any tint.")
+                flags.extend(_layer["flags"])
+                comp = _layer["mask"].astype(bool)
+                _seg_diag = {"_retained_component_masks":
+                             list(enumerate(_layer["region_masks"]))}
+                swatch_locked = False
+                region_confidence = "low"
+            else:
+                flags.append(
+                    f"no CAD layer route either: {_layer['reason']}")
+                return {"pdf": pdf, "area_m2": None,
                     "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                     "flags": flags + [
                         f"SURFACE NOT IDENTIFIED — the legend names '{label}' as tint {swatch}, "
                         f"but no region of that tint was found: the {_body_of} reads "
-                        f"{body_rgb} ({body_diff} levels apart, tolerance {SWATCH_BODY_AGREE_TOL}). "
-                        f"The surface is most likely drawn as a stipple or hatch on white paper "
-                        f"rather than a solid fill. NO substitute colour was assumed and no area "
-                        f"is reported — measuring the wrong surface is worse than measuring none. "
-                        f"Assessor: trace the surface the legend names."]}
+                        f"{body_rgb} ({body_diff} levels apart, tolerance "
+                        f"{SWATCH_BODY_AGREE_TOL}). The surface is most likely drawn as a "
+                        f"stipple or hatch on white paper rather than a solid fill. NO "
+                        f"substitute colour was assumed and no area is reported — measuring "
+                        f"the wrong surface is worse than measuring none. Assessor: trace "
+                        f"the surface the legend names."]}
         else:
             flags.append(
                 f"legend/body colour cross-check PASSED: swatch {swatch}, {_body_of} "

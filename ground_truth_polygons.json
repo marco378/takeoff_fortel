@@ -1251,5 +1251,252 @@
     "source": "Aryan's Bluebeam markup, #fortel 2 Sep 2026 (thread 1788346982), Drive id 1uaiPOcpL_DZmxpCFPJTfraYWMfUt_Yw9. Labels: 'Unclassified area - 60,426.30 m2', 'Cut-out 1 - 35,373.10 m2'. Markup kept at ~/fortel-ground-truth/, OUT of drawings/.",
     "corroboration": "Markup differs from the unmarked sheet by exactly 4 vector paths: the 163-vertex gross polygon, the 106-vertex cut-out, and two label boxes. Shoelace at k=0.352778: gross 95,799.4, cut-out 35,373.0 -> net 60,426.4 vs label 60,426.30. Ink coverage of yard/road hatch inside the net polygon is recorded in the session log; ask Aryan/Inderjit whether this net is yard+road combined (legend gives them DIFFERENT specs: A393@11 MSA vs A393@6 MSA).",
     "note": "Sheet is refused 4 gates deep on the shipped code (style guard 0.39%; vocabulary 'CONCRETE SLAB FOR YARD'; yard legend swatch is black strokes; yard hatch shares grey with the building grid). See memory fortel-hatch-detection.md."
+  },
+  "drawings/inderjit_p9p10/11_Indurent_Park_Newport_22513-RLL-25-00-DR-C-3151_P02_Proposed_Pavement_Construction.pdf": {
+    "surface": "C1 SERVICE YARD (three separate yards, one per unit)",
+    "area_m2": 11125.9,
+    "area_m2_independent_shoelace": 11125.73,
+    "min_iou": 0.85,
+    "page": 0,
+    "page_rotation": 0,
+    "k_m_per_pt": 0.176389,
+    "scale": "1:500 (title block only \u2014 no scale bar)",
+    "coord_space": "unrotated PDF points (fitz get_drawings space)",
+    "regions": [
+      {
+        "region": "C1 Service Yard 1",
+        "area_m2": 4438.0,
+        "area_m2_independent_shoelace": 4437.91,
+        "verts": 9,
+        "polygon_pts": [
+          [
+            572.586,
+            896.554
+          ],
+          [
+            571.734,
+            906.346
+          ],
+          [
+            601.109,
+            909.326
+          ],
+          [
+            578.546,
+            1179.654
+          ],
+          [
+            469.563,
+            1171.14
+          ],
+          [
+            470.84,
+            1160.497
+          ],
+          [
+            58.749,
+            1126.866
+          ],
+          [
+            81.737,
+            856.112
+          ],
+          [
+            572.586,
+            896.554
+          ]
+        ]
+      },
+      {
+        "region": "C1 Service Yard 2",
+        "area_m2": 3492.3,
+        "area_m2_independent_shoelace": 3492.26,
+        "verts": 21,
+        "polygon_pts": [
+          [
+            1400.174,
+            398.469
+          ],
+          [
+            1382.72,
+            611.326
+          ],
+          [
+            1400.174,
+            613.029
+          ],
+          [
+            1373.354,
+            931.037
+          ],
+          [
+            1169.012,
+            914.009
+          ],
+          [
+            1171.14,
+            885.912
+          ],
+          [
+            1159.646,
+            885.06
+          ],
+          [
+            1167.734,
+            785.017
+          ],
+          [
+            1164.329,
+            784.166
+          ],
+          [
+            1166.032,
+            761.603
+          ],
+          [
+            1169.863,
+            762.029
+          ],
+          [
+            1174.12,
+            708.389
+          ],
+          [
+            1170.714,
+            707.537
+          ],
+          [
+            1181.783,
+            578.12
+          ],
+          [
+            1184.763,
+            578.546
+          ],
+          [
+            1189.02,
+            527.034
+          ],
+          [
+            1185.614,
+            526.609
+          ],
+          [
+            1187.317,
+            504.046
+          ],
+          [
+            1191.574,
+            504.046
+          ],
+          [
+            1201.366,
+            381.866
+          ],
+          [
+            1400.174,
+            398.469
+          ]
+        ]
+      },
+      {
+        "region": "C1 Service Yard 3",
+        "area_m2": 3195.6,
+        "area_m2_independent_shoelace": 3195.56,
+        "verts": 12,
+        "polygon_pts": [
+          [
+            1687.957,
+            911.454
+          ],
+          [
+            1676.889,
+            910.603
+          ],
+          [
+            1674.76,
+            938.7
+          ],
+          [
+            1501.92,
+            924.652
+          ],
+          [
+            1504.9,
+            888.466
+          ],
+          [
+            1495.534,
+            708.814
+          ],
+          [
+            1487.872,
+            707.963
+          ],
+          [
+            1512.563,
+            407.409
+          ],
+          [
+            1661.137,
+            419.754
+          ],
+          [
+            1656.454,
+            479.354
+          ],
+          [
+            1723.717,
+            485.314
+          ],
+          [
+            1687.957,
+            911.454
+          ]
+        ]
+      }
+    ],
+    "polygon_pts": [
+      [
+        572.586,
+        896.554
+      ],
+      [
+        571.734,
+        906.346
+      ],
+      [
+        601.109,
+        909.326
+      ],
+      [
+        578.546,
+        1179.654
+      ],
+      [
+        469.563,
+        1171.14
+      ],
+      [
+        470.84,
+        1160.497
+      ],
+      [
+        58.749,
+        1126.866
+      ],
+      [
+        81.737,
+        856.112
+      ],
+      [
+        572.586,
+        896.554
+      ]
+    ],
+    "source": "Bluebeam area markup drawn by Aryan (U0BCUEBAAFQ) and posted to #fortel on 2026-09-07 in thread 1788727214.153909, in answer to 'is C1 - Service Yard the only surface you want priced on this sheet'. His reply was 'keep the c1 only'. Source PDF kept OUTSIDE the repo at ~/fortel-ground-truth/22513-RLL-3151_ARYAN_MARKUP.pdf \u2014 client drawings are gitignored; only the extracted vertices live here.",
+    "corroboration": "Independent shoelace over the extracted vertices at the title-block 1:500 (k=0.176389) reproduces each of Aryan's own labels to within 0.3%, which corroborates BOTH the vertices and the scale \u2014 the sheet has no scale bar, so this is the only cross-check the drawing supports.",
+    "min_iou_rationale": "0.85, not the 0.90 used for solid-fill sheets. This surface is drawn as a STIPPLE with no boundary path of any kind, so its outline is reconstructed by closing 15,634 marks; the closed envelope sits inside the true edge by about half a stipple pitch. Scoring is by IoU per region and never by area: an area match with the wrong region is the failure this file exists to catch.",
+    "note": "THE CAD-LAYER REFERENCE CASE. Colour cannot identify this surface at all: C1 Service Yard and F1 Footway (Vehicle Overrun) are the SAME ink, RGB (118,118,118), and the legend swatch has no matching region because the surface is stippled on white paper. The sheet is measured from the engineer's own CAD layer 'RL_Surfacing_Service Yard' instead. Before that shipped it reported 6,510 m2 of P2 CAR PARKING as service-yard concrete (IoU 0.0006 against these polygons) and quoted GBP 335,518 for it."
   }
 }

@@ -2,7 +2,7 @@
 
 Isolated jobs file so nothing lands in approval_jobs.json.
 """
-import asyncio, os, json, time, uuid, urllib.request, sys
+import asyncio, os, json, re, time, uuid, urllib.request, sys
 
 PORT = os.environ.get("QA_PORT", "5111")
 BASE = f"http://127.0.0.1:{PORT}"
@@ -17,10 +17,6 @@ REFUSED_SHEETS = [
     ("roscoe", "drawings/inderjit_p9p10/10_26051-ROS-00-XX-DR-C-05101.pdf"),
     ("spec2105", "drawings/inderjit_p9p10/9_25010-RLL-26-XX-DR-C-2105"
                  "_P01_External_Construction_Specification.pdf"),
-    # Indurent joins this list on 8 Sep: it now refuses rather than reporting the car park
-    # it used to report as a service yard. Its banner must NAME the reason, not point at
-    # the flags panel below the fold.
-    ("indurent_refused", INDURENT),
 ]
 
 def upload(path, name, ref, client):
@@ -210,11 +206,52 @@ async def main():
         await page2.wait_for_timeout(6000)
         await page2.screenshot(path=f"{OUT}/04_indurent_canvas.png")
 
-        # These checks used to run on Indurent, which reported 6,510 m2 across three regions.
-        # Those three regions were the P2 CAR PARKING (its own CAD layer, 219,219,219, inside the
-        # old fallback band); the sheet now refuses, so that subject is gone. The BEHAVIOUR they
-        # proved still matters, so they moved to project 8, which is genuinely multi-part and
-        # carries a ring. Expectations are derived from the job, never typed in.
+        # Aryan's sheet, on the screen he would look at. It reported 6,510 m2 across three
+        # regions that were the P2 CAR PARKING; it then refused; it is now measured from the
+        # engineer's own CAD layer. Three yards must be drawn as three yards, and the two
+        # things the assessor cannot see for himself — how far the outline bridged, and that
+        # the figure is a floor — must be on the screen, not only in the JSON.
+        ind_ui = await page2.evaluate("""(() => ({
+          regions: aiRegions.map(r => ({pts:r.points.length, area:r.area_m2})),
+          headline: document.getElementById('areaDisplay').textContent.trim(),
+          state: currentJob.measurement_state || (currentJob.result||{}).measurement_state,
+          body: document.body.innerText
+        }))()""")
+        ck("indurent: three service yards are drawn as three outlines, not one",
+           len(ind_ui["regions"]) == 3, f"{len(ind_ui['regions'])} outlines")
+        ck("indurent: the outlines carry the total the headline is made of",
+           abs(sum(r["area"] or 0 for r in ind_ui["regions"]) - (job2.get("area_m2") or 0)) < 1.0,
+           f"{sum(r['area'] or 0 for r in ind_ui['regions']):,.1f} vs job {job2.get('area_m2')}")
+        # Not "the words exist somewhere on the page" — the flags panel sits ~1,200 px down a
+        # 950 px screen, which is exactly where the surface-refusal reason used to hide. The
+        # caveat has to be in the viewport, next to the number it qualifies.
+        caveat = await page2.evaluate("""(() => {
+          const el = document.getElementById('refusalBanner');
+          if (!el || el.hidden) return {shown:false};
+          const r = el.getBoundingClientRect();
+          return {shown:true, text: el.innerText.trim(),
+                  inViewport: r.top >= 0 && r.top < window.innerHeight};
+        })()""")
+        ck("indurent: the minimum-area caveat is ON SCREEN, beside the headline",
+           caveat.get("shown") and caveat.get("inViewport"), json.dumps(caveat)[:300])
+        ck("indurent: it says the area is a MINIMUM and the true surface is larger, never smaller",
+           "MINIMUM" in (caveat.get("text") or "")
+           and "LARGER" in (caveat.get("text") or ""),
+           (caveat.get("text") or "")[:200])
+        ck("indurent: it says how far the outline was bridged, in metres",
+           re.search(r"closed across [\d.]+ m of blank paper", caveat.get("text") or "")
+           is not None,
+           (caveat.get("text") or "")[:200])
+        ck("indurent: it names the CAD layer rather than implying a colour was matched",
+           "CAD layer" in (caveat.get("text") or "")
+           and "Service Yard" in (caveat.get("text") or ""),
+           (caveat.get("text") or "")[:200])
+        ck("indurent: measured but not approvable — no scale bar on the sheet",
+           ind_ui["state"] == "MEASURED_UNVERIFIED", str(ind_ui["state"]))
+
+        # These checks used to run on Indurent when it reported the car park. The BEHAVIOUR
+        # they prove still matters, so they run on project 8, which is genuinely multi-part
+        # and carries a ring. Expectations are derived from the job, never typed in.
         ind = await page.evaluate("""(() => ({
           regions: aiRegions.map(r => ({cat:r.category, pts:r.points.length, area:r.area_m2,
                                         holes:r.holes.length})),
@@ -300,15 +337,14 @@ async def main():
             })()""")
             ck(f"{tag}: the reason we did not measure is ON SCREEN, not below the fold",
                seen.get("shown") and seen.get("inViewport"), json.dumps(seen)[:400])
-            if tag == "indurent_refused":
-                # The refusal flag shipped once WITHOUT an entry in the portal's
-                # REFUSAL_REASONS table, so the banner fell through to "see the flags
-                # below" and the reason rendered off-screen — the very defect the banner
-                # exists to prevent. Assert the sentence, not merely that a banner showed.
-                ck("indurent: the banner NAMES the surface refusal, it does not point below the fold",
-                   "drawn as a pattern on white paper" in (seen.get("text") or "")
-                   and "see the flags below" not in (seen.get("text") or "").lower(),
-                   (seen.get("text") or "")[:180])
+            # Whatever the reason, the banner must SAY it. A refusal flag once shipped
+            # without an entry in the portal's REFUSAL_REASONS table, so the banner fell
+            # through to "see the flags below" and the reason rendered off-screen — the
+            # very defect the banner exists to prevent.
+            ck(f"{tag}: the banner NAMES the reason rather than pointing below the fold",
+               "see the flags below" not in (seen.get("text") or "").lower()
+               and len((seen.get("text") or "")) > 80,
+               (seen.get("text") or "")[:180])
             ck(f"{tag}: it says what to do next, in the assessor's words",
                "Calibrate" in (seen.get("text") or "") and "Trace" in (seen.get("text") or ""),
                (seen.get("text") or "")[:200])

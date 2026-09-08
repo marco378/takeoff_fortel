@@ -81,6 +81,18 @@ SURFACE_DOUBT_MARKERS = (
     "SGP grey convention", "grey-hatch heuristic", "not a plausible surface tint",
 )
 SURFACE_DOUBT_LABEL = "SURFACE IDENTITY UNCONFIRMED"
+# ...unless the surface was identified by a stronger method than colour. When the engineer's
+# own CAD layer names the surface, the colour disagreement that preceded it is history, not
+# doubt: printing "SURFACE IDENTITY UNCONFIRMED" over a layer-identified yard would tell the
+# client we are unsure of the one thing we are most sure of.
+SURFACE_RESOLVED_MARKER = "SURFACE FROM CAD LAYER"
+
+# What IS uncertain on a layer-identified surface is its boundary. The layer holds marks, not
+# an outline, so the outline is those marks closed across blank ground, and the result is a
+# minimum. That belongs on the client document for the same reason the identity caveat does:
+# a caveat that does not survive export is not a caveat.
+OUTLINE_ASSUMPTION_MARKERS = ("OUTLINE BRIDGED", "AREA IS A FLOOR")
+OUTLINE_ASSUMPTION_LABEL = "AREA IS A MINIMUM — OUTLINE RECONSTRUCTED"
 # Column F, immediately right of VALUE — mirrors the REMEASURE caveat column in
 # Fortel's own costing sheet rather than crowding the DESCRIPTION cell.
 PROVISIONAL_COL = 6
@@ -541,8 +553,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         declarations.extend(f for f in flags if (
             "ASSUMED" in f or "architect" in f.lower() or "tolerance" in f.lower()))
         # Surface-identity doubt must reach the client document, not just the assessor's screen.
+        surface_resolved = any(SURFACE_RESOLVED_MARKER in f for f in flags)
         for flag in flags:
-            if any(marker in flag for marker in SURFACE_DOUBT_MARKERS):
+            if any(marker in flag for marker in OUTLINE_ASSUMPTION_MARKERS):
+                declarations.append(f"{OUTLINE_ASSUMPTION_LABEL}: {flag}")
+            elif not surface_resolved and any(m in flag for m in SURFACE_DOUBT_MARKERS):
                 declarations.append(f"{SURFACE_DOUBT_LABEL}: {flag}")
         for exclusion in unit.get("exclusions") or []:
             quantity = (f" ({float(exclusion['area_m2']):g} m²)"

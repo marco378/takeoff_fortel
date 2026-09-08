@@ -106,14 +106,30 @@ if _ind.exists():
     from takeoff_pipeline import takeoff as _tk_ind
     _r_ind = _tk_ind(str(_ind))
     _fl_ind = " ".join(_r_ind.get("flags") or [])
-    ck("a legend tint that cannot be found refuses instead of substituting another client's grey",
-       _r_ind.get("area_m2") is None and _r_ind.get("measurement_state") == "UNMEASURED",
-       f"area={_r_ind.get('area_m2')} state={_r_ind.get('measurement_state')}")
-    ck("...and it says the SURFACE was not identified, not that a colour needs confirming",
-       "SURFACE NOT IDENTIFIED" in _fl_ind and "FELL BACK" not in _fl_ind,
-       _fl_ind[:160])
+    # The refusal was correct and is now unnecessary: the surface is identified from the
+    # engineer's own CAD layer instead. What must never come back is the substitution — the
+    # number below has to come from `RL_Surfacing_Service Yard`, never from another client's
+    # grey. "FELL BACK" appearing here would mean the guess is back.
+    ck("a legend tint that cannot be found never substitutes another client's grey",
+       "FELL BACK" not in _fl_ind, _fl_ind[:160])
+    ck("...it identifies the surface from the CAD layer the engineer drew it on",
+       "SURFACE FROM CAD LAYER" in _fl_ind
+       and "RL_Surfacing_Service Yard" in _fl_ind,
+       _fl_ind[:200])
     ck("...and it never reports the car park it used to report",
        str(_r_ind.get("area_m2")) not in ("6510.0", "2519.8"), str(_r_ind.get("area_m2")))
+    # No scale bar on this sheet, so a measured number is the assessor's to verify, never
+    # approvable on its own.
+    ck("...capped at MEASURED_UNVERIFIED because the sheet carries no scale bar",
+       _r_ind.get("area_m2") is not None
+       and _r_ind.get("measurement_state") == "MEASURED_UNVERIFIED"
+       and _r_ind.get("needs_assessor") is True,
+       f"area={_r_ind.get('area_m2')} state={_r_ind.get('measurement_state')}")
+    # An outline reconstructed by closing a stipple is an assumption about blank ground, and
+    # it under-measures. Both must reach the assessor in metres, not be buried in a constant.
+    ck("...and it discloses the bridge it closed and that the area is a floor",
+       "OUTLINE BRIDGED" in _fl_ind and " m:" in _fl_ind and "AREA IS A FLOOR" in _fl_ind,
+       _fl_ind[:200])
 else:
     print(f"  [SKIP] Indurent sheet not present — {_ind}")
 

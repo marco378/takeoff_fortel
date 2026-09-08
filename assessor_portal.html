@@ -65,6 +65,7 @@ header span{opacity:.7;font-size:12px}
 #refusalBanner{margin:0 12px 8px;padding:9px 12px;border-radius:6px;font-size:13px;line-height:1.5;
   background:#f4ecff;border:1px solid #8e44ad;color:#3d1e57}
 #refusalBanner.rejected{background:#fdecea;border-color:#c0392b;color:#63160d}
+#refusalBanner.caveat{background:#fff4e5;border-color:#e67e22;color:#6b3a06}
 #refusalBanner .rb-head{font-weight:700;display:block;margin-bottom:2px}
 #refusalBanner .rb-next{display:block;margin-top:4px;color:#4a4a4a}
 .badge.mstate.REJECTED{background:#c0392b;color:#fff}
@@ -2429,7 +2430,14 @@ function renderRefusalBanner(job, res, flags) {
   // so without this the banner kept telling them to calibrate and trace a drawing they had just
   // thrown out.
   const rejected = mstate === 'REJECTED' || job.decision === 'rejected';
-  if (mstate !== 'UNMEASURED' && mstate !== 'REJECTED') { el.hidden = true; return; }
+  // A measured sheet can still carry an assumption the assessor must see before approving.
+  // The CAD-layer path measures a surface that has no drawn boundary at all: the outline is
+  // stipple marks closed across blank ground, and the area is therefore a MINIMUM. Leaving
+  // that in the flags panel puts it ~1,200 px down a 950 px screen, which is where the
+  // surface-refusal reason used to live before this banner existed.
+  if (mstate !== 'UNMEASURED' && mstate !== 'REJECTED') {
+    return renderMeasurementCaveat(el, Array.isArray(flags) ? flags : []);
+  }
   const reason = refusalReason(Array.isArray(flags) ? flags : []);
   el.className = rejected ? 'rejected' : '';
   el.innerHTML =
@@ -2439,6 +2447,33 @@ function renderRefusalBanner(job, res, flags) {
     (rejected ? '' : `<span class="rb-next">What to do: set the scale with <strong>Calibrate</strong>` +
                      ` (draw a line over a scale bar or a 2.5 m parking bay), then draw the surface` +
                      ` with <strong>Trace</strong>. Your trace is measured exactly like an AI one.</span>`);
+  el.hidden = false;
+}
+
+function renderMeasurementCaveat(el, flags) {
+  const find = rx => (flags.find(f => rx.test(f)) || '');
+  const layer = find(/^SURFACE FROM CAD LAYER/);
+  const bridged = find(/^OUTLINE BRIDGED/);
+  const floor = find(/^AREA IS A FLOOR/);
+  if (!bridged && !floor) { el.hidden = true; return; }
+  const metres = (bridged.match(/OUTLINE BRIDGED ([\d.]+) m/) || [])[1];
+  const named = (layer.match(/measured '([^']+)' as the ([\d,]+) marks/) || []);
+  const on = (layer.match(/on layer '([^']+)'/) || [])[1] || '';
+  el.className = 'caveat';
+  el.innerHTML =
+    '<span class="rb-head">Measured — but this area is a MINIMUM, not the answer.</span>' +
+    (named[1]
+      ? esc('We measured \u201c' + named[1] + '\u201d from the ' + named[2] + ' marks the engineer drew on CAD layer ' +
+            on.split('|').pop() + ' — the drawing names this surface on its own layer, so we did not '
+            + 'have to guess it from colour.') + ' '
+      : '') +
+    (metres
+      ? esc('That layer holds marks, not an outline, so the outline is those marks closed across '
+            + metres + ' m of blank paper. ')
+      : '') +
+    esc('A stipple stops short of its own edge, so the true surface is this size or LARGER — never smaller.') +
+    '<span class="rb-next">What to do: check the outline against the drawing before you approve, ' +
+    'and treat the figure as a floor when you price it.</span>';
   el.hidden = false;
 }
 
