@@ -3202,15 +3202,23 @@ try:
         print(f"  [SKIP] Newport multi-unit gold — client fixture not present ({_newport})")
     else:
         _np_res = _tu_hx.takeoff(_newport, source="engineer")
-        # Three unit yards measured individually: 2,505.3 + 2,070.8 + 1,909.7 = 6,485.8 m².
-        ck("the three-unit Newport sheet totals all three yards, not just the biggest",
-           abs((_np_res.get("area_m2") or 0) - 6485.8) / 6485.8 <= 0.05,
-           f"{_np_res.get('area_m2')} vs 6,485.8")
-        ck("...and it stays assessor-gated, with every region listed for keep/exclude",
-           _np_res.get("measurement_state") == "MEASURED_UNVERIFIED"
-           and len(_np_res.get("yard_regions") or []) >= 3
-           and any("keep or exclude every region" in f for f in _np_res.get("flags") or []),
-           _np_res.get("measurement_state"))
+        # THESE TWO CHECKS USED TO ASSERT 6,485.8 m² ACROSS "three unit yards". They were written
+        # for bc3e97a and they were wrong about what they were measuring. Aryan's own Bluebeam
+        # markup (7 Sep 2026, ~/fortel-ground-truth/22513-RLL-3151_ARYAN_MARKUP.pdf) puts the
+        # three Service Yards at 3,492.3 + 3,195.6 + 4,438.0 = 11,125.9 m², somewhere else
+        # entirely: 98.6% of this sheet's own `RL_Surfacing_Service Yard` CAD items fall inside
+        # his polygons and 0.2% inside what we were measuring, IoU 0.0006. The 6,485.8 was the
+        # P2 car parking, reached by substituting another client's grey for a legend tint we
+        # could not find. The sheet now refuses. A test that pins a number nobody checked
+        # against the client is not a gate — it is a way of not noticing.
+        ck("the Newport sheet refuses rather than reporting the car park as a service yard",
+           _np_res.get("area_m2") is None
+           and _np_res.get("measurement_state") == "UNMEASURED"
+           and _np_res.get("needs_assessor") is True,
+           f"area={_np_res.get('area_m2')} state={_np_res.get('measurement_state')}")
+        ck("...and the refusal names the surface, not a colour to nod at",
+           any("SURFACE NOT IDENTIFIED" in f for f in _np_res.get("flags") or []),
+           [f[:90] for f in (_np_res.get("flags") or [])][-1:])
 
     # ── The bridging limit is DISCLOSED, not detected ───────────────────────────────────
     # A kernel wide enough to bridge this sheet's stroke gaps also bridges a real corridor of
@@ -7690,6 +7698,62 @@ if _p6.exists():
 else:
     print(f"  [SKIP] real project-6 sheet not present — {_p6}")
 
+
+# ── a legend tint we cannot find is a REFUSAL, not a substitution ─────────────────────────
+# Indurent Park (22513-RLL-3151): the legend names "C1 - Service Yard" and the surface is drawn
+# as a stipple on white paper. We locked its tint, failed to find it, and answered by
+# re-segmenting on a constant from a different client's site plans — landing on the car park.
+# 98.6% of that sheet's own `RL_Surfacing_Service Yard` CAD items lie inside the client's own
+# markup; 0.2% lie inside what we measured. IoU 0.0006. It quoted GBP 335,518 as yard concrete.
+_ind = Path("drawings/inderjit_p9p10/11_Indurent_Park_Newport_22513-RLL-25-00-DR-C-3151"
+            "_P02_Proposed_Pavement_Construction.pdf")
+if _ind.exists():
+    from takeoff_pipeline import takeoff as _tk_ind
+    _r_ind = _tk_ind(str(_ind))
+    _fl_ind = " ".join(_r_ind.get("flags") or [])
+    ck("a legend tint that cannot be found refuses instead of substituting another client's grey",
+       _r_ind.get("area_m2") is None and _r_ind.get("measurement_state") == "UNMEASURED",
+       f"area={_r_ind.get('area_m2')} state={_r_ind.get('measurement_state')}")
+    ck("...and it says the SURFACE was not identified, not that a colour needs confirming",
+       "SURFACE NOT IDENTIFIED" in _fl_ind and "FELL BACK" not in _fl_ind,
+       _fl_ind[:160])
+    ck("...and it never reports the car park it used to report",
+       str(_r_ind.get("area_m2")) not in ("6510.0", "2519.8"), str(_r_ind.get("area_m2")))
+else:
+    print(f"  [SKIP] Indurent sheet not present — {_ind}")
+
+# The two gold sheets that legitimately depend on the generic grey convention reach it by the
+# OTHER gates (swatch unreadable / no plausible region), which the refusal above must not touch.
+for _gp, _want in (("drawings/real_sgp/D77_Hard_Landscaping.pdf", 3138.0),
+                   ("drawings/_int_d77.pdf", 3159.0)):
+    if Path(_gp).exists():
+        from takeoff_pipeline import takeoff as _tk_g
+        _rg = _tk_g(_gp)
+        ck(f"the grey-convention gold sheet {Path(_gp).name} is untouched by that refusal",
+           _rg.get("area_m2") == _want, f"{_rg.get('area_m2')} (want {_want})")
+    else:
+        print(f"  [SKIP] gold sheet not present — {_gp}")
+
+# ── surface-identity doubt must survive EXPORT, not just reach the portal ─────────────────
+# The Indurent quotation exported GBP 335,518.20 headed "EXTERNAL YARD SLABS", naming
+# "Service Yard" four times, with no trace in txt/html/xlsx that the surface was never
+# identified. A caveat the client document does not carry is not a caveat.
+from quotation import (generate_quotation as _gq_sd, quotation_text as _qt_sd,
+                       quotation_html as _qh_sd, SURFACE_DOUBT_LABEL as _SDL)
+_fake_sd = {"file": "sheet.pdf", "type": "UNMARKED vector", "area_m2": 1000.0,
+            "measurement_state": "MEASURED_UNVERIFIED", "needs_assessor": True,
+            "scale_k": 0.1, "confidence": "low",
+            "flags": ["legend/body colour DISAGREE: swatch (1,1,1), selected component dominant "
+                      "RGB (255,255,255), max channel difference 254 > 5"],
+            "brief_spec": {"depth_mm": 190, "mesh": "A252", "layers": 1, "conc_mix": "C32/40"}}
+_q_sd = _gq_sd(_fake_sd, project="CI", client="CI")
+ck("a surface-identity flag becomes a client-facing declaration",
+   any(_SDL in d for d in _q_sd["declarations"]),
+   str(_q_sd["declarations"])[:160])
+ck("...and it reaches the exported text quotation",
+   _SDL in _qt_sd(_q_sd), "not in txt")
+ck("...and the exported html quotation",
+   _SDL in _qh_sd(_q_sd), "not in html")
 
 print(f"\n==== {sum(P)}/{len(P)} PASS ====")
 sys.exit(0 if all(P) else 1)

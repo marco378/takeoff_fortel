@@ -69,6 +69,18 @@ _SECTION_RANK = {section: index for index, section in enumerate(SECTION_ORDER)}
 # sorts predictably and can never KeyError.
 _SECTION_RANK[UNCLASSIFIED_SECTION] = len(SECTION_ORDER)
 PROVISIONAL_LABEL = "PROVISIONAL — NO DETAILS PROVIDED"
+
+# Flags that say we are not sure WHICH SURFACE we measured, as opposed to how big it is.
+# These used to reach the portal and stop there: on 8 Sep 2026 the Indurent Park quotation
+# exported £335,518.20 under the heading "EXTERNAL YARD SLABS", naming "Service Yard" four
+# times, while the pipeline's own flags said the legend tint was never found and a different
+# client's grey had been substituted. The measurement had in fact landed on the car park.
+# The portal gate is not the deliverable: a caveat that does not survive export is not a caveat.
+SURFACE_DOUBT_MARKERS = (
+    "SURFACE NOT IDENTIFIED", "colour DISAGREE", "FELL BACK", "confirm region colour",
+    "SGP grey convention", "grey-hatch heuristic", "not a plausible surface tint",
+)
+SURFACE_DOUBT_LABEL = "SURFACE IDENTITY UNCONFIRMED"
 # Column F, immediately right of VALUE — mirrors the REMEASURE caveat column in
 # Fortel's own costing sheet rather than crowding the DESCRIPTION cell.
 PROVISIONAL_COL = 6
@@ -528,6 +540,10 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             )
         declarations.extend(f for f in flags if (
             "ASSUMED" in f or "architect" in f.lower() or "tolerance" in f.lower()))
+        # Surface-identity doubt must reach the client document, not just the assessor's screen.
+        for flag in flags:
+            if any(marker in flag for marker in SURFACE_DOUBT_MARKERS):
+                declarations.append(f"{SURFACE_DOUBT_LABEL}: {flag}")
         for exclusion in unit.get("exclusions") or []:
             quantity = (f" ({float(exclusion['area_m2']):g} m²)"
                         if isinstance(exclusion.get("area_m2"), (int, float)) else "")

@@ -2372,19 +2372,30 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         body_diff = max(abs(int(body_rgb[i]) - int(swatch[i])) for i in range(3)) \
             if body_rgb else 256
         if not _swatch_body_agrees(swatch, body_rgb):
-            flags.append(
-                f"legend/body colour DISAGREE: swatch {swatch}, {_body_of} dominant "
-                f"RGB {body_rgb}, max channel difference {body_diff} > "
-                f"{SWATCH_BODY_AGREE_TOL} — FELL BACK to validated SGP grey band "
-                f"{GREY_FALLBACK}±{GREY_TOL}; assessor confirm region colour"
-            )
-            region_confidence = "low"
-            rgb = GREY_FALLBACK
-            swatch_locked = False
-            _seg_diag = {}
-            comp = segment_hatch(
-                im, rgb, tol=GREY_TOL, k=k, S=S,
-                legend_exclusion_bbox=legend_exclusion_bbox, _diag=_seg_diag)
+            # We read the legend, locked its tint, went looking for that surface — and did not
+            # find it. That is the system working: it has just proved the method does not apply.
+            # It used to answer by re-segmenting on GREY_FALLBACK, a constant reconciled in June
+            # against a DIFFERENT client's site plans. On Indurent Park (22513-RLL-3151) that
+            # guess landed on the P2 car parking: 98.6% of the sheet's own
+            # `RL_Surfacing_Service Yard` CAD items sit inside the client's markup and 0.2%
+            # inside ours, IoU 0.0006. We reported 6,510 m² of car park as service-yard concrete
+            # and quoted £335,518 for it. Substituting another client's colour is a guess, and
+            # rule 5 says refuse instead. The surface is unidentified, so there is no number.
+            #
+            # Deliberately narrow: this is the gate where a swatch WAS read and disagreed. The
+            # two other paths onto GREY_FALLBACK (swatch unreadable, no plausible region) are
+            # untouched — both gold sheets that depend on the grey convention, D77_Hard_
+            # Landscaping 3138/3156 and _int_d77 3159/3156, arrive by those and land correctly.
+            return {"pdf": pdf, "area_m2": None,
+                    "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
+                    "flags": flags + [
+                        f"SURFACE NOT IDENTIFIED — the legend names '{label}' as tint {swatch}, "
+                        f"but no region of that tint was found: the {_body_of} reads "
+                        f"{body_rgb} ({body_diff} levels apart, tolerance {SWATCH_BODY_AGREE_TOL}). "
+                        f"The surface is most likely drawn as a stipple or hatch on white paper "
+                        f"rather than a solid fill. NO substitute colour was assumed and no area "
+                        f"is reported — measuring the wrong surface is worse than measuring none. "
+                        f"Assessor: trace the surface the legend names."]}
         else:
             flags.append(
                 f"legend/body colour cross-check PASSED: swatch {swatch}, {_body_of} "
