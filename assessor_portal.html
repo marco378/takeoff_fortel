@@ -1135,6 +1135,14 @@ async function renderJobUI(job, gen) {
       '<div class="kv"><span class="k">Measurement</span><span class="v">Takeoff running…</span></div>';
     document.getElementById('flagList').innerHTML =
       '<div class="flag">⏳ Flags appear once the takeoff finishes</div>';
+    // The scale, the perimeter and the rate build-up are the last job's too. Clearing the area
+    // alone left this job's name above the PREVIOUS job's 1:1000, its 4,456 m perimeter and a
+    // £1,091,996 quote — three panels that read as though they belonged to the drawing on screen.
+    document.getElementById('perimeterDisplay').textContent = '—';
+    document.getElementById('scaleDisplay').textContent = '—';
+    document.getElementById('scaleRatioDisplay').textContent = '—';
+    document.getElementById('costingBlock').innerHTML =
+      '<div style="color:var(--muted);font-size:13px">Pricing appears once the takeoff finishes</div>';
     document.getElementById('errorSection').style.display = 'none';
     hideThumb();
     _lastRenderedStatus = job.status;
@@ -4074,26 +4082,35 @@ function setupButtons() {
     activeCandidateId = null;
     // Drop cut-outs a previous press of this button loaded; keep the assessor's own.
     cutoutPolygons = cutoutPolygons.filter(cut => !cut.fromAiRegion);
-    poly = aiParts[0].points.map(p => ({x: p[0], y: p[1]}));
-    aiParts.slice(1).forEach(part => traceRegions.push({
+    // A RING-SHAPED surface cannot go into this editor: a trace region is a single closed
+    // outline with no hole, and calcArea sums region areas rather than unioning them. Loading
+    // the hole as a cut-out made the road's hole cancel the yard sitting inside it (38,527 m2
+    // for a 58,411 m2 sheet); loading the ring without its hole double-counts that same yard
+    // (90,236 m2). Both were measured on project 8. So we do not load it, and we say why —
+    // the measurement itself is unaffected, and Confirm scale + extent accepts it as it stands.
+    const ringParts = aiParts.filter(part => (part.holes || []).length);
+    const loadParts = aiParts.filter(part => !(part.holes || []).length);
+    if (!loadParts.length) {
+      toast(`Every measured surface here is ring-shaped, and the trace editor cannot hold a hole.` +
+            ` Use Confirm scale + extent to accept the measurement, or trace it yourself.`, 'error');
+      return;
+    }
+    poly = loadParts[0].points.map(p => ({x: p[0], y: p[1]}));
+    loadParts.slice(1).forEach(part => traceRegions.push({
       points: part.points.map(p => ({x: p[0], y: p[1]})),
       candidateId: null, candidateGroupId: null, category: part.category || null,
       boqScope: document.getElementById('traceScope').value || 'main'
     }));
-    aiParts.forEach(part => (part.holes || []).forEach(hole => {
-      if (Array.isArray(hole) && hole.length >= 3) cutoutPolygons.push({
-        points: hole.map(p => ({x: p[0], y: p[1]})), closed: true, fromAiRegion: true
-      });
-    }));
+
     draw();
-    const cutCount = cutoutPolygons.filter(cut => cut.fromAiRegion).length;
+    const cutCount = 0;
     // Does each outline actually reproduce the quantity it stands for? "Inspect every edge" is
     // useless advice if we already know WHICH edge is wrong, and by how much.
     aiLoadLoose = [];
     aiLoadTotalM2 = null;
     if (mpp > 0) {
       let stated = 0;
-      aiParts.forEach(part => {
+      loadParts.forEach(part => {
         if (typeof part.area_m2 !== 'number' || !(part.area_m2 > 0)) return;
         stated += part.area_m2;
         const drawn = shoelace(part.points.map(p => ({x: p[0], y: p[1]}))) * mpp * mpp;
@@ -4105,16 +4122,22 @@ function setupButtons() {
       if (stated > 0) aiLoadTotalM2 = stated;
     }
     aiLoadSnapshot = traceGeometryFingerprint();
-    if (aiLoadLoose.length) {
+    if (ringParts.length) {
+      const names = ringParts.map(part => part.label || 'a surface').join(', ');
+      const held = ringParts.reduce((sum, part) => sum + (part.area_m2 || 0), 0);
+      toast(`${names} is ring-shaped — the trace editor cannot hold a hole, so it was NOT loaded.` +
+            ` Its ${Math.round(held).toLocaleString()} m² is still in the measurement:` +
+            ` use Confirm scale + extent to accept it, or trace the ring as two outlines.`, 'error');
+    } else if (aiLoadLoose.length) {
       const worst = aiLoadLoose.slice().sort((a, b) => Math.abs(b.off) - Math.abs(a.off))[0];
       toast(`${worst.label}'s outline encloses ${Math.round(worst.drawn).toLocaleString()} m² ` +
             `against its ${Math.round(worst.stated).toLocaleString()} m² measurement ` +
             `(${worst.off > 0 ? '+' : ''}${(worst.off * 100).toFixed(0)}%) — tighten it before submitting`,
             'warn');
     } else {
-      toast(aiParts.length === 1 && !cutCount
+      toast(loadParts.length === 1 && !cutCount
         ? 'AI polygon loaded — nudge as needed'
-        : `AI measurement loaded — ${aiParts.length} surface${aiParts.length === 1 ? '' : 's'}` +
+        : `AI measurement loaded — ${loadParts.length} surface${loadParts.length === 1 ? '' : 's'}` +
           `${cutCount ? ` and ${cutCount} cut-out${cutCount === 1 ? '' : 's'}` : ''}; inspect every edge before submitting`);
     }
   });

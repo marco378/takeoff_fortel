@@ -347,14 +347,37 @@ async def main():
 
         # The ring on p8 must come back with its hole as a cut-out, or the loaded outline
         # overstates the road by the whole yard it loops around.
+        # A RING-shaped surface is REFUSED by Load AI polygon, and says so. The editor holds one
+        # closed outline per region with no hole, and calcArea SUMS regions rather than unioning
+        # them, so there is no honest way to load a ring: loading its hole as a cut-out made the
+        # road cancel the yard inside it (38,527 m2 for a 58,411 m2 sheet), and loading the ring
+        # without the hole double-counted that yard (90,236 m2). Both measured on project 8.
         ring = await page.evaluate("""(() => {
+          const seen = [];
+          const realToast = window.toast;
+          window.toast = (m, kind) => seen.push(String(m));
           document.getElementById('btnLoad').click();
-          return {regions: traceRegionEntries().length,
-                  cutouts: cutoutPolygons.filter(c => c.fromAiRegion).length,
-                  holes: aiRegions.filter(r => r.holes.length).length};
+          window.toast = realToast;
+          return {regions: traceRegionEntries().length, area: calcArea(), toasts: seen,
+                  aiRegions: aiRegions.length,
+                  rings: aiRegions.filter(r => r.holes.length).length,
+                  loadedStated: aiRegions.filter(r => !r.holes.length)
+                                         .reduce((sum, r) => sum + (r.area_m2 || 0), 0),
+                  cutouts: cutoutPolygons.filter(c => c.fromAiRegion).length};
         })()""")
-        ck("a ring-shaped surface loads with its hole as a cut-out",
-           ring["holes"] >= 1 and ring["cutouts"] >= ring["holes"], json.dumps(ring))
+        ck("the ring-shaped road is NOT loaded into an editor that cannot hold its hole",
+           ring["rings"] >= 1 and ring["regions"] == ring["aiRegions"] - ring["rings"]
+           and ring["cutouts"] == 0, json.dumps({k: ring[k] for k in ("regions","aiRegions","rings","cutouts")}))
+        ck("...and it names the surface it refused and where the area still is",
+           any("ring-shaped" in t and "road" in t and "Confirm scale + extent" in t for t in ring["toasts"]),
+           json.dumps(ring["toasts"]))
+        # The reference is the sum of the parts that WERE loaded (three yard parts plus the
+        # road's second, hole-free component) - NOT the yard zone total, and not the whole
+        # sheet. If this drifts, either a ring leaked in or a surface is being double-counted.
+        ck("what IS loaded adds up to the surfaces it came from, with nothing double-counted",
+           ring["area"] is not None and ring["loadedStated"] > 0
+           and abs(ring["area"] - ring["loadedStated"]) / ring["loadedStated"] < 0.03,
+           f"{ring['area']:.1f} enclosed vs {ring['loadedStated']:.1f} stated across the loaded parts")
 
         # ── a job still being measured must not wear the last job's numbers ────────────
         jid4 = upload(INDURENT, "Processing QA", "QA-PROC", "Indurent")
@@ -366,6 +389,10 @@ async def main():
           status: currentJob.status,
           area: document.getElementById('areaDisplay').textContent.trim(),
           readout: document.getElementById('readout').textContent.trim(),
+          perimeter: document.getElementById('perimeterDisplay').textContent.trim(),
+          scale: document.getElementById('scaleDisplay').textContent.trim(),
+          ratio: document.getElementById('scaleRatioDisplay').textContent.trim(),
+          costing: document.getElementById('costingBlock').innerText.trim(),
           zoomControls: !!document.getElementById('zoomControls')
         }))()""")
         if proc["status"] == "processing":
@@ -382,6 +409,9 @@ async def main():
             }))()""")
             ck("opening a processing job does not delete the zoom controls for the session",
                zoom["controls"] and zoom["zoomIn"], json.dumps(zoom))
+            ck("a processing job shows no scale, perimeter or price from the last job either",
+               all(v == "\u2014" for v in (proc.get("perimeter"), proc.get("scale"), proc.get("ratio")))
+               and "£" not in (proc.get("costing") or ""), json.dumps(proc))
             ck("...and the empty state gets its own words back",
                "Takeoff running" not in zoom["empty"], zoom["empty"][:80])
         else:
@@ -395,7 +425,13 @@ async def main():
         await pg.goto(f"{BASE}/portal?job={refused_jid}", wait_until="networkidle", timeout=60000)
         await pg.wait_for_timeout(4000)
         await pg.click("#btnReject")
-        await pg.wait_for_timeout(6000)
+        # The banner is hidden while /snapshot re-renders after the decision - measured at up
+        # to 10s on one sheet. Assert the steady state the assessor ends up looking at.
+        for _ in range(20):
+            await pg.wait_for_timeout(1000)
+            settled = await pg.evaluate("(() => { const el = document.getElementById('refusalBanner'); return !!(currentJob && currentJob.decision === 'rejected' && el && !el.hidden); })()")
+            if settled:
+                break
         rej = await pg.evaluate("""(() => {
           const el = document.getElementById('refusalBanner');
           return {hidden: !el || el.hidden, text: el ? el.innerText.trim() : null,
