@@ -23,7 +23,7 @@ try:
 
     def _sheet(path, *, stipple_chips=1, hatch_chips=3, field=True, field_pitch=3.0,
                rotation=0, stray_dashes=0, field_origin=(200.0, 200.0), field_n=70,
-               hatch_over_field=False):
+               hatch_over_field=False, ribbon=False):
         """A page carrying a legend column and (optionally) a stipple field.
 
         The legend is a column of chips down the right-hand side: each chip is either
@@ -63,6 +63,14 @@ try:
                     x = x0 + i * 1.6
                     page.draw_line(_fitz_sp.Point(x, oy),
                                    _fitz_sp.Point(x + 18.0, oy + 36.0),
+                                   color=(0, 0, 0), width=1.0, oc=xref)
+        if ribbon:
+            # a long, 3-dot-wide strip of the SAME stipple, well away from the field:
+            # real ground is compact, this is not, and it must be offered rather than counted
+            for j in range(240):
+                for w in range(3):
+                    x, y = 150.0 + j * 3.0, 780.0 + w * 3.0
+                    page.draw_line(_fitz_sp.Point(x, y), _fitz_sp.Point(x + 0.8, y),
                                    color=(0, 0, 0), width=1.0, oc=xref)
         for i in range(stray_dashes):
             # lone short marks, far apart -- short, but never a stipple
@@ -170,18 +178,89 @@ try:
     # remaining 23% sits in ~150 scattered patches the sheet gives us no way to attribute.
     # If a future change makes this measure, it must be checked by IoU against the
     # client's polygons in ground_truth_polygons.json, never by area.
+    # ── a ribbon of the same stipple is OFFERED, never counted ───────────────────────
+    # The client's decision, 9 Sep 2026: extra stipple areas become candidates the
+    # assessor opts into; they must not silently join the total, and must not make the
+    # whole sheet refuse either.
+    _p10 = str(_P_sp(_d_sp) / "ribbon.pdf")
+    _doc10 = _sheet(_p10, ribbon=True)
+    _r10 = _sp.measure(_doc10, _doc10[0], _K_SP)
+    ck("a ribbon of the same stipple does not stop the sheet being measured",
+       _r10.get("ok") is True, f"{_r10.get('reason')}")
+    if _r10.get("ok"):
+        ck("...it is held out as a CANDIDATE rather than counted",
+           len(_r10.get("candidate_regions") or []) >= 1,
+           f"candidates={len(_r10.get('candidate_regions') or [])}")
+        ck("...and the total is the compact ground only, unchanged by its presence",
+           abs((_r10.get("area_m2") or 0) - (_r1.get("area_m2") or 0)) <= 1.0,
+           f"{_r10.get('area_m2')} vs plain {_r1.get('area_m2')}")
+        ck("...and the assessor is told candidates exist and are excluded",
+           any("CANDIDATE" in f for f in (_r10.get("flags") or [])),
+           f"{_r10.get('flags')}")
+
+    # ── the real sheet: measured, and checked by SHAPE against the client's markup ────
+    # This measured nothing until 9 Sep 2026. It measures now because the client decided
+    # extra stipple areas should be offered rather than cause a refusal. The number is
+    # scored by IoU against his polygons -- an area can match while outlining the wrong
+    # ground, which is exactly what went wrong on Indurent.
     _p2105 = _P_sp("drawings/inderjit_p9p10/"
                    "9_25010-RLL-26-XX-DR-C-2105_P01_External_Construction_Specification.pdf")
-    if not _p2105.exists():
-        print("  [SKIP] 2105 not present — real-sheet refusal check needs client drawings")
+    _gt_sp = _P_sp("ground_truth_polygons.json")
+    if not (_p2105.exists() and _gt_sp.exists()):
+        print("  [SKIP] 2105 not present — real-sheet checks need client drawings")
     else:
+        import json as _json_sp
+        _g9 = _json_sp.loads(_gt_sp.read_text()).get(
+            "drawings/inderjit_p9p10/"
+            "9_25010-RLL-26-XX-DR-C-2105_P01_External_Construction_Specification.pdf")
         _doc9 = _fitz_sp.open(str(_p2105))
-        _r9 = _sp.measure(_doc9, _doc9[0], _K_SP)
-        ck("2105 refuses, and for one of the two safety gates rather than a silent pass",
-           _r9.get("ok") is False
-           and ("blank paper" in (_r9.get("reason") or "")
-                or "ink ends up inside" in (_r9.get("reason") or "")),
-           f"{_r9.get('reason')}")
+        _pg9 = _doc9[0]
+        _r9 = _sp.measure(_doc9, _pg9, _K_SP)
+        ck("2105 measures from the one stipple pattern in its own legend",
+           _r9.get("ok") is True and (_r9.get("area_m2") or 0) > 0,
+           f"{_r9.get('reason') or _r9.get('area_m2')}")
+        if _r9.get("ok") and _g9:
+            import cv2 as _cv9
+            _S9 = 2.0
+            _rot9 = _pg9.rotation_matrix
+            _W9 = int(_np_sp.ceil(_pg9.rect.width * _S9))
+            _H9 = int(_np_sp.ceil(_pg9.rect.height * _S9))
+
+            def _m9(pts):
+                _m = _np_sp.zeros((_H9, _W9), _np_sp.uint8)
+                _q = _np_sp.round(_np_sp.array(
+                    [tuple(_fitz_sp.Point(x, y) * _rot9) for x, y in pts]) * _S9
+                ).astype(_np_sp.int32)
+                _cv9.fillPoly(_m, [_q], 1)
+                return _m.astype(bool)
+
+            _ours = [_m9(x["polygon_pts"]) for x in _r9["regions"] if x.get("polygon_pts")]
+            _worst = 1.0
+            for _g in _g9["regions"]:
+                _gm = _m9(_g["polygon_pts"])
+                _best = 0.0
+                for _om in _ours:
+                    _u = int((_om | _gm).sum())
+                    _best = max(_best, (int((_om & _gm).sum()) / _u) if _u else 0.0)
+                _worst = min(_worst, _best)
+            ck(f"...and every region the CLIENT marked is found (IoU >= {_g9['min_iou']})",
+               _worst >= _g9["min_iou"], f"worst IoU {_worst:.3f}")
+            # Reading OVER would mean quoting ground nobody is paving. A stipple stops
+            # inside its own edge, so this direction is not a preference, it is the method.
+            ck("...and the total reads UNDER the client's own figure, never over it",
+               _r9["area_m2"] <= _g9["area_m2"],
+               f"{_r9['area_m2']} vs client {_g9['area_m2']} "
+               f"({100 * _r9['area_m2'] / _g9['area_m2'] - 100:+.2f}%)")
+            ck("...the stray strip is a CANDIDATE, kept out of the priced total",
+               len(_r9.get("candidate_regions") or []) >= 1
+               and _r9["area_m2"] + (_r9.get("candidate_area_m2") or 0) > _r9["area_m2"],
+               f"candidates={_r9.get('candidate_area_m2')} m2")
+            ck("...and the stipple left uncounted is disclosed with its own number",
+               any("NOT IN THE TOTAL" in f or "IS IN THE TOTAL" in f
+                   for f in (_r9.get("flags") or [])),
+               f"{(_r9.get('flags') or [''])[0][:80]}")
+            ck("...closing never assumes more blank paper than the cap allows",
+               (_r9.get("bridge_gap_m") or 0) <= 3.0, f"bridge {_r9.get('bridge_gap_m')} m")
 
 except Exception as _e_sp:                                     # pragma: no cover - defensive
     import traceback as _tb_sp

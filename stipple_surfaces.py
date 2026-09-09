@@ -73,18 +73,33 @@ MAX_PITCH_PT = 40.0
 MIN_REGION_M2 = _ls.MIN_REGION_M2
 MIN_INK_RETENTION = _ls.MIN_INK_RETENTION
 
-# Below this, a region is a ribbon rather than a piece of ground: the two real regions on
-# 2105 score 86%, the unexplained strip 14%. This does NOT delete anything -- it only
-# raises a flag the assessor can see.
-SOLIDITY_SUSPECT = 0.40
+# How WIDE a region is at its widest point, in metres -- not how concave it is. Solidity
+# was the first attempt and it is wrong: a straight thin bar is convex, so it scores ~1.0
+# and would be counted as ground. (The 2105 strip only scored 14% because it happens to
+# wind; a straight one would have walked straight through.) Width is the property that
+# actually matters and it is interpretable: on 2105 the two yards are 51 m across at their
+# widest and the stray strip is 2.8 m. A service yard 3 m wide is not a service yard.
+# Nothing is ever deleted by this -- it decides
+# whether a region is reported as MEASURED or as a CANDIDATE the assessor must opt into.
+# The client asked for exactly that split on 9 Sep 2026: "the two main regions should be
+# detected as normal, and any additional stipple regions should appear separately as
+# candidate areas. Don't automatically include them in the final total, but also don't
+# reject the whole sheet because of them."
+# The asymmetry is what makes a shape threshold safe here: a real region misfiled as a
+# candidate under-counts until a human opts in, and nothing misfiled can inflate a price.
+MIN_REGION_WIDTH_M = 6.0
 
 # A stipple is not "a short mark" -- it is short marks REPEATED at a density. Dashes,
 # symbols and the stub ends of hatch strokes are short too, and they scatter across a
 # sheet without ever being ground. So a mark only counts as stipple if it also has
 # company: at least MIN_NEIGHBOURS other short marks within NEIGHBOUR_RADII times the
 # dot spacing the legend chip itself is drawn at. Both properties come from the chip.
+# "Not alone" is the whole test. Asking for 4 neighbours deleted 19% of the real stipple
+# on 2105 and made things WORSE: the field went ragged, so closing it needed a 3.88 m
+# bridge instead of 2.65 m -- a bigger assumption about blank paper, for less area. A
+# stipple dot always has a neighbour; a stray dash does not.
 NEIGHBOUR_RADII = 2.5
-MIN_NEIGHBOURS = 4
+MIN_NEIGHBOURS = 1
 
 
 def _seg_len(item_dict):
@@ -306,6 +321,30 @@ def _fitz_point(x, y, rot):
     return p.x, p.y
 
 
+def _outline(mask_u8, rot, scale):
+    """The region's outline as unrotated PDF points -- the space ground truth and the
+    marked-up drawing both use. Simplified enough to draw, not so much that it moves."""
+    cs, _h = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cs:
+        return []
+    c = max(cs, key=cv2.contourArea)
+    eps = 0.002 * cv2.arcLength(c, True)
+    c = cv2.approxPolyDP(c, eps, True)
+    inv = ~rot
+    import fitz
+    out = []
+    for pt in c.reshape(-1, 2):
+        q = fitz.Point(float(pt[0]) / scale, float(pt[1]) / scale) * inv
+        out.append([round(q.x, 3), round(q.y, 3)])
+    return out
+
+
+def _max_width_m(mask_u8, k, scale):
+    """Width of the widest circle that fits inside the region, in metres."""
+    dt = cv2.distanceTransform(mask_u8, cv2.DIST_L2, 5)
+    return float(dt.max()) * 2.0 * k / scale
+
+
 def _solidity(mask_u8, per_px_m2):
     cs, _h = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cs:
@@ -438,57 +477,97 @@ def _measure(doc, page, k, S=2.0, layer_suffix=None):
     field = _ls._fill_holes(closer.close(radius_pt * S), per_px_m2, _ls.HOLE_KEEP_M2)[0]
     cand = field.astype(bool) & ~hatched
 
-    n, lab, st, _c = cv2.connectedComponentsWithStats(cand.astype(np.uint8), 8)
-    regions, kept = [], np.zeros(shape, bool)
-    for i in range(1, n):
-        a_m2 = float(st[i, cv2.CC_STAT_AREA]) * per_px_m2
-        if a_m2 < MIN_REGION_M2:
-            continue
-        cm = (lab == i)
-        sol = _solidity(cm.astype(np.uint8), per_px_m2)
-        regions.append({
-            "area_m2": round(a_m2, 1),
-            "solidity": round(sol, 3),
-            "width_m": round(st[i, cv2.CC_STAT_WIDTH] * k / S, 1),
-            "height_m": round(st[i, cv2.CC_STAT_HEIGHT] * k / S, 1),
-            "looks_like_a_ribbon": sol < SOLIDITY_SUSPECT,
-        })
-        kept |= cm
-    if not regions:
-        return {"ok": False, "reason": "no stipple region reached the 200 m2 floor"}
-
-    # The independent net: did the 200 m2 region floor throw away real ground? That is
-    # what this catches (on Roscoe it caught a real 168 m2 third of the yard being
-    # discarded as noise). It is measured against the ink the outline was BUILT from --
-    # stipple standing on ground this method did not judge to be hatched. Measuring it
-    # against every short mark on the layer would be asking the yard's outline to contain
-    # the road's marks too, which on a seven-build-up sheet it can never do.
     ink = sm.astype(bool)
     built_from = ink & ~hatched
-    retention = float((built_from & kept).sum()) / float(built_from.sum() or 1)
-    # Disclosed, not gated: if most of the layer's short marks sat on hatched ground, the
-    # pattern match is thin and the assessor should know before trusting the outline.
-    hatch_excluded = 1.0 - (float(built_from.sum()) / float(ink.sum() or 1))
-    if retention < MIN_INK_RETENTION:
-        return {"ok": False,
-                "reason": (f"only {retention:.1%} of the stipple ink ends up inside the "
-                           f"outline (floor {MIN_INK_RETENTION:.0%}) — this is not one surface"),
-                "regions": regions}
+    total_ink = float(built_from.sum()) or 1.0
 
-    total = round(sum(r["area_m2"] for r in regions), 1)
-    ribbons = [r for r in regions if r["looks_like_a_ribbon"]]
+    n, lab, st, _c = cv2.connectedComponentsWithStats(cand.astype(np.uint8), 8)
+    main, candidates, kept = [], [], np.zeros(shape, bool)
+    seen = [False] * n
+    for i in range(1, n):
+        a_m2 = float(st[i, cv2.CC_STAT_AREA]) * per_px_m2
+        cm = (lab == i)
+        share = float((built_from & cm).sum()) / total_ink
+        # The post-Roscoe rule: an absolute floor alone threw away a real 168 m2 third of
+        # that yard as "noise". A patch carrying a real share of the surface's own marks
+        # is a region however small it is.
+        if a_m2 < MIN_REGION_M2 and share < _ls.MIN_REGION_INK_SHARE:
+            continue
+        seen[i] = True
+        cmu = cm.astype(np.uint8)
+        sol = _solidity(cmu, per_px_m2)
+        width_across = _max_width_m(cmu, k, S)
+        rec = {
+            "area_m2": round(a_m2, 1),
+            "ink_share": round(share, 3),
+            "solidity": round(sol, 3),
+            "width_across_m": round(width_across, 1),
+            "width_m": round(st[i, cv2.CC_STAT_WIDTH] * k / S, 1),
+            "height_m": round(st[i, cv2.CC_STAT_HEIGHT] * k / S, 1),
+            "polygon_pts": _outline(cm.astype(np.uint8), rot, S),
+        }
+        if width_across < MIN_REGION_WIDTH_M:
+            rec["candidate_reason"] = (
+                f"only {width_across:.1f} m across at its widest — a strip, not a piece of "
+                "ground, so it is offered for review rather than counted")
+            candidates.append(rec)
+        else:
+            main.append(rec)
+            kept |= cm
+    if not main:
+        return {"ok": False,
+                "reason": ("no stipple region is wider than "
+                           f"{MIN_REGION_WIDTH_M:.0f} m — {len(candidates)} narrow strips only")}
+
+    # How much of the stipple ended up in the measured total. On a sheet where ONE layer
+    # carries every build-up this will not reach the layer-method's 95% floor, and the
+    # client has said explicitly that it should not reject the sheet. So for this method
+    # it is DISCLOSED with its number rather than gated -- and the number reaches the
+    # assessor and the quotation, the same way AREA IS A MINIMUM does. It is not a
+    # licence to ignore it: a low figure means most of the pattern is unaccounted for.
+    retention = float((built_from & kept).sum()) / total_ink
+    hatch_excluded = 1.0 - (total_ink / float(ink.sum() or 1))
+    cand_ink = round(sum(r["ink_share"] for r in candidates), 3)
+    # The honest disclosure is the GROUND that failed to qualify as a region, not the
+    # area of the ink itself -- ink is thin, and quoting its extent as though it were
+    # ground would understate what is being left out by an order of magnitude.
+    unformed = [i for i in range(1, n)
+                if not seen[i]
+                and float(st[i, cv2.CC_STAT_AREA]) * per_px_m2 > 0.0]
+    unformed_m2 = round(sum(float(st[i, cv2.CC_STAT_AREA]) * per_px_m2 for i in unformed), 1)
+
+    flags = []
+    if retention < MIN_INK_RETENTION:
+        flags.append(
+            f"ONLY {retention:.0%} OF THE STIPPLE IS IN THE TOTAL — the rest is offered as "
+            f"{len(candidates)} candidate area(s), plus {len(unformed)} patches covering about "
+            f"{unformed_m2:,.0f} m2 that were too small or too scattered to qualify as regions. "
+            "None of that is counted, and no area is claimed for it.")
+    if candidates:
+        flags.append(
+            f"{len(candidates)} CANDIDATE AREA(S) NOT IN THE TOTAL — review and include "
+            "each one deliberately; they are shaped unlike the measured ground.")
+    flags.append("AREA IS A MINIMUM — OUTLINE RECONSTRUCTED from a stipple, which stops "
+                 "short of the edge it is drawn inside.")
+
+    total = round(sum(r["area_m2"] for r in main), 1)
     return {
         "ok": True,
         "layer": layer,
         "area_m2": total,
-        "regions": sorted(regions, key=lambda r: -r["area_m2"]),
+        "regions": sorted(main, key=lambda r: -r["area_m2"]),
+        "candidate_regions": sorted(candidates, key=lambda r: -r["area_m2"]),
+        "candidate_area_m2": round(sum(r["area_m2"] for r in candidates), 1),
+        "unformed_stipple_m2": unformed_m2,
+        "unformed_patches": len(unformed),
+        "candidate_ink_share": cand_ink,
+        "flags": flags,
         "chips": sig,
         "hatch_pitch_pt": round(pitch, 2) if pitch else None,
         "hatch_pitch_m": round(pitch * k, 3) if pitch else None,
         "bridge_gap_m": round(bridge_m, 2),
         "ink_retention": round(retention, 3),
         "short_ink_on_hatched_ground": round(hatch_excluded, 3),
-        "unexplained_regions": len(ribbons),
         "area_is_a_minimum": True,
         "identified_by": ("the only stipple pattern in the sheet's own legend "
                           f"({stipples[0]['seg_p90_pt']} pt strokes)"),

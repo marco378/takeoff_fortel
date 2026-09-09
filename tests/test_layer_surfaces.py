@@ -235,12 +235,11 @@ try:
     # ── 2105: a MEASURED NEGATIVE RESULT, pinned so nobody re-treads it ───────────────────
     # Aryan marked this sheet up on 9 Sep 2026 (two regions, 13,132.13 m2). His markup is
     # recorded as ground truth so that ANY future method is scored by IoU against his shape.
-    # The stipple/hatch split DOES find both his regions -- IoU 0.920/0.912, 12,963.3 m2, 1.3%
-    # under, at a dilation derived from the sheet's own 0.28 m hatch pitch rather than fitted
-    # to his answer. It is recorded WITHOUT a measurement because it also returns a 345 m2
-    # ribbon he did not mark, ~33 m away by the staff car park, drawn in the yard's OWN stipple
-    # (exactly one of the 8 legend chips is a stipple), so no pattern test can reject it and
-    # only the client can say whether it is concrete. Shipping it would price unknown ground.
+    # stipple_surfaces now finds both regions (IoU 0.918/0.914, 2.25% under) -- but only
+    # because HE decided how the extra stipple should be handled: offered as candidates
+    # outside the total, never a reason to reject the sheet. That decision is quoted in the
+    # note verbatim, because it is a scope call no measurement rule could have made.
+    # The module is still inert, so a real upload of 2105 refuses; the check below pins that.
     _gt2105_key = ("drawings/inderjit_p9p10/"
                    "9_25010-RLL-26-XX-DR-C-2105_P01_External_Construction_Specification.pdf")
     _gt2105 = _json_ls.loads(_P_ls("ground_truth_polygons.json").read_text()).get(_gt2105_key)
@@ -269,17 +268,17 @@ try:
         ck("...and scored by IoU, never by area",
            _gt2105.get("min_iou", 0) >= 0.85, f"min_iou={_gt2105.get('min_iou')}")
         _n2105 = (_gt2105.get("note") or "").lower()
-        ck("...and the note records that it is NOT shipped, and where the stray region sits",
-           "not shipped" in _n2105 and "car parking" in _n2105,
+        ck("...and the note records that the module is not yet wired into the pipeline",
+           "not yet wired" in _n2105 and "car parking" in _n2105,
            f"note={len(_n2105)} chars")
         # The shape IS right: IoU 0.920/0.912 at a DERIVED dilation, reading 1.3% under. What
         # stops it is a 345 m2 third region the client did not mark, drawn in the yard's own
         # stipple, whose identity the sheet cannot settle. A future session that remembers only
         # "the IoU was good" will ship it, so the note must carry the third region AND the fact
         # that no pattern test can reject it.
-        ck("...including what actually blocks it: an unattributed third region in the yard's own pattern",
-           "third region" in _n2105 and "scope question" in _n2105,
-           "note does not record the blocking reason")
+        ck("...and records the CLIENT's decision that made it measurable, in his own words",
+           "candidate areas" in _n2105 and "don't reject the whole sheet" in _n2105,
+           "note does not carry the client's decision")
 
     _p2105 = _P_ls(_gt2105_key)
     if not _p2105.exists():
