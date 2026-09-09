@@ -35,6 +35,10 @@ MEASUREMENT_PATHS = {
     "sanity.py", "hatch_legend_raster.py", "structural_light_fill.py", "office_candidates.py",
     "spec_extractor.py", "slab_spec.py", "defaults.py", "costing.py", "pricing.py",
     "read_marked.py", "gold.json", "ground_truth_polygons.json", "robustness_tests.py",
+    # Identity methods: these decide WHICH ground gets measured, which moves quantities
+    # just as surely as the geometry does. layer_surfaces went live on 9 Sep and was
+    # missing from this set -- a change to it would not have demanded the corpus run.
+    "layer_surfaces.py", "stipple_surfaces.py",
 }
 # The assessor's screen and the artefacts it hands the client.
 PORTAL_PATHS = {"assessor_portal.html", "approval_server.py", "marked_pdf.py", "quotation.py"}
