@@ -1893,5 +1893,173 @@
     "source": "Bluebeam markup by Aryan (U0BCUEBAAFQ), #fortel thread 1788727214.153909, 9 Sep 2026, Drive id 1nams5fQo62i5q4D6qTRalx3Igqj8xGbG. Three regions labelled 629.85 / 372.53 / 168.17 m2; an independent shoelace over the extracted vertices reproduces each label to 0.01 m2 at his stated 1:200, corroborating both the vertices and the scale.",
     "corroboration": "98.9% of the 25,810 items on CAD layer D956G-path fall inside these three polygons \u2014 that layer IS the concrete. layer_surfaces.measure on it returns 1,094.0 m2 in 3 regions at IoU 0.907 / 0.966 / 0.927, reading 6.5% under the client figure, the usual direction for a reconstructed outline.",
     "note": "THIS SHEET CANNOT BE IDENTIFIED AUTOMATICALLY, and the polygons above are the only thing that identifies it. The layer carrying the concrete is called 'D956G-path' \u2014 a name that suggests a footpath \u2014 so no layer-name rule can or should reach it, and the sheet's readable text is dowel-and-joint notes ('existing slab to be drilled and fixed into existing slab'), not a surface legend, so no legend rule can either. It refuses, correctly. Measuring it needs a human to say which layer is the surface \u2014 an assessor trace in the portal does this today and is measured exactly."
+  },
+  "drawings/inderjit_p9p10/9_25010-RLL-26-XX-DR-C-2105_P01_External_Construction_Specification.pdf": {
+    "surface": "UNCLASSIFIED / service yard stipple (two regions) \u2014 layer RL_Surface",
+    "area_m2": 13132.13,
+    "area_m2_independent_shoelace": 13132.12,
+    "min_iou": 0.85,
+    "page": 0,
+    "page_rotation": 270,
+    "k_m_per_pt": 0.17638888888888887,
+    "scale": "1:500 from the title block, supplied by Aryan. This sheet has no usable scale bar; the automatic candidate was rejected as implausible.",
+    "coord_space": "unrotated PDF points (fitz get_drawings space); page /Rotate is 270 so page.rotation_matrix must be applied before rasterising",
+    "regions": [
+      {
+        "region": "2105-1",
+        "area_m2": 7445.83,
+        "area_m2_independent_shoelace": 7445.83,
+        "verts": 11,
+        "polygon_pts": [
+          [
+            634.007,
+            1582.095
+          ],
+          [
+            558.182,
+            1582.095
+          ],
+          [
+            513.048,
+            1593.529
+          ],
+          [
+            512.446,
+            1712.08
+          ],
+          [
+            453.471,
+            1712.08
+          ],
+          [
+            452.87,
+            1593.529
+          ],
+          [
+            407.736,
+            1582.095
+          ],
+          [
+            351.168,
+            1582.095
+          ],
+          [
+            350.566,
+            766.073
+          ],
+          [
+            634.007,
+            766.073
+          ],
+          [
+            634.007,
+            1582.095
+          ]
+        ]
+      },
+      {
+        "region": "2105-2",
+        "area_m2": 5686.3,
+        "area_m2_independent_shoelace": 5686.29,
+        "verts": 23,
+        "polygon_pts": [
+          [
+            1443.409,
+            1888.404
+          ],
+          [
+            1290.555,
+            1888.404
+          ],
+          [
+            1285.741,
+            1888.404
+          ],
+          [
+            1283.334,
+            1889.607
+          ],
+          [
+            1280.325,
+            1890.811
+          ],
+          [
+            1277.918,
+            1893.82
+          ],
+          [
+            1276.714,
+            1897.43
+          ],
+          [
+            1275.511,
+            1903.448
+          ],
+          [
+            1268.289,
+            1966.636
+          ],
+          [
+            1209.916,
+            1960.618
+          ],
+          [
+            1220.748,
+            1856.509
+          ],
+          [
+            1220.748,
+            1852.898
+          ],
+          [
+            1220.146,
+            1850.491
+          ],
+          [
+            1218.943,
+            1848.084
+          ],
+          [
+            1216.536,
+            1845.677
+          ],
+          [
+            1214.73,
+            1844.473
+          ],
+          [
+            1211.721,
+            1843.27
+          ],
+          [
+            1208.712,
+            1843.27
+          ],
+          [
+            1206.305,
+            1842.668
+          ],
+          [
+            1160.57,
+            1842.668
+          ],
+          [
+            1160.57,
+            1248.706
+          ],
+          [
+            1443.409,
+            1248.706
+          ],
+          [
+            1443.409,
+            1888.404
+          ]
+        ]
+      }
+    ],
+    "source": "Aryan's Bluebeam markup, 2105_ARYAN_MARKUP.pdf, posted in #fortel 9 Sep 2026. Magenta (0.88,0,0.48) polygons; his own printed labels read 7,445.83 and 5,686.30 m2 and our independent shoelace of his vertices reproduces both.",
+    "corroboration": "shoelace of his polygons == his Bluebeam printed areas to 0.01 m2",
+    "note": "NOT SHIPPED as a measurement as of 9 Sep 2026 \u2014 recorded so any future method is scored by IoU against this shape, not by area. What WORKS: splitting the single RL_Surface layer's marks into short (stipple) and long (hatch) strokes, subtracting the hatch dilated by half the measured 0.28 m hatch pitch (0.14 m \u2014 derived from the sheet, NOT fitted to this answer), then closing the stipple, finds both of the client's regions at IoU 0.920 and 0.912, totalling 12,963.3 m2 = 1.3% UNDER his 13,132.13, which is the correct direction for a reconstructed stipple outline. All 8 legend chips were characterised: exactly ONE is a stipple ('Concrete Service Yard', seg p90 2.75 pt); the other seven are hatches (7.2-30.0 pt). WHY IT IS NOT SHIPPED: it also returns a THIRD region of 345 m2 that the client did not mark \u2014 a thin ribbon (48 x 123 m envelope, 5.9% bbox fill, 13.8% solidity vs 86% for the two real regions), median 33 m from his outlines, centroid beside the '120no. car parking spaces / Staff' labels. It is drawn in the yard's OWN stipple pattern, so no pattern test can reject it; whether it is concrete to be priced is a scope question only the client can answer. It is also parameter-sensitive \u2014 its nearest point is 0.49 m from region 2, so a slightly larger bridge merges it INTO that region and inflates it rather than showing as a separate region. A compactness/solidity gate would separate it cleanly but would be invented to delete ground whose identity is unknown, so it was not added. ASKED THE CLIENT 9 Sep: is that strip concrete you are pricing? NOTE a 'pin this layer' feature does NOT fix this sheet: RL_Surface carries every build-up."
   }
 }
