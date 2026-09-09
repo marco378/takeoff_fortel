@@ -2454,8 +2454,14 @@ function renderMeasurementCaveat(el, flags) {
   const find = rx => (flags.find(f => rx.test(f)) || '');
   const layer = find(/^SURFACE FROM CAD LAYER/);
   const bridged = find(/^OUTLINE BRIDGED/);
-  const floor = find(/^AREA IS A FLOOR/);
+  const floor = find(/^AREA IS A MINIMUM/);
+  const kept = find(/void\(s\) totalling/);
   if (!bridged && !floor) { el.hidden = true; return; }
+  // Only ever qualifies the AI's own number. After the assessor traces, the headline is
+  // THEIR measurement and these caveats describe something that is no longer on screen —
+  // but the flags that produced them persist on the job, so the flags cannot be the gate.
+  const src = (document.getElementById('areaSource') || {}).textContent || '';
+  if (!/^AI measurement/.test(src)) { el.hidden = true; return; }
   const metres = (bridged.match(/OUTLINE BRIDGED ([\d.]+) m/) || [])[1];
   const named = (layer.match(/measured '([^']+)' as the ([\d,]+) marks/) || []);
   const on = (layer.match(/on layer '([^']+)'/) || [])[1] || '';
@@ -2469,9 +2475,11 @@ function renderMeasurementCaveat(el, flags) {
       : '') +
     (metres
       ? esc('That layer holds marks, not an outline, so the outline is those marks closed across '
-            + metres + ' m of blank paper. ')
+            + 'gaps of up to ' + metres + ' m of blank paper. ')
       : '') +
-    esc('A stipple stops short of its own edge, so the true surface is this size or LARGER — never smaller.') +
+    esc('The marks stop short of the edge they are drawn inside, so this is the extent of the '
+        + 'marks rather than the edge of the surface — treat it as a floor.') +
+    (kept ? ' ' + esc(kept.replace(/^assessor: /, '')) : '') +
     '<span class="rb-next">What to do: check the outline against the drawing before you approve, ' +
     'and treat the figure as a floor when you price it.</span>';
   el.hidden = false;
@@ -3637,6 +3645,11 @@ function updateAreaDisplay() {
   document.getElementById('readout').textContent =
     `${zoneBreakdown && !tracedArea ? 'all measured zones' : 'main area'}: ${aStr}  ·  ${areaElementEntries().length} separate area(s)  ·  ${cutoutPolygons.length} cut-out(s)  ·  ${userChannels.length} channel(s)  ·  scale: ${mpp?mpp.toFixed(4)+' m/px':'not set'}`;
   renderAreaElementsEditor();
+  { const _cb = document.getElementById('refusalBanner');
+    const _st = currentJob && (currentJob.measurement_state
+                               || (currentJob.result || {}).measurement_state);
+    if (_cb && _st && _st !== 'UNMEASURED' && _st !== 'REJECTED')
+      renderMeasurementCaveat(_cb, ((currentJob.result || currentJob).flags) || []); }
 }
 
 function applyScaleOverride(rawValue) {

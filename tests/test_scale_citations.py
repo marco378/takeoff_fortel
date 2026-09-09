@@ -127,9 +127,19 @@ if _ind.exists():
        f"area={_r_ind.get('area_m2')} state={_r_ind.get('measurement_state')}")
     # An outline reconstructed by closing a stipple is an assumption about blank ground, and
     # it under-measures. Both must reach the assessor in metres, not be buried in a constant.
-    ck("...and it discloses the bridge it closed and that the area is a floor",
-       "OUTLINE BRIDGED" in _fl_ind and " m:" in _fl_ind and "AREA IS A FLOOR" in _fl_ind,
+    ck("...and it discloses the GAP it bridged, in metres, and that the area is a minimum",
+       "OUTLINE BRIDGED" in _fl_ind and "AREA IS A MINIMUM" in _fl_ind
+       and "closed across gaps up to" in _fl_ind,
        _fl_ind[:200])
+    # A disc of radius R closes a gap of 2R. An earlier revision disclosed R and so told the
+    # assessor half the distance it had actually assumed was surface.
+    import re as _re_sc
+    _m_gap = _re_sc.search(r"OUTLINE BRIDGED ([\d.]+) m", _fl_ind)
+    _m_rad = _re_sc.search(r"a disc of radius ([\d.]+) m", _fl_ind)
+    ck("...and the disclosed bridge is the GAP (2R), not the disc radius",
+       bool(_m_gap and _m_rad)
+       and abs(float(_m_gap.group(1)) - 2 * float(_m_rad.group(1))) < 0.02,
+       f"gap={_m_gap and _m_gap.group(1)} radius={_m_rad and _m_rad.group(1)}")
 else:
     print(f"  [SKIP] Indurent sheet not present — {_ind}")
 

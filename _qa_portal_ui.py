@@ -234,13 +234,13 @@ async def main():
         })()""")
         ck("indurent: the minimum-area caveat is ON SCREEN, beside the headline",
            caveat.get("shown") and caveat.get("inViewport"), json.dumps(caveat)[:300])
-        ck("indurent: it says the area is a MINIMUM and the true surface is larger, never smaller",
+        ck("indurent: it says the area is a MINIMUM and to treat it as a floor",
            "MINIMUM" in (caveat.get("text") or "")
-           and "LARGER" in (caveat.get("text") or ""),
+           and "floor" in (caveat.get("text") or ""),
            (caveat.get("text") or "")[:200])
-        ck("indurent: it says how far the outline was bridged, in metres",
-           re.search(r"closed across [\d.]+ m of blank paper", caveat.get("text") or "")
-           is not None,
+        ck("indurent: it says how wide a GAP the outline was closed across, in metres",
+           re.search(r"closed across gaps of up to [\d.]+ m of blank paper",
+                     caveat.get("text") or "") is not None,
            (caveat.get("text") or "")[:200])
         ck("indurent: it names the CAD layer rather than implying a colour was matched",
            "CAD layer" in (caveat.get("text") or "")

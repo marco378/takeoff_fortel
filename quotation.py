@@ -91,7 +91,7 @@ SURFACE_RESOLVED_MARKER = "SURFACE FROM CAD LAYER"
 # an outline, so the outline is those marks closed across blank ground, and the result is a
 # minimum. That belongs on the client document for the same reason the identity caveat does:
 # a caveat that does not survive export is not a caveat.
-OUTLINE_ASSUMPTION_MARKERS = ("OUTLINE BRIDGED", "AREA IS A FLOOR")
+OUTLINE_ASSUMPTION_MARKERS = ("OUTLINE BRIDGED", "AREA IS A MINIMUM")
 OUTLINE_ASSUMPTION_LABEL = "AREA IS A MINIMUM — OUTLINE RECONSTRUCTED"
 # Column F, immediately right of VALUE — mirrors the REMEASURE caveat column in
 # Fortel's own costing sheet rather than crowding the DESCRIPTION cell.
