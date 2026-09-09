@@ -1667,5 +1667,231 @@
     "min_iou_rationale": "0.90, the repo convention for a client-drawn reference, chosen before the observed value rather than fitted to it; the current measurement scores 0.971. Scored by IoU and NEVER by area: this sheet is expected to read a few percent under, and an area test would either fail a correct measurement or have to be loosened until it proved nothing.",
     "note": "THE SELF-NAMED LAYER CASE. This sheet's legend is drawn as outlines rather than text, so no legend-reading path can work on it: the whole page yields ~238 extractable characters and none are legend words. The surface is found by its CAD layer name alone, with no legend to cross-check it, which is why the result is capped at MEASURED_UNVERIFIED however well the scale verifies.",
     "area_m2_independent_shoelace": 6565.64
+  },
+  "drawings/inderjit_p9p10/10_26051-ROS-00-XX-DR-C-05101.pdf": {
+    "surface": "CONCRETE SLAB (three regions) \u2014 layer D956G-path",
+    "area_m2": 1170.55,
+    "area_m2_independent_shoelace": 1170.55,
+    "min_iou": 0.85,
+    "page": 0,
+    "page_rotation": 0,
+    "k_m_per_pt": 0.070556,
+    "scale": "1:200, CONFIRMED BY ARYAN 9 Sep. The printed scale BAR on this sheet is wrong (reads 3 m / 16 pt, implying ~1:547); the title block is right.",
+    "coord_space": "unrotated PDF points (fitz get_drawings space)",
+    "regions": [
+      {
+        "region": "roscoe-1",
+        "area_m2": 629.85,
+        "area_m2_independent_shoelace": 629.85,
+        "verts": 9,
+        "polygon_pts": [
+          [
+            1601.963,
+            1647.515
+          ],
+          [
+            1676.037,
+            1604.943
+          ],
+          [
+            953.174,
+            367.392
+          ],
+          [
+            839.934,
+            432.1
+          ],
+          [
+            864.626,
+            473.82
+          ],
+          [
+            877.823,
+            466.157
+          ],
+          [
+            959.986,
+            610.474
+          ],
+          [
+            991.489,
+            592.169
+          ],
+          [
+            1601.963,
+            1647.515
+          ]
+        ]
+      },
+      {
+        "region": "roscoe-2",
+        "area_m2": 372.53,
+        "area_m2_independent_shoelace": 372.53,
+        "verts": 7,
+        "polygon_pts": [
+          [
+            1290.34,
+            1828.017
+          ],
+          [
+            1188.594,
+            1653.474
+          ],
+          [
+            1151.983,
+            1674.334
+          ],
+          [
+            1144.746,
+            1661.563
+          ],
+          [
+            881.654,
+            1812.266
+          ],
+          [
+            989.36,
+            2002.56
+          ],
+          [
+            1290.34,
+            1828.017
+          ]
+        ]
+      },
+      {
+        "region": "roscoe-3",
+        "area_m2": 168.17,
+        "area_m2_independent_shoelace": 168.17,
+        "verts": 21,
+        "polygon_pts": [
+          [
+            295.446,
+            632.612
+          ],
+          [
+            220.094,
+            676.034
+          ],
+          [
+            226.054,
+            685.4
+          ],
+          [
+            215.411,
+            692.211
+          ],
+          [
+            276.714,
+            797.789
+          ],
+          [
+            308.643,
+            779.909
+          ],
+          [
+            320.137,
+            797.363
+          ],
+          [
+            507.877,
+            688.806
+          ],
+          [
+            517.243,
+            704.557
+          ],
+          [
+            567.052,
+            675.609
+          ],
+          [
+            557.26,
+            658.58
+          ],
+          [
+            555.131,
+            659.857
+          ],
+          [
+            553.003,
+            656.452
+          ],
+          [
+            554.706,
+            654.323
+          ],
+          [
+            545.766,
+            640.7
+          ],
+          [
+            544.063,
+            640.274
+          ],
+          [
+            542.36,
+            636.869
+          ],
+          [
+            543.211,
+            635.592
+          ],
+          [
+            514.689,
+            586.208
+          ],
+          [
+            329.929,
+            691.786
+          ],
+          [
+            295.446,
+            632.612
+          ]
+        ]
+      }
+    ],
+    "polygon_pts": [
+      [
+        1601.963,
+        1647.515
+      ],
+      [
+        1676.037,
+        1604.943
+      ],
+      [
+        953.174,
+        367.392
+      ],
+      [
+        839.934,
+        432.1
+      ],
+      [
+        864.626,
+        473.82
+      ],
+      [
+        877.823,
+        466.157
+      ],
+      [
+        959.986,
+        610.474
+      ],
+      [
+        991.489,
+        592.169
+      ],
+      [
+        1601.963,
+        1647.515
+      ]
+    ],
+    "source": "Bluebeam markup by Aryan (U0BCUEBAAFQ), #fortel thread 1788727214.153909, 9 Sep 2026, Drive id 1nams5fQo62i5q4D6qTRalx3Igqj8xGbG. Three regions labelled 629.85 / 372.53 / 168.17 m2; an independent shoelace over the extracted vertices reproduces each label to 0.01 m2 at his stated 1:200, corroborating both the vertices and the scale.",
+    "corroboration": "98.9% of the 25,810 items on CAD layer D956G-path fall inside these three polygons \u2014 that layer IS the concrete. layer_surfaces.measure on it returns 1,094.0 m2 in 3 regions at IoU 0.907 / 0.966 / 0.927, reading 6.5% under the client figure, the usual direction for a reconstructed outline.",
+    "note": "THIS SHEET CANNOT BE IDENTIFIED AUTOMATICALLY, and the polygons above are the only thing that identifies it. The layer carrying the concrete is called 'D956G-path' \u2014 a name that suggests a footpath \u2014 so no layer-name rule can or should reach it, and the sheet's readable text is dowel-and-joint notes ('existing slab to be drilled and fixed into existing slab'), not a surface legend, so no legend rule can either. It refuses, correctly. Measuring it needs a human to say which layer is the surface \u2014 an assessor trace in the portal does this today and is measured exactly."
   }
 }

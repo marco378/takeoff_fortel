@@ -56,6 +56,14 @@ CONVERGENCE_GROWTH = 0.02       # ...and call it converged below this fraction
 MAX_BRIDGE_M = 3.0
 
 MIN_REGION_M2 = 200.0           # below this a component is stipple noise, not a surface
+
+# ...UNLESS it carries a real share of the layer's own marks. The floor above exists to drop
+# specks, and on Roscoe (26051-ROS-05101) it dropped a 157 m2 component holding 14.6% of the
+# engineer's ink — one of the three yards the client had marked up at 168.17 m2. Retention
+# then fell to 0.854 and the sheet refused. Both rules were working; the floor was simply
+# wrong about what counts as noise. A patch of ground carrying this much of the surface's own
+# marks is a region however small it is, and specks carry essentially none.
+MIN_REGION_INK_SHARE = 0.05
 # The closed mask may not swallow this much of another surface. KNOW WHAT THIS DOES AND DOES
 # NOT CATCH. It compares against sibling layers' INK, not against the ground those strokes
 # hatch, so on a sparse hatch it is far weaker than the 5% suggests: on a sheet whose siblings
@@ -315,14 +323,25 @@ def _fill_holes(mask, per_px_m2=None, keep_m2=None):
     return (mask | fill), kept_m2, kept_n
 
 
-def _regions(mask, scale, k):
-    """Connected components above ``MIN_REGION_M2``, as (label index, area_m2) pairs."""
+def _regions(mask, scale, k, ink=None):
+    """Connected components that are surfaces rather than specks.
+
+    A component qualifies on EITHER test: it is at least ``MIN_REGION_M2``, or it holds at
+    least ``MIN_REGION_INK_SHARE`` of the layer's own ink. The second test is what keeps a
+    genuinely small yard — see the note on MIN_REGION_INK_SHARE — and it cannot admit noise,
+    because noise by definition carries almost none of the marks.
+    """
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     per_px_m2 = (k / scale) ** 2
+    ink_bool = ink.astype(bool) if ink is not None else None
+    ink_total = int(ink_bool.sum()) if ink_bool is not None else 0
     out = []
     for index in range(1, count):
         area = stats[index, cv2.CC_STAT_AREA] * per_px_m2
-        if area >= MIN_REGION_M2:
+        share = 0.0
+        if ink_total:
+            share = int(((labels == index) & ink_bool).sum()) / ink_total
+        if area >= MIN_REGION_M2 or share >= MIN_REGION_INK_SHARE:
             out.append((index, area))
     return labels, out, per_px_m2
 
@@ -444,7 +463,7 @@ def _measure(doc, page, label, k, S=2.0):
     if bleed_px:
         closed = (closed & ~others.astype(bool)).astype(np.uint8)
 
-    labels, regions, _ = _regions(closed, S, k)
+    labels, regions, _ = _regions(closed, S, k, ink=ink)
     if not regions:
         return {"ok": False, "candidates": candidates,
                 "reason": (f"CAD layer '{layer}' closes into nothing larger than "
