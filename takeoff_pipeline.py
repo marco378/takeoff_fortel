@@ -795,9 +795,16 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     # verifies. Force confidence low in that case so the state machine caps it at
                     # MEASURED_UNVERIFIED (matches the cap inside takeoff_unmarked; the pipeline
                     # re-derives state here with the router's confidence, so the cap must be re-applied).
+                    # The default is FALSE on purpose. It was True, which meant a result that never
+                    # said whether it had found a legend was treated as though it had. Only one of
+                    # the eight return paths in takeoff() sets the key, and the line/hatch branch
+                    # returns before legend_found is even computed — so the cap rested entirely on
+                    # each promoted path REMEMBERING to hand-write region_confidence="low". A path
+                    # that forgot would emit an approvable number whose only identification was a
+                    # CAD layer name. Absent evidence of a legend is not evidence of one.
                     eff_conf = (
                         "low"
-                        if (not tu.get("legend_found", True)
+                        if (not tu.get("legend_found", False)
                             or tu.get("region_confidence") == "low")
                         else conf
                     )
@@ -927,7 +934,7 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                 # MEASURED_UNVERIFIED even if the scale verifies.
                 eff_conf = (
                     "low"
-                    if (not tu.get("legend_found", True)
+                    if (not tu.get("legend_found", False)
                         or tu.get("region_confidence") == "low")
                     else conf
                 )

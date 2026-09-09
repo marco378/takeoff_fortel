@@ -56,7 +56,17 @@ CONVERGENCE_GROWTH = 0.02       # ...and call it converged below this fraction
 MAX_BRIDGE_M = 3.0
 
 MIN_REGION_M2 = 200.0           # below this a component is stipple noise, not a surface
-MAX_BLEED_FRACTION = 0.05       # closed mask may not swallow this much of another surface
+# The closed mask may not swallow this much of another surface. KNOW WHAT THIS DOES AND DOES
+# NOT CATCH. It compares against sibling layers' INK, not against the ground those strokes
+# hatch, so on a sparse hatch it is far weaker than the 5% suggests: on a sheet whose siblings
+# ink 1.5% of what they cover, the mask must swallow several times the measured area before it
+# fires. Closing the siblings first to get their real extent was tried and is WRONG — it
+# inflates a neighbouring hatch across its own boundary (measured on 3151: siblings 10,781 m2
+# of ink close to 40,842 m2 and produce 59.9% false bleed, refusing a sheet that is correct).
+# So read a low bleed number as ABSENCE OF EVIDENCE, not as proof of no overlap. The guards
+# actually carrying the weight here are the single-visible-layer rule, the wall/kerb denylist
+# and MIN_INK_RETENTION; this one only catches gross spillage.
+MAX_BLEED_FRACTION = 0.05
 
 # A void larger than this is an ISLAND — a building, a pond, a planter the surface goes
 # around — and is kept as a deduction, the way the colour path already keeps them. Anything

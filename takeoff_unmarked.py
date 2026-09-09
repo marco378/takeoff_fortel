@@ -2293,8 +2293,36 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 hatch_result.get("flags") or [])
             return hatch_result
         flags = flags + list(hatch_result.get("flags") or [])
+        # LIST, DO NOT PICK. A line/hatch sheet that refuses is a success state, but a blank
+        # refusal wastes what the drawing is telling us. South Mimms declares a CAD layer
+        # called C-060-M_YARD and we say nothing about it, so the assessor starts from
+        # scratch on a sheet whose engineer already named the surface. Naming the layers is
+        # evidence; CHOOSING one would be an identification, and nothing on these sheets
+        # tells us which layer the quote is for — 2105 draws seven different build-ups on a
+        # single layer called RL_Surface. So: enumerate, measure nothing, claim nothing.
+        # Read from get_ocgs() alone (no geometry parse) — this is the refusal path for 554
+        # of 617 corpus drawings and must not cost them a second pass over the page.
+        try:
+            _named = sorted({
+                info["name"].split("|")[-1]
+                for info in (fitz.open(pdf).get_ocgs() or {}).values()
+                if info.get("on", True) and info.get("name")
+                and any(_t in info["name"].lower() for _t in
+                        ("yard", "apron", "hardstand", "surfac", "pavement", "concrete",
+                         "carriageway", "footway", "parking"))})
+        except Exception:
+            _named = []
+        if _named:
+            flags.append(
+                "ASSESSOR — THE DRAWING NAMES ITS OWN SURFACES: this sheet carries CAD layers "
+                + ", ".join(f"'{n}'" for n in _named[:12])
+                + (f" (+{len(_named) - 12} more)" if len(_named) > 12 else "")
+                + ". We have NOT measured any of them and are not proposing one: nothing on "
+                "this sheet says which layer the quote is for. If one of these is the surface "
+                "to price, trace it and it will be measured exactly.")
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
+                "legend_found": False,
                 "flags": flags + [
                     "NON-COLOUR-CODED (line/hatch) drawing — solid-fill colour segmentation does NOT apply "
                     "(it scrapes stray grey -> wrong area). Route to hatch-mode / Claude vision / assessor "

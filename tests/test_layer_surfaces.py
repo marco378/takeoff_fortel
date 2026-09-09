@@ -159,6 +159,37 @@ try:
        not any("never high" in f or "5% low" in f for f in _base.get("flags", [])),
        str(_base.get("flags"))[:160])
 
+    # ── the cap on approving an unlabelled number must FAIL SAFE ─────────────────────────
+    # takeoff_pipeline read tu.get("legend_found", True): a result that never said whether it
+    # had found a legend was treated as though it had. Only 1 of 8 return paths in takeoff()
+    # sets the key, and the line/hatch branch returns before legend_found is computed — so the
+    # only thing standing between an unlabelled surface and MEASURED_VERIFIED was each
+    # promoted path REMEMBERING to hand-write region_confidence="low".
+    from pathlib import Path as _P_ls
+    _pipe_src = _P_ls("takeoff_pipeline.py").read_text()
+    ck("an omitted legend_found is treated as NO legend, never as a found one",
+       'tu.get("legend_found", True)' not in _pipe_src
+       and _pipe_src.count('tu.get("legend_found", False)') == 2,
+       f'permissive={_pipe_src.count(chr(34)+"legend_found"+chr(34)+", True")} '
+       f'failsafe={_pipe_src.count(chr(34)+"legend_found"+chr(34)+", False")}')
+
+    # ── a refusal should hand over what the drawing already knows ─────────────────────────
+    _mimms = _P_ls("drawings/inderjit_p9p10/12_South_Mimms.pdf")
+    if not _mimms.exists():
+        print("  [SKIP] South Mimms not present — layer-enumeration check needs client drawings")
+    else:
+        import takeoff_unmarked as _tu_ls
+        _mm = _tu_ls.takeoff(str(_mimms))
+        _mmf = " ".join(_mm.get("flags") or [])
+        ck("a line/hatch refusal NAMES the CAD layers the drawing declares",
+           "NAMES ITS OWN SURFACES" in _mmf and "C-060-M_YARD" in _mmf,
+           _mmf[-200:])
+        ck("...and still measures nothing, because naming is not identifying",
+           _mm.get("area_m2") is None
+           and _mm.get("measurement_state") == "UNMEASURED"
+           and "We have NOT measured any of them" in _mmf,
+           f"area={_mm.get('area_m2')} state={_mm.get('measurement_state')}")
+
 except Exception as _e_ls:                                     # pragma: no cover - defensive
     import traceback as _tb_ls
     print(f"  [SKIP] CAD-layer surfaces — missing dependency or fixture: {_e_ls}")
