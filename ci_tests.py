@@ -78,14 +78,14 @@ MODULES = [
 
 # How many checks SHOULD run here. Client drawings are gitignored, so ~166 checks skip on a
 # clean checkout — which is exactly what .github/workflows/tests.yml runs. Both numbers below
-# were MEASURED on 9 Sep 2026, not estimated: 901 in this repo, and 733 from an rsync copy
+# were MEASURED on 9 Sep 2026, not estimated: 909 in this repo, and 741 from an rsync copy
 # with drawings/ removed. The first version of this guard hardcoded a single floor of 820,
 # which would have failed every push — the same mistake as the (214,214,214) constant it was
 # written alongside: a number that looked reasonable and was never checked against the case
 # it governs.
 CLIENT_DRAWINGS = (Path(__file__).resolve().parent / "drawings").is_dir()
-EXPECTED_CHECKS = 901 if CLIENT_DRAWINGS else 733
-MIN_CHECKS = 888 if CLIENT_DRAWINGS else 721
+EXPECTED_CHECKS = 909 if CLIENT_DRAWINGS else 741
+MIN_CHECKS = 896 if CLIENT_DRAWINGS else 729
 
 broken = []
 for _name in MODULES:

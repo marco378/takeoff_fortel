@@ -3232,10 +3232,12 @@ def marked_pdf_download(job_id):
     job, err, code = require_job(job_id)
     if err:
         return err, code
-    if job.get("decision") not in {"approved", "adjusted"}:
-        return jsonify({
-            "error": "marked PDF is available after assessor approval or adjustment"
-        }), 409
+    # Deliberately NOT gated on approval. The assessor needs to see what was measured in
+    # order to decide whether to approve it; a markup you can only obtain by first approving
+    # is useless for checking and is the reason a car park was priced as a service yard for
+    # six days. An unmeasured job still has nothing to draw and build_marked_pdf raises
+    # MarkedPdfError -> 409 below, and anything before a decision is stamped and named
+    # UNAPPROVED so it cannot be mistaken for an issued document.
     result = job.get("result") or {}
     pdf_path = result.get("pdf_path") or job.get("pdf_path") or job.get("pdf")
     if pdf_path and not Path(pdf_path).is_absolute():

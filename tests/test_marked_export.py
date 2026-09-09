@@ -116,6 +116,76 @@ try:
     except _MarkedPdfError as _marked_error:
         ck("marked-PDF refuses a job with no exportable geometry",
            "no measured/assessor markup geometry" in str(_marked_error), str(_marked_error))
+    # ── the markup is how you CHECK a measurement, so it cannot require approving it ──────
+    # Aryan, 9 Sep: "give us a visual reference for every measurement it produces, so we can
+    # verify that the AI is measuring the correct area and not just confirm that the
+    # calculation ran successfully." The export existed but was gated on
+    # decision in {approved, adjusted} — you could only obtain the document that proves the
+    # number by first accepting the number. That is how a car park stayed priced as a service
+    # yard for six days.
+    import fitz as _fitz_ua
+    from marked_pdf import build_marked_pdf as _bmp_ua, marked_pdf_filename as _mpf_ua
+    _ua_doc = _fitz_ua.open()
+    _ua_page = _ua_doc.new_page(width=800, height=600)
+    _ua_src = str(Path(_TMP_MARKED) / "unapproved_source.pdf") if "_TMP_MARKED" in dir() \
+        else "/tmp/_qa_unapproved_source.pdf"
+    _ua_doc.save(_ua_src)
+    _ua_doc.close()
+    _ua_job = {
+        "id": "job-unapproved", "project_ref": "QA-UA", "pdf_path": _ua_src,
+        "result": {"file": "sheet.pdf", "page": 0, "area_m2": 1234.5,
+                   "measurement_state": "MEASURED_UNVERIFIED",
+                   "flags": ["AREA IS A MINIMUM: the marks stop short of the edge."],
+                   "yard_regions": [{"region_id": "yard-region-1", "area_m2": 1234.5,
+                                     "polygon_pts": [[100, 100], [400, 100],
+                                                     [400, 380], [100, 380]],
+                                     "included": True}]},
+    }
+    _ua_bytes, _ua_manifest = _bmp_ua(_ua_job, _ua_src)
+    ck("a measured job that has NOT been approved still exports a marked drawing",
+       isinstance(_ua_bytes, bytes) and len(_ua_bytes) > 500
+       and len(_ua_manifest["geometry"]["regions"]) == 1,
+       f"bytes={len(_ua_bytes)} regions={len(_ua_manifest['geometry']['regions'])}")
+    # Normalise whitespace: the stamp wraps, and what matters is the sentence surviving, not
+    # where the line breaks fall.
+    _ua_text = " ".join(
+        _fitz_ua.open(stream=_ua_bytes, filetype="pdf")[0].get_text().split())
+    ck("...stamped on the drawing as NOT APPROVED, so it cannot be mistaken for an issue copy",
+       "NOT APPROVED. FOR CHECKING ONLY." in _ua_text, _ua_text[:140])
+    ck("...and the stamp renders no corrupt glyphs (base-14 fonts have no em-dash or bullet)",
+       "?" not in _ua_text.split("computed from")[0], _ua_text[:160])
+    # A narrow page once wrapped the headline and DROPPED the word "NOT", rendering
+    # "AI MEASUREMENT - APPROVED. FOR CHECKING ONLY." on an unapproved measurement. The
+    # headline may never wrap; where it cannot fit, the export must refuse outright rather
+    # than hand over a drawing that says the opposite of the truth.
+    _narrow = _fitz_ua.open()
+    _narrow.new_page(width=90, height=70)
+    _narrow_src = "/tmp/_ci_marked_narrow.pdf"
+    _narrow.save(_narrow_src); _narrow.close()
+    _narrow_job = _copy.deepcopy(_ua_job)
+    _narrow_job["pdf_path"] = _narrow_src
+    _narrow_job["result"]["yard_regions"][0]["polygon_pts"] = [[10, 10], [40, 10],
+                                                              [40, 40], [10, 40]]
+    try:
+        _narrow_bytes, _ = _bmp_ua(_narrow_job, _narrow_src)
+        _narrow_text = " ".join(
+            _fitz_ua.open(stream=_narrow_bytes, filetype="pdf")[0].get_text().split())
+        _narrow_ok = "NOT APPROVED. FOR CHECKING ONLY." in _narrow_text
+        _narrow_why = _narrow_text[:120]
+    except Exception as _narrow_exc:
+        _narrow_ok = "too small to carry the UNAPPROVED stamp" in str(_narrow_exc)
+        _narrow_why = str(_narrow_exc)[:120]
+    ck("a page too narrow for the warning refuses, rather than printing 'APPROVED'",
+       _narrow_ok, _narrow_why)
+    ck("...and its filename says so too, so it never files next to an approved markup",
+       _mpf_ua(_ua_job).endswith("_AI_CHECK_UNAPPROVED.pdf"), _mpf_ua(_ua_job))
+    _ua_job_ok = _copy.deepcopy(_ua_job); _ua_job_ok["decision"] = "approved"
+    ck("...while an APPROVED job keeps its revisioned issue name and carries no stamp",
+       _mpf_ua(_ua_job_ok).endswith("_REV_01_MARKED.pdf")
+       and "NOT APPROVED" not in _fitz_ua.open(
+           stream=_bmp_ua(_ua_job_ok, _ua_src)[0], filetype="pdf")[0].get_text(),
+       _mpf_ua(_ua_job_ok))
+
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] marked-PDF export tests — missing dependency or file: {_e}")
 

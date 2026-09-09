@@ -44,6 +44,10 @@ def marked_pdf_filename(job: dict) -> str:
         # that implementation detail in the client-facing download name.
         drawing = _safe_filename_part(drawing[len(stored_prefix):], "drawing")
     revision = int(job.get("quotation_revision") or 1)
+    if job.get("decision") not in {"approved", "adjusted"}:
+        # A markup produced BEFORE a decision is a thing to check, not a thing to issue.
+        # It must not be filed alongside approved markups under a name that looks the same.
+        return f"{project_ref}_{drawing}_AI_CHECK_UNAPPROVED.pdf"
     return f"{project_ref}_{drawing}_REV_{revision:02d}_MARKED.pdf"
 
 
@@ -551,6 +555,86 @@ def build_marked_pdf(job: dict, pdf_path=None, *, snapshot_scale_value=None) -> 
             label += " - PROVISIONAL"
         _draw_line(page, transition["points"], label, transition_color,
                    dashed=bool(transition.get("provisional")), occupied=occupied_labels)
+
+    if job.get("decision") not in {"approved", "adjusted"}:
+        # Aryan, 9 Sep: "give us a visual reference for every measurement it produces, so we
+        # can verify that the AI is measuring the correct area and not just confirm that the
+        # calculation ran successfully." That is exactly what this export is for, and it is
+        # why it is no longer gated behind approval — you cannot check a measurement with a
+        # document you can only obtain by first approving it. But an unapproved markup that
+        # looks like an approved one is a document that gets emailed by mistake, so it says
+        # what it is, on the drawing, in the corner every viewer opens at.
+        state = str(result.get("measurement_state") or "").replace("_", " ") or "NOT MEASURED"
+        caveats = [f for f in (result.get("flags") or [])
+                   if f.startswith(("AREA IS A MINIMUM", "OUTLINE BRIDGED",
+                                    "SURFACE FROM CAD LAYER"))]
+        # ASCII only. The base-14 fonts have no em-dash and no bullet, and PyMuPDF renders
+        # both as "?" - a stamp about trustworthiness must not look corrupted.
+        lines = ["AI MEASUREMENT - NOT APPROVED. FOR CHECKING ONLY.",
+                 f"State: {state}. No assessor has confirmed this outline or its extent.",
+                 "Every outline drawn below is exactly the geometry the reported area was",
+                 "computed from. If an outline sits on the wrong ground, so does the number."]
+        for caveat in caveats[:3]:
+            sentence = caveat.split(":", 1)[-1].strip().split(". ")[0]
+            ascii_text = "".join(
+                {"\u00b2": "2", "\u00b3": "3", "\u2019": "'", "\u2014": "-",
+                 "\u2013": "-"}.get(ch, ch if ord(ch) < 128 else " ")
+                for ch in sentence).strip()
+            if len(ascii_text) > 104:                 # cut on a word, never mid-word
+                ascii_text = ascii_text[:104].rsplit(" ", 1)[0] + "..."
+            lines.append("- " + ascii_text)
+        # The stamp must ALWAYS render. An unapproved markup carrying no warning is the one
+        # document this whole export must never produce, and a fixed 620pt box silently
+        # produced exactly that on a 300x200 sheet: insert_textbox refused every font size
+        # and wrote nothing at all. Measure the wrap instead of trying and hoping, drop
+        # detail lines before shrinking past legibility, and if even the headline cannot fit
+        # the page, refuse to build the file rather than hand over an unlabelled one.
+        max_width = max(96.0, min(page.rect.width - 36, 620.0))
+        max_height = max(40.0, page.rect.height - 36)
+
+        # Find a size that genuinely fits by ASKING PyMuPDF, on a scratch page of the same
+        # size, before drawing anything on the real one. Estimating the wrap was not good
+        # enough: insert_textbox returns < 0 and writes NOTHING when the text overflows, so
+        # an estimate that was a few points optimistic produced a marked drawing with no
+        # stamp on it at all — the one document this export must never hand over.
+        scratch = fitz.open()
+        probe = scratch.new_page(width=page.rect.width, height=page.rect.height)
+        fitted = None
+        # The headline must fit on ONE line, always. Left to wrap on a narrow page,
+        # insert_textbox dropped the word "NOT" and the stamp rendered as
+        # "AI MEASUREMENT - APPROVED. FOR CHECKING ONLY." — an unapproved measurement
+        # declaring itself approved, produced by a line break.
+        headline = lines[0]
+        for keep in range(len(lines), 0, -1):
+            for size in (8.2, 7.4, 6.6, 6.0, 5.4, 4.8, 4.2):
+                if fitz.get_text_length(headline, fontname="hebo",
+                                        fontsize=size) > max_width - 16:
+                    continue
+                height = min(max_height, size * 1.45 * (keep + 3) + 12)
+                inner = fitz.Rect(26, 24, 18 + max_width - 8, 18 + height - 4)
+                if probe.insert_textbox(inner, "\n".join(lines[:keep]), fontsize=size,
+                                        fontname="hebo", align=0) >= 0:
+                    fitted = (keep, size, height)
+                    break
+            if fitted:
+                break
+        scratch.close()
+        if fitted is None:
+            raise MarkedPdfError(
+                "the drawing is too small to carry the UNAPPROVED stamp; refusing to export "
+                "an unapproved markup that cannot say so on its face")
+        keep, stamp_size, stamp_height = fitted
+        box = fitz.Rect(18, 18, 18 + max_width, 18 + stamp_height)
+        page.draw_rect(box, color=(0.55, 0.0, 0.0), fill=(1, 0.96, 0.93), width=1.4)
+        written = page.insert_textbox(
+            fitz.Rect(26, 24, 18 + max_width - 8, 18 + stamp_height - 4),
+            "\n".join(lines[:keep]), fontsize=stamp_size, fontname="hebo",
+            color=(0.45, 0.0, 0.0), align=0)
+        if written < 0:                       # belt and braces: never ship an unstamped copy
+            raise MarkedPdfError(
+                "the UNAPPROVED stamp could not be written onto the drawing; refusing to "
+                "export an unapproved markup without it")
+        manifest["assessor_approved"] = False
 
     manifest["source_annotations_burned_in"] = source_annotation_count
     manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")

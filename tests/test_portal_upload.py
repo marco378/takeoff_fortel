@@ -105,11 +105,26 @@ try:
         _AS.save_jobs({_marked_route_job["id"]:_marked_route_job})
         _premature_marked = _client_up.get(
             f"/marked-pdf/{_marked_route_job['id']}.pdf")
-        ck("marked-PDF route refuses unreviewed AI geometry",
-           _premature_marked.status_code == 409 and
-           "after assessor approval or adjustment" in
-               (_premature_marked.get_json().get("error") or ""),
-           _premature_marked.get_json())
+        # This check used to assert a 409: the marked PDF was available only AFTER approval.
+        # That was backwards. The markup is the only way to see WHERE a number came from, so
+        # requiring approval to obtain it meant the assessor had to accept a number before he
+        # could check it — which is how 6,510 m2 of car park stayed priced as a service yard
+        # for six days. It is now served before a decision, and the thing that must hold is
+        # not that it is withheld but that it can never PASS AS APPROVED.
+        ck("an unreviewed AI measurement can be exported as a drawing to check",
+           _premature_marked.status_code == 200
+           and _premature_marked.mimetype == "application/pdf"
+           and len(_premature_marked.data) > 500,
+           f"{_premature_marked.status_code} {_premature_marked.mimetype}")
+        import fitz as _fitz_pm
+        _pm_text = " ".join(_fitz_pm.open(
+            stream=_premature_marked.data, filetype="pdf")[0].get_text().split())
+        ck("...stamped NOT APPROVED on the drawing itself, not merely in a header",
+           "NOT APPROVED. FOR CHECKING ONLY." in _pm_text, _pm_text[:140])
+        ck("...and downloaded under a name that cannot be filed as an issued markup",
+           "AI_CHECK_UNAPPROVED" in (
+               _premature_marked.headers.get("Content-Disposition") or ""),
+           _premature_marked.headers.get("Content-Disposition"))
         import gzip as _gzip_marked
         _vector_view = _client_up.get(
             f"/snapshot-vector/{_marked_route_job['id']}.svg",

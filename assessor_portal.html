@@ -2522,10 +2522,25 @@ function renderDecision(job) {
       <br><span style="font-size:11px">The earlier issued quotation is preserved in revision history; downloads below are the corrected revision.</span>
     </div>`;
   }
-  const markedPdfReady = job.decision === 'approved' || job.decision === 'adjusted';
+  // The markup is how you CHECK a measurement, so it cannot be locked behind approving it.
+  // Before a decision it is offered as a check and labelled as one; after, it is the issued
+  // marked drawing. Offered whenever there is a measurement to draw.
+  const _mstate = job.measurement_state || (job.result || {}).measurement_state;
+  const markedPdfApproved = job.decision === 'approved' || job.decision === 'adjusted';
+  const markedPdfReady = markedPdfApproved
+    || (_mstate && _mstate !== 'UNMEASURED' && _mstate !== 'REJECTED');
   ml.style.display = markedPdfReady ? 'block' : 'none';
   if (markedPdfReady) {
-    document.getElementById('linkMarkedPdf').href = `${BASE}/marked-pdf/${job.id}.pdf`;
+    const _a = document.getElementById('linkMarkedPdf');
+    _a.href = `${BASE}/marked-pdf/${job.id}.pdf`;
+    _a.textContent = markedPdfApproved
+      ? '📐 Marked-up drawing (approved)'
+      : '🔍 Check the measurement — marked-up drawing (not approved)';
+    _a.title = markedPdfApproved
+      ? 'The approved markup, for issue.'
+      : 'The drawing with every measured outline burned onto it, exactly as measured. '
+        + 'Open it next to the original and confirm the outlines are on the right ground '
+        + 'before you approve. Stamped UNAPPROVED.';
   }
   if (job.quotation_error) {
     el.innerHTML += `<div class="flag err" style="margin-top:8px">
