@@ -2506,25 +2506,11 @@ function renderDecision(job) {
     _jobs.some(sibling => sibling.project_ref === job.project_ref &&
       (sibling.spec_pricing_warning || zoneReviewRequired(sibling)) &&
       (sibling.decision === 'approved' || sibling.decision === 'adjusted')));
-  if (!job.decision) {
-    el.innerHTML = '<div style="color:var(--muted);font-size:13px">No decision yet</div>';
-    ql.style.display = 'none';
-    ml.style.display = 'none';
-    return;
-  }
-  el.innerHTML = `<div class="decision-banner ${esc(job.decision)}">
-    ${esc(job.decision).toUpperCase()} · ${(job.decided_at||'').substring(0,16).replace('T',' ')}
-  </div>`;
-  if (job.spec_corrected_after_approval) {
-    const rev = Number(job.quotation_revision || 2);
-    el.innerHTML += `<div class="flag warn assumption-item" style="margin-top:8px">
-      📝 <strong>CORRECTED AFTER APPROVAL · REV_${String(rev).padStart(2,'0')}</strong>
-      <br><span style="font-size:11px">The earlier issued quotation is preserved in revision history; downloads below are the corrected revision.</span>
-    </div>`;
-  }
-  // The markup is how you CHECK a measurement, so it cannot be locked behind approving it.
-  // Before a decision it is offered as a check and labelled as one; after, it is the issued
-  // marked drawing. Offered whenever there is a measurement to draw.
+  // THE MARKUP LINK IS NOT PART OF THE DECISION. It sits above the early return below
+  // because that return fires for every job with no decision yet — which is precisely the
+  // job an assessor needs the markup for. Moving the availability check without moving it
+  // out of this function shipped a feature that worked on the server and was invisible in
+  // the browser, and Aryan tested it and correctly reported nothing had changed.
   const _mstate = job.measurement_state || (job.result || {}).measurement_state;
   const markedPdfApproved = job.decision === 'approved' || job.decision === 'adjusted';
   const markedPdfReady = markedPdfApproved
@@ -2541,6 +2527,22 @@ function renderDecision(job) {
       : 'The drawing with every measured outline burned onto it, exactly as measured. '
         + 'Open it next to the original and confirm the outlines are on the right ground '
         + 'before you approve. Stamped UNAPPROVED.';
+  }
+
+  if (!job.decision) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:13px">No decision yet</div>';
+    ql.style.display = 'none';
+    return;
+  }
+  el.innerHTML = `<div class="decision-banner ${esc(job.decision)}">
+    ${esc(job.decision).toUpperCase()} · ${(job.decided_at||'').substring(0,16).replace('T',' ')}
+  </div>`;
+  if (job.spec_corrected_after_approval) {
+    const rev = Number(job.quotation_revision || 2);
+    el.innerHTML += `<div class="flag warn assumption-item" style="margin-top:8px">
+      📝 <strong>CORRECTED AFTER APPROVAL · REV_${String(rev).padStart(2,'0')}</strong>
+      <br><span style="font-size:11px">The earlier issued quotation is preserved in revision history; downloads below are the corrected revision.</span>
+    </div>`;
   }
   if (job.quotation_error) {
     el.innerHTML += `<div class="flag err" style="margin-top:8px">

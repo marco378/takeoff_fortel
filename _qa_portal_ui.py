@@ -249,6 +249,34 @@ async def main():
         ck("indurent: measured but not approvable — no scale bar on the sheet",
            ind_ui["state"] == "MEASURED_UNVERIFIED", str(ind_ui["state"]))
 
+        # THE CHECK THAT WAS MISSING. The marked-PDF export was made available before
+        # approval, the route returned 200 and the builder was tested — and the link stayed
+        # invisible in the browser, because renderDecision() returns early for a job with no
+        # decision and hid it on the way out. Server-side tests all passed; Aryan opened the
+        # portal and correctly reported that nothing had changed. Assert the LINK, in the DOM,
+        # on an undecided job, and that it actually serves a PDF.
+        mk = await page2.evaluate("""(() => {
+          const box = document.getElementById('markedPdfLinks');
+          const a = document.getElementById('linkMarkedPdf');
+          const vis = box && getComputedStyle(box).display !== 'none';
+          return {shown: !!vis, href: a ? a.getAttribute('href') : null,
+                  text: a ? a.textContent.trim() : null,
+                  decision: currentJob.decision || null};
+        })()""")
+        ck("indurent: the marked-up drawing is offered BEFORE any decision, in the browser",
+           mk.get("shown") and not mk.get("decision"), json.dumps(mk)[:220])
+        ck("...and it is labelled as a check, not as an approved issue document",
+           "Check the measurement" in (mk.get("text") or "")
+           and "not approved" in (mk.get("text") or "").lower(),
+           str(mk.get("text")))
+        _mk_resp = urllib.request.urlopen(f"{BASE}/marked-pdf/{jid2}.pdf")
+        _mk_bytes = _mk_resp.read()
+        ck("...and that link really returns the stamped PDF, not a 409",
+           _mk_resp.status == 200 and _mk_bytes[:4] == b"%PDF"
+           and "AI_CHECK_UNAPPROVED" in (
+               _mk_resp.headers.get("Content-Disposition") or ""),
+           f"{_mk_resp.status} {len(_mk_bytes)}B {_mk_resp.headers.get('Content-Disposition')}")
+
         # These checks used to run on Indurent when it reported the car park. The BEHAVIOUR
         # they prove still matters, so they run on project 8, which is genuinely multi-part
         # and carries a ring. Expectations are derived from the job, never typed in.
