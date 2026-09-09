@@ -1501,7 +1501,7 @@
   },
   "drawings/inderjit_p9p10/12_South_Mimms.pdf": {
     "surface": "HEAVY DUTY CONCRETE SERVICE YARD",
-    "area_m2": 6294.4,
+    "area_m2": 6565.63,
     "min_iou": 0.9,
     "page": 0,
     "page_rotation": 0,
@@ -1510,153 +1510,162 @@
     "coord_space": "unrotated PDF points (fitz get_drawings space)",
     "polygon_pts": [
       [
-        204.5,
-        1842.5
+        198.383,
+        1836.532
       ],
       [
-        208.0,
-        1967.5
+        197.106,
+        1958.286
       ],
       [
-        238.5,
-        1984.5
+        229.034,
+        1988.512
       ],
       [
-        244.0,
-        2005.0
+        243.934,
+        2005.115
       ],
       [
-        257.0,
-        2003.5
+        254.577,
+        2014.906
       ],
       [
-        262.0,
-        2023.5
+        261.814,
+        2023.42
       ],
       [
-        275.0,
-        2021.5
+        270.754,
+        2031.509
       ],
       [
-        280.0,
-        2042.0
+        280.12,
+        2042.152
       ],
       [
-        293.5,
-        2039.5
+        291.614,
+        2052.794
       ],
       [
         298.0,
-        2060.5
+        2060.457
       ],
       [
-        311.5,
-        2058.0
+        308.643,
+        2074.506
       ],
       [
-        316.0,
-        2079.5
+        315.88,
+        2079.615
       ],
       [
-        329.0,
-        2075.5
+        329.077,
+        2091.96
       ],
       [
-        338.0,
-        2094.0
+        338.017,
+        2094.089
       ],
       [
-        398.0,
-        2092.5
+        397.617,
+        2105.583
       ],
       [
-        415.0,
-        2109.0
+        415.071,
+        2108.989
       ],
       [
-        489.5,
-        2111.0
+        489.146,
+        2122.612
       ],
       [
-        553.0,
-        2135.5
+        553.003,
+        2135.383
       ],
       [
-        599.5,
-        2129.5
+        597.703,
+        2143.046
       ],
       [
-        614.5,
-        2147.5
+        614.306,
+        2147.303
       ],
       [
-        691.0,
-        2147.5
+        691.36,
+        2160.926
       ],
       [
-        737.5,
-        2171.0
+        759.9,
+        2174.975
       ],
       [
-        1153.5,
-        2167.0
+        1143.043,
+        2174.549
       ],
       [
-        1164.5,
-        2181.0
+        1149.429,
+        2174.975
       ],
       [
-        1158.0,
-        2374.0
+        1150.28,
+        2381.02
       ],
       [
-        1616.0,
-        2374.0
+        1616.863,
+        2381.02
       ],
       [
-        1625.0,
-        2365.0
+        1632.615,
+        2381.02
       ],
       [
-        1625.0,
-        1631.5
+        1631.337,
+        1628.357
       ],
       [
-        1609.5,
-        1635.5
+        1604.517,
+        1628.783
       ],
       [
-        1605.0,
-        1615.0
+        1603.666,
+        1611.755
       ],
       [
-        525.5,
-        1613.5
+        521.926,
+        1608.349
       ],
       [
-        515.5,
-        1638.0
+        521.5,
+        1628.357
       ],
       [
-        360.5,
-        1631.5
+        351.64,
+        1628.783
       ],
       [
-        350.5,
-        1702.0
+        350.363,
+        1702.006
       ],
       [
-        278.0,
-        1714.0
+        276.289,
+        1701.58
       ],
       [
-        276.5,
-        1830.5
+        276.289,
+        1830.572
+      ],
+      [
+        203.491,
+        1832.275
+      ],
+      [
+        198.383,
+        1836.532
       ]
     ],
-    "source": "ACCEPTED BY ARYAN (U0BCUEBAAFQ) in #fortel thread 1788727214.153909 on 9 Sep 2026: 'that's the yard, the edges are close enough to be accepted please deploy'. He was shown this exact outline as a rendered markup (CANDIDATE_South_Mimms_C-060-M_YARD.pdf) before answering. A cleaner Bluebeam markup to tighten the EDGES was promised and is still outstanding \u2014 when it arrives, replace polygon_pts with it and raise min_iou.",
-    "corroboration": "99.9% of CAD layer C-060-M_YARD's 2,528 items fall inside this outline, and 0.0% of every other surfacing layer including C-900-ASPHALT FOOTPATH (9,141 items). The scale is independently verified: printed scale bar (50 m / 567 pt) agrees with the title-block 1:250 to 0.0%.",
-    "min_iou_rationale": "0.90. The surface is hatch-drawn and its outline is reconstructed by closing the marks, but unlike Indurent this sheet has a VERIFIED scale, and Aryan accepted these edges by eye rather than by measurement \u2014 so this pins the SHAPE he accepted, not a shape anyone measured. Scored by IoU, never by area.",
-    "note": "THE SELF-NAMED LAYER CASE. This sheet's legend is drawn as outlines rather than text, so no legend-reading path can work on it: the whole page yields ~238 extractable characters and none are legend words. The surface is found by its CAD layer name alone, with no legend to cross-check it, which is why the result is capped at MEASURED_UNVERIFIED however well the scale verifies."
+    "source": "Bluebeam markup drawn by Aryan (U0BCUEBAAFQ) and posted to #fortel thread 1788727214.153909 on 9 Sep 2026, Drive id 1vvopVGZ5NUZ90MtKEGQJkEKNsJJYa2pc. This REPLACES the outline he accepted by eye earlier the same day ('the edges are close enough') \u2014 he then sent this corrected one to tighten those edges, exactly as he said he would. His label reads 6,565.63 m2 and an independent shoelace over the extracted 38 vertices gives 6,565.64, which corroborates both the vertices and the 1:250 scale. Source PDF kept OUTSIDE the repo at ~/fortel-ground-truth/SOUTH_MIMMS_ARYAN_MARKUP.pdf.",
+    "corroboration": "Our measurement of 6,294.4 m2 scores IoU 0.971 against this polygon \u2014 the same ground \u2014 while reading 4.1% under its area. That is the documented behaviour of a reconstructed stipple outline, not an error: the marks stop short of the edge they are drawn inside, which is why the job and the quotation both say AREA IS A MINIMUM. Indurent reads 4.9% under the client markup by the same mechanism. Separately, 99.9% of CAD layer C-060-M_YARD's 2,528 items fall inside our outline and 0.0% of every other surfacing layer.",
+    "min_iou_rationale": "0.90, the repo convention for a client-drawn reference, chosen before the observed value rather than fitted to it; the current measurement scores 0.971. Scored by IoU and NEVER by area: this sheet is expected to read a few percent under, and an area test would either fail a correct measurement or have to be loosened until it proved nothing.",
+    "note": "THE SELF-NAMED LAYER CASE. This sheet's legend is drawn as outlines rather than text, so no legend-reading path can work on it: the whole page yields ~238 extractable characters and none are legend words. The surface is found by its CAD layer name alone, with no legend to cross-check it, which is why the result is capped at MEASURED_UNVERIFIED however well the scale verifies.",
+    "area_m2_independent_shoelace": 6565.64
   }
 }

@@ -221,8 +221,16 @@ try:
 
             _mm_best = max((_mm_iou(_mm_gt["polygon_pts"], _r["polygon_pts"])
                             for _r in _mm.get("yard_regions") or []), default=0.0)
-            ck(f"...and it outlines the ground Aryan accepted (IoU >= {_mm_gt['min_iou']})",
+            ck(f"...and it outlines the ground the CLIENT marked up (IoU >= {_mm_gt['min_iou']})",
                _mm_best >= _mm_gt["min_iou"], f"IoU {_mm_best:.3f}")
+            # It reads UNDER the client's outline, and that direction is the whole contract.
+            # A reconstructed stipple outline stops inside the true edge, which is why the job
+            # and the quotation both say AREA IS A MINIMUM. Reading OVER would mean quoting
+            # ground nobody is paving, and no disclosure makes that acceptable.
+            ck("...and it reads UNDER the client's own figure, never over it",
+               _mm.get("area_m2") <= _mm_gt["area_m2"],
+               f"{_mm.get('area_m2')} vs client {_mm_gt['area_m2']} "
+               f"({100 * _mm.get('area_m2') / _mm_gt['area_m2'] - 100:+.1f}%)")
 
 except Exception as _e_ls:                                     # pragma: no cover - defensive
     import traceback as _tb_ls
