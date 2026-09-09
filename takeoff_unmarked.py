@@ -2303,6 +2303,13 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         # Read from get_ocgs() alone (no geometry parse) — this is the refusal path for 554
         # of 617 corpus drawings and must not cost them a second pass over the page.
         try:
+            _named_full = sorted({
+                info["name"]
+                for info in (fitz.open(pdf).get_ocgs() or {}).values()
+                if info.get("on", True) and info.get("name")
+                and any(_t in info["name"].lower() for _t in
+                        ("yard", "apron", "hardstand", "surfac", "pavement", "concrete",
+                         "carriageway", "footway", "parking"))})
             _named = sorted({
                 info["name"].split("|")[-1]
                 for info in (fitz.open(pdf).get_ocgs() or {}).values()
@@ -2311,7 +2318,62 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                         ("yard", "apron", "hardstand", "surfac", "pavement", "concrete",
                          "carriageway", "footway", "parking"))})
         except Exception:
-            _named = []
+            _named, _named_full = [], []
+        # A layer whose name ENDS in "yard" or "apron" is the engineer naming the surface we
+        # price, not describing it. Where exactly one visible layer does that, measure it.
+        # Deliberately a closed set of two words and a terminal-token match: dropping the
+        # legend anchor to the full surface vocabulary was measured at 41 corpus files,
+        # taking PRP_Concrete off a Drainage Details sheet. This rule takes ONE — South Mimms,
+        # 6,294.4 m2 — and Aryan confirmed that outline is the yard on 9 Sep ("that's the
+        # yard, the edges are close enough to be accepted"). Identification here comes from a
+        # layer name and not a legend, so legend_found stays False and the pipeline caps the
+        # result at MEASURED_UNVERIFIED however well the scale verifies.
+        _self_named = [n for n in (_named_full if "_named_full" in dir() else [])
+                       if layer_surfaces.normalise(n).endswith(("yard", "apron"))]
+        if len(_self_named) == 1:
+            _k_sn, _ver_sn, _note_sn, _src_sn = scale_for(pdf)
+            if _k_sn:
+                _doc_sn = fitz.open(pdf)
+                _res_sn = layer_surfaces.measure(_doc_sn, _doc_sn[0],
+                                                 _self_named[0].split("|")[-1], _k_sn, S=S)
+                if _res_sn.get("ok"):
+                    _regions_sn = []
+                    for _i_sn, _m_sn in enumerate(_res_sn["region_masks"], 1):
+                        _regions_sn.append({
+                            "region_id": f"yard-region-{_i_sn}",
+                            "component_id": _i_sn,
+                            "area_m2": round(float(_m_sn.sum()) * (_k_sn / S) ** 2, 1),
+                            "polygon_pts": _hatch_contour(_m_sn.astype(np.uint8), S),
+                            "perimeter_lm": None,
+                            "perimeter_source": "unresolved: outline reconstructed from CAD "
+                                                "layer marks, not a native boundary",
+                            "perimeter_confidence": "unresolved",
+                            "included": True, "chosen_primary": _i_sn == 1,
+                            "classification_source": "CAD layer named by the engineer",
+                        })
+                    _doc_sn.close()
+                    return {
+                        "pdf": os.path.basename(pdf), "style": style,
+                        "area_m2": round(_res_sn["area_m2"], 1),
+                        "measurement_state": sanity.MEASURED_UNVERIFIED,
+                        "needs_assessor": True, "legend_found": False,
+                        "region_confidence": "low",
+                        "scale_k": round(_k_sn, 6), "scale_verified": bool(_ver_sn),
+                        "scale_src": _note_sn, "scale_sources": _src_sn,
+                        "yard_regions": _regions_sn,
+                        "yard_region_review_required": len(_regions_sn) > 1,
+                        "polygon_pts": _regions_sn[0]["polygon_pts"],
+                        "price_gbp": None,
+                        "flags": flags + [_note_sn] + _res_sn["flags"] + [
+                            "SURFACE IDENTIFIED WITHOUT A LEGEND: this sheet's legend could "
+                            "not be read, so the surface was found by its CAD layer name "
+                            f"'{_self_named[0].split('|')[-1]}' alone. That is the engineer's "
+                            "own label and nothing cross-checks it — approval is blocked "
+                            "until an assessor confirms the outline is the surface being "
+                            "priced."],
+                    }
+                _doc_sn.close()
+
         if _named:
             flags.append(
                 "ASSESSOR — THE DRAWING NAMES ITS OWN SURFACES: this sheet carries CAD layers "

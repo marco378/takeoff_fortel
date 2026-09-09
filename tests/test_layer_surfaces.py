@@ -165,6 +165,7 @@ try:
     # sets the key, and the line/hatch branch returns before legend_found is computed — so the
     # only thing standing between an unlabelled surface and MEASURED_VERIFIED was each
     # promoted path REMEMBERING to hand-write region_confidence="low".
+    import json as _json_ls
     from pathlib import Path as _P_ls
     _pipe_src = _P_ls("takeoff_pipeline.py").read_text()
     ck("an omitted legend_found is treated as NO legend, never as a found one",
@@ -181,14 +182,47 @@ try:
         import takeoff_unmarked as _tu_ls
         _mm = _tu_ls.takeoff(str(_mimms))
         _mmf = " ".join(_mm.get("flags") or [])
-        ck("a line/hatch refusal NAMES the CAD layers the drawing declares",
-           "NAMES ITS OWN SURFACES" in _mmf and "C-060-M_YARD" in _mmf,
-           _mmf[-200:])
-        ck("...and still measures nothing, because naming is not identifying",
-           _mm.get("area_m2") is None
-           and _mm.get("measurement_state") == "UNMEASURED"
-           and "We have NOT measured any of them" in _mmf,
+        # South Mimms has no readable legend at all — the key is drawn as outlines, so the
+        # page yields ~238 extractable characters and none are legend words. Every
+        # legend-reading path declines at the same step. The surface is found by its CAD
+        # layer name alone, and Aryan accepted this outline on 9 Sep ("that's the yard, the
+        # edges are close enough to be accepted"). Scored by SHAPE against what he accepted,
+        # never by area.
+        ck("a sheet whose legend cannot be read is measured from its self-named CAD layer",
+           _mm.get("area_m2") is not None
+           and _mm.get("measurement_state") == "MEASURED_UNVERIFIED"
+           and "C-060-M_YARD" in _mmf,
            f"area={_mm.get('area_m2')} state={_mm.get('measurement_state')}")
+        # The scale on this sheet VERIFIES. That must not be enough to make an unlabelled
+        # surface approvable: identification came from a layer name with nothing to
+        # cross-check it.
+        ck("...and a verified scale still does not make an unlabelled surface approvable",
+           _mm.get("scale_verified") is True
+           and _mm.get("measurement_state") == "MEASURED_UNVERIFIED"
+           and "SURFACE IDENTIFIED WITHOUT A LEGEND" in _mmf,
+           f"scale_verified={_mm.get('scale_verified')} state={_mm.get('measurement_state')}")
+        _mm_gt = _json_ls.loads(_P_ls("ground_truth_polygons.json").read_text()).get(
+            "drawings/inderjit_p9p10/12_South_Mimms.pdf")
+        if not _mm_gt:
+            print("  [SKIP] no accepted outline recorded for South Mimms")
+        else:
+            import numpy as _np_ls2, cv2 as _cv_ls2
+
+            def _mm_iou(a, b):
+                _a = _np_ls2.asarray(a, dtype=float); _b = _np_ls2.asarray(b, dtype=float)
+                _o = _np_ls2.minimum(_a.min(0), _b.min(0))
+                _s = _np_ls2.maximum(_a.max(0), _b.max(0)) - _o
+                _ma = _np_ls2.zeros((int(_s[1]) + 2, int(_s[0]) + 2), _np_ls2.uint8)
+                _mb = _ma.copy()
+                _cv_ls2.fillPoly(_ma, [_np_ls2.round(_a - _o).astype(_np_ls2.int32)], 1)
+                _cv_ls2.fillPoly(_mb, [_np_ls2.round(_b - _o).astype(_np_ls2.int32)], 1)
+                _u = int((_ma | _mb).sum())
+                return (int((_ma & _mb).sum()) / _u) if _u else 0.0
+
+            _mm_best = max((_mm_iou(_mm_gt["polygon_pts"], _r["polygon_pts"])
+                            for _r in _mm.get("yard_regions") or []), default=0.0)
+            ck(f"...and it outlines the ground Aryan accepted (IoU >= {_mm_gt['min_iou']})",
+               _mm_best >= _mm_gt["min_iou"], f"IoU {_mm_best:.3f}")
 
 except Exception as _e_ls:                                     # pragma: no cover - defensive
     import traceback as _tb_ls

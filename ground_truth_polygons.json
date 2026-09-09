@@ -1498,5 +1498,165 @@
     "corroboration": "Independent shoelace over the extracted vertices at the title-block 1:500 (k=0.176389) reproduces each of Aryan's own labels to within 0.3%, which corroborates BOTH the vertices and the scale \u2014 the sheet has no scale bar, so this is the only cross-check the drawing supports.",
     "min_iou_rationale": "0.85, not the 0.90 used for solid-fill sheets. This surface is drawn as a STIPPLE with no boundary path of any kind, so its outline is reconstructed by closing 15,634 marks; the closed envelope sits inside the true edge by about half a stipple pitch. Scoring is by IoU per region and never by area: an area match with the wrong region is the failure this file exists to catch.",
     "note": "THE CAD-LAYER REFERENCE CASE. Colour cannot identify this surface at all: C1 Service Yard and F1 Footway (Vehicle Overrun) are the SAME ink, RGB (118,118,118), and the legend swatch has no matching region because the surface is stippled on white paper. The sheet is measured from the engineer's own CAD layer 'RL_Surfacing_Service Yard' instead. Before that shipped it reported 6,510 m2 of P2 CAR PARKING as service-yard concrete (IoU 0.0006 against these polygons) and quoted GBP 335,518 for it."
+  },
+  "drawings/inderjit_p9p10/12_South_Mimms.pdf": {
+    "surface": "HEAVY DUTY CONCRETE SERVICE YARD",
+    "area_m2": 6294.4,
+    "min_iou": 0.9,
+    "page": 0,
+    "page_rotation": 0,
+    "k_m_per_pt": 0.088202,
+    "scale": "1:250 (scale bar AGREES with title to 0.0% \u2014 VERIFIED)",
+    "coord_space": "unrotated PDF points (fitz get_drawings space)",
+    "polygon_pts": [
+      [
+        204.5,
+        1842.5
+      ],
+      [
+        208.0,
+        1967.5
+      ],
+      [
+        238.5,
+        1984.5
+      ],
+      [
+        244.0,
+        2005.0
+      ],
+      [
+        257.0,
+        2003.5
+      ],
+      [
+        262.0,
+        2023.5
+      ],
+      [
+        275.0,
+        2021.5
+      ],
+      [
+        280.0,
+        2042.0
+      ],
+      [
+        293.5,
+        2039.5
+      ],
+      [
+        298.0,
+        2060.5
+      ],
+      [
+        311.5,
+        2058.0
+      ],
+      [
+        316.0,
+        2079.5
+      ],
+      [
+        329.0,
+        2075.5
+      ],
+      [
+        338.0,
+        2094.0
+      ],
+      [
+        398.0,
+        2092.5
+      ],
+      [
+        415.0,
+        2109.0
+      ],
+      [
+        489.5,
+        2111.0
+      ],
+      [
+        553.0,
+        2135.5
+      ],
+      [
+        599.5,
+        2129.5
+      ],
+      [
+        614.5,
+        2147.5
+      ],
+      [
+        691.0,
+        2147.5
+      ],
+      [
+        737.5,
+        2171.0
+      ],
+      [
+        1153.5,
+        2167.0
+      ],
+      [
+        1164.5,
+        2181.0
+      ],
+      [
+        1158.0,
+        2374.0
+      ],
+      [
+        1616.0,
+        2374.0
+      ],
+      [
+        1625.0,
+        2365.0
+      ],
+      [
+        1625.0,
+        1631.5
+      ],
+      [
+        1609.5,
+        1635.5
+      ],
+      [
+        1605.0,
+        1615.0
+      ],
+      [
+        525.5,
+        1613.5
+      ],
+      [
+        515.5,
+        1638.0
+      ],
+      [
+        360.5,
+        1631.5
+      ],
+      [
+        350.5,
+        1702.0
+      ],
+      [
+        278.0,
+        1714.0
+      ],
+      [
+        276.5,
+        1830.5
+      ]
+    ],
+    "source": "ACCEPTED BY ARYAN (U0BCUEBAAFQ) in #fortel thread 1788727214.153909 on 9 Sep 2026: 'that's the yard, the edges are close enough to be accepted please deploy'. He was shown this exact outline as a rendered markup (CANDIDATE_South_Mimms_C-060-M_YARD.pdf) before answering. A cleaner Bluebeam markup to tighten the EDGES was promised and is still outstanding \u2014 when it arrives, replace polygon_pts with it and raise min_iou.",
+    "corroboration": "99.9% of CAD layer C-060-M_YARD's 2,528 items fall inside this outline, and 0.0% of every other surfacing layer including C-900-ASPHALT FOOTPATH (9,141 items). The scale is independently verified: printed scale bar (50 m / 567 pt) agrees with the title-block 1:250 to 0.0%.",
+    "min_iou_rationale": "0.90. The surface is hatch-drawn and its outline is reconstructed by closing the marks, but unlike Indurent this sheet has a VERIFIED scale, and Aryan accepted these edges by eye rather than by measurement \u2014 so this pins the SHAPE he accepted, not a shape anyone measured. Scored by IoU, never by area.",
+    "note": "THE SELF-NAMED LAYER CASE. This sheet's legend is drawn as outlines rather than text, so no legend-reading path can work on it: the whole page yields ~238 extractable characters and none are legend words. The surface is found by its CAD layer name alone, with no legend to cross-check it, which is why the result is capped at MEASURED_UNVERIFIED however well the scale verifies."
   }
 }
