@@ -75,6 +75,7 @@ MODULES = [
     "tests.test_scale_citations",
     "tests.test_layer_surfaces",
     "tests.test_stipple_surfaces",
+    "tests.test_boundary_surfaces",
 ]
 
 # How many checks SHOULD run here. Client drawings are gitignored, so ~166 checks skip on a
@@ -85,8 +86,8 @@ MODULES = [
 # written alongside: a number that looked reasonable and was never checked against the case
 # it governs.
 CLIENT_DRAWINGS = (Path(__file__).resolve().parent / "drawings").is_dir()
-EXPECTED_CHECKS = 950 if CLIENT_DRAWINGS else 768
-MIN_CHECKS = 937 if CLIENT_DRAWINGS else 756
+EXPECTED_CHECKS = 964 if CLIENT_DRAWINGS else 777
+MIN_CHECKS = 951 if CLIENT_DRAWINGS else 765
 
 broken = []
 for _name in MODULES:

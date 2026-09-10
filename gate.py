@@ -39,6 +39,10 @@ MEASUREMENT_PATHS = {
     # just as surely as the geometry does. layer_surfaces went live on 9 Sep and was
     # missing from this set -- a change to it would not have demanded the corpus run.
     "layer_surfaces.py", "stipple_surfaces.py",
+    # boundary_surfaces decides which ground is OFFERED. It is inert today, and it is
+    # listed now rather than on the day it goes live, because layer_surfaces was missing
+    # from this set on the day IT went live.
+    "boundary_surfaces.py",
 }
 # The assessor's screen and the artefacts it hands the client.
 PORTAL_PATHS = {"assessor_portal.html", "approval_server.py", "marked_pdf.py", "quotation.py"}
