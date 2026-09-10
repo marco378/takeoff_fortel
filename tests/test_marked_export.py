@@ -219,6 +219,34 @@ try:
        len(_kept_names) == 2 and "yard-region-1" in _kept_names,
        str(sorted(_kept_names)))
 
+    # The SAME builder produces the issued markup once a decision exists. An issued drawing
+    # that still shows the outlines the assessor declined disagrees with the quantity it is
+    # filed against -- Aryan hit exactly this on his approved LDSS2 export (10 Sep).
+    _issued = _copy.deepcopy(_cand_job)
+    _issued["decision"] = "approved"
+    _issued_regions = _bmp_ua(_issued, _ua_src)[1]["geometry"]["regions"]
+    _issued_names = {region["region_id"]: region["name"] for region in _issued_regions}
+    ck("an APPROVED markup drops the candidate the assessor never ticked",
+       "yard-region-2" not in _issued_names, str(sorted(_issued_names)))
+    ck("...and carries only what is actually in the approved quantity",
+       set(_issued_names) == {"yard-region-1"}, str(sorted(_issued_names)))
+    ck("...so no outline on an issued drawing is labelled out of the total",
+       not any("CANDIDATE" in str(region.get("name") or "") for region in _issued_regions),
+       str([region.get("name") for region in _issued_regions]))
+    # ...and the check sheet must NOT lose the offers in the process: that is the document
+    # Aryan asked for on 9 Sep so a declined area is still visible to the next assessor.
+    _pre = _copy.deepcopy(_cand_job)
+    _pre.pop("decision", None)
+    _pre_names = {region["region_id"] for region in _bmp_ua(_pre, _ua_src)[1]["geometry"]["regions"]}
+    ck("...while the pre-decision CHECK sheet still shows what was on offer",
+       _pre_names == {"yard-region-1", "yard-region-2"}, str(sorted(_pre_names)))
+    # An INCLUDED candidate is approved ground and must survive into the issued drawing.
+    _issued_kept = _copy.deepcopy(_kept_job)
+    _issued_kept["decision"] = "approved"
+    _ik = {region["region_id"] for region in _bmp_ua(_issued_kept, _ua_src)[1]["geometry"]["regions"]}
+    ck("...and a candidate the assessor DID tick is still on the approved drawing",
+       _ik == {"yard-region-1", "yard-region-2"}, str(sorted(_ik)))
+
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] marked-PDF export tests — missing dependency or file: {_e}")
 

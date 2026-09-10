@@ -634,6 +634,14 @@ async def main():
             })()""")
             ck("LDSS2 confirm: the way out of the block is VISIBLE, not a dead end",
                confVis.get("shown"), json.dumps(confVis)[:200])
+            import urllib.request as _u0, fitz as _fitz0
+            _chk = _fitz0.open(stream=_u0.urlopen(f"{BASE}/marked-pdf/{jidL}.pdf").read(),
+                               filetype="pdf")
+            _chk_txt = "\n".join(pg.get_text() for pg in _chk)
+            ck("LDSS2 export: the pre-decision CHECK sheet DOES show what was declined",
+               "CANDIDATE" in _chk_txt.upper(),
+               str("CANDIDATE" in _chk_txt.upper()))
+            _chk.close()
             await pgL.evaluate("confirmExistingMeasurement()")
             await pgL.wait_for_timeout(4000)
             await pgL.screenshot(path=f"{OUT}/13_ldss2_confirmed.png", full_page=True)
@@ -652,6 +660,25 @@ async def main():
                afterL.get("approve") == 200, json.dumps(afterL)[:220])
             ck("LDSS2 confirm: ...with his 1,114 m² intact through the whole round trip",
                abs((afterL.get("area") or 0) - 1114.0) < 1.0, str(afterL.get("area")))
+            # The document he actually downloads. Before approval it is a CHECK sheet and
+            # must show every offer; after approval it is the ISSUED markup and must show
+            # only what the quantity contains. Same builder, two jobs -- which is how the
+            # declined outlines ended up on his approved LDSS2 drawing.
+            import urllib.request as _u, fitz as _fitz
+            _pdf_url = f"{BASE}/marked-pdf/{jidL}.pdf"
+            _issued_bytes = _u.urlopen(_pdf_url).read()
+            _doc = _fitz.open(stream=_issued_bytes, filetype="pdf")
+            _txt = "\n".join(pg.get_text() for pg in _doc)
+            ck("LDSS2 export: the APPROVED drawing carries no declined candidate",
+               "CANDIDATE" not in _txt.upper(),
+               [ln for ln in _txt.splitlines() if "CANDIDATE" in ln.upper()][:2])
+            ck("LDSS2 export: ...and it does carry the 1,114 m² he approved",
+               "1,114" in _txt or "1114" in _txt.replace(",", ""),
+               _txt[:120].replace("\n", " "))
+            ck("LDSS2 export: ...and is no longer stamped NOT APPROVED",
+               "NOT APPROVED" not in _txt.upper(),
+               [ln for ln in _txt.splitlines() if "APPROVED" in ln.upper()][:2])
+            _doc.close()
             ck("LDSS2: no uncaught page errors", not errsL, "; ".join(errsL[:2]))
             await pgL.close()
 

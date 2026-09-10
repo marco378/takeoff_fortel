@@ -319,6 +319,8 @@ def _overlay_manifest(job: dict, source_path: Path, page_index: int,
         # Prefer individually surfaced native Yard/zone geometry. Fall back to the job's
         # assessor-approved top-level polygon when the pipeline exposes only one region.
         seen = set()
+        # A markup BEFORE a decision is a thing to check; one after it is a thing to issue.
+        issued = job.get("decision") in {"approved", "adjusted"}
         native_regions = job.get("yard_regions") or result.get("yard_regions") or []
         for index, region in enumerate(native_regions):
             points = region.get("polygon_pts") if isinstance(region, dict) else None
@@ -331,9 +333,16 @@ def _overlay_manifest(job: dict, source_path: Path, page_index: int,
             # ...and a candidate the assessor has INCLUDED is measured ground: it is in
             # the total, so it must not be stamped "not in total" on the very document
             # someone checks the total against.
+            # ...but ONLY on the check sheet. Once a decision is made this same builder
+            # produces the ISSUED markup (..._REV_nn_MARKED.pdf), and an issued drawing
+            # showing outlines the assessor DECLINED is a drawing that disagrees with the
+            # quantity it accompanies. Aryan, 10 Sep, on his approved LDSS2 export: "The
+            # approved drawing should only show the region that was actually selected and
+            # approved... Any other measured-region candidates that were left
+            # unticked/excluded should not appear in the final approved markup."
             is_candidate = (region.get("candidate") is True
                             and region.get("included") is False)
-            if region.get("included") is False and not is_candidate:
+            if region.get("included") is False and (issued or not is_candidate):
                 continue
             normalised = _normalise_points(points)
             key = tuple(tuple(point) for point in normalised)
