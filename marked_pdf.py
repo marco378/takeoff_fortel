@@ -328,7 +328,11 @@ def _overlay_manifest(job: dict, source_path: Path, page_index: int,
             # not drawn at all. Collapsing the two would either hide ground the assessor
             # was asked to rule on, or burn an area onto the drawing that no number
             # includes -- and this document is the thing someone checks the number against.
-            is_candidate = region.get("candidate") is True
+            # ...and a candidate the assessor has INCLUDED is measured ground: it is in
+            # the total, so it must not be stamped "not in total" on the very document
+            # someone checks the total against.
+            is_candidate = (region.get("candidate") is True
+                            and region.get("included") is False)
             if region.get("included") is False and not is_candidate:
                 continue
             normalised = _normalise_points(points)

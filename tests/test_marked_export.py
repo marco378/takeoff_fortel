@@ -186,6 +186,39 @@ try:
            stream=_bmp_ua(_ua_job_ok, _ua_src)[0], filetype="pdf")[0].get_text(),
        _mpf_ua(_ua_job_ok))
 
+    # A candidate the assessor has INCLUDED is measured ground. It is in the total, so the
+    # markup must not stamp "not in total" across it -- this document is the thing someone
+    # checks the total against, and a label that contradicts the number is the same class of
+    # bug as the dropped "NOT" in "NOT APPROVED". `candidate` stays true for provenance;
+    # what the drawing keys on is whether the area is still being OFFERED.
+    _cand_job = _copy.deepcopy(_ua_job)
+    _cand_job["result"]["yard_regions"] = [
+        {"region_id": "yard-region-1", "area_m2": 1234.5, "included": True,
+         "polygon_pts": [[100, 100], [400, 100], [400, 380], [100, 380]]},
+        {"region_id": "yard-region-2", "area_m2": 344.5, "included": False,
+         "candidate": True, "candidate_reason": "detached from the named ground",
+         "polygon_pts": [[430, 100], [560, 100], [560, 200], [430, 200]]},
+        {"region_id": "yard-region-3", "area_m2": 500.0, "included": False,
+         "polygon_pts": [[600, 100], [700, 100], [700, 200], [600, 200]]},
+    ]
+    _cand_names = {region["region_id"]: region["name"]
+                   for region in _bmp_ua(_cand_job, _ua_src)[1]["geometry"]["regions"]}
+    ck("an OFFERED candidate is drawn, and named so nobody adds it to the total by eye",
+       _cand_names.get("yard-region-2") == "CANDIDATE (not in total)",
+       repr(_cand_names.get("yard-region-2")))
+    ck("...while a plain excluded region is not drawn at all",
+       "yard-region-3" not in _cand_names, str(sorted(_cand_names)))
+    _kept_job = _copy.deepcopy(_cand_job)
+    _kept_job["result"]["yard_regions"][1]["included"] = True
+    _kept_names = {region["region_id"]: region["name"]
+                   for region in _bmp_ua(_kept_job, _ua_src)[1]["geometry"]["regions"]}
+    ck("...and once the assessor KEEPS it, the markup stops calling it out of the total",
+       _kept_names.get("yard-region-2") == "Service yard",
+       repr(_kept_names.get("yard-region-2")))
+    ck("...but it is still drawn, with the ground it measures",
+       len(_kept_names) == 2 and "yard-region-1" in _kept_names,
+       str(sorted(_kept_names)))
+
 except (ImportError, FileNotFoundError) as _e:
     print(f"  [SKIP] marked-PDF export tests — missing dependency or file: {_e}")
 

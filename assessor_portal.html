@@ -1384,7 +1384,10 @@ function buildAiRegions(res, job) {
     // the assessor includes it, but it must be VISIBLE or there is nothing to review. That
     // is the client's design, 9 Sep 2026 -- "appear separately as candidate areas... don't
     // automatically include them in the final total".
-    const isCandidate = region.candidate === true;
+    // ...and once the assessor INCLUDES a candidate it stops being one: it is in the
+    // number, so it must not carry a label saying it isn't. `candidate` stays true for
+    // provenance; what the screen keys on is whether it is still being OFFERED.
+    const isCandidate = region.candidate === true && region.included === false;
     if (region.included === false && !isCandidate) return;
     const poly = region.polygon_pts;
     if (!Array.isArray(poly) || poly.length < 3) return;
@@ -1715,10 +1718,11 @@ function renderSegmentationComponentSummary(job) {
     const bbox = Array.isArray(region.bbox_pdf_pts)
       ? region.bbox_pdf_pts.map(value => Number(value).toFixed(1)).join(', ') : '—';
     const checked = region.included !== false ? 'checked' : '';
-    const isCandidate = region.candidate === true;
+    const isCandidate = region.candidate === true && region.included === false;
     const rowLabel = isCandidate ? 'CANDIDATE — NOT IN TOTAL'
-      : (region.chosen_primary ? 'PRIMARY REGION' : 'SAME-TINT REGION');
-    const why = isCandidate && region.candidate_reason
+      : (region.candidate === true ? 'CANDIDATE — INCLUDED BY ASSESSOR'
+      : (region.chosen_primary ? 'PRIMARY REGION' : 'SAME-TINT REGION'));
+    const why = region.candidate === true && region.candidate_reason
       ? `<div style="font-weight:400;color:#8a6d3b;font-size:9px;margin-top:2px">${esc(region.candidate_reason)}</div>` : '';
     return `<tr style="background:${isCandidate?'#fff3df':(region.included!==false?'#eef7ed':'#f4f4f4')}">
       <td style="padding:4px;border-top:1px solid #e0d8c6;font-weight:700">
@@ -1737,8 +1741,8 @@ function renderSegmentationComponentSummary(job) {
     component, component.chosen ? 'RAW LARGEST COMPONENT' : 'RAW CO-COMPONENT (NOT SUMMED)'
   )).join('');
   return `<div style="margin:8px 0;border:1px solid #d8b96d;border-radius:6px;overflow:hidden;background:#fffdf6">
-    <div style="padding:6px 8px;background:#fff1c9;color:#664700;font-size:11px;font-weight:800">SURFACE-TINT COMPONENT REVIEW</div>
-    <div style="padding:6px 8px;font-size:10px;color:#6b5730">Every retained same-tint region is shown separately with its measured area and bbox. Checked rows feed the candidate Yard total; uncheck neighbouring buildings or out-of-scope regions, then save. ${reviewRequired?'<strong>Approval is blocked until this review is saved.</strong>':''} Raw largest: ${esc(evidence.raw_largest_component_m2 ?? '—')} m² · all matching-tint pixels: ${esc(evidence.raw_tint_union_m2 ?? '—')} m².</div>
+    <div style="padding:6px 8px;background:#fff1c9;color:#664700;font-size:11px;font-weight:800">MEASURED REGION REVIEW</div>
+    <div style="padding:6px 8px;font-size:10px;color:#6b5730">Every measured region is shown separately with its measured area and bbox. Checked rows feed the candidate Yard total; uncheck neighbouring buildings or out-of-scope regions, then save. Offered areas start unchecked and are out of the total until you tick them. ${reviewRequired?'<strong>Approval is blocked until this review is saved.</strong>':''} Raw largest: ${esc(evidence.raw_largest_component_m2 ?? '—')} m² · all matching-tint pixels: ${esc(evidence.raw_tint_union_m2 ?? '—')} m².</div>
     <table style="width:100%;border-collapse:collapse;font-size:10px"><thead><tr><th style="text-align:left;padding:4px">Status</th><th style="text-align:right;padding:4px">Area</th><th style="text-align:left;padding:4px">BBox (PDF pt)</th></tr></thead><tbody>${rows}${rawRows}</tbody></table>
     ${yardRegions.length ? '<div style="padding:6px 8px;text-align:right"><button type="button" onclick="saveYardRegionReview()">Save kept/excluded regions</button></div>' : ''}
   </div>`;

@@ -444,6 +444,48 @@ async def main():
                 or (job2105.get("result") or {}).get("yard_region_review_required")),
            str(job2105.get("yard_region_review_required")))
         ck("2105: no uncaught page errors", not errs5, "; ".join(errs5[:2]))
+
+        # Now walk the path Aryan will walk FIRST: tick the offered area, save, and look at
+        # what the screen says afterwards. Everything above only proved the opening state.
+        # An included candidate is measured ground -- if the outline and the row still said
+        # "NOT IN TOTAL" while the headline had risen, the label would contradict the number.
+        _before = st.get("area") or 0
+        _cand_ids = [r["id"] for r in st.get("regions", []) if r.get("cand")]
+        for _tid in _cand_ids:
+            await pg5.click(f'.yard-region-toggle[data-region-id="{_tid}"]')
+        await pg5.evaluate("saveYardRegionReview()")
+        await pg5.wait_for_timeout(6000)
+        await pg5.screenshot(path=f"{OUT}/10_2105_candidate_included.png", full_page=True)
+        st2 = await pg5.evaluate("""(() => {
+          const res = (currentJob && currentJob.result) || currentJob || {};
+          const regions = (currentJob.yard_regions || res.yard_regions || []);
+          const drawn = (typeof aiRegions !== 'undefined' ? aiRegions : []).map(r => ({
+            label: r.label, cand: !!r.candidate, area: r.area_m2}));
+          return {
+            area: res.area_m2, drawn,
+            regions: regions.map(r => ({id: r.region_id, a: r.area_m2,
+                                        inc: r.included, cand: !!r.candidate})),
+            reviewRequired: !!(currentJob.yard_region_review_required
+                               || res.yard_region_review_required),
+            saysNotInTotal: /NOT IN TOTAL/i.test(document.body.innerText),
+          };
+        })()""")
+        _cand_area = sum(r["a"] for r in st.get("regions", []) if r.get("cand"))
+        ck("2105: ticking the offered area adds exactly its own m² to the headline",
+           abs((st2.get("area") or 0) - (_before + _cand_area)) < 1.0,
+           f"{_before} + {_cand_area} -> {st2.get('area')}")
+        ck("2105: ...and the endpoint keeps `candidate` on it, so its provenance survives",
+           all(r["cand"] and r["inc"] for r in st2.get("regions", []) if r["id"] in _cand_ids),
+           json.dumps(st2.get("regions"))[:220])
+        ck("2105: ...the outline stops being drawn as an offer once it is IN the total",
+           bool(st2.get("drawn")) and not any(d.get("cand") for d in st2.get("drawn", [])),
+           json.dumps(st2.get("drawn"))[:220])
+        ck("2105: ...no label anywhere still says NOT IN TOTAL while the total includes it",
+           not st2.get("saysNotInTotal"), str(st2.get("saysNotInTotal")))
+        ck("2105: ...and saving the review unblocks approval",
+           st2.get("reviewRequired") is False, str(st2.get("reviewRequired")))
+        ck("2105: no uncaught page errors through the include round trip",
+           not errs5, "; ".join(errs5[:2]))
         await pg5.close()
 
         # A measured job must NOT carry the banner: it would tell the assessor there is no
