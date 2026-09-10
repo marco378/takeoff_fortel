@@ -482,7 +482,11 @@ async def main():
            json.dumps(st2.get("drawn"))[:220])
         ck("2105: ...no label anywhere still says NOT IN TOTAL while the total includes it",
            not st2.get("saysNotInTotal"), str(st2.get("saysNotInTotal")))
-        ck("2105: ...and saving the review unblocks approval",
+        # It clears the REGION-REVIEW block and nothing else: the sheet is still
+        # MEASURED_UNVERIFIED, so Approve stays blocked behind Confirm scale + extent, the
+        # same route as Indurent and South Mimms. Saying "Save unblocks Approve" would have
+        # been a sentence the assessor could disprove with one click.
+        ck("2105: ...saving the review clears the region-review block (scale+extent still required)",
            st2.get("reviewRequired") is False, str(st2.get("reviewRequired")))
         ck("2105: no uncaught page errors through the include round trip",
            not errs5, "; ".join(errs5[:2]))
