@@ -101,6 +101,39 @@ MIN_REGION_WIDTH_M = 6.0
 NEIGHBOUR_RADII = 2.5
 MIN_NEIGHBOURS = 1
 
+# ── The outline's SHAPE, as distinct from its area ────────────────────────────────────
+# Aryan, 10 Sep 2026: "the borders still need fixing". Measured against his markup, our
+# outline was missing 616.6 m2 of his ground and covering 533.9 m2 that was not his, while
+# the TOTALS differed by only 82.7 m2. The two errors nearly cancel, which is why the
+# number looked right and the border looked wrong. They have different shapes and need
+# different treatment:
+#   * the EXCESS is a thin ribbon -- 97% of it in one piece per region, max width 2.29 m,
+#     median 0.18 m -- where the stipple runs a little past the kerb the yard stops at.
+#   * the MISSING is deep chunks up to 3.5 m wide: the gaps where lorry-bay markings
+#     interrupt the stipple, which the disc bridge cannot span.
+# Snapping the outline onto the sheet's line work does NOT work: along half the boundary
+# there is no drawn edge within 2 m, and the nearest line is usually an illustrative
+# masterplan underlay. Douglas-Peucker, contour smoothing and symmetric open/close all
+# fail too -- measured, not assumed.
+KERB_WORDS = ("kerb", "edging", "flush")   # the words a drawing office uses for an edge
+# ...but ONLY on this drawing's own engineering layers. A tender sheet carries underlays --
+# an illustrative masterplan X-Ref, OS mapping, a topographic survey -- whose lines are not
+# this engineer's statement about where the kerb is. On 2105 the X-Ref masterplan supplies
+# 278 of the 709 "kerb" lines, and fencing against it trimmed the wrong ground: IoU barely
+# moved (0.918 -> 0.920) where the engineering layers alone give 0.951.
+NOT_OUR_DRAWING = ("x-ref", "xref", "illustrative", "masterplan", "topo", "os mapping",
+                   "survey", "external reference")
+FENCE_MIN_LEN_M = 3.0          # shorter than this is a detail, not an edge
+FENCE_SEARCH_M = 2.0           # only fence with lines that run alongside the outline
+FENCE_CORRIDOR_M = 1.0         # ...and only cut within this band of the line itself
+# Reach far to find the bay-gap notches, then keep only the ones the SHEET supports.
+# Length alone is the wrong rule: the notches filled by a 3 m close carry 2.95% stipple
+# ink against an interior density of ~4%, but past that they collapse to 0.07% -- blank
+# paper being claimed as surface, which is exactly what MAX_BRIDGE_M exists to prevent.
+FILL_REACH_M = 8.0
+FILL_MIN_INK_RATIO = 0.25      # a filled notch must carry >= this share of the region's
+                               # own stipple density; 0.25 and 0.50 give the same answer
+
 
 def _seg_len(item_dict):
     """Longest straight segment in one drawing item, in points."""
@@ -359,6 +392,112 @@ def _solidity(mask_u8, per_px_m2):
     return float(mask_u8.sum()) / hull if hull > 0 else 0.0
 
 
+
+def _kerb_lines(by_layer, rot, k, scale):
+    """Long edge lines from layers a drawing office names for a kerb, in MASK PIXELS.
+
+    Vocabulary, so it is client-specific by nature. When a sheet uses none of these words
+    the fence finds nothing and does nothing -- a no-op is the correct failure here,
+    because the fence only ever REMOVES area and never invents any.
+    """
+    out = []
+    for name, items in by_layer.items():
+        low = str(name).lower()
+        if not any(w in low for w in KERB_WORDS):
+            continue
+        if any(w in low for w in NOT_OUR_DRAWING):
+            continue
+        for d in items:
+            for op in d.get("items", ()):
+                if op[0] != "l":
+                    continue
+                a = _fitz_point(op[1].x, op[1].y, rot)
+                b = _fitz_point(op[2].x, op[2].y, rot)
+                if math.hypot(a[0] - b[0], a[1] - b[1]) * k < FENCE_MIN_LEN_M:
+                    continue
+                out.append(((a[0] * scale, a[1] * scale), (b[0] * scale, b[1] * scale)))
+    return out
+
+
+def _fence(mask, lines, k, scale):
+    """Cut away the part of `mask` lying beyond a kerb line that runs alongside it.
+
+    A yard does not extend past its own kerb. This is NOT snapping: the line is used as a
+    one-sided limit, never as something to move the outline towards. It can only ever
+    remove area, so it cannot push a measurement over the client's figure -- safe by
+    construction rather than by tuning.
+    """
+    if not lines or not mask.any():
+        return mask, np.zeros_like(mask)
+    ys, xs = np.nonzero(mask)
+    y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+    cy, cx = float(ys.mean()), float(xs.mean())
+    search = FENCE_SEARCH_M / k * scale
+    corridor = FENCE_CORRIDOR_M / k * scale
+    sub = mask[y0:y1 + 1, x0:x1 + 1]
+    gy, gx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+    out = sub.copy()
+    cut = 0
+    for (ax, ay), (bx, by) in lines:
+        if (max(ax, bx) < x0 - search or min(ax, bx) > x1 + search
+                or max(ay, by) < y0 - search or min(ay, by) > y1 + search):
+            continue
+        dx, dy = bx - ax, by - ay
+        L = math.hypot(dx, dy)
+        if L < 1e-9:
+            continue
+        nx, ny = -dy / L, dx / L
+        signed = (gx - ax) * nx + (gy - ay) * ny
+        t = ((gx - ax) * dx + (gy - ay) * dy) / (L * L)
+        inside_span = (t >= 0.0) & (t <= 1.0)
+        centre_side = (cx - ax) * nx + (cy - ay) * ny
+        if centre_side == 0:
+            continue
+        far = signed < 0 if centre_side > 0 else signed > 0
+        band = np.abs(signed) <= corridor
+        drop = out & far & band & inside_span
+        if drop.any():
+            cut += int(drop.sum())
+            out = out & ~drop
+    removed = np.zeros_like(mask)
+    removed[y0:y1 + 1, x0:x1 + 1] = sub & ~out
+    mask = mask.copy()
+    mask[y0:y1 + 1, x0:x1 + 1] = out
+    return mask, removed
+
+
+def _fill_notches(mask, stipple, k, scale):
+    """Fill the bay-gap notches -- but only those the sheet's own stipple supports.
+
+    Reach is set generously and the EVIDENCE decides, rather than a length deciding. Each
+    filled piece must carry at least FILL_MIN_INK_RATIO of the region's own stipple
+    density; the blank gaps a long reach also spans carry essentially none and are
+    dropped. Measured on 2105: this is what separates real bay gaps (2.95% ink against a
+    ~4% interior) from blank paper (0.07%).
+    """
+    if not mask.any():
+        return mask, 0.0, 0
+    interior = float(stipple[mask].mean()) if mask.any() else 0.0
+    if interior <= 0:
+        return mask, 0.0, 0
+    px = max(1, int(round(FILL_REACH_M / k * scale)))
+    m = mask.astype(np.uint8)
+    kx = cv2.getStructuringElement(cv2.MORPH_RECT, (px, 1))
+    ky = cv2.getStructuringElement(cv2.MORPH_RECT, (1, px))
+    closed = cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_CLOSE, kx), cv2.MORPH_CLOSE, ky)
+    added = (closed > 0) & ~mask
+    if not added.any():
+        return mask, interior, 0
+    n, lab = cv2.connectedComponents(added.astype(np.uint8), 8)[:2]
+    out = mask.copy()
+    kept = 0
+    for i in range(1, n):
+        piece = lab == i
+        if float(stipple[piece].mean()) >= FILL_MIN_INK_RATIO * interior:
+            out |= piece
+            kept += 1
+    return out, interior, kept
+
 def measure(doc, page, k, S=2.0, layer_suffix=None):
     """Measure the stipple-drawn surface. Never raises; refuses with a reason."""
     try:
@@ -486,12 +625,34 @@ def _measure(doc, page, k, S=2.0, layer_suffix=None):
     built_from = ink & ~hatched
     total_ink = float(built_from.sum()) or 1.0
 
+    fence_lines = _kerb_lines(by_layer, rot, k, S)
     n, lab, st, _c = cv2.connectedComponentsWithStats(cand.astype(np.uint8), 8)
     main, candidates, kept = [], [], np.zeros(shape, bool)
     seen = [False] * n
+    shape_fix = {"kerb_lines": len(fence_lines), "trimmed_m2": 0.0,
+                 "notches_filled": 0, "filled_m2": 0.0}
     for i in range(1, n):
-        a_m2 = float(st[i, cv2.CC_STAT_AREA]) * per_px_m2
         cm = (lab == i)
+        # The outline's SHAPE. Fence first (only ever removes), then fill the bay-gap
+        # notches the stipple itself supports (only ever adds, and only where evidenced).
+        # Both act on the SAME mask the area and the polygon are read from, so the number
+        # and the drawing can never disagree about what was measured.
+        before = int(cm.sum())
+        cm, beyond_kerb = _fence(cm, fence_lines, k, S)
+        shape_fix["trimmed_m2"] += (before - int(cm.sum())) * per_px_m2
+        mid = int(cm.sum())
+        cm, _interior, _kept_n = _fill_notches(cm, built_from, k, S)
+        # The kerb is a LIMIT, not a suggestion. Filling reaches 8 m, so it closes straight
+        # back over the thin sliver the fence just removed -- and that sliver IS stipple, so
+        # it passes the evidence test and comes back. Measured on 2105: the fence cut the
+        # excess from 208/280 m2 to 95/126, and the fill restored it to 220/297. Ground the
+        # kerb ruled out stays out.
+        cm = cm & ~beyond_kerb
+        shape_fix["filled_m2"] += (int(cm.sum()) - mid) * per_px_m2
+        shape_fix["notches_filled"] += _kept_n
+        if not cm.any():
+            continue
+        a_m2 = float(cm.sum()) * per_px_m2
         share = float((built_from & cm).sum()) / total_ink
         # The post-Roscoe rule: an absolute floor alone threw away a real 168 m2 third of
         # that yard as "noise". A patch carrying a real share of the surface's own marks
@@ -576,6 +737,10 @@ def _measure(doc, page, k, S=2.0, layer_suffix=None):
         "area_is_a_minimum": True,
         "identified_by": ("the only stipple pattern in the sheet's own legend "
                           f"({stipples[0]['seg_p90_pt']} pt strokes)"),
+        "shape_fix": {"kerb_lines": shape_fix["kerb_lines"],
+                      "trimmed_m2": round(shape_fix["trimmed_m2"], 1),
+                      "notches_filled": shape_fix["notches_filled"],
+                      "filled_m2": round(shape_fix["filled_m2"], 1)},
         "diagnostics": {"bridge": bridge_diag, "short_marks": len(short),
                         "long_marks": len(long_)},
     }
