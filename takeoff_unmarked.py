@@ -2260,11 +2260,17 @@ def _offer_boundaries(pdf, flags):
             "polygon_pts": b["polygon_pts"],
             "included": False,
             "candidate": True,
+            # "exactly" is a claim about SHAPE, and only about shape. The outline is the
+            # engineer's own closed loop, so no "AREA IS A MINIMUM" applies to it -- but the
+            # m² it converts to rides on scale_for()'s k, which no scale_consensus has
+            # cross-checked. "1,114 m² exactly" invites the reader to hear "this area is
+            # certain", which is an over-promise about the scale, not a fact about the shape.
             "candidate_reason": (
-                f"a closed outline the engineer drew on layer '{b['short_name']}' — "
-                f"{b['area_m2']:,.0f} m² exactly, not reconstructed. Nothing on the sheet says "
-                "which of these is the surface you are pricing, so none is counted until you "
-                "include it."),
+                f"a closed outline the engineer drew on layer '{b['short_name']}' — the shape "
+                "is his own, not reconstructed, so no \"AREA IS A MINIMUM\" applies to it. The "
+                f"{b['area_m2']:,.0f} m² it encloses still converts through this sheet's scale, "
+                "which is not verified. Nothing on the sheet says which of these is the surface "
+                "you are pricing, so none is counted until you include it."),
             "source": "closed_cad_boundary",
             "layer": b["layer"],
         })
@@ -2274,7 +2280,9 @@ def _offer_boundaries(pdf, flags):
             "closed outlines on named layers, so these shapes are the engineer's own rather "
             "than reconstructed. We are NOT proposing one: nothing on the sheet says which is "
             "the surface being priced, and the largest is not reliably it. Include the one "
-            "that is yours and it is measured exactly.")
+            "that is yours and its OUTLINE is measured exactly — the m² still rests on this "
+            "sheet's unverified scale, so approval stays blocked until you confirm "
+            "scale + extent.")
     return regions, raw[:12]
 
 

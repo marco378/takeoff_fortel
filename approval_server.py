@@ -2222,11 +2222,45 @@ def review_yard_regions(job_id):
                 zone["needs_assessor"] = False
                 zone["region_count"] = len(kept)
         zones_total = round(sum(float(zone.get("area_m2") or 0) for zone in zones), 1)
+        # An UNMEASURED sheet that an assessor has now identified IS measured.
+        #
+        # Until 10 Sep this endpoint wrote an area and said nothing about the state, so
+        # including a boundary on LDSS2 put "1,114 m2" on screen directly beneath a banner
+        # reading "No AI measurement on this sheet" -- the dropped-NOT contradiction again,
+        # on the FIRST click the assessor makes. The number was right and the screen called
+        # it nothing.
+        #
+        # Promotion is to MEASURED_UNVERIFIED, never straight to VERIFIED: the assessor
+        # supplied IDENTITY (which closed outline is the priced surface -- the one thing the
+        # sheet does not say), not SCALE. These areas rest on scale_for()'s k, which no
+        # scale_consensus ever cross-checked. So approval stays blocked behind Confirm
+        # scale + extent, exactly as it is for any other unverified area, and the 95,463 m2
+        # incident stays impossible. Never downgrade a state that is already better.
+        prior_state = (job.get("measurement_state")
+                       or result.get("measurement_state") or "")
+        promoted_state = None
+        if prior_state == "UNMEASURED" and kept:
+            promoted_state = "MEASURED_UNVERIFIED"
         old_flags = [flag for flag in (result.get("flags") or [])
                      if not str(flag).startswith("YARD REGION REVIEW REQUIRED:")]
+        from_boundary = all(str(region.get("source") or "") == "closed_cad_boundary"
+                            for region in kept)
+        # "none counted" stops being true the moment one is counted.
+        if from_boundary:
+            old_flags = [flag for flag in old_flags
+                         if "EXACT BOUNDARIES OFFERED" not in str(flag)]
+        noun = "engineer-drawn closed boundaries" if from_boundary else "same-tint regions"
         summary = (f"assessor Yard-region review: kept {len(kept)} of {len(ordered_regions)} "
-                   f"same-tint regions; final Yard {area_m2:,.1f} m²")
+                   f"{noun}; final Yard {area_m2:,.1f} m²")
         old_flags.append(summary)
+        if promoted_state:
+            old_flags.append(
+                f"UNMEASURED → {promoted_state}: an assessor identified the priced surface "
+                f"from the sheet's own geometry, so this area is measured, not traced. The "
+                f"scale behind it is still unverified — approval remains blocked until "
+                f"Confirm scale + extent.")
+        if promoted_state:
+            result["measurement_state"] = promoted_state
         result.update({
             "area_m2": area_m2,
             "zones": zones,
@@ -2243,6 +2277,8 @@ def review_yard_regions(job_id):
         job_flags = [flag for flag in (job.get("flags") or [])
                      if not str(flag).startswith("YARD REGION REVIEW REQUIRED:")]
         job_flags.append(summary)
+        if promoted_state:
+            job["measurement_state"] = promoted_state
         job.update({
             "area_m2": area_m2,
             "zones": zones,

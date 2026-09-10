@@ -572,6 +572,53 @@ async def main():
                json.dumps(posL))
             ck("LDSS2: ...the banner tells the assessor to TICK one, not to trace what we just gave them",
                posL.get("bannerSaysWhere"), json.dumps(posL))
+            # The path he will walk FIRST: tick the one that is his, save. This starts from
+            # UNMEASURED with NO scale_k, which the review endpoint was never built for --
+            # it recomputes an area from the kept region and says nothing about the state.
+            await pgL.click('.yard-region-toggle[data-region-id="boundary-2"]')
+            await pgL.evaluate("saveYardRegionReview()")
+            await pgL.wait_for_timeout(6000)
+            await pgL.screenshot(path=f"{OUT}/12_ldss2_included.png", full_page=True)
+            st2L = await pgL.evaluate("""(() => {
+              const res = (currentJob && currentJob.result) || currentJob || {};
+              const el = document.getElementById('refusalBanner');
+              const body = document.body.innerText;
+              return {area: res.area_m2, state: res.measurement_state,
+                      bannerHidden: !el || el.hidden,
+                      bannerText: (el && el.innerText || '').slice(0, 120),
+                      saysNoMeasurement: /No AI measurement on this sheet/i.test(body),
+                      costing: !!(res.costing || currentJob.costing),
+                      price: res.price_gbp || currentJob.price_gbp || null,
+                      readout: (document.querySelector('.readout') || {}).innerText || ''};
+            })()""")
+            ck("LDSS2 include: ticking his outline gives exactly its own area",
+               abs((st2L.get("area") or 0) - 1114.0) < 1.0, json.dumps(st2L)[:200])
+            # A headline number under a banner reading "No AI measurement on this sheet" is
+            # the dropped-NOT contradiction again: the screen asserting the opposite of the
+            # figure beside it, on the first click the assessor makes.
+            ck("LDSS2 include: ...and the screen STOPS saying there is no measurement",
+               not st2L.get("saysNoMeasurement"),
+               f"state={st2L.get('state')} area={st2L.get('area')} banner={st2L.get('bannerText')!r}")
+            ck("LDSS2 include: ...the state is no longer UNMEASURED once a human identified it",
+               st2L.get("state") != "UNMEASURED", str(st2L.get("state")))
+            # My first version of this check probed `price_gbp`, a field that exists NOWHERE
+            # in the codebase, so it could only ever pass -- the same self-congratulating test
+            # as the below-the-fold one. The contract does not forbid a price here; it forbids
+            # an ungated one. Assert the GATE, and assert it server-side rather than by
+            # reading a colour off the screen.
+            blockL = await pgL.evaluate("""(async (jid) => {
+              const r = await fetch('/approve/' + encodeURIComponent(jid),
+                                    {method: 'POST'});
+              let body = null; try { body = await r.json(); } catch (e) { body = null; }
+              return {status: r.status, error: (body && (body.error || body.reason)) || ''};
+            })""", jidL)
+            ck("LDSS2 include: ...and approval is still BLOCKED, because scale is unverified",
+               blockL.get("status") != 200 and re.search(
+                   r"scale", str(blockL.get("error") or ""), re.I) is not None,
+               json.dumps(blockL)[:220])
+            ck("LDSS2 include: ...and the block names MEASURED_UNVERIFIED, not UNMEASURED",
+               "MEASURED_UNVERIFIED" in str(blockL.get("error") or ""),
+               json.dumps(blockL)[:220])
             ck("LDSS2: no uncaught page errors", not errsL, "; ".join(errsL[:2]))
             await pgL.close()
 

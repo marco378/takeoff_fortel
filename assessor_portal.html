@@ -2436,7 +2436,9 @@ const REFUSAL_REASONS = [
   [/EXACT BOUNDARIES OFFERED/i,
    "nothing on this sheet says which layer is the surface you are pricing, so the AI has not "
    + "chosen one — but the engineer drew the extents as closed outlines, and they are listed "
-   + "below. Include the one that is yours and it is measured exactly, with no reconstruction"]
+   + "below. Include the one that is yours and its outline is measured exactly, with no "
+   + "reconstruction \u2014 the m\u00b2 still rests on this sheet's unverified scale, so you "
+   + "will be asked to confirm scale + extent before approving"]
 ];
 // Layer names carry a CAD naming-standard prefix nobody reads: "Zz_20_40_60-M_Onsite_Dock_
 // (Rigid)". Chopping the last 34 characters left fragments like "60-M_Onsite_Carriageway_
