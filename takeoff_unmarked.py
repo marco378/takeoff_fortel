@@ -21,6 +21,7 @@ import cv2
 import scale as SC
 import layer_surfaces
 import stipple_surfaces
+import boundary_surfaces
 import sanity
 with contextlib.redirect_stdout(io.StringIO()):
     from pricing import slab_rate
@@ -2221,6 +2222,62 @@ def scale_for(pdf, page=0):
 
 
 # ---------------------------------------------------------------- main takeoff
+
+def _offer_boundaries(pdf, flags):
+    """Closed CAD boundaries to OFFER on a sheet we are refusing to measure.
+
+    Before falling back to "trace it by hand", check whether the engineer drew the pavement
+    extents as closed outlines on named layers. On the Skanska LDSS2 sheet four of them close
+    to 0.00 pt, and the one the client confirmed as his concrete encloses 1,114.0 m2 against
+    his own traced 1,114.55 -- IoU 0.9924. That is an exact outline, not a reconstruction, so
+    it carries no "AREA IS A MINIMUM".
+
+    They are OFFERED and never chosen. Which one is the priced surface is not on the sheet:
+    the LARGEST loop on LDSS2 is the carriageway. So each arrives excluded and named by its
+    own layer -- the client's rule for ambiguity, 10 Sep 2026: "If there are ambiguous areas,
+    show them as separate candidates for the user to review rather than simply rejecting the
+    whole measurement."
+
+    Returns (regions, raw). Never raises: an offer must not break a clean refusal.
+    """
+    try:
+        k_bd, _v, _n, _src = scale_for(pdf)
+        if not k_bd:
+            return [], []
+        doc_bd = fitz.open(pdf)
+        try:
+            raw = boundary_surfaces.find(doc_bd[0], k_bd)
+        finally:
+            if not doc_bd.is_closed:
+                doc_bd.close()
+    except Exception:
+        return [], []
+    regions = []
+    for i, b in enumerate(raw[:12], 1):
+        regions.append({
+            "region_id": f"boundary-{i}",
+            "area_m2": b["area_m2"],
+            "polygon_pts": b["polygon_pts"],
+            "included": False,
+            "candidate": True,
+            "candidate_reason": (
+                f"a closed outline the engineer drew on layer '{b['short_name']}' — "
+                f"{b['area_m2']:,.0f} m² exactly, not reconstructed. Nothing on the sheet says "
+                "which of these is the surface you are pricing, so none is counted until you "
+                "include it."),
+            "source": "closed_cad_boundary",
+            "layer": b["layer"],
+        })
+    if regions:
+        flags.append(
+            f"{len(regions)} EXACT BOUNDARIES OFFERED, NONE COUNTED — this drawing carries "
+            "closed outlines on named layers, so these shapes are the engineer's own rather "
+            "than reconstructed. We are NOT proposing one: nothing on the sheet says which is "
+            "the surface being priced, and the largest is not reliably it. Include the one "
+            "that is yours and it is measured exactly.")
+    return regions, raw[:12]
+
+
 def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     """Returns a result dict. source in {'architect','engineer'} controls the assumption flag."""
     flags = []
@@ -2476,9 +2533,23 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                 + ". We have NOT measured any of them and are not proposing one: nothing on "
                 "this sheet says which layer the quote is for. If one of these is the surface "
                 "to price, trace it and it will be measured exactly.")
+        # Nothing on the sheet identified the surface. Before falling back to "trace it by
+        # hand", check whether the engineer drew the pavement extents as CLOSED boundaries on
+        # named layers -- on the Skanska LDSS2 sheet four of them close to 0.00 pt, and the
+        # one the client confirmed as his concrete encloses 1,114.0 m2 against his own traced
+        # 1,114.55 (IoU 0.9924). That is an exact outline, not a reconstruction.
+        #
+        # They are OFFERED and never chosen. Which one is the priced surface is not on the
+        # sheet: the largest loop on LDSS2 is the CARRIAGEWAY. So each arrives as a candidate,
+        # excluded, named by its own layer -- the client's rule for ambiguity, 10 Sep 2026:
+        # "If there are ambiguous areas, show them as separate candidates for the user to
+        # review rather than simply rejecting the whole measurement."
+        _bound_regions, _bounds = _offer_boundaries(pdf, flags)
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "legend_found": False,
+                "yard_regions": _bound_regions,
+                "boundary_candidates": _bounds[:12],
                 "flags": flags + [
                     "NON-COLOUR-CODED (line/hatch) drawing — solid-fill colour segmentation does NOT apply "
                     "(it scrapes stray grey -> wrong area). Route to hatch-mode / Claude vision / assessor "
@@ -2918,10 +2989,16 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     # confidently wrong small number is the same failure class as a confidently wrong large
     # one. Emit NO area and send it to the assessor instead.
     if _seg_diag.get("no_plausible_component") and not (PLAUSIBLE_MIN_M2 <= yard_area <= PLAUSIBLE_MAX_M2):
+        # Colour found nothing usable -- but the engineer may still have drawn the extents.
+        # This is the exit the Skanska LDSS2 sheet takes (solid-fill 23%, so it comes down
+        # the colour route), and it is where four exact boundaries are worth offering.
+        _bd_regions, _bd_raw = _offer_boundaries(pdf, flags)
         return {"pdf": os.path.basename(pdf), "area_m2": None,
                 "scale_k": round(k, 5), "scale_verified": verified,
                 "scale_src": note, "scale_sources": scale_sources,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
+                "yard_regions": _bd_regions,
+                "boundary_candidates": _bd_raw,
                 "flags": flags + [
                     f"REFUSED — no region fell inside the plausible service-yard band "
                     f"({PLAUSIBLE_MIN_M2:,.0f}-{PLAUSIBLE_MAX_M2:,.0f} m²); the largest candidate was "

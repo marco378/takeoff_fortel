@@ -828,6 +828,17 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     ]
                     r["measurement_state"] = UNMEASURED
                     r["needs_assessor"] = True
+                    # A refusal can still carry OFFERED geometry. Where the engineer drew the
+                    # pavement extents as closed outlines we hand those to the assessor rather
+                    # than an empty canvas -- excluded, named by their layer, none counted.
+                    # This branch used to drop them: yard_regions was only copied when an area
+                    # existed, so the four exact boundaries on the Skanska LDSS2 sheet reached
+                    # the flag text and never reached the screen. That is the same shape as the
+                    # markup feature that was live server-side and invisible in the browser.
+                    if tu.get("yard_regions"):
+                        r["yard_regions"] = tu["yard_regions"]
+                    if tu.get("boundary_candidates"):
+                        r["boundary_candidates"] = tu["boundary_candidates"]
                     # Office GA sheets are commonly line/hatch drawings with several level plans
                     # on one page.  Ordinary closed-vector faces remain trace candidates only.
                     # A narrower, corroborated metal-deck hatch class may emit an assessor-gated

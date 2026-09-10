@@ -2423,8 +2423,32 @@ const REFUSAL_REASONS = [
    "the surfaces here are drawn as line work rather than colour fills — the AI measures colour fills and stroke-pattern legends, and will not guess at the rest"],
   [/scale.*(?:refus|disagree|consensus)/i,
    "the scale could not be verified on this sheet, and we do not measure from a scale we cannot check"],
-  [/scan|raster/i, "this page is a scan, so there is no geometry to measure"]
+  // Was /scan|raster/i, which matched the WORD "raster" anywhere in any flag. On the Skanska
+  // LDSS2 sheet the flag "raster outline retained for manual trace" made the banner announce
+  // "this page is a scan" about a drawing carrying 24,608 vector items -- while the same
+  // screen offered four exact CAD boundaries taken from it. Two statements on one page
+  // contradicting each other is worse than saying nothing. Match the scan VERDICT, not a word
+  // that appears in the internals.
+  [/RASTER\s*\/\s*scanned|scanned or flattened|no reliable vector geometry/i,
+   "this page is a scan, so there is no geometry to measure"],
+  // Added with the flag itself, per the note at the top of this list -- the boundary offer is
+  // a refusal that still hands over geometry, so the banner has to say what to DO with it.
+  [/EXACT BOUNDARIES OFFERED/i,
+   "nothing on this sheet says which layer is the surface you are pricing, so the AI has not "
+   + "chosen one — but the engineer drew the extents as closed outlines, and they are listed "
+   + "below. Include the one that is yours and it is measured exactly, with no reconstruction"]
 ];
+// Layer names carry a CAD naming-standard prefix nobody reads: "Zz_20_40_60-M_Onsite_Dock_
+// (Rigid)". Chopping the last 34 characters left fragments like "60-M_Onsite_Carriageway_
+// (Flexible)" -- truncated at the wrong end, so the reader sees the numbering and loses the
+// word that identifies the surface. Strip the prefix instead of cutting the tail.
+function tidyLayerName(raw) {
+  let n = String(raw || '').split('|').pop();
+  n = n.replace(/^[A-Za-z]{1,3}[_-]?[\d_]{2,}[_-]?[A-Za-z]?[_-]/, '');   // Zz_20_40_60-M_
+  n = n.replace(/^Onsite[_-]/i, '');
+  n = n.replace(/_/g, ' ').trim();
+  return n.length > 40 ? n.slice(0, 39) + '…' : n;
+}
 function refusalReason(flags) {
   for (const [rx, text] of REFUSAL_REASONS) {
     if (flags.some(f => rx.test(String(f)))) return text;
@@ -2457,14 +2481,41 @@ function renderRefusalBanner(job, res, flags) {
     return renderMeasurementCaveat(el, Array.isArray(flags) ? flags : []);
   }
   const reason = refusalReason(Array.isArray(flags) ? flags : []);
+  // When the only content on the page is a set of offered outlines, LIST them here rather
+  // than merely pointing down the page at them. Measured on the Skanska LDSS2 sheet: the
+  // review box sits at y=1124 on a 950 px screen, so an assessor who does not scroll never
+  // learns the offer exists. Naming the box was not enough -- that is the same
+  // below-the-fold defect this banner was built to fix, one level removed.
+  let offered = '';
+  const offers = (currentJob && (currentJob.yard_regions
+                  || (currentJob.result || {}).yard_regions) || [])
+                 .filter(r => r && r.candidate === true && r.included === false
+                              && r.source === 'closed_cad_boundary');
+  if (offers.length) {
+    offered = '<span class="rb-next">On offer, none counted: '
+      + offers.slice(0, 6).map(r =>
+          `<strong>${Number(r.area_m2).toLocaleString()} m²</strong> `
+          + `${esc(tidyLayerName(r.layer))}`).join(' · ')
+      + (offers.length > 6 ? ` · +${offers.length - 6} more` : '')
+      + '</span>';
+  }
   el.className = rejected ? 'rejected' : '';
   el.innerHTML =
     `<span class="rb-head">${rejected ? 'This drawing was rejected — no measurement.'
                                       : 'No AI measurement on this sheet.'}</span>` +
     esc(reason || 'See the flags below for the reason recorded by the pipeline.') +
-    (rejected ? '' : `<span class="rb-next">What to do: set the scale with <strong>Calibrate</strong>` +
-                     ` (draw a line over a scale bar or a 2.5 m parking bay), then draw the surface` +
-                     ` with <strong>Trace</strong>. Your trace is measured exactly like an AI one.</span>`);
+    // "Trace it by hand" is the wrong next step when the engineer's own outlines are sitting
+    // on the same screen. Telling an assessor to draw what we have already handed them reads
+    // as the page not knowing what it is offering, so the offer gets its own instruction.
+    (rejected ? ''
+     : (Array.isArray(flags) && flags.some(f => /EXACT BOUNDARIES OFFERED/i.test(String(f)))
+        ? `<span class="rb-next">What to do: tick the outline you are pricing in` +
+          ` <strong>MEASURED REGION REVIEW</strong> below, then` +
+          ` <strong>Save kept/excluded regions</strong>. Nothing is counted until you do.` +
+          ` If none of them is your surface, Calibrate and Trace it instead.</span>` + offered
+        : `<span class="rb-next">What to do: set the scale with <strong>Calibrate</strong>` +
+          ` (draw a line over a scale bar or a 2.5 m parking bay), then draw the surface` +
+          ` with <strong>Trace</strong>. Your trace is measured exactly like an AI one.</span>`));
   el.hidden = false;
 }
 

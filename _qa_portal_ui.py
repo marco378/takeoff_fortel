@@ -21,6 +21,12 @@ REFUSED_SHEETS = [
 MIMMS = "drawings/inderjit_p9p10/12_South_Mimms.pdf"
 SPEC2105 = ("drawings/inderjit_p9p10/9_25010-RLL-26-XX-DR-C-2105"
             "_P01_External_Construction_Specification.pdf")
+# LDSS2 refuses -- nothing on it says which layer is the priced surface -- but it DOES carry
+# four closed boundaries the engineer drew. They must reach the SCREEN, not just the flags:
+# the pipeline dropped them on the refusal branch because yard_regions was only copied when
+# an area existed, which is server-side-correct and browser-invisible, the exact failure the
+# client caught last time.
+LDSS2 = "drawings/aryan_10sep/LDSS2-01-DR-C-151-XX-ZZ-PVMT-ARP.pdf"
 
 def upload(path, name, ref, client):
     boundary = "----qa" + uuid.uuid4().hex
@@ -491,6 +497,83 @@ async def main():
         ck("2105: no uncaught page errors through the include round trip",
            not errs5, "; ".join(errs5[:2]))
         await pg5.close()
+
+        # ── LDSS2: a REFUSAL that still hands over exact geometry ───────────────────────
+        import os as _os_ldss
+        if not _os_ldss.path.exists(LDSS2):
+            print("  [SKIP] LDSS2 not present")
+        else:
+            jidL = upload(LDSS2, "Skanska Equinix QA", "QA-LDSS2", "Skanska")
+            jobL = wait_done(jidL)
+            pgL = await ctx.new_page()
+            errsL = []
+            pgL.on("pageerror", lambda e: errsL.append(str(e)))
+            await pgL.goto(f"{BASE}/portal?job={jidL}", wait_until="networkidle", timeout=90000)
+            await pgL.wait_for_timeout(6000)
+            await pgL.screenshot(path=f"{OUT}/11_ldss2_boundaries.png", full_page=True)
+            stL = await pgL.evaluate("""(() => {
+              const res = (currentJob && currentJob.result) || currentJob || {};
+              const regions = (currentJob.yard_regions || res.yard_regions || []);
+              const drawn = (typeof aiRegions !== 'undefined' ? aiRegions : []).map(r => ({
+                label: r.label, cand: !!r.candidate, area: r.area_m2}));
+              const toggles = Array.from(document.querySelectorAll('.yard-region-toggle'))
+                .map(t => ({id: t.dataset.regionId, checked: t.checked}));
+              const body = document.body.innerText;
+              return {state: res.measurement_state, area: res.area_m2,
+                      regions: regions.map(r => ({id: r.region_id, a: r.area_m2,
+                                                  inc: r.included, cand: !!r.candidate})),
+                      drawn, toggles,
+                      saysOffered: /EXACT BOUNDARIES OFFERED/i.test(body),
+                      namesLayer: /Onsite_Dock_\(Rigid\)/i.test(body)};
+            })()""")
+            ck("LDSS2: still refuses — no number is invented from a boundary nobody chose",
+               stL.get("state") == "UNMEASURED" and not stL.get("area"),
+               f"state={stL.get('state')} area={stL.get('area')}")
+            ck("LDSS2: ...but the four exact boundaries reach the SCREEN, not just the flags",
+               len(stL.get("regions") or []) >= 3,
+               json.dumps(stL.get("regions"))[:200])
+            ck("LDSS2: ...every one of them is OUT of the total until a human includes it",
+               bool(stL.get("regions"))
+               and all(r["inc"] is False and r["cand"] for r in stL["regions"]),
+               json.dumps(stL.get("regions"))[:200])
+            ck("LDSS2: ...they are DRAWN on the canvas, so the assessor can see the shape",
+               any(d.get("cand") for d in stL.get("drawn", [])),
+               json.dumps(stL.get("drawn"))[:200])
+            ck("LDSS2: ...and each is named by the layer it came from",
+               stL.get("namesLayer"), str(stL.get("namesLayer")))
+            ck("LDSS2: ...with every checkbox starting UNCHECKED",
+               bool(stL.get("toggles"))
+               and all(not t["checked"] for t in stL.get("toggles", [])),
+               json.dumps(stL.get("toggles")))
+            # "Correct but below the fold" is the defect the refusal banner was built to fix.
+            # On a sheet whose ONLY content is four offered outlines, the list of them is the
+            # primary thing on the page -- if the assessor has to scroll to discover it exists,
+            # the offer may as well not have been made.
+            posL = await pgL.evaluate("""(() => {
+              const t = document.querySelector('.yard-region-toggle');
+              const box = t ? t.closest('div[style*="border"]') : null;
+              const el = box || t;
+              if (!el) return {found: false};
+              const r = el.getBoundingClientRect();
+              return {found: true, top: Math.round(r.top + window.scrollY),
+                      viewport: window.innerHeight,
+                      inView: (r.top + window.scrollY) < window.innerHeight,
+                      bannerSaysWhere: /MEASURED REGION REVIEW/i.test(
+                        (document.getElementById('refusalBanner') || {}).innerText || ''),
+                      bannerListsOffers: /On offer, none counted/i.test(
+                        (document.getElementById('refusalBanner') || {}).innerText || '')};
+            })()""")
+            # The first version of this check passed on `inView OR the banner names the box`,
+            # and the data showed top=1124 on a 950 px viewport -- it was a test written so the
+            # defect could pass. What matters is that the assessor SEES WHAT IS ON OFFER without
+            # scrolling, not that something points down the page at it.
+            ck("LDSS2: ...and what is on offer is visible without scrolling, areas and all",
+               posL.get("found") and (posL.get("inView") or posL.get("bannerListsOffers")),
+               json.dumps(posL))
+            ck("LDSS2: ...the banner tells the assessor to TICK one, not to trace what we just gave them",
+               posL.get("bannerSaysWhere"), json.dumps(posL))
+            ck("LDSS2: no uncaught page errors", not errsL, "; ".join(errsL[:2]))
+            await pgL.close()
 
         # A measured job must NOT carry the banner: it would tell the assessor there is no
         # measurement while the headline shows one. Checked on project 8 — Indurent is a
