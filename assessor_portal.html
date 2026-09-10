@@ -1377,13 +1377,22 @@ function buildAiRegions(res, job) {
   // assessor (or the colour gate) has excluded are not drawn, because they are not measured.
   const zoneCategory = zones.length ? String(zones[0].category || '').trim().toLowerCase() : '';
   effectiveYardRegions(job).forEach(region => {
-    if (!region || typeof region !== 'object' || region.included === false) return;
+    if (!region || typeof region !== 'object') return;
+    // A CANDIDATE is not the same thing as an excluded region, and the difference matters.
+    // An excluded region is one somebody has judged not to be the surface, so it is not
+    // drawn. A candidate is ground we found and are OFFERING: it is out of the total until
+    // the assessor includes it, but it must be VISIBLE or there is nothing to review. That
+    // is the client's design, 9 Sep 2026 -- "appear separately as candidate areas... don't
+    // automatically include them in the final total".
+    const isCandidate = region.candidate === true;
+    if (region.included === false && !isCandidate) return;
     const poly = region.polygon_pts;
     if (!Array.isArray(poly) || poly.length < 3) return;
     out.push({
       category: zoneCategory || 'external_yard',
       label: region.region_id || 'measured region',
       area_m2: typeof region.area_m2 === 'number' ? region.area_m2 : null,
+      candidate: isCandidate,
       points: poly.map(pt => [pt[0] * snapScale, pt[1] * snapScale]),
       holes: []
     });
@@ -1706,12 +1715,17 @@ function renderSegmentationComponentSummary(job) {
     const bbox = Array.isArray(region.bbox_pdf_pts)
       ? region.bbox_pdf_pts.map(value => Number(value).toFixed(1)).join(', ') : '—';
     const checked = region.included !== false ? 'checked' : '';
-    return `<tr style="background:${region.included!==false?'#eef7ed':'#f4f4f4'}">
+    const isCandidate = region.candidate === true;
+    const rowLabel = isCandidate ? 'CANDIDATE — NOT IN TOTAL'
+      : (region.chosen_primary ? 'PRIMARY REGION' : 'SAME-TINT REGION');
+    const why = isCandidate && region.candidate_reason
+      ? `<div style="font-weight:400;color:#8a6d3b;font-size:9px;margin-top:2px">${esc(region.candidate_reason)}</div>` : '';
+    return `<tr style="background:${isCandidate?'#fff3df':(region.included!==false?'#eef7ed':'#f4f4f4')}">
       <td style="padding:4px;border-top:1px solid #e0d8c6;font-weight:700">
         <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
           <input class="yard-region-toggle" type="checkbox" data-region-id="${esc(region.region_id)}" ${checked}>
-          ${region.chosen_primary?'PRIMARY REGION':'SAME-TINT REGION'}
-        </label>
+          ${rowLabel}
+        </label>${why}
       </td>
       <td style="padding:4px;border-top:1px solid #e0d8c6;text-align:right">${Number(region.area_m2).toLocaleString()} m²</td>
       <td style="padding:4px;border-top:1px solid #e0d8c6;font-family:monospace;font-size:9px">${esc(bbox)}</td>
@@ -2822,9 +2836,13 @@ function draw() {
   // Measured surfaces: one outline per part, holes cut out (evenodd), each labelled with the
   // quantity that belongs to THAT part.
   aiRegions.forEach(region => {
-    const rgb = AI_REGION_COLOURS[region.category] || AI_REGION_COLOURS.unclassified;
+    // Candidates are drawn in amber with a heavier dash and an explicit label, so a glance
+    // at the canvas tells you which outlines are in the number and which are being offered.
+    // Same colour as the measured ground would invite exactly the mistake this guards.
+    const rgb = region.candidate ? [214,122,0]
+      : (AI_REGION_COLOURS[region.category] || AI_REGION_COLOURS.unclassified);
     ctx.save();
-    ctx.setLineDash([6,4]);
+    ctx.setLineDash(region.candidate ? [14,7] : [6,4]);
     ctx.beginPath();
     region.points.forEach((pt,i)=> i ? ctx.lineTo(pt[0],pt[1]) : ctx.moveTo(pt[0],pt[1]));
     ctx.closePath();
@@ -2835,9 +2853,23 @@ function draw() {
     });
     ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.10)`;
     ctx.fill('evenodd');
-    ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.55)`;
-    ctx.lineWidth = lw;
+    ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${region.candidate ? 0.95 : 0.55})`;
+    ctx.lineWidth = region.candidate ? lw * 1.8 : lw;
     ctx.stroke();
+    if (region.candidate && region.points.length) {
+      const xs = region.points.map(pt => pt[0]), ys = region.points.map(pt => pt[1]);
+      const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+      const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+      const txt = `CANDIDATE — NOT IN TOTAL${region.area_m2 ? ` · ${Math.round(region.area_m2).toLocaleString()} m²` : ''}`;
+      ctx.setLineDash([]);
+      ctx.font = '700 13px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+      ctx.strokeText(txt, cx, cy);
+      ctx.fillStyle = 'rgba(150,80,0,1)';
+      ctx.fillText(txt, cx, cy);
+    }
     ctx.restore();
   });
 

@@ -13,11 +13,14 @@ INDURENT = ("drawings/inderjit_p9p10/11_Indurent_Park_Newport_22513-RLL-25-00-DR
 # The other three sheets Inderjit sent on 4 Sep. All three are correctly UNMEASURED; what was
 # wrong was that the portal never said so where he could see it.
 REFUSED_SHEETS = [
-    ("mimms",  "drawings/inderjit_p9p10/12_South_Mimms.pdf"),
     ("roscoe", "drawings/inderjit_p9p10/10_26051-ROS-00-XX-DR-C-05101.pdf"),
-    ("spec2105", "drawings/inderjit_p9p10/9_25010-RLL-26-XX-DR-C-2105"
-                 "_P01_External_Construction_Specification.pdf"),
 ]
+# South Mimms measures from its CAD layer name (9 Sep) and 2105 measures from the only
+# stipple in its own legend (10 Sep). Both were in REFUSED_SHEETS and had to come out --
+# leaving them would have asserted the wrong behaviour and passed while the product changed.
+MIMMS = "drawings/inderjit_p9p10/12_South_Mimms.pdf"
+SPEC2105 = ("drawings/inderjit_p9p10/9_25010-RLL-26-XX-DR-C-2105"
+            "_P01_External_Construction_Specification.pdf")
 
 def upload(path, name, ref, client):
     boundary = "----qa" + uuid.uuid4().hex
@@ -381,6 +384,67 @@ async def main():
             ck(f"{tag}: no uncaught page errors", not errs3, "; ".join(errs3[:2]))
             refused_jid = jid3
             await pg.close()
+
+        # ── 2105: candidates must be VISIBLE and OUT of the total ───────────────────────
+        # The client's design, 9 Sep 2026: extra stipple areas "appear separately as
+        # candidate areas... don't automatically include them in the final total, but also
+        # don't reject the whole sheet because of them." Both halves are checked HERE, in a
+        # real browser, because the last portal feature I shipped was correct server-side and
+        # invisible on screen, and Aryan was the one who found that.
+        jid2105 = upload(SPEC2105, "Inderjit 2105 QA", "QA-091", "Indurent")
+        job2105 = wait_done(jid2105)
+        pg5 = await ctx.new_page()
+        errs5 = []
+        pg5.on("pageerror", lambda e: errs5.append(str(e)))
+        await pg5.goto(f"{BASE}/portal?job={jid2105}", wait_until="networkidle", timeout=90000)
+        await pg5.wait_for_timeout(6000)
+        await pg5.screenshot(path=f"{OUT}/09_2105_candidates.png", full_page=True)
+        st = await pg5.evaluate("""(() => {
+          const res = (currentJob && currentJob.result) || currentJob || {};
+          const regions = (currentJob.yard_regions || res.yard_regions || []);
+          const drawn = (typeof aiRegions !== 'undefined' ? aiRegions : []).map(r => ({
+            label: r.label, cand: !!r.candidate, area: r.area_m2}));
+          const toggles = Array.from(document.querySelectorAll('.yard-region-toggle'))
+            .map(t => ({id: t.dataset.regionId, checked: t.checked}));
+          const bodyText = document.body.innerText;
+          return {
+            state: res.measurement_state, area: res.area_m2,
+            regions: regions.map(r => ({id: r.region_id, a: r.area_m2,
+                                        inc: r.included, cand: !!r.candidate})),
+            drawn, toggles,
+            saysCandidate: /CANDIDATE/i.test(bodyText),
+            saysNotInTotal: /NOT IN TOTAL/i.test(bodyText),
+          };
+        })()""")
+        cands = [r for r in st.get("regions", []) if r.get("cand")]
+        mains = [r for r in st.get("regions", []) if not r.get("cand")]
+        ck("2105: it measures now, from the one stipple in its own legend",
+           st.get("state") == "MEASURED_UNVERIFIED" and (st.get("area") or 0) > 0,
+           json.dumps({k: st.get(k) for k in ("state", "area")}))
+        ck("2105: the headline is the MAIN regions only — no candidate is in the number",
+           abs((st.get("area") or 0) - sum(r["a"] for r in mains)) < 1.0,
+           f"headline {st.get('area')} vs mains {sum(r['a'] for r in mains) if mains else None}")
+        ck("2105: the candidate area is NOT added to the total",
+           all(abs((st.get("area") or 0) - (sum(r["a"] for r in mains) + c["a"])) > 1.0
+               for c in cands) if cands else False,
+           json.dumps(st.get("regions"))[:220])
+        # The whole point of a candidate is that a human can look at it. An excluded region
+        # is not drawn; a candidate MUST be, or there is nothing to review.
+        ck("2105: the candidate is DRAWN on the canvas, not hidden like an excluded region",
+           any(d.get("cand") for d in st.get("drawn", [])),
+           json.dumps(st.get("drawn"))[:220])
+        ck("2105: ...and the screen says CANDIDATE and NOT IN TOTAL in so many words",
+           st.get("saysCandidate") and st.get("saysNotInTotal"),
+           json.dumps({k: st.get(k) for k in ("saysCandidate", "saysNotInTotal")}))
+        ck("2105: the candidate's checkbox starts UNCHECKED — opt in, never opt out",
+           bool(st.get("toggles")) and any(not t["checked"] for t in st.get("toggles", [])),
+           json.dumps(st.get("toggles")))
+        ck("2105: approval is blocked until every offered area has been ruled on",
+           bool(job2105.get("yard_region_review_required")
+                or (job2105.get("result") or {}).get("yard_region_review_required")),
+           str(job2105.get("yard_region_review_required")))
+        ck("2105: no uncaught page errors", not errs5, "; ".join(errs5[:2]))
+        await pg5.close()
 
         # A measured job must NOT carry the banner: it would tell the assessor there is no
         # measurement while the headline shows one. Checked on project 8 — Indurent is a

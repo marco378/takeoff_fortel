@@ -20,6 +20,7 @@ import cv2
 
 import scale as SC
 import layer_surfaces
+import stipple_surfaces
 import sanity
 with contextlib.redirect_stdout(io.StringIO()):
     from pricing import slab_rate
@@ -2373,6 +2374,99 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
                             "priced."],
                     }
                 _doc_sn.close()
+
+        # Some sheets defeat the layer name entirely: 2105 draws all EIGHT of its build-ups
+        # on one layer called RL_Surface, every mark pure black, and its PDF clip paths are
+        # viewport boxes rather than outlines. Nothing names the surface -- but the sheet
+        # draws its own legend chips in the SAME pattern as the ground each one denotes, so
+        # the drawing is its own key. Exactly one chip is a stipple ("Concrete Service Yard",
+        # 2.75 pt strokes; the other seven are hatches at 7.2-30.0 pt), and that pattern is
+        # the surface. stipple_surfaces refuses unless exactly one chip is a stipple, because
+        # with two, matching "dots" no longer tells you WHICH surface you measured.
+        #
+        # Identification is by pattern, with no legend text and nothing cross-checking it, so
+        # legend_found stays False and the pipeline caps this at MEASURED_UNVERIFIED however
+        # well the scale verifies. The area is a MINIMUM: a stipple stops short of the edge
+        # it is drawn inside, so the reconstructed outline sits inside the true boundary.
+        if not _self_named:
+            _k_sp, _ver_sp, _note_sp, _src_sp = scale_for(pdf)
+            if _k_sp:
+                _doc_sp = fitz.open(pdf)
+                try:
+                    _res_sp = stipple_surfaces.measure(_doc_sp, _doc_sp[0], _k_sp, S=S)
+                    if _res_sp.get("ok") and _res_sp.get("regions"):
+                        _regs_sp, _rank_sp = [], 0
+                        # Main regions are measured and counted. Candidates are measured and
+                        # SHOWN, but excluded from the total until an assessor includes them
+                        # -- the client's decision on 9 Sep 2026: "any additional stipple
+                        # regions should appear separately as candidate areas. Don't
+                        # automatically include them in the final total, but also don't
+                        # reject the whole sheet because of them."
+                        for _r_sp in _res_sp["regions"]:
+                            _rank_sp += 1
+                            _regs_sp.append({
+                                "region_id": f"yard-region-{_rank_sp}",
+                                "component_id": _rank_sp,
+                                "area_m2": _r_sp["area_m2"],
+                                "polygon_pts": _r_sp["polygon_pts"],
+                                "perimeter_lm": None,
+                                "perimeter_source": "unresolved: outline reconstructed from a "
+                                                    "stipple, not a native boundary",
+                                "perimeter_confidence": "unresolved",
+                                "included": True,
+                                "chosen_primary": _rank_sp == 1,
+                                "classification_source":
+                                    "matched the only stipple pattern in the sheet's legend",
+                            })
+                        for _c_sp in _res_sp.get("candidate_regions") or []:
+                            _rank_sp += 1
+                            _regs_sp.append({
+                                "region_id": f"yard-region-{_rank_sp}",
+                                "component_id": _rank_sp,
+                                "area_m2": _c_sp["area_m2"],
+                                "polygon_pts": _c_sp["polygon_pts"],
+                                "perimeter_lm": None,
+                                "perimeter_source": "unresolved: candidate area, outline "
+                                                    "reconstructed from a stipple",
+                                "perimeter_confidence": "unresolved",
+                                "included": False,
+                                "candidate": True,
+                                "candidate_reason": _c_sp.get("candidate_reason") or "",
+                                "chosen_primary": False,
+                                "classification_source":
+                                    "same stipple pattern, but shaped unlike the measured ground",
+                            })
+                        _cand_sp = [r for r in _regs_sp if r.get("candidate")]
+                        _doc_sp.close()
+                        return {
+                            "pdf": os.path.basename(pdf), "style": style,
+                            # The total is the INCLUDED regions only. Candidates are drawn
+                            # and listed, never summed, until a human says so.
+                            "area_m2": round(_res_sp["area_m2"], 1),
+                            "measurement_state": sanity.MEASURED_UNVERIFIED,
+                            "needs_assessor": True, "legend_found": False,
+                            "region_confidence": "low",
+                            "scale_k": round(_k_sp, 6), "scale_verified": bool(_ver_sp),
+                            "scale_src": _note_sp, "scale_sources": _src_sp,
+                            "yard_regions": _regs_sp,
+                            # Any candidate forces the keep/exclude review, so the sheet
+                            # cannot be approved until every offered area has been decided.
+                            "yard_region_review_required":
+                                bool(_cand_sp) or len(_regs_sp) > 1,
+                            "polygon_pts": _regs_sp[0]["polygon_pts"],
+                            "price_gbp": None,
+                            "flags": flags + [_note_sp] + list(_res_sp.get("flags") or []) + [
+                                "SURFACE IDENTIFIED BY ITS PATTERN, NOT BY A NAME: every "
+                                "build-up on this sheet shares one CAD layer, so no layer "
+                                "name can separate them. The surface was matched to the only "
+                                "stipple in the sheet's own legend key "
+                                f"({_res_sp.get('identified_by')}). Nothing cross-checks that "
+                                "reading — approval is blocked until an assessor confirms the "
+                                "outline is the surface being priced."],
+                        }
+                finally:
+                    if not _doc_sp.is_closed:
+                        _doc_sp.close()
 
         if _named:
             flags.append(

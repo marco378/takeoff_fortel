@@ -268,8 +268,8 @@ try:
         ck("...and scored by IoU, never by area",
            _gt2105.get("min_iou", 0) >= 0.85, f"min_iou={_gt2105.get('min_iou')}")
         _n2105 = (_gt2105.get("note") or "").lower()
-        ck("...and the note records that the module is not yet wired into the pipeline",
-           "not yet wired" in _n2105 and "car parking" in _n2105,
+        ck("...and the note records how the surface is identified, and where the strip sits",
+           "legend" in _n2105 and "car parking" in _n2105,
            f"note={len(_n2105)} chars")
         # The shape IS right: IoU 0.920/0.912 at a DERIVED dilation, reading 1.3% under. What
         # stops it is a 345 m2 third region the client did not mark, drawn in the yard's own
@@ -286,12 +286,28 @@ try:
     else:
         import takeoff_unmarked as _tu2105
         _r2105 = _tu2105.takeoff(str(_p2105))
-        # The failure this guards: a future session loosens the stipple path, 2105 starts
-        # emitting ~13,000 m2, and it looks RIGHT because it matches Aryan -- while quietly
-        # including 315 m2 of car park nobody is paving. Refusing is the correct state here.
-        ck("2105 still REFUSES rather than emitting a stipple number it cannot attribute",
-           _r2105.get("area_m2") is None,
+        # 2105 measures end to end from 10 Sep 2026. The failure this guards is the one that
+        # would look RIGHT: the total quietly swallowing the offered candidate, because it
+        # brings the number closer to the client's own figure. The headline must be the
+        # INCLUDED regions only, and a candidate must never be counted without a human.
+        _rg2105 = _r2105.get("yard_regions") or []
+        _inc2105 = [r for r in _rg2105 if r.get("included")]
+        _cnd2105 = [r for r in _rg2105 if r.get("candidate")]
+        ck("2105 measures end to end, capped at MEASURED_UNVERIFIED",
+           _r2105.get("area_m2") is not None
+           and _r2105.get("measurement_state") == "MEASURED_UNVERIFIED",
            f"area_m2={_r2105.get('area_m2')} state={_r2105.get('measurement_state')}")
+        ck("...and the headline is the INCLUDED regions only, never the candidate",
+           bool(_inc2105) and abs(_r2105["area_m2"]
+                                  - sum(r["area_m2"] for r in _inc2105)) < 1.0,
+           f"{_r2105.get('area_m2')} vs included {sum(r['area_m2'] for r in _inc2105) if _inc2105 else None}")
+        ck("...and the offered candidate is carried, excluded, with its reason",
+           bool(_cnd2105) and all(r.get("included") is False and r.get("candidate_reason")
+                                  for r in _cnd2105),
+           f"candidates={[(r['region_id'], r['area_m2'], r['included']) for r in _cnd2105]}")
+        ck("...and it stays approve-blocked until every offered area is ruled on",
+           _r2105.get("yard_region_review_required") is True,
+           f"review_required={_r2105.get('yard_region_review_required')}")
 
 except Exception as _e_ls:                                     # pragma: no cover - defensive
     import traceback as _tb_ls

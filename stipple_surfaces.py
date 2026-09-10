@@ -322,21 +322,26 @@ def _fitz_point(x, y, rot):
 
 
 def _outline(mask_u8, rot, scale):
-    """The region's outline as unrotated PDF points -- the space ground truth and the
-    marked-up drawing both use. Simplified enough to draw, not so much that it moves."""
+    """The region's outline in RENDERED PDF points -- mask pixel / scale, nothing else.
+
+    This is the canonical space in this codebase (see _hatch_contour in takeoff_unmarked):
+    the same space render_snapshot() uses, which the portal converts to canvas pixels once
+    by multiplying by snapScale. It is the VISUALLY ROTATED page, because get_pixmap()
+    applies the page rotation while get_drawings() does not.
+
+    An earlier version of this function transformed back to UNROTATED points. On the two
+    sheets that measure today that is invisible -- both are /Rotate 0 -- but 2105 is
+    /Rotate 270, so it would have drawn the outline in the wrong place on the assessor's
+    screen while every server-side number stayed correct. Do not "fix" this by rotating.
+    """
     cs, _h = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cs:
         return []
     c = max(cs, key=cv2.contourArea)
     eps = 0.002 * cv2.arcLength(c, True)
     c = cv2.approxPolyDP(c, eps, True)
-    inv = ~rot
-    import fitz
-    out = []
-    for pt in c.reshape(-1, 2):
-        q = fitz.Point(float(pt[0]) / scale, float(pt[1]) / scale) * inv
-        out.append([round(q.x, 3), round(q.y, 3)])
-    return out
+    return [[round(float(pt[0]) / scale, 3), round(float(pt[1]) / scale, 3)]
+            for pt in c.reshape(-1, 2)]
 
 
 def _max_width_m(mask_u8, k, scale):

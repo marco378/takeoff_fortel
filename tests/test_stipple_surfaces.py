@@ -234,7 +234,18 @@ try:
                 _cv9.fillPoly(_m, [_q], 1)
                 return _m.astype(bool)
 
-            _ours = [_m9(x["polygon_pts"]) for x in _r9["regions"] if x.get("polygon_pts")]
+            # Ours are already in RENDERED space; the client's markup is in unrotated
+            # space, so only the latter gets the rotation matrix. Rasterising both the
+            # same way would silently score a rotated sheet against a rotated copy of
+            # itself and pass while the portal drew the outline in the wrong place.
+            def _m9_rendered(pts):
+                _m = _np_sp.zeros((_H9, _W9), _np_sp.uint8)
+                _q = _np_sp.round(_np_sp.array(pts, dtype=float) * _S9).astype(_np_sp.int32)
+                _cv9.fillPoly(_m, [_q], 1)
+                return _m.astype(bool)
+
+            _ours = [_m9_rendered(x["polygon_pts"]) for x in _r9["regions"]
+                     if x.get("polygon_pts")]
             _worst = 1.0
             for _g in _g9["regions"]:
                 _gm = _m9(_g["polygon_pts"])

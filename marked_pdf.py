@@ -322,16 +322,24 @@ def _overlay_manifest(job: dict, source_path: Path, page_index: int,
         native_regions = job.get("yard_regions") or result.get("yard_regions") or []
         for index, region in enumerate(native_regions):
             points = region.get("polygon_pts") if isinstance(region, dict) else None
-            if not _valid_points(points, 3) or region.get("included") is False:
+            if not _valid_points(points, 3):
+                continue
+            # A CANDIDATE is drawn but is NOT part of the quantity. An EXCLUDED region is
+            # not drawn at all. Collapsing the two would either hide ground the assessor
+            # was asked to rule on, or burn an area onto the drawing that no number
+            # includes -- and this document is the thing someone checks the number against.
+            is_candidate = region.get("candidate") is True
+            if region.get("included") is False and not is_candidate:
                 continue
             normalised = _normalise_points(points)
             key = tuple(tuple(point) for point in normalised)
             seen.add(key)
             geometry["regions"].append({
                 "region_id": str(region.get("region_id") or f"yard-region-{index + 1}"),
-                "name": "Service yard",
+                "name": "CANDIDATE (not in total)" if is_candidate else "Service yard",
                 "category": "external_yard",
                 "area_m2": region.get("area_m2"),
+                "candidate": is_candidate,
                 "points": normalised,
                 "source_coordinate_space": "rotated_pdf_points",
                 "assessor_supplied": False,
@@ -530,7 +538,10 @@ def build_marked_pdf(job: dict, pdf_path=None, *, snapshot_scale_value=None) -> 
         label = region.get("name") or "Measured area"
         if isinstance(quantity, (int, float)):
             label += f" - {quantity:,.2f} m2"
-        _draw_polygon(page, region["points"], label, area_color,
+        # Candidates take the amber cut-out colour, never the measured-area colour: on a
+        # printed sheet the label can be missed, the colour cannot.
+        _draw_polygon(page, region["points"], label,
+                      transition_color if region.get("candidate") else area_color,
                       occupied=occupied_labels)
     for cutout in geometry["cutouts"]:
         quantity = cutout.get("area_m2")
