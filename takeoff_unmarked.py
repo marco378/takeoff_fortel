@@ -2243,7 +2243,7 @@ def _offer_boundaries(pdf, flags):
     try:
         k_bd, _v, _n, _src = scale_for(pdf)
         if not k_bd:
-            return [], []
+            return [], [], None, None
         doc_bd = fitz.open(pdf)
         try:
             raw = boundary_surfaces.find(doc_bd[0], k_bd)
@@ -2251,7 +2251,7 @@ def _offer_boundaries(pdf, flags):
             if not doc_bd.is_closed:
                 doc_bd.close()
     except Exception:
-        return [], []
+        return [], [], None, None
     regions = []
     for i, b in enumerate(raw[:12], 1):
         regions.append({
@@ -2283,7 +2283,14 @@ def _offer_boundaries(pdf, flags):
             "that is yours and its OUTLINE is measured exactly — the m² still rests on this "
             "sheet's unverified scale, so approval stays blocked until you confirm "
             "scale + extent.")
-    return regions, raw[:12]
+    # Hand back the k as well. These areas were computed WITH it, so a refusal that offers
+    # them and drops the scale leaves the assessor at a dead end: including one gives a
+    # MEASURED_UNVERIFIED job whose only unblocking control -- Confirm scale + extent -- is
+    # hidden on `existingScale > 0` and whose endpoint 409s with "existing scale is
+    # required". Recording it asserts nothing new; it is what the numbers already used.
+    # scale_verified stays FALSE, so the state is still capped and Confirm is still a
+    # deliberate human act.
+    return regions, raw[:12], (k_bd if regions else None), (_src if regions else None)
 
 
 def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
@@ -2552,12 +2559,13 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         # excluded, named by its own layer -- the client's rule for ambiguity, 10 Sep 2026:
         # "If there are ambiguous areas, show them as separate candidates for the user to
         # review rather than simply rejecting the whole measurement."
-        _bound_regions, _bounds = _offer_boundaries(pdf, flags)
+        _bound_regions, _bounds, _bd_k, _bd_src = _offer_boundaries(pdf, flags)
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "legend_found": False,
                 "yard_regions": _bound_regions,
                 "boundary_candidates": _bounds[:12],
+                "boundary_scale_k": _bd_k, "boundary_scale_src": _bd_src,
                 "flags": flags + [
                     "NON-COLOUR-CODED (line/hatch) drawing — solid-fill colour segmentation does NOT apply "
                     "(it scrapes stray grey -> wrong area). Route to hatch-mode / Claude vision / assessor "
@@ -3000,7 +3008,7 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         # Colour found nothing usable -- but the engineer may still have drawn the extents.
         # This is the exit the Skanska LDSS2 sheet takes (solid-fill 23%, so it comes down
         # the colour route), and it is where four exact boundaries are worth offering.
-        _bd_regions, _bd_raw = _offer_boundaries(pdf, flags)
+        _bd_regions, _bd_raw, _bd_k2, _bd_src2 = _offer_boundaries(pdf, flags)
         return {"pdf": os.path.basename(pdf), "area_m2": None,
                 "scale_k": round(k, 5), "scale_verified": verified,
                 "scale_src": note, "scale_sources": scale_sources,

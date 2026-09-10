@@ -619,6 +619,39 @@ async def main():
             ck("LDSS2 include: ...and the block names MEASURED_UNVERIFIED, not UNMEASURED",
                "MEASURED_UNVERIFIED" in str(blockL.get("error") or ""),
                json.dumps(blockL)[:220])
+            # ...and now WALK the only route out. A MEASURED_UNVERIFIED job whose Confirm
+            # button is hidden is a dead end: approve 409s by design and nothing on screen
+            # clears it. The button is gated on `existingScale > 0`, and this sheet reached
+            # the portal with scale_k=None until the pipeline was taught to carry it.
+            await pgL.reload(); await pgL.wait_for_timeout(2500)
+            await pgL.evaluate("selectJob(%r)" % jidL); await pgL.wait_for_timeout(2500)
+            confVis = await pgL.evaluate("""(() => {
+              const b = document.getElementById('btnConfirmExisting');
+              const res = (currentJob && currentJob.result) || currentJob || {};
+              return {shown: !!b && b.style.display !== 'none' && b.offsetParent !== null,
+                      scale_k: res.scale_k || currentJob.scale_k || null,
+                      state: res.measurement_state || currentJob.measurement_state};
+            })()""")
+            ck("LDSS2 confirm: the way out of the block is VISIBLE, not a dead end",
+               confVis.get("shown"), json.dumps(confVis)[:200])
+            await pgL.evaluate("confirmExistingMeasurement()")
+            await pgL.wait_for_timeout(4000)
+            await pgL.screenshot(path=f"{OUT}/13_ldss2_confirmed.png", full_page=True)
+            afterL = await pgL.evaluate("""(async (jid) => {
+              const j = await (await fetch('/jobs')).json();
+              const job = j[jid] || {};
+              const r = await fetch('/approve/' + encodeURIComponent(jid), {method: 'POST'});
+              let b = null; try { b = await r.json(); } catch (e) {}
+              return {confirmed: !!job.scale_confirmed, area: job.area_m2,
+                      state: job.measurement_state,
+                      approve: r.status, err: (b && b.error) || ''};
+            })""", jidL)
+            ck("LDSS2 confirm: confirming scale+extent actually records it",
+               afterL.get("confirmed") is True, json.dumps(afterL)[:220])
+            ck("LDSS2 confirm: ...and the job can THEN be approved — the path completes",
+               afterL.get("approve") == 200, json.dumps(afterL)[:220])
+            ck("LDSS2 confirm: ...with his 1,114 m² intact through the whole round trip",
+               abs((afterL.get("area") or 0) - 1114.0) < 1.0, str(afterL.get("area")))
             ck("LDSS2: no uncaught page errors", not errsL, "; ".join(errsL[:2]))
             await pgL.close()
 

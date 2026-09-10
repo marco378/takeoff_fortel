@@ -70,6 +70,11 @@ got it wrong once. Do not relax them to make your work look done.
   by "copying" them.
 - UI changes: drive the real portal (playwright) before shipping. The blank-screen bug lived
   only in the browser; unit tests never saw it.
+- QA the portal with BOTH `JOBS_FILE` and `DRAWINGS_DIR` pointed at scratch. The server reads
+  `JOBS_FILE` (not `APPROVAL_JOBS_FILE`), and `DRAWINGS_DIR` defaults to the repo's
+  `drawings/` — so QA uploads land in the corpus and the next robustness run reports 625
+  files / 69 MEASURED_OK instead of 619 / 65. That reads exactly like your change moved four
+  sheets. Exclude QA rows before believing a blast radius, and clean up after.
 
 ## Working conventions
 - Commit directly to main after CI is green; push without asking (Jas's standing instruction).

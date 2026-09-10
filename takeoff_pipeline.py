@@ -839,6 +839,22 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                         r["yard_regions"] = tu["yard_regions"]
                     if tu.get("boundary_candidates"):
                         r["boundary_candidates"] = tu["boundary_candidates"]
+                    # ...and the scale those offered areas were computed with. takeoff_unmarked
+                    # already returns it on this exit; the pipeline dropped it, so the job
+                    # reached the portal with scale_k=None. That is a DEAD END once a boundary
+                    # is included: the job is MEASURED_UNVERIFIED (approve 409s by design) and
+                    # the only control that clears the block -- Confirm scale + extent -- is
+                    # hidden behind `existingScale > 0` and 409s with "existing scale is
+                    # required". An assessor handed exact geometry would have had nothing to
+                    # click. scale_verified is deliberately NOT set: the number stays capped at
+                    # MEASURED_UNVERIFIED and confirming stays a human act.
+                    if r.get("yard_regions") and not r.get("scale_k"):
+                        _bk = tu.get("scale_k") or tu.get("boundary_scale_k")
+                        if _bk:
+                            r["scale_k"] = round(float(_bk), 5)
+                            r["scale_src"] = (tu.get("scale_src")
+                                              or tu.get("boundary_scale_src")
+                                              or "scale behind the offered boundaries")
                     # Office GA sheets are commonly line/hatch drawings with several level plans
                     # on one page.  Ordinary closed-vector faces remain trace candidates only.
                     # A narrower, corroborated metal-deck hatch class may emit an assessor-gated
