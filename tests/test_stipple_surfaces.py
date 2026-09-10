@@ -12,6 +12,17 @@ Imported by ci_tests.py, which owns the running total. Do not reorder.
 """
 from tests import ck
 
+
+def _shoe_sp(pts):
+    """Shoelace area in square PDF points -- the polygon's own enclosure, not the mask's."""
+    a = 0.0
+    for _i in range(len(pts)):
+        _x1, _y1 = pts[_i]
+        _x2, _y2 = pts[(_i + 1) % len(pts)]
+        a += _x1 * _y2 - _x2 * _y1
+    return abs(a) / 2.0
+
+
 print("\n[Stipple surfaces: identity from the sheet's own pattern key]")
 try:
     import math as _math_sp, tempfile as _tmp_sp
@@ -272,6 +283,22 @@ try:
                f"{(_r9.get('flags') or [''])[0][:80]}")
             ck("...closing never assumes more blank paper than the cap allows",
                (_r9.get("bridge_gap_m") or 0) <= 3.0, f"bridge {_r9.get('bridge_gap_m')} m")
+            # The retention line fell from 67% to 54% when the kerb fence landed, because
+            # the stipple past the kerb is ~8x denser than the stipple inside it. The
+            # number is right and the bare sentence misleads: an assessor reading "only
+            # 54%" concludes we captured LESS of the yard when we captured more. If the
+            # fence trimmed anything, the disclosure has to say so.
+            _sfx = _r9.get("shape_fix") or {}
+            _dis = " ".join(str(f) for f in (_r9.get("flags") or []))
+            ck("...and when the kerb trims the outline, the disclosure says so",
+               (_sfx.get("trimmed_m2") or 0) < 1.0
+               or ("trimmed back to the kerb" in _dis and "does not extend past" in _dis),
+               f"trimmed={_sfx.get('trimmed_m2')} m2, said={'trimmed back to the kerb' in _dis}")
+            ck("...and the outline it draws encloses the area it reports, within 2%",
+               all(abs(_shoe_sp(_x["polygon_pts"]) * (_K_SP ** 2) / _x["area_m2"] - 1.0) < 0.02
+                   for _x in _r9["regions"] if _x.get("polygon_pts")),
+               "; ".join(f"{_shoe_sp(_x['polygon_pts']) * (_K_SP ** 2):.0f} vs {_x['area_m2']}"
+                         for _x in _r9["regions"]))
 
 except Exception as _e_sp:                                     # pragma: no cover - defensive
     import traceback as _tb_sp

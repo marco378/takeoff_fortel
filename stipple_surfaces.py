@@ -704,11 +704,22 @@ def _measure(doc, page, k, S=2.0, layer_suffix=None):
 
     flags = []
     if retention < MIN_INK_RETENTION:
+        # Say WHERE the missing stipple went, or this line misleads. The kerb fence
+        # deliberately drops the stipple drawn past the edge the yard stops at, and that
+        # band is roughly 8x denser than the interior -- on 2105 it is 2.3% of the area but
+        # 12.6% of the marks. So this percentage falls sharply while the yard we capture
+        # goes UP, and an assessor reading the bare number would conclude the opposite.
+        trimmed = shape_fix["trimmed_m2"]
+        where = (f" A further {trimmed:,.0f} m2 was trimmed back to the kerb and edging "
+                 "lines on the sheet, because a yard does not extend past its own kerb; "
+                 "that band carries dense stipple, so it lowers this percentage while "
+                 "making the measured ground more accurate, not less."
+                 if trimmed >= 1.0 else "")
         flags.append(
             f"ONLY {retention:.0%} OF THE STIPPLE IS IN THE TOTAL — the rest is offered as "
             f"{len(candidates)} candidate area(s), plus {len(unformed)} patches covering about "
             f"{unformed_m2:,.0f} m2 that were too small or too scattered to qualify as regions. "
-            "None of that is counted, and no area is claimed for it.")
+            "None of that is counted, and no area is claimed for it." + where)
     if candidates:
         flags.append(
             f"{len(candidates)} CANDIDATE AREA(S) NOT IN THE TOTAL — review and include "
