@@ -1458,7 +1458,21 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
                 break
     best_size = sizes[best_idx]
     retained_indices = [best_idx]
+    # A component big enough to be a real second yard but LARGER than the cap was being
+    # dropped by the same clause that drops legend chips, and called a "satellite". Nothing
+    # said so. The largest component this system has ever measured is 48,568.9 m² -- 97.1%
+    # of the cap -- so this is one scale step from live, and the failure is silent: the sheet
+    # reports the smaller region and reads as a clean measurement. Record them so takeoff()
+    # can say it out loud. The cap itself is NOT changed here: takeoff_unmarked refuses above
+    # 50,000 while sanity.plausible allows 60,000, and which of those is right is Aryan's
+    # call, not a number to quietly move.
+    oversize_dropped_m2 = []
     if not no_plausible_component:
+        for idx in order:
+            if idx == best_idx or sizes[idx] < SATELLITE_FRAC * best_size:
+                continue
+            if k is not None and float(sizes[idx]) / px_per_m2 > PLAUSIBLE_MAX_M2:
+                oversize_dropped_m2.append(round(float(sizes[idx]) / px_per_m2, 1))
         retained_indices.extend(
             idx for idx in order
             if idx != best_idx
@@ -1549,6 +1563,8 @@ def segment_hatch(im_rgb, rgb, tol=14, close=6, k=None, S=2.0, max_void_m2=1.0,
         excluded_satellite_px = 0
 
     if _diag is not None:
+        if oversize_dropped_m2:
+            _diag['oversize_dropped_m2'] = sorted(oversize_dropped_m2, reverse=True)
         total_excluded_px = margin_excluded_px + legend_excluded_px + excluded_satellite_px
         n_excluded = (1 if margin_excluded_px > 0 else 0) + \
                      (1 if legend_excluded_px > 0 else 0) + \
@@ -2751,6 +2767,20 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     dock_detection = detect_raw_dock_zone(pdf, k, S=S, target_rgb=rgb)
     dock_zone = dock_detection.get("zone")
     retained_component_masks = list(_seg_diag.pop("_retained_component_masks", []))
+    # A same-tint region too LARGE for the plausibility band was dropped by the satellite
+    # rule and never mentioned. Say it, and stop the sheet certifying itself: the number we
+    # are about to report is a smaller region than the one we threw away, which is the one
+    # shape of error that reads as a clean measurement.
+    _oversize = _seg_diag.get("oversize_dropped_m2") or []
+    if _oversize:
+        _big = ", ".join(f"{m:,.0f} m²" for m in _oversize[:3])
+        flags.append(
+            f"OVERSIZE REGION DROPPED, NOT MEASURED — {len(_oversize)} same-tint region(s) "
+            f"({_big}) exceeded the {PLAUSIBLE_MAX_M2:,.0f} m² plausibility cap and were "
+            "discarded by the satellite rule. The area reported below is a SMALLER region "
+            "than the one discarded. Assessor: confirm whether the large region is the "
+            "surface being priced before this number is used.")
+        region_confidence = "low"
     yard_comp = np.zeros_like(comp, dtype=bool)
     overlap_m2 = 0.0
     dock_mask_bool = None

@@ -46,6 +46,7 @@ from tests import P
 # already records this exact shape — "tests passed because the sections silently skipped".
 MODULES = [
     "tests.test_geometry",
+    "tests.test_oversize_region",
     "tests.test_scale",
     "tests.test_gate",
     "tests.test_router_refusal",
@@ -86,8 +87,8 @@ MODULES = [
 # written alongside: a number that looked reasonable and was never checked against the case
 # it governs.
 CLIENT_DRAWINGS = (Path(__file__).resolve().parent / "drawings").is_dir()
-EXPECTED_CHECKS = 977 if CLIENT_DRAWINGS else 785
-MIN_CHECKS = 964 if CLIENT_DRAWINGS else 772
+EXPECTED_CHECKS = 985 if CLIENT_DRAWINGS else 793
+MIN_CHECKS = 972 if CLIENT_DRAWINGS else 780
 
 broken = []
 for _name in MODULES:
