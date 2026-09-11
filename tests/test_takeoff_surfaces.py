@@ -25,9 +25,17 @@ try:
     ck("D77 area unchanged at 3,159 m² (Smita gold 3,156)", _d77.get("area_m2") == 3159.0)
     ck("D77 scale verified True (bar agrees with title via scale_consensus)",
        _d77.get("scale_verified") is True)
-    ck("D77 measurement_state MEASURED_VERIFIED", _d77.get("measurement_state") == MEASURED_VERIFIED)
-    ck("D77 needs_assessor False", _d77.get("needs_assessor") is False)
-    ck("D77 VERIFIED state has independent native-boundary extent corroboration",
+    # 11 Sep: both were VERIFIED / needs_assessor False. This sheet's legend chip cannot be
+    # read, so its surface IDENTITY comes from the SGP grey constant -- a guess about which
+    # colour is the priced surface. Extent corroboration below still passes, but that proves
+    # the region is a real drawn shape, never that it is the RIGHT shape. A guessed identity
+    # is now gated like its sibling branches instead of being certified. The AREA is the
+    # invariant this block exists to protect and it has not moved.
+    ck("D77 measurement_state MEASURED_UNVERIFIED — identity came from the grey constant",
+       _d77.get("measurement_state") == MEASURED_UNVERIFIED, _d77.get("measurement_state"))
+    ck("D77 needs_assessor True — a guessed surface colour must reach a human",
+       _d77.get("needs_assessor") is True, _d77.get("needs_assessor"))
+    ck("D77 has independent native-boundary extent corroboration (shape real, identity still guessed)",
        _d77.get("extent_corroborated") is True and
        all(region.get("perimeter_confidence") == "high"
            for region in _d77.get("yard_regions", []) if region.get("included")),

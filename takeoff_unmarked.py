@@ -160,8 +160,18 @@ def _choose_surface_band(pdf, im, S, flags):
                      "(lower confidence; assessor confirm)")
         return GREY_FALLBACK, swatch, label, BAND_GUESS_SWATCH_IMPLAUSIBLE, False, "low"
     if label:
-        flags.append(f"legend '{label}' found (swatch unreadable) — using SGP grey convention {GREY_FALLBACK}")
-        return GREY_FALLBACK, swatch, label, BAND_GUESS_SWATCH_UNREADABLE, False, None
+        # "low", not None. This branch GUESSES the surface colour from another client's grey
+        # convention because the chip could not be read -- the same kind of guess as its two
+        # siblings above and below, both of which lower confidence. Returning None let
+        # sanity.measurement_state promote it to MEASURED_VERIFIED whenever the scale verified
+        # and extent corroborated: a priced, one-click-approvable number whose surface IDENTITY
+        # was never confirmed by anything. That is the 6,510 m2 car-park failure with the gate
+        # missing -- there, a substituted grey from a different client's site plans was measured
+        # and quoted at GBP 335,518. Extent corroboration proves a region is a real drawn shape,
+        # never that it is the RIGHT shape, so it must not be allowed to promote a guess.
+        flags.append(f"legend '{label}' found (swatch unreadable) — using SGP grey convention "
+                     f"{GREY_FALLBACK} (lower confidence; assessor confirm)")
+        return GREY_FALLBACK, swatch, label, BAND_GUESS_SWATCH_UNREADABLE, False, "low"
     flags.append(f"no concrete-yard legend label — grey-hatch heuristic {GREY_FALLBACK} (LOW confidence; assessor confirm)")
     return GREY_FALLBACK, swatch, label, BAND_GUESS_NO_LEGEND, False, "low"
 
@@ -2680,9 +2690,14 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
             # rule 5 says refuse instead. The surface is unidentified, so there is no number.
             #
             # Deliberately narrow: this is the gate where a swatch WAS read and disagreed. The
-            # two other paths onto GREY_FALLBACK (swatch unreadable, no plausible region) are
-            # untouched — both gold sheets that depend on the grey convention, D77_Hard_
-            # Landscaping 3138/3156 and _int_d77 3159/3156, arrive by those and land correctly.
+            # other paths onto GREY_FALLBACK are untouched — both gold sheets that depend on the
+            # grey convention, D77_Hard_Landscaping 3138/3156 and _int_d77 3159/3156, arrive by
+            # those and land correctly. To be accurate about how many there are, because this
+            # note previously said "two" and that was wrong: _choose_surface_band can guess it
+            # three ways (implausible swatch, unreadable swatch, no legend at all) and the
+            # swatch-lock fallback below at ~2643 is a FOURTH route, reached after a swatch was
+            # read AND locked. All four now carry region_confidence="low", so a guessed surface
+            # identity is capped at MEASURED_UNVERIFIED and cannot be approved without a human.
             # Colour has failed here, and on this class of sheet it CANNOT succeed: on
             # Indurent Park the C1 Service Yard and the F1 Footway (Vehicle Overrun) are
             # the same ink, (118,118,118). Before refusing, ask the drawing what the

@@ -3149,8 +3149,18 @@ def _html_confirm_page(action: str, job_id: str) -> str:
     label, col = labels.get(action, (action.title(), "#13294b"))
     # Preserve ?token=... (or a cookie already covers it) so the POST from this page's form
     # is itself authorised when the token gate is on.
+    # The token is echoed back into an HTML attribute, so it is attacker-reachable text,
+    # not a trusted value. A crafted ?token=">... closes action="..." and injects live
+    # markup into a page served as text/html. The victim is an assessor who is ALREADY
+    # signed in -- their cookie satisfies the before_request gate before this page is ever
+    # rendered, and the injected script then runs in the portal's own origin and can
+    # approve, reject or read any job as them. Percent-encode for the URL, then escape for
+    # the attribute; both steps are needed and neither changes the token's real value.
+    import html as _html
+    from urllib.parse import quote as _urlquote
     token = request.args.get("token", "")
-    action_url = f"/{action}/{job_id}" + (f"?token={token}" if token else "")
+    _qs = f"?token={_urlquote(token, safe='')}" if token else ""
+    action_url = _html.escape(f"/{action}/{job_id}{_qs}", quote=True)
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
     <title>Fortel AI Takeoff — Confirm {action.title()}</title></head>
@@ -3160,7 +3170,7 @@ def _html_confirm_page(action: str, job_id: str) -> str:
                 box-shadow:0 2px 20px rgba(0,0,0,.1);text-align:center">
       <h2 style="color:#13294b;margin:0 0 8px 0">Confirm action</h2>
       <p style="color:#666;font-size:14px">
-        Job <b>{job_id}</b> — clicking below will <b>{action}</b> this job.
+        Job <b>{_html.escape(str(job_id))}</b> — clicking below will <b>{action}</b> this job.
       </p>
       <form method="POST" action="{action_url}">
         <button type="submit" style="

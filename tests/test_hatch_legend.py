@@ -224,7 +224,12 @@ try:
     # ── Regression guards: sheets on other paths must be byte-identical (captured from the
     #    unpatched code earlier this session).
     for _gp, _ga, _gs in (("drawings/real_sgp/D77_Hard_Landscaping.pdf", 3138.0, "MEASURED_UNVERIFIED"),
-                          ("drawings/_int_d77.pdf", 3159.0, "MEASURED_VERIFIED"),
+                          # 11 Sep: was MEASURED_VERIFIED. This sheet's surface identity comes
+                          # from the SGP grey CONSTANT because its legend chip cannot be read --
+                          # a guess. _choose_surface_band now returns "low" on that branch like
+                          # its siblings, so the guess is gated instead of certified. The AREA is
+                          # what this guard protects and it has not moved.
+                          ("drawings/_int_d77.pdf", 3159.0, "MEASURED_UNVERIFIED"),
                           ("drawings/inderjit_p7/7_25195-MJM-00-00-DR-C-9000-D2-P04-External_Works_Layout.pdf", 9762.0, "MEASURED_UNVERIFIED"),
                           ("drawings/inderjit_p7/7_25195-MJM-ZZ-ZZ-DR-S-2300-D2-P02-Mezzanine_Suspended_Slab_Layout.pdf", 1189.8, "MEASURED_UNVERIFIED")):
         if not _os_hl.path.exists(_gp):

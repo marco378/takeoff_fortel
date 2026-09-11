@@ -288,3 +288,54 @@ try:
 except ImportError as _e:
     print(f"  [SKIP] approval_server /portal login-form tests — missing dependency: {_e}")
 
+
+
+# ---------------------------------------------------------------------------
+# Reflected XSS on the approve/reject confirm page.
+# A signed-in assessor has the auth cookie, so the token QUERY param is not
+# what lets them in — it is just echoed back into the form's action attribute.
+# A crafted link therefore ran script in the portal's own origin.
+print("approval_server: confirm page escapes the reflected token (XSS regression)")
+try:
+    import approval_server as _AS6c
+    import tempfile as _tempfile6c
+
+    _tmpdir6c = Path(_tempfile6c.mkdtemp(prefix="ci_xss_"))
+    _orig_jobs_file6c = _AS6c.JOBS_FILE
+    _orig_token6c = _AS6c.APPROVAL_TOKEN
+    _AS6c.JOBS_FILE = _tmpdir6c / "jobs.json"
+    _AS6c.APPROVAL_TOKEN = "test-login-code"
+    try:
+        _app6c = _AS6c.app
+        _app6c.testing = True
+        _client6c = _app6c.test_client()
+        _client6c.post("/portal", data={"code": "test-login-code"})   # real assessor session
+
+        _jid6c = "job-xss-1"
+        _AS6c.save_jobs({_jid6c: {"id": _jid6c, "status": "pending", "decision": None,
+                                  "project_name": "Test Yard", "flags": []}})
+
+        _payload6c = '"><script>alert(document.domain)</script>'
+        _r6c = _client6c.get(f"/approve/{_jid6c}", query_string={"token": _payload6c})
+        _body6c = _r6c.data.decode("utf-8", "replace")
+
+        ck("XSS: the confirm page still renders for a signed-in assessor",
+           _r6c.status_code == 200, _r6c.status_code)
+        ck("XSS: no raw <script> tag reflected from the token param",
+           "<script>alert(document.domain)</script>" not in _body6c,
+           _body6c[:200])
+        ck("XSS: the quote that broke out of the attribute is percent-encoded",
+           "%22%3E" in _body6c or '"' not in _body6c.split("action=")[1][:80],
+           _body6c.split("action=")[1][:120] if "action=" in _body6c else "no action attr")
+        ck("XSS: the job id is HTML-escaped where it is printed",
+           "&lt;" in _body6c or "<" not in _jid6c)
+
+        # ...and a legitimate link is not collateral damage.
+        _r6c_ok = _client6c.get(f"/approve/{_jid6c}", query_string={"token": "test-login-code"})
+        ck("XSS fix does not break the ordinary confirm link",
+           _r6c_ok.status_code == 200 and b"<form" in _r6c_ok.data, _r6c_ok.status_code)
+    finally:
+        _AS6c.JOBS_FILE = _orig_jobs_file6c
+        _AS6c.APPROVAL_TOKEN = _orig_token6c
+except ImportError as _e:
+    print(f"  [SKIP] approval_server XSS regression tests — missing dependency: {_e}")

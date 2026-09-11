@@ -114,6 +114,29 @@ try:
     _d77_regress = _tu_takeoff_fp("drawings/_int_d77.pdf")
     ck("GOLD GUARD: _int_d77.pdf still exactly 3,159 m² (swatch-lock did not touch it)",
        _d77_regress.get("area_m2") == 3159.0, _d77_regress.get("area_m2"))
+    # ...and the AREA being right is not the same as the IDENTITY being known. This fixture's
+    # chip is unreadable, so its colour comes from the SGP grey CONSTANT -- another client's
+    # convention -- not from anything on the sheet. That branch used to return confidence None
+    # while its two sibling guesses returned "low", which let the state machine promote a
+    # guessed identity to MEASURED_VERIFIED: priced, one-click approvable, nothing human in the
+    # way. It is the 6,510 m2 car-park failure with the gate missing. Extent corroboration
+    # proves a region is a real drawn shape, never that it is the RIGHT shape.
+    ck("GUESSED IDENTITY IS GATED: a swatch we could not read caps at MEASURED_UNVERIFIED",
+       _d77_regress.get("measurement_state") == MEASURED_UNVERIFIED,
+       f"state={_d77_regress.get('measurement_state')} area={_d77_regress.get('area_m2')}")
+    ck("...and it says on the job that the colour was assumed, not read",
+       any("assessor confirm" in str(f) for f in _d77_regress.get("flags", [])),
+       [f for f in _d77_regress.get("flags", []) if "grey convention" in str(f)][:1])
+    # Every route onto the grey constant must lower confidence. If a future branch forgets,
+    # this catches it at the source rather than three layers downstream in the portal.
+    import inspect as _insp
+    import takeoff_unmarked as _tu_mod6c
+    _src_band = _insp.getsource(_tu_mod6c._choose_surface_band)
+    _grey_returns = [ln.strip() for ln in _src_band.splitlines()
+                     if "return GREY_FALLBACK" in ln]
+    ck("EVERY guess onto the grey constant returns low confidence, not None",
+       _grey_returns and all(ln.rstrip().endswith('"low"') for ln in _grey_returns),
+       str(_grey_returns))
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] {_e} — fixture not present")
 except (ImportError, FileNotFoundError) as _e:
