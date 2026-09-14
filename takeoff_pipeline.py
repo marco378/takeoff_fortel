@@ -900,9 +900,18 @@ def takeoff(pdf, vision=None, engineer_spec=None, send_approval=None, auto_extra
                     if tu.get("manhole_count_assumed"):
                         r["manhole_count_assumed"] = tu["manhole_count_assumed"]
                 else:
-                    r["flags"] = r["flags"] + tu.get("flags", []) + [
-                        "takeoff_unmarked: no area emitted — assessor must trace manually"
-                    ]
+                    # "trace manually" is the right instruction for an empty canvas and the
+                    # wrong one when the refusal already hands over measured candidates: a
+                    # Surface Finishes Plan arrives with its own constructions offered, and
+                    # telling the assessor to trace by hand beside four measured shapes sends
+                    # them to do work the drawing already did.
+                    _offered = tu.get("yard_regions") or []
+                    _closing = ("takeoff_unmarked: no area emitted — include one of the "
+                                f"{len(_offered)} candidate area(s) offered above, or trace it "
+                                "yourself if none of them is the surface being priced"
+                                if _offered else
+                                "takeoff_unmarked: no area emitted — assessor must trace manually")
+                    r["flags"] = r["flags"] + tu.get("flags", []) + [_closing]
                     r["measurement_state"] = UNMEASURED
                     r["needs_assessor"] = True
                     # A refusal can still carry OFFERED geometry. Where the engineer drew the

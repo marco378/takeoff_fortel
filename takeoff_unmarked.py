@@ -2672,18 +2672,44 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         _sf_regions, _sf_k, _sf_src = _offer_surface_finishes(pdf, flags, S)
         if _sf_regions:
             _bound_regions, _bounds, _bd_k, _bd_src = _sf_regions, [], _sf_k, _sf_src
+            # Two things on the assessor's screen stop being true the moment constructions are
+            # offered, and both of them point the wrong way.
+            #
+            # "THE DRAWING NAMES ITS OWN SURFACES" sends the assessor to the CAD layer names —
+            # and on this very sheet those names are wrong (BWB_Bituminous Area draws the HGV
+            # concrete slab). Left in, it sits directly above candidates that say otherwise and
+            # invites the reader to trust the layer over the legend, which is the opposite of
+            # what Aryan ruled on 14 Sep.
+            #
+            # "no area emitted — assessor must trace manually" tells someone to trace by hand
+            # while four measured constructions wait beside it.
+            flags = [f for f in flags
+                     if not f.startswith("ASSESSOR — THE DRAWING NAMES ITS OWN SURFACES")
+                     and not f.startswith("takeoff_unmarked: no area emitted")]
+            flags.append(
+                "CAD LAYERS ARE NOT THE IDENTITY ON THIS SHEET — the constructions above come "
+                "from the legend, which names each one and shows its hatch. The layer names on "
+                "this drawing disagree with what they actually draw, so they are recorded as "
+                "background only and were not used to identify anything.")
         else:
             _bound_regions, _bounds, _bd_k, _bd_src = _offer_boundaries(pdf, flags)
+        _closing_flag = (
+            "NON-COLOUR-CODED (line/hatch) drawing — solid-fill colour segmentation does NOT apply "
+            "(it scrapes stray grey -> wrong area). Route to hatch-mode / Claude vision / assessor "
+            "trace. No area emitted (this is the fix for the 'entirely wrong area' the team hit).")
+        if _sf_regions:
+            _closing_flag = (
+                "NON-COLOUR-CODED (line/hatch) drawing — solid-fill colour segmentation does NOT "
+                "apply here (it scrapes stray grey -> wrong area). The constructions above were "
+                "measured from the hatch drawn in each legend row's own colour instead. No area "
+                "is counted until you include one.")
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "legend_found": False,
                 "yard_regions": _bound_regions,
                 "boundary_candidates": _bounds[:12],
                 "boundary_scale_k": _bd_k, "boundary_scale_src": _bd_src,
-                "flags": flags + [
-                    "NON-COLOUR-CODED (line/hatch) drawing — solid-fill colour segmentation does NOT apply "
-                    "(it scrapes stray grey -> wrong area). Route to hatch-mode / Claude vision / assessor "
-                    "trace. No area emitted (this is the fix for the 'entirely wrong area' the team hit)."]}
+                "flags": flags + [_closing_flag]}
 
     # --- region colour ---
     # The priced "Concrete Service Yard construction" hatch on SGP architect sheets is a light grey
