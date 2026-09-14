@@ -20,6 +20,7 @@ import cv2
 
 import scale as SC
 import layer_surfaces
+import surface_finishes
 import stipple_surfaces
 import boundary_surfaces
 import sanity
@@ -2249,6 +2250,84 @@ def scale_for(pdf, page=0):
 
 # ---------------------------------------------------------------- main takeoff
 
+def _offer_surface_finishes(pdf, flags, S=2.0):
+    """Offer the constructions a Surface Finishes Plan names in its own legend.
+
+    This is how the priced surface is identified on Radlett WP5, and Aryan confirmed it on
+    14 Sep: the legend names each construction, gives its thickness, and shows its hatch
+    swatch, and the CAD layer is supporting information only. On those sheets the layer names
+    are measurably wrong -- `BWB_Bituminous Area` draws the HGV concrete slab -- so a system
+    that trusted them would drop Fortel's main priced item as somebody else's tarmac.
+
+    Offered and never chosen, exactly like the closed boundaries: five concrete constructions
+    on one sheet and nothing on it saying which is being quoted for. Returns ([], None, None)
+    unless the sheet says it is a Surface Finishes Plan and its legend reads cleanly.
+    """
+    try:
+        if not surface_finishes.is_surface_finishes_plan(fitz.open(pdf)[0]):
+            return [], None, None
+        k_sf, _verified, _note, src_sf = scale_for(pdf)
+        if not k_sf:
+            return [], None, None
+        doc_sf = fitz.open(pdf)
+        try:
+            offer = surface_finishes.candidates(doc_sf[0], k_sf, S=S)
+        finally:
+            if not doc_sf.is_closed:
+                doc_sf.close()
+    except Exception:
+        return [], None, None
+    if not offer.get("ok"):
+        if offer.get("reason"):
+            flags.append("SURFACE FINISHES PLAN, LEGEND NOT USABLE — " + offer["reason"]
+                         + ". No construction is proposed from it.")
+        return [], None, None
+
+    regions, undrawn = [], []
+    for index, row in enumerate(offer["rows"], 1):
+        if row["area_m2"] is None:
+            undrawn.append(f"{row['name']} ({row['reason']})")
+            continue
+        depth = (f"{row['depth_mm']} mm thick" if row["depth_mm"]
+                 else "no thickness stated in its legend row")
+        regions.append({
+            "region_id": f"surface-finish-{index}",
+            "area_m2": row["area_m2"],
+            "polygon_pts": row["polygon_pts"],
+            "included": False,
+            "candidate": True,
+            "source": "surface_finishes_legend",
+            "surface_name": row["name"],
+            "depth_mm": row["depth_mm"],
+            "detail_ref": row["detail_ref"],
+            # The edge uncertainty is KNOWN, not guessed: closing at 1.5x the hatch's own
+            # period can carry the outline that far past the last stroke. Saying "about 2 m"
+            # would be a nicer sentence and a worse number.
+            "candidate_reason": (
+                f"named in this sheet's own legend as \u201c{row['name']}\u201d, {depth}, built to "
+                f"{row['detail_ref'] or 'no detail reference'}. Its ground is the hatch drawn in "
+                f"that legend row's colour: {row['marks']:,} strokes, closed into "
+                f"{row['components']} region(s). The outline is RECONSTRUCTED from those strokes, "
+                f"not an outline the engineer drew, so its edges are uncertain by up to "
+                f"{row['edge_uncertainty_m']:.1f} m — one and a half of this hatch's own spacings. "
+                f"The {row['area_m2']:,.0f} m² also converts through this sheet's scale, which is "
+                "not verified. Nothing on the sheet says which construction is being priced, so "
+                "none is counted until you include it."),
+        })
+    if regions:
+        named = ", ".join(f"{r['surface_name']} ({r['area_m2']:,.0f} m²)" for r in regions[:6])
+        flags.append(
+            f"{len(regions)} CONSTRUCTIONS OFFERED FROM THE SURFACE FINISHES LEGEND, NONE "
+            f"COUNTED — this sheet names its own surfacing and draws each one in its legend "
+            f"row's hatch colour: {named}. Each carries the thickness its legend row states. "
+            "Include the one you are pricing. This sheet is one of a set, so each area is "
+            "this sheet's portion of that construction, not the project total.")
+    if undrawn:
+        flags.append("ALSO IN THE LEGEND, NOT DRAWN HERE — " + "; ".join(undrawn[:6])
+                     + ". Those constructions are on a companion sheet.")
+    return regions, k_sf, src_sf
+
+
 def _offer_boundaries(pdf, flags):
     """Closed CAD boundaries to OFFER on a sheet we are refusing to measure.
 
@@ -2585,7 +2664,16 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
         # excluded, named by its own layer -- the client's rule for ambiguity, 10 Sep 2026:
         # "If there are ambiguous areas, show them as separate candidates for the user to
         # review rather than simply rejecting the whole measurement."
-        _bound_regions, _bounds, _bd_k, _bd_src = _offer_boundaries(pdf, flags)
+        # A Surface Finishes Plan names its own constructions and draws each in its legend
+        # row's hatch colour, so where the sheet says it is one, those rows ARE the candidates
+        # and the closed boundaries are not offered beside them: on 0700/0701 the only closed
+        # shapes are small structures near the access road, and offering one of those next to
+        # a real construction would be worse than offering nothing (told to Aryan, 14 Sep).
+        _sf_regions, _sf_k, _sf_src = _offer_surface_finishes(pdf, flags, S)
+        if _sf_regions:
+            _bound_regions, _bounds, _bd_k, _bd_src = _sf_regions, [], _sf_k, _sf_src
+        else:
+            _bound_regions, _bounds, _bd_k, _bd_src = _offer_boundaries(pdf, flags)
         return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style, "price_gbp": None,
                 "measurement_state": sanity.UNMEASURED, "needs_assessor": True,
                 "legend_found": False,

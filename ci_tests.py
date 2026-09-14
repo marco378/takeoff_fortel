@@ -49,6 +49,7 @@ MODULES = [
     "tests.test_oversize_region",
     "tests.test_spec_schedule",
     "tests.test_router_annotation_scale",
+    "tests.test_surface_finishes",
     "tests.test_scale",
     "tests.test_gate",
     "tests.test_router_refusal",
@@ -89,8 +90,8 @@ MODULES = [
 # written alongside: a number that looked reasonable and was never checked against the case
 # it governs.
 CLIENT_DRAWINGS = (Path(__file__).resolve().parent / "drawings").is_dir()
-EXPECTED_CHECKS = 1011 if CLIENT_DRAWINGS else 810
-MIN_CHECKS = 998 if CLIENT_DRAWINGS else 797
+EXPECTED_CHECKS = 1026 if CLIENT_DRAWINGS else 825
+MIN_CHECKS = 1013 if CLIENT_DRAWINGS else 812
 
 broken = []
 for _name in MODULES:
