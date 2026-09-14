@@ -327,9 +327,18 @@ def find_engineer_spec(pdf_path: str, project_ref: str | None = None,
                 # runs across neighbouring legend rows, so the 90-char head printed beside
                 # "180 mm" was the line that says 225mm — which is exactly how I misread
                 # Radlett WP5 0700 and reported a contradiction to Aryan that was not there.
-                stated = re.search(rf"{value}\s*mm", quote, re.I) if value is not None else None
+                stated, lead = None, 70
+                if value is not None:
+                    entry = _SCHEDULE_ENTRY_PATTERNS.get(field)
+                    attempts = ([(entry[0], entry[2])] if entry else []) + [(r"(?<!\d){value}", 70)]
+                    for candidate, candidate_lead in attempts:
+                        stated = re.search(candidate.format(value=re.escape(str(value))),
+                                           quote, re.I)
+                        if stated:
+                            lead = candidate_lead
+                            break
                 if stated:
-                    quote = quote[max(0, stated.start() - 70):stated.end() + 60].strip()
+                    quote = quote[max(0, stated.start() - lead):stated.end() + 90].strip()
                 where = Path(str(record.get("file") or "")).name
                 unit = " mm" if field == "depth_mm" else ""
                 detail = f"\u201c{quote[:90]}\u2026\u201d" if quote else ""
@@ -337,9 +346,12 @@ def find_engineer_spec(pdf_path: str, project_ref: str | None = None,
                     detail = f"{detail} [{where}]" if detail else f"[{where}]"
                 parts.append(f"{value}{unit}" + (f" {detail}" if detail else ""))
             if _is_enumerated_schedule(field, records):
+                noun = ("constructions, each with its own build-up reference"
+                        if field == "depth_mm"
+                        else "details, each for its own location and detail reference")
                 flags.append(
                     f"SPEC SCHEDULE — {labels.get(field, field)}: this sheet lists "
-                    f"{len(parts)} constructions, each with its own build-up reference: "
+                    f"{len(parts)} {noun}: "
                     + "; and ".join(parts)
                     + ". That is a schedule, not a contradiction — nothing is assumed for "
                       "pricing, and the assessor selects the construction being priced."
@@ -361,16 +373,38 @@ def find_engineer_spec(pdf_path: str, project_ref: str | None = None,
     return merged
 
 
+# What a value must look like to count as one entry in a schedule rather than one side of a
+# contradiction: it states its own application, and it carries its own detail reference.
+#   depth_mm — "HGV Slab Construction 200mm thick / Refer to ...-DD-C-1010": a legend row
+#              naming one construction. Radlett WP5 0700 lists four.
+#   mesh     — "Additional layer of A393 mesh to be provided 1.2m either side of joint /
+#              refer to ...-DD-C-1020": a reinforcement detail at a named location. The slab
+#              layouts carry two — A393 beside the joints, A252 along the slab edge — and
+#              they augment the slab, they do not compete for it.
+# (entry pattern, how far after it to look for the detail reference, how much text to keep
+# BEFORE it when quoting). The lead differs because the construction name precedes a thickness
+# — "HGV Slab Construction 200mm thick" — whereas the mesh phrase is inside the match already.
+_SCHEDULE_ENTRY_PATTERNS = {
+    "depth_mm": (r"{value}\s*mm\s+thick", 80, 70),
+    "mesh": (r"additional\s+layer\s+of\s+{value}\b", 140, 5),
+}
+
+
 def _is_enumerated_schedule(field: str, records: list) -> bool:
-    """Several thicknesses on one sheet are not a contradiction when each one names its own
-    construction and its own build-up reference — that is a schedule, and multi-thickness is
-    normal on a big terminal. Radlett WP5 0700/0701 lists 180/200/225/375 mm this way; calling
-    it a SPEC CONFLICT told Aryan on 14 Sep that the sheet contradicted itself when it does not.
-    Deliberately strict: cross-sheet disagreement, or a value with no "Refer to" build-up of its
-    own, stays a conflict. Nothing about routing changes either way — the value is still never
-    assumed and the assessor still picks."""
-    if field != "depth_mm":
+    """Several values on one sheet are not a contradiction when each names its own application
+    and its own build-up or detail reference — that is a schedule, and a big terminal has one.
+    Radlett WP5 lists 180/200/225/375 mm constructions and two additional mesh layers this way;
+    calling either a SPEC CONFLICT told Aryan on 14 Sep that the sheets contradicted themselves
+    when they do not, and he has since confirmed both readings.
+
+    Deliberately strict: cross-sheet disagreement, or a value with no reference of its own,
+    stays a conflict. Nothing about routing changes either way — the value is still never
+    assumed for pricing, and the assessor still picks.
+    """
+    pattern = _SCHEDULE_ENTRY_PATTERNS.get(field)
+    if pattern is None:
         return False
+    entry_pattern, window, _lead = pattern
     values = {record.get("value") for record in records if record.get("value") is not None}
     if len(values) < 2:
         return False
@@ -379,10 +413,11 @@ def _is_enumerated_schedule(field: str, records: list) -> bool:
         return False
     for record in records:
         text = " ".join(str(record.get("text") or "").split())
-        stated = re.search(rf"{record.get('value')}\s*mm\s+thick", text, re.I)
+        stated = re.search(entry_pattern.format(value=re.escape(str(record.get("value")))),
+                           text, re.I)
         if not stated:
             return False
-        if not re.search(r"refer\s+to\s+\S", text[stated.end():stated.end() + 80], re.I):
+        if not re.search(r"refer\s+to\s+\S", text[stated.end():stated.end() + window], re.I):
             return False
     return True
 

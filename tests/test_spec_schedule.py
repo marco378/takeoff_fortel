@@ -57,7 +57,7 @@ ck("thicknesses with no build-up reference of their own stay a CONFLICT",
 
 ck("a single stated thickness is neither",
    _is_enumerated_schedule("depth_mm", _schedule_records[:1]) is False)
-ck("the schedule reading is scoped to slab thickness only",
+ck("a thickness legend does not accidentally read as a mesh schedule",
    _is_enumerated_schedule("mesh", _schedule_records) is False)
 
 _source = inspect.getsource(takeoff_pipeline)
@@ -67,7 +67,30 @@ ck("the schedule flag says it is not a contradiction, and who picks",
    "not a contradiction" in _source and
    "the assessor selects the construction being priced" in _source)
 ck("the printed quote is re-centred on the value it sits beside",
-   'rf"{value}\\s*mm"' in _source and "stated.start() - 70" in _source)
+   "stated.start() - lead" in _source and "_SCHEDULE_ENTRY_PATTERNS.get(field)" in _source)
+ck("...with a lead chosen per field, since a thickness is named before it and a mesh inside it",
+   '"depth_mm": (r"{value}\\s*mm\\s+thick", 80, 70)' in _source and
+   '"mesh": (r"additional\\s+layer\\s+of\\s+{value}\\b", 140, 5)' in _source)
+
+_MESH = (
+    "Day Joint with 1200mm restriction either side of joint. "
+    "Additional layer of A393 mesh to be provided 1.2m either side of joint - refer to "
+    "details on drawing RAD-BWB-A1EX-IT1-DD-C-1020 "
+    "Additional layer of A252 mesh along edge of slab, refer to RAD-BWB-A1EX-IT1-DD-C-1021"
+)
+_mesh_records = [
+    {"value": value, "file": "slab_layout.pdf", "page": 1, "text": _MESH}
+    for value in ("A393", "A252")
+]
+ck("two additional mesh layers, each at its own location with its own detail, is a SCHEDULE",
+   _is_enumerated_schedule("mesh", _mesh_records) is True)
+ck("a base mesh competing with another base mesh is still a CONFLICT",
+   _is_enumerated_schedule("mesh", [
+       {"value": "A252", "file": "s.pdf", "page": 1, "text": "slab reinforced with A252 mesh"},
+       {"value": "A393", "file": "s.pdf", "page": 1, "text": "slab reinforced with A393 mesh"},
+   ]) is False)
+ck("a field with no schedule pattern of its own is never reclassified",
+   _is_enumerated_schedule("conc_mix", _schedule_records) is False)
 
 _radlett = Path("drawings/radlett_wp5/wp5_24.pdf")
 try:
@@ -90,3 +113,22 @@ try:
         "needs_assessor": _result.get("needs_assessor")})
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] Radlett schedule guard — {_e} — fixture not present")
+
+_slab_layout = Path("drawings/inderjit_13sep/radlett_4_Slab_Layout.pdf")
+try:
+    _require_fixture(_slab_layout, "Radlett slab layout not present")
+    _mesh_result = takeoff_pipeline.takeoff(str(_slab_layout), send_approval=False)
+    _mesh_flags = [flag for flag in (_mesh_result.get("flags") or []) if "SPEC " in flag]
+    _mesh_flag = _mesh_flags[0] if _mesh_flags else ""
+    ck("the real slab layout's two additional mesh layers read as a schedule",
+       _mesh_flag.startswith("SPEC SCHEDULE — mesh") and "SPEC CONFLICT" not in _mesh_flag,
+       _mesh_flag[:200])
+    ck("...with each quote naming its own mesh and its own detail sheet",
+       "A252 mesh along edge of slab" in _mesh_flag and
+       "A393 mesh to be provided" in _mesh_flag, _mesh_flag[:400])
+    ck("...and the sheet still refuses and still routes to an assessor",
+       _mesh_result.get("measurement_state") == "UNMEASURED" and
+       _mesh_result.get("needs_assessor") is True,
+       {"state": _mesh_result.get("measurement_state")})
+except _FixtureNotPresent as _e:
+    print(f"  [SKIP] slab-layout mesh guard — {_e} — fixture not present")

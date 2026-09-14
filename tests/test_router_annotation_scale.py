@@ -25,7 +25,9 @@ print("router annotation scaling")
 import router
 from router import classify
 
-_TMP = Path(__file__).resolve().parent.parent / "_tmp_router_annots.pdf"
+import tempfile
+_TMPDIR = tempfile.mkdtemp(prefix="router_annots_")
+_TMP = Path(_TMPDIR) / "router_annots.pdf"
 _doc = fitz.open()
 _page = _doc.new_page(width=842, height=595)
 for _i in range(60):
@@ -69,7 +71,6 @@ ck("classify filters by annotation subtype before loading anything",
 ck("the 300k-path page is scanned once, not twice",
    _source.count("get_drawings()") == 1, _source.count("get_drawings()"))
 
-_TMP.unlink(missing_ok=True)
 
 _photometric = Path("drawings/radlett_wp5/wp5_33.pdf")
 try:
@@ -83,3 +84,6 @@ try:
        _typ2 == "UNMARKED vector" and _detail2.get("area_markups") == 0, _detail2)
 except _FixtureNotPresent as _e:
     print(f"  [SKIP] photometric sheet scaling guard — {_e} — fixture not present")
+
+import shutil as _shutil
+_shutil.rmtree(_TMPDIR, ignore_errors=True)
