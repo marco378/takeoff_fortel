@@ -9,12 +9,26 @@ import fitz, glob, os, re
 
 def classify(path):
     p = fitz.open(path)[0]
-    annots = list(p.annots() or [])
-    area_markups = sum(1 for a in annots
-                       if a.type[1] == "Polygon" and "sq m" in (a.info.get("content", "") or ""))
-    vec = len(p.get_drawings())
+    # Count the Bluebeam area markups WITHOUT loading every annotation. page.annots() fetches
+    # each one by xref, and that lookup rescans the annotation list from the beginning — so the
+    # walk is O(n^2). Radlett WP5 1301 is a photometric lighting sheet carrying 36,135 lux-grid
+    # squares, and that quadratic walk hung the pipeline past the 180s watchdog: no area, no
+    # refusal, no state at all, which is the one outcome the four-state contract forbids.
+    # annot_xrefs() returns (xref, subtype, id) without loading anything, so filter to Polygon
+    # first and load only those — a marked-up sheet carries one or two.
+    area_markups = 0
+    for xref, subtype, _id in (p.annot_xrefs() or []):
+        if subtype != fitz.PDF_ANNOT_POLYGON:
+            continue
+        annot = p.load_annot(xref)
+        if annot is not None and "sq m" in (annot.info.get("content", "") or ""):
+            area_markups += 1
+    # One pass, not two: this sheet carries 300,563 vector paths and we were building the
+    # whole list twice to ask two questions of it.
+    drawings = p.get_drawings()
+    vec = len(drawings)
     has_red = any(dr.get("color") and dr["color"][0] > 0.5 and dr["color"][1] < 0.45 and dr["color"][2] < 0.45
-                  for dr in p.get_drawings())
+                  for dr in drawings)
     scales = sorted(set(re.findall(r"1\s*:\s*\d{2,4}", p.get_text())))
 
     if vec < 50:
