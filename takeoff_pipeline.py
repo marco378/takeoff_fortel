@@ -21,7 +21,7 @@ MANUAL APPROVAL FLOW:
 
   Set SEND_APPROVAL_EMAILS=1 to enable; defaults to off for dev runs.
 """
-import math, json, io, contextlib, os, fitz
+import math, json, io, contextlib, os, re, fitz
 from pathlib import Path
 from router import classify, classify_page
 from robust_takeoff import read_marked, read_marked_zones, count_manholes_marked
@@ -323,18 +323,34 @@ def find_engineer_spec(pdf_path: str, project_ref: str | None = None,
                     continue
                 seen.add(value)
                 quote = " ".join(str(record.get("text") or "").split())
+                # Centre the quote on THIS value's own statement. The raw extraction window
+                # runs across neighbouring legend rows, so the 90-char head printed beside
+                # "180 mm" was the line that says 225mm — which is exactly how I misread
+                # Radlett WP5 0700 and reported a contradiction to Aryan that was not there.
+                stated = re.search(rf"{value}\s*mm", quote, re.I) if value is not None else None
+                if stated:
+                    quote = quote[max(0, stated.start() - 70):stated.end() + 60].strip()
                 where = Path(str(record.get("file") or "")).name
                 unit = " mm" if field == "depth_mm" else ""
                 detail = f"\u201c{quote[:90]}\u2026\u201d" if quote else ""
                 if where:
                     detail = f"{detail} [{where}]" if detail else f"[{where}]"
                 parts.append(f"{value}{unit}" + (f" {detail}" if detail else ""))
-            flags.append(
-                f"SPEC CONFLICT — {labels.get(field, field)}: the drawing states "
-                + "; and ".join(parts)
-                + ". Both are on the sheet, so nothing is assumed for pricing — the assessor "
-                  "must select the one that applies to this surface."
-            )
+            if _is_enumerated_schedule(field, records):
+                flags.append(
+                    f"SPEC SCHEDULE — {labels.get(field, field)}: this sheet lists "
+                    f"{len(parts)} constructions, each with its own build-up reference: "
+                    + "; and ".join(parts)
+                    + ". That is a schedule, not a contradiction — nothing is assumed for "
+                      "pricing, and the assessor selects the construction being priced."
+                )
+            else:
+                flags.append(
+                    f"SPEC CONFLICT — {labels.get(field, field)}: the drawing states "
+                    + "; and ".join(parts)
+                    + ". Both are on the sheet, so nothing is assumed for pricing — the assessor "
+                      "must select the one that applies to this surface."
+                )
     if evidence:
         merged["_evidence"] = evidence
     if flags:
@@ -343,6 +359,32 @@ def find_engineer_spec(pdf_path: str, project_ref: str | None = None,
                            if item.get("file")})
     merged["_from_file"] = ", ".join(source_files) if source_files else target.name
     return merged
+
+
+def _is_enumerated_schedule(field: str, records: list) -> bool:
+    """Several thicknesses on one sheet are not a contradiction when each one names its own
+    construction and its own build-up reference — that is a schedule, and multi-thickness is
+    normal on a big terminal. Radlett WP5 0700/0701 lists 180/200/225/375 mm this way; calling
+    it a SPEC CONFLICT told Aryan on 14 Sep that the sheet contradicted itself when it does not.
+    Deliberately strict: cross-sheet disagreement, or a value with no "Refer to" build-up of its
+    own, stays a conflict. Nothing about routing changes either way — the value is still never
+    assumed and the assessor still picks."""
+    if field != "depth_mm":
+        return False
+    values = {record.get("value") for record in records if record.get("value") is not None}
+    if len(values) < 2:
+        return False
+    origins = {(str(record.get("file") or ""), record.get("page")) for record in records}
+    if len(origins) != 1:
+        return False
+    for record in records:
+        text = " ".join(str(record.get("text") or "").split())
+        stated = re.search(rf"{record.get('value')}\s*mm\s+thick", text, re.I)
+        if not stated:
+            return False
+        if not re.search(r"refer\s+to\s+\S", text[stated.end():stated.end() + 80], re.I):
+            return False
+    return True
 
 
 # ── Approval flags — any of these triggers a manual review email ─────────────
