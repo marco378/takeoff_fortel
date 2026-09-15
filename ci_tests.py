@@ -19,6 +19,7 @@ Modules, in execution order:
   tests/test_defaults.py — defaults.spec_with_defaults / assumption_note / flag_assumed
   tests/test_spec_extractor.py — spec_extractor text parsing + the Brief_Spec schema and provenance
   tests/test_quotation.py — quotation generation, BOQ rows and the xlsx/html/json/text exports
+  tests/test_construction_pricing.py — one quote line per construction, summed at the end
   tests/test_marked_zones.py — marked zone-aware measurement, BOQ allocation, Yard/Dock split, channels
   tests/test_costing_rates.py — price_with_defaults, the client rate-override layer, supplier fields
   tests/test_pipeline_states.py — sanity.measurement_state, router.rank_pages, takeoff_pipeline routing
@@ -62,6 +63,7 @@ MODULES = [
     "tests.test_defaults",
     "tests.test_spec_extractor",
     "tests.test_quotation",
+    "tests.test_construction_pricing",
     "tests.test_marked_zones",
     "tests.test_costing_rates",
     "tests.test_pipeline_states",
@@ -90,8 +92,8 @@ MODULES = [
 # written alongside: a number that looked reasonable and was never checked against the case
 # it governs.
 CLIENT_DRAWINGS = (Path(__file__).resolve().parent / "drawings").is_dir()
-EXPECTED_CHECKS = 1047 if CLIENT_DRAWINGS else 846
-MIN_CHECKS = 1034 if CLIENT_DRAWINGS else 833
+EXPECTED_CHECKS = 1090 if CLIENT_DRAWINGS else 889
+MIN_CHECKS = 1077 if CLIENT_DRAWINGS else 876
 
 broken = []
 for _name in MODULES:

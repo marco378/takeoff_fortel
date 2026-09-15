@@ -38,6 +38,8 @@ from slab_spec import (brief_spec_signature, build_brief_spec,
 with contextlib.redirect_stdout(io.StringIO()):
     from costing import rate_buildup, MESH_KG
 from defaults import spec_with_defaults, assumption_note
+from construction_pricing import (combined as combined_constructions,
+                                  price_constructions, zone_constructions)
 
 # Fortel company details for the quotation header
 FORTEL_NAME    = "Fortel Group Limited"
@@ -121,6 +123,105 @@ def _unit_name(result: dict) -> str:
     return f"Unit-{match.group(1)}" if match else filename
 
 
+def _fan_constructions(base_unit, constructions, parent, *, section_label,
+                       construction_of, brief_spec_category):
+    """Turn one measured area with a construction breakdown into one input per construction.
+
+    Shared by the zone path and by the zone-less path a reviewed Surface Finishes Plan takes,
+    so the two cannot drift -- they differ only in how the BOQ section was resolved.
+
+    Only thickness varies between the pieces. Everything that belongs to the measured area
+    ONCE -- its extras, its perimeter, its outline -- stays on the first piece alone, or the
+    quotation would print a perimeter row per construction for a slab that has one perimeter.
+    """
+    costing = base_unit.get("costing") or {}
+    priced = price_constructions(constructions, costing.get("spec") or {})
+    extras_holder = costing.get("extras") or []
+    once_only = ("perimeter_lm", "polygon_pts")
+    pieces = []
+    for c_index, entry in enumerate(priced):
+        piece = dict(base_unit)
+        piece["area_m2"] = float(entry["area_m2"])
+        piece["unit_name"] = entry["name"]
+        piece["area_label"] = entry["name"]
+        piece["construction_name"] = entry["name"]
+        # Groups are keyed per section; mark which measured area these came from so the
+        # combined "Total ... Slab Area" row sums exactly these and nothing else, leaving
+        # every job without constructions rendering as it does now.
+        piece["construction_of"] = construction_of
+        if brief_spec_category:
+            piece["brief_spec"] = _construction_brief_spec(
+                brief_spec_category, entry, base_unit.get("brief_spec"), parent)
+        else:
+            piece["brief_spec"] = _construction_brief_spec(
+                normalise_slab_type(section_label, text=str(
+                    parent.get("file") or Path(str(parent.get("pdf_path") or "")).name)),
+                entry, base_unit.get("brief_spec"), parent)
+        piece_costing = dict(costing)
+        piece_costing.update({
+            "area_m2": float(entry["area_m2"]),
+            "rate": entry["rate"],
+            "total_gbp": entry["total_gbp"],
+            "spec": entry["spec"],
+            "breakdown": entry["breakdown"],
+            "extras": list(extras_holder) if c_index == 0 else [],
+        })
+        piece["costing"] = piece_costing
+        if c_index:
+            for key in once_only:
+                piece.pop(key, None)
+        piece_flags = list(parent.get("flags") or [])
+        if entry["depth_assumed"]:
+            piece_flags.append(
+                f"THICKNESS NOT STATED FOR THIS CONSTRUCTION: {entry['name']} is priced at "
+                f"the drawing's general slab specification because the sheet's legend did not "
+                f"state a thickness for it. ASSUMED — confirm before issue."
+            )
+        if c_index == 0 and len(priced) > 1:
+            piece["construction_declaration"] = (
+                f"{section_label} are priced as {len(priced)} separate constructions, each at "
+                "its own stated thickness with its own rate build-up; the combined area and "
+                "value are the sum of them, not one slab at a single depth."
+            )
+        piece["flags"] = piece_flags
+        pieces.append(piece)
+    return pieces
+
+
+def _construction_brief_spec(category, entry, zone_brief_spec, parent):
+    """The zone's checklist re-stated at one construction's own stated thickness.
+
+    The thickness is a DRAWING fact -- the Surface Finishes Plan legend states it beside the
+    construction's own hatch -- so it is recorded with ``engineer_drawing`` provenance and a
+    citation, not as an assessor entry. Every other field keeps the zone's provenance
+    untouched: this function confirms nothing it was not given.
+    """
+    if entry.get("depth_assumed") or not entry.get("depth_mm"):
+        return zone_brief_spec
+    evidence_text = "Surface Finishes Plan legend"
+    if entry.get("detail_ref"):
+        evidence_text += f" — {entry['name']} (refer to {entry['detail_ref']})"
+    else:
+        evidence_text += f" — {entry['name']}"
+    evidence = {"text": evidence_text}
+    drawing = parent.get("file") or Path(str(parent.get("pdf_path") or "")).name
+    if drawing:
+        evidence["file"] = drawing
+    page = parent.get("page") or parent.get("page_number")
+    if page:
+        evidence["page"] = page
+    try:
+        return build_brief_spec(
+            category,
+            existing=zone_brief_spec,
+            confirmed={"depth_mm": entry["depth_mm"]},
+            source="engineer_drawing",
+            evidence={"depth_mm": evidence},
+        )
+    except (TypeError, ValueError):
+        return zone_brief_spec
+
+
 def _expand_zone_results(results: list[dict]) -> list[dict]:
     """Fan a mixed marked drawing into unpriced BOQ-area inputs by proven zone category.
 
@@ -135,6 +236,29 @@ def _expand_zone_results(results: list[dict]) -> list[dict]:
                       if zone.get("area_m2") is not None]
         zones = [zone for zone in area_zones if zone.get("category") in ZONE_SECTION]
         if not zones:
+            # A sheet that arrived UNMEASURED carries no zones at all: the assessor's Yard
+            # region review is what measures it, and its per-construction breakdown sits on
+            # the result rather than on a zone. That is the shape the real Radlett Surface
+            # Finishes Plans take, so it must fan here too -- portal QA found it doing exactly
+            # what this feature exists to stop, pricing four thicknesses at one default depth.
+            #
+            # The section is resolved exactly as it is today, from the drawing. Nothing is
+            # invented here: a zone-less result with no constructions still passes through
+            # whole, unchanged.
+            loose = zone_constructions(parent)
+            if loose:
+                section_label = quotation_section(parent)
+                base = dict(parent)
+                base["brief_spec"] = parent.get("brief_spec") or build_brief_spec(
+                    normalise_slab_type(section_label, text=str(
+                        parent.get("file") or Path(str(parent.get("pdf_path") or "")).name)),
+                    effective_spec=(parent.get("costing") or {}).get("spec") or {})
+                expanded.extend(_fan_constructions(
+                    base, loose, parent,
+                    section_label=section_label,
+                    construction_of=f"{_unit_name(parent)}::{section_label}",
+                    brief_spec_category=None))
+                continue
             # No recognised zone: the parent passes through whole, so its area is still counted.
             expanded.append(parent)
             continue
@@ -188,6 +312,28 @@ def _expand_zone_results(results: list[dict]) -> list[dict]:
             if index and costing.get("extras"):
                 costing["extras"] = []
             virtual["costing"] = costing
+
+            # A Yard zone an assessor reviewed carries its own per-construction breakdown.
+            #
+            # Aryan, 15 Sep: each construction gets its own quantity and its own rate
+            # build-up, and they are summed only for a combined total at the end. The zone
+            # keeps the total (nothing downstream that reads zone area_m2 changes), and the
+            # breakdown fans into one input per construction here. Only THICKNESS varies --
+            # everything else in the build-up stays the zone's single set of assumptions,
+            # because the sheet does not vary them per construction.
+            #
+            # No new rendering is needed: the BOQ group key already includes the brief-spec
+            # signature and the rate, so two constructions at different depths land in
+            # different groups and get separate priced rows, separate specification blocks
+            # and separate take-off totals on their own.
+            constructions = zone_constructions(zone)
+            if constructions:
+                expanded.extend(_fan_constructions(
+                    virtual, constructions, parent,
+                    section_label=ZONE_SECTION[category],
+                    construction_of=f"{_unit_name(parent)}::{category}",
+                    brief_spec_category=category))
+                continue
             expanded.append(virtual)
 
         # Carry the orphans through as their own unclassified, unpriced rows. No rate is
@@ -299,6 +445,13 @@ def _normalise_section(section, fallback="External yard slabs"):
     if not probe:
         return fallback
     return UNCLASSIFIED_SECTION
+
+
+def _section_area_total_label(section: str) -> str:
+    """Aryan's own wording for the combined area line at the foot of a fanned section."""
+    if section == "External yard slabs":
+        return "External/Service Yard Slab Area"
+    return f"{section[:1].upper()}{section[1:]} Area"
 
 
 def _spec_key(costing, brief_spec=None):
@@ -478,9 +631,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         )
         boq_scope = str(unit.get("boq_scope") or "main")
         key = (section, _spec_key(costing, brief_spec), rate,
-               group_provisional, boq_scope, unit.get("area_element_id"))
+               group_provisional, boq_scope, unit.get("area_element_id"),
+               unit.get("construction_of"))
         group = groups.setdefault(key, {
             "section": section, "spec": spec, "brief_spec": brief_spec,
+            "construction_of": unit.get("construction_of"),
             "rate": rate, "assumed": group_provisional,
             "area_element_id": unit.get("area_element_id"),
             "area_element_name": unit.get("area_element_name"),
@@ -533,6 +688,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         if area:
             accumulate_group(unit, costing, spec, rate, section, drawing, brief_spec, area,
                              assumed)
+        if unit.get("construction_declaration"):
+            declarations.append(unit["construction_declaration"])
 
         if assumed:
             if all(spec.get(key) is not None for key in ("depth_mm", "mesh")):
@@ -960,6 +1117,7 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "drawings": group["drawings"],
             "area_rows": group["area_rows"],
             "area_m2": area,
+            "construction_of": group.get("construction_of"),
         })
         common = {
             "section": group["section"], "qty": area, "unit": "m²",
@@ -970,7 +1128,16 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "pod_first_floor": "POD first floor — ",
         }.get(group.get("boq_scope"), "")
         if group.get("area_element_name"):
-            scope_prefix = f"{group['area_element_name']} — " 
+            scope_prefix = f"{group['area_element_name']} — "
+        elif group.get("construction_of"):
+            # Name the construction on the priced line itself, not only in the take-off block
+            # above it. Only when this group IS one construction: two constructions drawn at
+            # the same thickness share one specification and therefore one priced row, and
+            # labelling that row with either of their names would be false.
+            names = {str(area_row.get("description") or "")
+                     for area_row in group.get("area_rows") or []}
+            if len(names) == 1 and names != {""}:
+                scope_prefix = f"{names.pop()} — " 
         slab_desc = scope_prefix + _fortel_concrete_description(spec)
         line_items.append({
             **common, "description": slab_desc, "rate": group["rate"],
@@ -2021,6 +2188,11 @@ def quotation_xlsx(q: dict) -> bytes:
                 ws.row_dimensions[row].height = 30
             row += 1
 
+        # Where one reviewed zone fanned into several constructions, each keeps its own
+        # take-off block above and they are summed once at the end of the section, exactly as
+        # Aryan asked: "Total External/Service Yard Slab Area". Keyed by the zone the
+        # constructions came from, so a section that never had any renders unchanged.
+        construction_total_rows = {}
         for group_id in group_ids:
             specification = specifications.get(group_id) or {}
             source_rows = specification.get("area_rows") or []
@@ -2065,10 +2237,31 @@ def quotation_xlsx(q: dict) -> bytes:
                 ws.row_dimensions[row].height = max(30, 12 * (len(display_lines) + 1))
                 row += 1
 
+            if total_area_row and specification.get("construction_of"):
+                construction_total_rows.setdefault(
+                    specification["construction_of"], []).append(total_area_row)
+
             qty_formula = f"=B{total_area_row}" if total_area_row else None
             for item in section_items:
                 if item.get("specification_id") == group_id:
                     _write_item(item, qty_formula=qty_formula)
+
+        # The combined figure sums the constructions' OWN take-off totals rather than
+        # restating the zone's stored area: each construction is rounded to 0.1 m2
+        # independently upstream, so the zone figure can differ from their sum by 0.1 and the
+        # sheet would then contradict the rows printed directly above it.
+        for source_rows_added in construction_total_rows.values():
+            if len(source_rows_added) < 2:
+                continue
+            ws.cell(row, 1, _excel_text(f"Total {_section_area_total_label(section)}:"))
+            ws.cell(row, 1).font = Font(name="Arial", size=8, bold=True)
+            ws.cell(row, 2, "=" + "+".join(f"B{r}" for r in source_rows_added))
+            ws.cell(row, 2).number_format = '#,##0.##'
+            ws.cell(row, 3, "m2")
+            for col in range(1, 6):
+                ws.cell(row, col).font = Font(name="Arial", size=8, bold=col == 1)
+                ws.cell(row, col).border = Border(bottom=thin_grey)
+            row += 1
 
         for item in ungrouped:
             _write_item(item)

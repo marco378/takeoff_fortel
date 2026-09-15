@@ -2252,6 +2252,20 @@ def review_yard_regions(job_id):
                 zone["region_count"] = len(kept)
                 if constructions:
                     zone["constructions"] = constructions
+        # A Surface Finishes Plan that arrived UNMEASURED has NO zones at all -- the assessor's
+        # region review is what measures it. So the loop above has nothing to attach the
+        # breakdown to, and until 15 Sep the constructions were built for the flag and then
+        # silently dropped: the portal card and the client quotation both fell back to one
+        # blended rate at the default thickness, on the sheet this whole feature exists for.
+        # Caught by portal QA on the real Radlett sheet, not by any unit test -- every fixture
+        # had put the constructions on a zone that prod does not have.
+        #
+        # The breakdown is carried on the result instead of inventing a zone for it. Creating
+        # an "external_yard" zone here would stamp that category on LDSS2's dock and footway
+        # boundary reviews, which reach this same endpoint, and would route the sheet through
+        # zone expansion that drops its perimeter row.
+        if constructions and not any(zone.get("constructions") for zone in zones):
+            result["constructions"] = constructions
         zones_total = round(sum(float(zone.get("area_m2") or 0) for zone in zones), 1)
         # An UNMEASURED sheet that an assessor has now identified IS measured.
         #
@@ -2623,6 +2637,13 @@ def spec_override(job_id):
             if pricing_fields_submitted and zone_area_m2 > 0:
                 zone_costing, brief_spec, pricing_warning = _costing_for_brief_spec(
                     zone_area_m2, brief_spec)
+                if zone_costing:
+                    # Same arithmetic as the default path: an assessor correcting the zone
+                    # specification must not collapse a reviewed per-construction breakdown
+                    # back into one blended rate.
+                    zone_costing = _roll_up_constructions(zone_costing, {"zones": [
+                        zone for zone in zones if isinstance(zone, dict)
+                        and zone.get("category") == zone_category]})
                 repriced = zone_costing is not None
             elif pricing_fields_submitted:
                 pricing_warning = ""
@@ -3150,6 +3171,46 @@ def _save_quotation(job_id: str, result: dict, costing: dict | None,
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _roll_up_constructions(costing: dict, result) -> dict:
+    """Re-price a costing as the sum of its zone's constructions, when it has any.
+
+    Only thickness varies per construction; the rest of the build-up is the costing's own
+    spec, unchanged. A job with no reviewed constructions is returned untouched, so nothing
+    that does not go through the Yard-region review changes by a penny.
+    """
+    from construction_pricing import combined, price_constructions, results_constructions
+
+    pairs = results_constructions(result)
+    if not pairs or not (costing or {}).get("spec"):
+        return costing
+    priced = []
+    for _zone, constructions in pairs:
+        priced.extend(price_constructions(constructions, costing["spec"]))
+    rolled = combined(priced)
+    if rolled["total_gbp"] is None:
+        return costing
+    costing = dict(costing)
+    costing["constructions"] = rolled["constructions"]
+    costing["constructions_area_m2"] = rolled["area_m2"]
+    # The area this costing was called with may include zones with no breakdown (a Dock
+    # alongside the Yard). Only the constructions' own share is re-priced; the remainder keeps
+    # the single rate it already had rather than being silently repriced or dropped.
+    remainder_m2 = round(float(costing.get("area_m2") or 0) - rolled["area_m2"], 1)
+    remainder_gbp = (round(remainder_m2 * costing["rate"], 2)
+                     if isinstance(costing.get("rate"), (int, float)) and remainder_m2 > 0
+                     else 0.0)
+    total = round(rolled["total_gbp"] + remainder_gbp, 2)
+    costing["total_gbp"] = total
+    if costing.get("area_m2"):
+        costing["rate"] = round(total / float(costing["area_m2"]), 2)
+    costing["constructions_note"] = (
+        "Priced as " + str(len(rolled["constructions"])) + " constructions at their own "
+        "thicknesses, summed; the rate shown is the average that total implies, not a rate "
+        "anything was priced at."
+    )
+    return costing
+
+
 def _run_costing(area_m2, result: dict) -> dict | None:
     """Run costing with defaults (or any spec stored in result)."""
     if not area_m2 or area_m2 <= 0:
@@ -3182,6 +3243,13 @@ def _run_costing(area_m2, result: dict) -> dict | None:
             "flags":     flag_assumed(spec, assumed),
             "breakdown": parts,
         }
+        # A Yard zone an assessor has reviewed carries its own per-construction breakdown,
+        # and the quotation prices each construction at its own thickness and sums them. The
+        # portal card and /jobs read THIS costing, so if it stayed a single blended rate the
+        # screen the assessor approves from would show a different number from the document
+        # that goes to the client. One helper does the arithmetic for both.
+        costing = _roll_up_constructions(costing, result)
+
         if manhole_in_scope:
             from takeoff_pipeline import manhole_eo_line
             line, is_estimate = manhole_eo_line(
