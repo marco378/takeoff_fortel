@@ -287,6 +287,14 @@ def _hatch_period_px(ink):
 # measures at 45 degrees is why this is 1.5 and not 0.5: the two nearly cancel.
 CLOSE_AT_PERIOD = 1.5
 
+# Simplify the traced outline no finer than this fraction of the closing radius. The radius is
+# how well the extent is located at all, so detail below it is stroke-end wobble rather than
+# the drawn edge. Measured on Radlett 0701 at a quarter of the radius: the Container slab goes
+# from 97 vertices to 10 for +0.7% area, HGV 180mm from 67 to 5 for +3.0%, while the 225mm
+# channelised strip -- a genuinely thin ring round the slab -- keeps 95 of its 149 and stays a
+# ring. Coarser than this starts eating that strip.
+OUTLINE_EPS_OF_RADIUS = 0.25
+
 
 def _row_regions(closed, ink, scale, k):
     """Every component of the closed field that holds some of this row's hatch.
@@ -415,8 +423,15 @@ def _candidates(page, k, S, drawings):
             offered.append(entry)
             continue
 
+        # Simplify no finer than this row's own closing radius. The outline is only located
+        # to within that radius, so any wobble below it is the stroke ends showing through the
+        # mask, not the engineer's boundary -- and it is exactly the zigzag Aryan reported on
+        # 15 Sep. A quarter of the radius is enough to cut across the sawtooth while leaving
+        # real corners alone; the fidelity check still refuses anything that stops reproducing
+        # the measured area.
+        _eps_floor = radius_px * OUTLINE_EPS_OF_RADIUS
         polygon, _holes, fidelity = hatch_legend_raster._outline_for(
-            kept.astype(np.uint8), area_m2, S, k)
+            kept.astype(np.uint8), area_m2, S, k, min_eps_px=_eps_floor)
         if not polygon and len(parts) > 1:
             # A construction the drawing puts in two places is still one construction, and the
             # only thing missing is a single outline around both. Trace each piece on its own
@@ -430,7 +445,7 @@ def _candidates(page, k, S, drawings):
                     remainder_n += 1
                     continue
                 part_poly, _part_holes, _part_fid = hatch_legend_raster._outline_for(
-                    part_mask.astype(np.uint8), part_area, S, k)
+                    part_mask.astype(np.uint8), part_area, S, k, min_eps_px=_eps_floor)
                 if not part_poly:
                     remainder_m2 += part_area
                     remainder_n += 1

@@ -23,6 +23,7 @@ from pathlib import Path
 import fitz
 import numpy as np
 
+import hatch_legend_raster
 import layer_surfaces
 import surface_finishes
 from tests import ck
@@ -229,3 +230,48 @@ ck("the unsplit sheet is untouched by the multi-part path — no row gains parts
 
 import shutil as _shutil
 _shutil.rmtree(_DIR, ignore_errors=True)
+
+# Aryan, 15 Sep: the markup must follow the actual boundary, not the individual hatch strokes.
+# The outline is only located to within the closing radius, but it was simplified at
+# 0.001 x perimeter -- far finer -- so every wobble the stroke ends left in the mask survived
+# into the polygon. On 0701's Container slab that was 97 vertices jagging in and out by about
+# one hatch cell while the real edge ran straight alongside.
+_SAW = np.zeros((400, 900), np.uint8)
+_SAW[80:320, 60:840] = 1
+for _i in range(60, 840, 20):                 # a sawtooth along the top edge, 12 px deep
+    _SAW[80:92, _i:_i + 10] = 0
+_saw_area = float(_SAW.sum()) * (_K / _S) ** 2
+_fine_poly, _fine_holes, _fine_fid = hatch_legend_raster._outline_for(_SAW, _saw_area, _S, _K)
+_coarse_poly, _coarse_holes, _coarse_fid = hatch_legend_raster._outline_for(
+    _SAW, _saw_area, _S, _K, min_eps_px=24 * surface_finishes.OUTLINE_EPS_OF_RADIUS * 4)
+
+ck("a sawtooth edge traces as many vertices when simplified finer than it",
+   bool(_fine_poly) and len(_fine_poly) > 40, {"pts": len(_fine_poly or [])})
+ck("...and collapses to the real rectangle once the tolerance matches the resolution",
+   bool(_coarse_poly) and len(_coarse_poly) <= 12,
+   {"pts": len(_coarse_poly or []), "was": len(_fine_poly or [])})
+ck("...without the area walking off — the fidelity check still governs",
+   bool(_coarse_poly) and _coarse_fid is not None and _coarse_fid < 0.05,
+   {"fidelity": round(_coarse_fid, 4) if _coarse_fid is not None else None})
+
+# The floor is OPT-IN. hatch_legend_raster._outline_for is on the shipped MJM/gold path, and a
+# silently coarser outline there would move numbers this project treats as facts.
+_default_poly, _d_holes, _d_fid = hatch_legend_raster._outline_for(_SAW, _saw_area, _S, _K)
+ck("the default is byte-identical to the historical behaviour — gold paths cannot drift",
+   _default_poly == _fine_poly)
+
+# A thin strip must survive: the 225mm channelised edge is a real ring round the slab, and a
+# tolerance near its own width would eat it rather than smooth it.
+_STRIP = np.zeros((400, 900), np.uint8)
+_STRIP[190:210, 60:840] = 1
+_strip_area = float(_STRIP.sum()) * (_K / _S) ** 2
+_strip_poly, _sh, _sfid = hatch_legend_raster._outline_for(
+    _STRIP, _strip_area, _S, _K, min_eps_px=400)
+ck("a thin strip is not destroyed by an oversized tolerance",
+   _strip_poly is None or (_sfid is not None and _sfid < hatch_legend_raster.OUTLINE_FIDELITY_TOL),
+   {"poly": None if _strip_poly is None else len(_strip_poly),
+    "fidelity": None if _sfid is None else round(_sfid, 3)})
+
+ck("the simplification tolerance is tied to the hatch's own radius, not the perimeter",
+   0 < surface_finishes.OUTLINE_EPS_OF_RADIUS <= 0.5,
+   {"OUTLINE_EPS_OF_RADIUS": surface_finishes.OUTLINE_EPS_OF_RADIUS})

@@ -125,8 +125,20 @@ def _poly_area_m2(pts, k):
     return abs(total) * 0.5 * k * k
 
 
-def _contour_with_holes(comp, S, k, max_pts=180):
+def _contour_with_holes(comp, S, k, max_pts=180, min_eps_px=None):
     """Outer boundary AND its holes, in PDF points: ([[x, y], ...], [[[x, y], ...], ...]).
+
+    ``min_eps_px`` sets a FLOOR on the simplification tolerance, in raster pixels. Default
+    None keeps the historical behaviour exactly, because this is on paths that carry gold
+    numbers; only a caller that knows its own resolution should raise it.
+
+    Why a floor is ever wanted: an outline reconstructed by closing hatch strokes is only
+    located to within the closing radius, but the default tolerance is 0.001 x perimeter,
+    which is far finer than that. The result keeps every wobble the stroke ends put into the
+    mask -- on Radlett 0701 the Container slab came out as 97 vertices jagging in and out by
+    about one hatch cell, while the real edge is a straight line alongside. Simplifying no
+    finer than the measurement's own resolution removes the zigzag instead of dressing it up:
+    that same outline becomes 10 vertices and moves 0.7% in area.
 
     T._hatch_contour is RETR_EXTERNAL and stays untouched — it is on the shipped MJM path.
     This module needs holes because a road drawn as a loop around a yard has an outer contour
@@ -152,6 +164,11 @@ def _contour_with_holes(comp, S, k, max_pts=180):
         def simplify(c):
             peri = cv2.arcLength(c, True)
             eps = 0.001 * peri
+            if min_eps_px:
+                # Never simplify finer than the caller's own resolution, but never coarser
+                # than a shape can survive either: a thin strip is destroyed by a tolerance
+                # near its own width, so the floor is capped at a fraction of the perimeter.
+                eps = max(eps, min(float(min_eps_px), 0.02 * peri))
             approx = cv2.approxPolyDP(c, eps, True)
             while len(approx) > max_pts and eps < 0.05 * peri:
                 eps *= 1.5
@@ -177,10 +194,14 @@ def _contour_with_holes(comp, S, k, max_pts=180):
         return None, []
 
 
-def _outline_for(mask, area_m2, S, k):
+def _outline_for(mask, area_m2, S, k, min_eps_px=None):
     """(polygon, holes, fidelity) for a hatch mask, or (None, [], fidelity) when the traced
-    outline cannot reproduce the measured quantity within OUTLINE_FIDELITY_TOL."""
-    poly, holes = _contour_with_holes(mask, S, k)
+    outline cannot reproduce the measured quantity within OUTLINE_FIDELITY_TOL.
+
+    ``min_eps_px`` is passed through to _contour_with_holes; see its note. The fidelity check
+    below is what keeps a coarser tolerance honest -- an outline simplified past the shape it
+    is describing stops reproducing the measured area and is refused, exactly as before."""
+    poly, holes = _contour_with_holes(mask, S, k, min_eps_px=min_eps_px)
     if not poly:
         return None, [], None
     drawn = _poly_area_m2(poly, k) - sum(_poly_area_m2(h, k) for h in holes)
