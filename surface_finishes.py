@@ -296,18 +296,24 @@ def _row_regions(closed, ink, scale, k):
     pieces: the 225mm channelised edge runs round the slab as 36 fragments, and a per-component
     floor discards every one of them and reports 0 m2 for a real strip. The floor belongs to the
     ROW, applied to its total, so a construction is judged as the thing it is.
+
+    Returns ``(kept, areas, parts)``. ``parts`` holds each component's own mask alongside its
+    own area, which is what lets a construction drawn in separate pieces be offered piece by
+    piece when no single outline can reproduce the whole.
     """
     count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(closed, 8)
     per_px_m2 = (k / scale) ** 2
     ink_bool = ink.astype(bool)
-    kept, areas = np.zeros_like(ink_bool), []
+    kept, areas, parts = np.zeros_like(ink_bool), [], []
     for index in range(1, count):
         component = (labels == index)
         if not (component & ink_bool).any():
             continue
         kept |= component
-        areas.append(float(component.sum()) * per_px_m2)
-    return kept, areas
+        area = float(component.sum()) * per_px_m2
+        areas.append(area)
+        parts.append((component, area))
+    return kept, areas, parts
 
 
 def candidates(page, k, S=2.0, drawings=None) -> dict:
@@ -345,12 +351,15 @@ def _candidates(page, k, S, drawings):
                                         drawings=drawings, layer_scoped=layer_scoped)
 
     offered = []
-    for row in rows:
+    for ordinal, row in enumerate(rows, 1):
         ink, marks = inks[row["name"]]
+        # The row's place in the legend, not its place in the output: one construction drawn in
+        # two places emits two entries, and numbering by output position would label the second
+        # piece as if it were a different construction.
         entry = {"name": row["name"], "colour": row["colour"], "depth_mm": row["depth_mm"],
                  "detail_ref": row["detail_ref"], "marks": marks, "area_m2": None,
                  "polygon_pts": None, "components": 0, "edge_uncertainty_m": None,
-                 "reason": ""}
+                 "row_ordinal": ordinal, "reason": ""}
         if marks == 0 or not ink.any():
             # Normal, not a failure: 0700 is sheet 1 of 2 and each draws only its own portion.
             entry["reason"] = ("named in this sheet's legend but not drawn on it — its ground "
@@ -381,7 +390,7 @@ def _candidates(page, k, S, drawings):
         bleed_px = int((closed & others).sum())
         closed = (closed & ~others).astype(np.uint8)
 
-        kept, areas = _row_regions(closed, ink, S, k)
+        kept, areas, parts = _row_regions(closed, ink, S, k)
         area_m2 = sum(areas)
         if area_m2 < layer_surfaces.MIN_REGION_M2:
             entry["reason"] = (f"its hatch closes into {area_m2:,.0f} m², under the "
@@ -408,6 +417,41 @@ def _candidates(page, k, S, drawings):
 
         polygon, _holes, fidelity = hatch_legend_raster._outline_for(
             kept.astype(np.uint8), area_m2, S, k)
+        if not polygon and len(parts) > 1:
+            # A construction the drawing puts in two places is still one construction, and the
+            # only thing missing is a single outline around both. Trace each piece on its own
+            # and offer them as parts: every part is a shape the assessor can see, and including
+            # all of them gives the construction's area on this sheet. 0701's Container slab is
+            # 17,689 m2 in two pieces, and withholding it hid the biggest thing on the sheet.
+            piece_entries, remainder_m2, remainder_n = [], 0.0, 0
+            for part_mask, part_area in sorted(parts, key=lambda p: -p[1]):
+                if part_area < layer_surfaces.MIN_REGION_M2:
+                    remainder_m2 += part_area
+                    remainder_n += 1
+                    continue
+                part_poly, _part_holes, _part_fid = hatch_legend_raster._outline_for(
+                    part_mask.astype(np.uint8), part_area, S, k)
+                if not part_poly:
+                    remainder_m2 += part_area
+                    remainder_n += 1
+                    continue
+                piece_entries.append((part_area, part_poly))
+            if piece_entries:
+                offered_total = sum(area for area, _poly in piece_entries)
+                for part_index, (part_area, part_poly) in enumerate(piece_entries, 1):
+                    part = dict(entry)
+                    part["area_m2"] = round(part_area, 1)
+                    part["polygon_pts"] = part_poly
+                    part["components"] = 1
+                    part["retention"] = round(retention, 3)
+                    part["part_index"] = part_index
+                    part["part_count"] = len(piece_entries)
+                    part["part_total_m2"] = round(offered_total, 1)
+                    part["remainder_m2"] = round(remainder_m2, 1)
+                    part["remainder_n"] = remainder_n
+                    offered.append(part)
+                continue
+
         if not polygon:
             # An offer the assessor cannot see on the sheet is not an offer. The area may well
             # be right, but a candidate with no outline cannot be reviewed, included, or drawn

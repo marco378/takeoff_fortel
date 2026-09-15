@@ -11,7 +11,13 @@ import fitz
 DISPLAY_W, DISPLAY_H = 1190, 842
 
 
-def build(path, rotation=0):
+def build(path, rotation=0, split=False):
+    """``split`` draws the container construction in two separated blocks.
+
+    That is 0701's Container slab: one construction, two pieces, and no single outline that
+    reproduces their combined area. The gap is far wider than the closing radius, so the two
+    stay apart on purpose rather than by luck.
+    """
     doc = fitz.open()
     if rotation in (90, 270):
         page = doc.new_page(width=DISPLAY_H, height=DISPLAY_W)
@@ -45,8 +51,13 @@ def build(path, rotation=0):
         text((960, y + 3), body, 6)
 
     # Two constructions, well clear of the legend column so nothing reads as a swatch.
-    for (x0, y0, x1, y1), colour, period in (((100, 200, 380, 620), (0, 1, 1), 16),
-                                             ((420, 200, 700, 620), (1, 0.75, 0), 16)):
+    blocks = [((100, 200, 380, 620), (0, 1, 1), 16)]
+    if split:
+        blocks += [((420, 200, 560, 620), (1, 0.75, 0), 16),
+                   ((640, 200, 780, 620), (1, 0.75, 0), 16)]
+    else:
+        blocks += [((420, 200, 700, 620), (1, 0.75, 0), 16)]
+    for (x0, y0, x1, y1), colour, period in blocks:
         offset = x0 - (y1 - y0)
         while offset < x1:
             ax = max(offset, x0)

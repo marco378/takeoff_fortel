@@ -2290,14 +2290,35 @@ def _offer_surface_finishes(pdf, flags, S=2.0):
             continue
         depth = (f"{row['depth_mm']} mm thick" if row["depth_mm"]
                  else "no thickness stated in its legend row")
+        # A construction the sheet draws in separate places is offered piece by piece, because
+        # no single outline encloses both and a number without a shape beside it is not an
+        # offer. Each part is its own region so the assessor can see and include it; the reason
+        # says what the parts add up to, so including all of them is an informed choice and not
+        # an arithmetic exercise.
+        part_index, part_count = row.get("part_index"), row.get("part_count")
+        part_label = f" (part {part_index} of {part_count})" if part_count else ""
+        if part_count:
+            remainder_n = row.get("remainder_n") or 0
+            part_note = (
+                f" This construction is drawn in {part_count} separate places on this sheet and "
+                "is offered one place at a time; "
+                + ("both" if part_count == 2 else f"all {part_count}")
+                + f" together come to {row['part_total_m2']:,.0f} m² on this sheet."
+                + (f" A further {remainder_n} fragment(s) totalling "
+                   f"{row['remainder_m2']:,.0f} m² were too small or too broken to offer a shape "
+                   "for, and are not included in that figure." if remainder_n else ""))
+        else:
+            part_note = ""
         regions.append({
-            "region_id": f"surface-finish-{index}",
+            "region_id": (f"surface-finish-{row.get('row_ordinal', index)}-part-{part_index}"
+                          if part_count
+                          else f"surface-finish-{row.get('row_ordinal', index)}"),
             "area_m2": row["area_m2"],
             "polygon_pts": row["polygon_pts"],
             "included": False,
             "candidate": True,
             "source": "surface_finishes_legend",
-            "surface_name": row["name"],
+            "surface_name": row["name"] + part_label,
             "depth_mm": row["depth_mm"],
             "detail_ref": row["detail_ref"],
             # The edge uncertainty is KNOWN, not guessed: closing at 1.5x the hatch's own
@@ -2306,21 +2327,45 @@ def _offer_surface_finishes(pdf, flags, S=2.0):
             "candidate_reason": (
                 f"named in this sheet's own legend as \u201c{row['name']}\u201d, {depth}, built to "
                 f"{row['detail_ref'] or 'no detail reference'}. Its ground is the hatch drawn in "
-                f"that legend row's colour: {row['marks']:,} strokes, closed into "
-                f"{row['components']} region(s). The outline is RECONSTRUCTED from those strokes, "
+                + (f"that legend row's colour — {row['marks']:,} strokes across the whole "
+                   "construction, of which this part is one closed piece. "
+                   if part_count else
+                   f"that legend row's colour: {row['marks']:,} strokes, closed into "
+                   f"{row['components']} region(s). ")
+                + "The outline is RECONSTRUCTED from those strokes, "
                 f"not an outline the engineer drew, so its edges are uncertain by up to "
                 f"{row['edge_uncertainty_m']:.1f} m — one and a half of this hatch's own spacings. "
                 f"The {row['area_m2']:,.0f} m² also converts through this sheet's scale, which is "
                 "not verified. Nothing on the sheet says which construction is being priced, so "
-                "none is counted until you include it."),
+                "none is counted until you include it." + part_note),
         })
     if regions:
-        named = ", ".join(f"{r['surface_name']} ({r['area_m2']:,.0f} m²)" for r in regions[:6])
+        # Count CONSTRUCTIONS, not regions. A construction drawn in two places is offered as two
+        # regions and is still one construction: saying "6 constructions" over five of them, and
+        # listing the same construction twice as "(part 1 of 2)" and "(part 2 of 2)", tells the
+        # assessor to pick one and stop. That is the same fault 616f67b fixed -- a flag on the
+        # screen pointing the opposite way to the offer beneath it.
+        grouped = {}
+        for region in regions:
+            grouped.setdefault(region["surface_name"].split(" (part ")[0], []).append(region)
+        described = []
+        for surface_name, group in grouped.items():
+            total = sum(r["area_m2"] for r in group)
+            if len(group) == 1:
+                described.append(f"{surface_name} ({total:,.0f} m²)")
+            else:
+                pieces = " + ".join(f"{r['area_m2']:,.0f}" for r in group)
+                described.append(f"{surface_name} ({total:,.0f} m² in {len(group)} parts: "
+                                 f"{pieces})")
+        # No silent truncation: the parts are exactly what pushes this list past a fixed cap.
+        shown, rest = described[:6], len(described) - 6
+        named = ", ".join(shown) + (f", and {rest} more" if rest > 0 else "")
         flags.append(
-            f"{len(regions)} CONSTRUCTIONS OFFERED FROM THE SURFACE FINISHES LEGEND, NONE "
+            f"{len(grouped)} CONSTRUCTIONS OFFERED FROM THE SURFACE FINISHES LEGEND, NONE "
             f"COUNTED — this sheet names its own surfacing and draws each one in its legend "
             f"row's hatch colour: {named}. Each carries the thickness its legend row states. "
-            "Include the one you are pricing. This sheet is one of a set, so each area is "
+            "Include the one you are pricing — every part of it, where it is offered in parts. "
+            "This sheet is one of a set, so each area is "
             "this sheet's portion of that construction, not the project total.")
     if undrawn:
         flags.append("ALSO IN THE LEGEND, NOT DRAWN HERE — " + "; ".join(undrawn[:6])
