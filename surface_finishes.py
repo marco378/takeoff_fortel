@@ -451,6 +451,21 @@ def _candidates(page, k, S, drawings):
                     remainder_n += 1
                     continue
                 piece_entries.append((part_area, part_poly))
+            if len(piece_entries) == 1:
+                # One piece cleared the floor and the rest did not. It is not "part 1 of 1" --
+                # that phrasing promises a part 2 the assessor will never be offered, and the
+                # note reads "drawn in 1 separate places". Offer it as the construction, and
+                # say in the reason what was left out so the number is not silently short.
+                only_area, only_poly = piece_entries[0]
+                entry["area_m2"] = round(only_area, 1)
+                entry["polygon_pts"] = only_poly
+                entry["components"] = 1
+                entry["retention"] = round(retention, 3)
+                if remainder_n:
+                    entry["short_by_m2"] = round(remainder_m2, 1)
+                    entry["short_by_n"] = remainder_n
+                offered.append(entry)
+                continue
             if piece_entries:
                 offered_total = sum(area for area, _poly in piece_entries)
                 for part_index, (part_area, part_poly) in enumerate(piece_entries, 1):

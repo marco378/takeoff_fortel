@@ -2214,6 +2214,35 @@ def review_yard_regions(job_id):
             return jsonify({"error": "at least one Yard region must be kept; use Adjust to replace it"}), 400
         area_m2 = round(sum(float(region.get("area_m2") or 0) for region in kept), 1)
 
+        # Roll the kept regions up BY CONSTRUCTION, not into one lump.
+        #
+        # Aryan, 15 Sep: each construction gets its own quantity and its own rate build-up,
+        # and the constructions are summed only for a combined total at the end. Multiple
+        # disconnected regions of ONE construction roll up into that construction's quantity.
+        # The zone still carries the total, so nothing downstream that reads area_m2 changes;
+        # the breakdown rides alongside it for pricing and for the quote to render lines from.
+        # Depth is the legend's own thickness for that construction, which is what makes a
+        # per-construction rate possible at all -- costing.rate_buildup prices concrete as
+        # depth_mm / 1000 * conc_rate.
+        constructions = []
+        for region in kept:
+            name = str(region.get("surface_name") or "").split(" (part ")[0].strip()
+            if not name:
+                continue
+            existing = next((c for c in constructions if c["name"] == name), None)
+            if existing is None:
+                constructions.append({
+                    "name": name,
+                    "depth_mm": region.get("depth_mm"),
+                    "detail_ref": region.get("detail_ref"),
+                    "area_m2": round(float(region.get("area_m2") or 0), 1),
+                    "region_ids": [region.get("region_id")],
+                })
+            else:
+                existing["area_m2"] = round(
+                    existing["area_m2"] + float(region.get("area_m2") or 0), 1)
+                existing["region_ids"].append(region.get("region_id"))
+
         zones = job.get("zones") if isinstance(job.get("zones"), list) else result.get("zones")
         zones = [dict(zone) for zone in (zones or [])]
         for zone in zones:
@@ -2221,6 +2250,8 @@ def review_yard_regions(job_id):
                 zone["area_m2"] = area_m2
                 zone["needs_assessor"] = False
                 zone["region_count"] = len(kept)
+                if constructions:
+                    zone["constructions"] = constructions
         zones_total = round(sum(float(zone.get("area_m2") or 0) for zone in zones), 1)
         # An UNMEASURED sheet that an assessor has now identified IS measured.
         #
@@ -2249,16 +2280,50 @@ def review_yard_regions(job_id):
         if from_boundary:
             old_flags = [flag for flag in old_flags
                          if "EXACT BOUNDARIES OFFERED" not in str(flag)]
+        # Same for the Surface Finishes offer: "N CONSTRUCTIONS OFFERED ... NONE COUNTED" and
+        # "no area emitted -- include one of the N candidates" both describe the screen BEFORE
+        # this decision. Left in, they sit above a counted area telling the assessor nothing
+        # is counted and to go and include something. That is the fault 616f67b fixed, one
+        # click later in the same flow.
+        #
+        # This predicate is applied to BOTH flag lists. result["flags"] and job["flags"] are
+        # assembled separately in this handler and the screen renders job["flags"], so
+        # filtering only one leaves the stale text exactly where the assessor reads it.
+        def _stale_after_review(flag):
+            text = str(flag)
+            return ("CONSTRUCTIONS OFFERED FROM THE SURFACE FINISHES LEGEND" in text
+                    or text.startswith("takeoff_unmarked: no area emitted"))
+
+        old_flags = [flag for flag in old_flags if not _stale_after_review(flag)]
         noun = "engineer-drawn closed boundaries" if from_boundary else "same-tint regions"
         summary = (f"assessor Yard-region review: kept {len(kept)} of {len(ordered_regions)} "
                    f"{noun}; final Yard {area_m2:,.1f} m²")
-        old_flags.append(summary)
+        # Every flag this review produces goes on BOTH lists. result["flags"] and
+        # job["flags"] are assembled separately here, and job["flags"] was only ever getting
+        # the one-line summary -- so the UNMEASURED -> MEASURED_UNVERIFIED explanation never
+        # reached the screen the assessor actually reads. Build once, append to both.
+        review_flags = [summary]
+        if constructions:
+            # Show the breakdown the quote will be built from, so the assessor can see the
+            # per-construction quantities before anything is priced rather than after.
+            breakdown = "; ".join(
+                f"{c['name']} — {c['area_m2']:,.0f} m²"
+                + (f" at {c['depth_mm']} mm" if c.get("depth_mm") else "")
+                + (f" ({len(c['region_ids'])} regions)" if len(c["region_ids"]) > 1 else "")
+                for c in constructions)
+            review_flags.append(
+                f"INCLUDED BY CONSTRUCTION — {breakdown}. Total {area_m2:,.1f} m². Each "
+                "construction keeps its own quantity and its own thickness; the total is the "
+                "sum of them, not a single slab at one depth.")
+        old_flags.extend(review_flags)
         if promoted_state:
-            old_flags.append(
+            promotion_flag = (
                 f"UNMEASURED → {promoted_state}: an assessor identified the priced surface "
                 f"from the sheet's own geometry, so this area is measured, not traced. The "
                 f"scale behind it is still unverified — approval remains blocked until "
                 f"Confirm scale + extent.")
+            old_flags.append(promotion_flag)
+            review_flags.append(promotion_flag)
         if promoted_state:
             result["measurement_state"] = promoted_state
         result.update({
@@ -2275,8 +2340,9 @@ def review_yard_regions(job_id):
         if costing_result:
             result["costing"] = costing_result
         job_flags = [flag for flag in (job.get("flags") or [])
-                     if not str(flag).startswith("YARD REGION REVIEW REQUIRED:")]
-        job_flags.append(summary)
+                     if not str(flag).startswith("YARD REGION REVIEW REQUIRED:")
+                     and not _stale_after_review(flag)]
+        job_flags.extend(review_flags)
         if promoted_state:
             job["measurement_state"] = promoted_state
         job.update({

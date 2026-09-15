@@ -90,8 +90,8 @@ MODULES = [
 # written alongside: a number that looked reasonable and was never checked against the case
 # it governs.
 CLIENT_DRAWINGS = (Path(__file__).resolve().parent / "drawings").is_dir()
-EXPECTED_CHECKS = 1043 if CLIENT_DRAWINGS else 842
-MIN_CHECKS = 1030 if CLIENT_DRAWINGS else 829
+EXPECTED_CHECKS = 1047 if CLIENT_DRAWINGS else 846
+MIN_CHECKS = 1034 if CLIENT_DRAWINGS else 833
 
 broken = []
 for _name in MODULES:

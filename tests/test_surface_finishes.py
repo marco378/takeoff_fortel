@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 import fitz
+import cv2
 import numpy as np
 
 import hatch_legend_raster
@@ -228,8 +229,6 @@ ck("the unsplit sheet is untouched by the multi-part path — no row gains parts
    bool(_single) and not any(r.get("part_count") for r in _single),
    {"offered": len(_single)})
 
-import shutil as _shutil
-_shutil.rmtree(_DIR, ignore_errors=True)
 
 # Aryan, 15 Sep: the markup must follow the actual boundary, not the individual hatch strokes.
 # The outline is only located to within the closing radius, but it was simplified at
@@ -275,3 +274,76 @@ ck("a thin strip is not destroyed by an oversized tolerance",
 ck("the simplification tolerance is tied to the hatch's own radius, not the perimeter",
    0 < surface_finishes.OUTLINE_EPS_OF_RADIUS <= 0.5,
    {"OUTLINE_EPS_OF_RADIUS": surface_finishes.OUTLINE_EPS_OF_RADIUS})
+
+# A construction drawn in pieces where only ONE clears the floor is not "part 1 of 1". That
+# phrasing promises a part 2 that will never be offered, and the note read "drawn in 1 separate
+# places". Not reachable on 0700/0701, so it is built here rather than waiting for a client
+# sheet to expose it.
+class _OnePieceOnly:
+    """_outline_for that refuses the whole row but accepts a single piece."""
+    def __init__(self, real, whole_mask):
+        self._real, self._whole = real, whole_mask
+    def __call__(self, mask, area_m2, S, k, min_eps_px=None):
+        if mask.shape == self._whole.shape and int(mask.sum()) == int(self._whole.sum()):
+            return None, [], 0.99
+        return self._real(mask, area_m2, S, k, min_eps_px=min_eps_px)
+
+
+_BIG = 260.0 / ((_K / _S) ** 2)            # comfortably over MIN_REGION_M2
+_SMALL = 60.0 / ((_K / _S) ** 2)           # under it
+_PIECES = np.zeros((300, 900), np.uint8)
+_side = int(_BIG ** 0.5)
+_PIECES[40:40 + _side, 40:40 + _side] = 1
+_sside = int(_SMALL ** 0.5)
+_PIECES[40:40 + _sside, 700:700 + _sside] = 1
+_whole_kept, _whole_areas, _whole_parts = surface_finishes._row_regions(
+    _PIECES, _PIECES, _S, _K)
+ck("the fixture really is two pieces, one over the floor and one under",
+   len(_whole_parts) == 2
+   and max(a for _m, a in _whole_parts) > layer_surfaces.MIN_REGION_M2
+   and min(a for _m, a in _whole_parts) < layer_surfaces.MIN_REGION_M2,
+   {"areas": [round(a, 1) for _m, a in _whole_parts]})
+
+_saved = hatch_legend_raster._outline_for
+try:
+    hatch_legend_raster._outline_for = _OnePieceOnly(_saved, _whole_kept.astype(np.uint8))
+    _one_poly, _oh, _ofid = hatch_legend_raster._outline_for(
+        _whole_kept.astype(np.uint8), sum(_whole_areas), _S, _K)
+    _big_mask = max(_whole_parts, key=lambda p: p[1])[0]
+    _big_poly, _bh, _bfid = hatch_legend_raster._outline_for(
+        _big_mask.astype(np.uint8), max(a for _m, a in _whole_parts), _S, _K)
+finally:
+    hatch_legend_raster._outline_for = _saved
+
+ck("the whole row refuses an outline while its largest piece traces one",
+   _one_poly is None and bool(_big_poly),
+   {"whole": _one_poly, "piece_pts": len(_big_poly or [])})
+# Drive the real offer with a landmine in place: any mask holding more than one component
+# refuses, so the whole row cannot trace but a single piece can. The entry must come back as
+# ONE construction, never a lone "part 1 of 1".
+_saved2 = hatch_legend_raster._outline_for
+_one_doc = fitz.open(str(_SHEETS[0]))
+try:
+    def _only_single(mask, area_m2, S, k, min_eps_px=None, _real=_saved2):
+        count, _lab, _st, _ct = cv2.connectedComponentsWithStats(
+            (np.asarray(mask) > 0).astype(np.uint8), 8)
+        if count - 1 > 1:
+            return None, [], 0.99
+        return _real(mask, area_m2, S, k, min_eps_px=min_eps_px)
+
+    hatch_legend_raster._outline_for = _only_single
+    _forced = surface_finishes.candidates(_one_doc[0], _K, S=_S)
+finally:
+    hatch_legend_raster._outline_for = _saved2
+    _one_doc.close()
+
+_forced_rows = [r for r in _forced["rows"] if r["area_m2"] is not None]
+ck("with only single pieces traceable, every offer is a whole construction",
+   bool(_forced_rows) and not any(r.get("part_count") for r in _forced_rows),
+   {"offered": len(_forced_rows),
+    "part_counts": [r.get("part_count") for r in _forced_rows]})
+ck("...and none is labelled as a part",
+   not any("(part " in (r.get("name") or "") for r in _forced_rows))
+
+import shutil as _shutil
+_shutil.rmtree(_DIR, ignore_errors=True)

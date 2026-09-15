@@ -63,7 +63,6 @@ import fitz
 import numpy as np
 from scipy import ndimage as ndi
 
-sys.path.insert(0, "/Users/jas/fortel-takeoff-repo")
 import takeoff_unmarked as T   # noqa: E402  (read-only helpers)
 import sanity                  # noqa: E402
 

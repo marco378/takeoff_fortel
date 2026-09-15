@@ -2307,6 +2307,15 @@ def _offer_surface_finishes(pdf, flags, S=2.0):
                 + (f" A further {remainder_n} fragment(s) totalling "
                    f"{row['remainder_m2']:,.0f} m² were too small or too broken to offer a shape "
                    "for, and are not included in that figure." if remainder_n else ""))
+        elif row.get("short_by_n"):
+            # The construction is drawn in pieces, but only one of them is big enough or clean
+            # enough to offer. Saying nothing here would present a partial quantity as if it
+            # were the whole construction.
+            part_note = (
+                f" This construction is also drawn in {row['short_by_n']} smaller piece(s) "
+                f"totalling {row['short_by_m2']:,.0f} m² on this sheet, which were too small or "
+                "too broken to put a shape around. They are NOT in the figure above, so treat "
+                "it as this construction's largest piece rather than its total here.")
         else:
             part_note = ""
         regions.append({
