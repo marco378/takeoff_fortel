@@ -287,6 +287,29 @@ def _construction_brief_spec(category, entry, zone_brief_spec, parent):
         return zone_brief_spec
 
 
+# Fields the extractor marks when the DRAWING itself gave more than one answer. The note it
+# writes says "nothing assumed, nothing priced" -- and until 16 Sep 2026 the price contradicted
+# it. PLP Warwick Site A quoted 2,222.5 m2 at 190 mm for GBP 100,188 while its own flag read
+# "SPEC CONFLICT - slab thickness: the drawing states 180 mm... and 200 mm... and 150 mm". The
+# 190 came from DEFAULT_SPEC. The sheet does say 190 -- under "Ground Floor Slab Construction
+# (By Others)", which is not Fortel's scope -- so the number was doubly not ours to use.
+_DRAWING_CONFLICT_SOURCES = {"drawing_states_more_than_one"}
+
+
+def depth_unresolved_on_drawing(brief_spec) -> bool:
+    """True when the sheet states several slab thicknesses and none was chosen.
+
+    This is the same rule the Rail Crossing already follows (``aba682a``): a thickness nobody
+    stated for THIS surface must not become a rate. There it was a legend row with no
+    thickness at all; here it is a sheet with several, which is the same absence of an answer.
+    A single stated thickness, or an assessor's choice, is unaffected.
+    """
+    field = ((brief_spec or {}).get("fields") or {}).get("depth_mm")
+    if not isinstance(field, dict) or field.get("value") is not None:
+        return False
+    return str(field.get("source") or "") in _DRAWING_CONFLICT_SOURCES
+
+
 def _build_up_note(spec: dict, brief_spec: dict | None) -> str:
     """Fortel's standard build-up disclosure, minus the part of it that is not true.
 
@@ -722,6 +745,18 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             for field in (brief_spec.get("fields") or {}).values()
             if isinstance(field, dict)
         )
+        # The sheet gave several thicknesses and none was chosen for this surface, so there is
+        # no thickness to price at. Carry the quantity, leave the rate for the assessor. This
+        # is the Rail Crossing rule applied to the whole-sheet path; without it the default
+        # 190 mm silently became the price while the flag beside it said nothing was assumed.
+        if depth_unresolved_on_drawing(brief_spec):
+            rate = None
+            # ...and the DESCRIPTION must not keep quoting the default either. A row reading
+            # "190mm. th Concrete Slabs" beside a blank rate is the same false statement in a
+            # different column, which is exactly what the Rail Crossing row used to do.
+            spec = dict(spec or {}, depth_mm=None)
+            costing = dict(costing or {}, rate=None, total_gbp=None,
+                           spec=dict((costing or {}).get("spec") or {}, depth_mm=None))
         boq_scope = str(unit.get("boq_scope") or "main")
         key = (section, _spec_key(costing, brief_spec), rate,
                group_provisional, boq_scope, unit.get("area_element_id"),
@@ -1244,6 +1279,11 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             # _fortel_concrete_description already omits the thickness when there is none, but
             # a row reading "Concrete Slabs" beside a blank rate does not say WHY it is blank.
             slab_desc += " — thickness not stated on the drawing, rate for assessor"
+        elif depth_unresolved_on_drawing(group["brief_spec"]):
+            # Same requirement, different reason: here the sheet states SEVERAL thicknesses,
+            # each for its own surface, and none has been chosen for this one.
+            slab_desc += (" — the drawing states more than one thickness and none is "
+                          "confirmed for this surface, rate for assessor")
         # Name the details that ARE from the drawing. "NO DETAILS PROVIDED" on a row whose
         # thickness was read off the legend and cited is simply untrue, and the client reads it.
         group_reason = provisional_reason_for(group["brief_spec"]) if group["assumed"] else ""

@@ -213,8 +213,18 @@ def build_brief_spec(slab_type=None, *, effective_spec=None, confirmed=None,
     for key, note in (field_notes or {}).items():
         if key not in applicable or not isinstance(note, dict):
             continue
-        if result["fields"][key].get("value") is not None:
-            continue
+        field = result["fields"][key]
+        if field.get("value") is not None:
+            # A note derived from the DRAWING outranks a value that only came from our own
+            # defaults. On PLP Warwick the extractor wrote "STATED ON THE DRAWING as 150, 180,
+            # 200 mm ... nothing assumed, nothing priced" and this guard threw it away, because
+            # spec_with_defaults had already put 190 in the field: the checklist then read
+            # "Thickness of slab: 190, assumed_default" and 2,222 m2 was priced at a thickness
+            # the sheet never gave for that surface. A CONFIRMED value still wins, as it must.
+            if str(field.get("source") or "") != "assumed_default":
+                continue
+            field["value"] = None
+            field.pop("evidence", None)
         result["fields"][key].update({
             "source": str(note.get("source") or "drawing_text_unreadable"),
             "note": str(note.get("note") or "Drawing detail detected; assessor entry required"),

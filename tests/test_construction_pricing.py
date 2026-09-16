@@ -578,3 +578,65 @@ ck("...which defaults to the main slab",
    '<option value="">＋ Region → Main slab</option>' in _portal_src)
 ck("...and a region sent to a named area reuses that area's element id",
    "elementId: target.elementId" in _portal_src)
+
+
+# ── A sheet that states several thicknesses prices none of them ──────────────────────────
+# PLP Warwick Site A, on the 16 Sep handover call: the quotation priced 2,222.5 m² at 190 mm
+# for £100,188.08 while the job's own flag read "SPEC CONFLICT — slab thickness: the drawing
+# states 180 mm… and 200 mm… and 150 mm… nothing is assumed for pricing". The extractor was
+# telling the truth and the price was contradicting it: 190 came from DEFAULT_SPEC. The sheet
+# does contain 190, under "Ground Floor Slab Construction (By Others)" — not Fortel's scope —
+# so it was doubly not ours to charge for. Same rule as the Rail Crossing: measured, not priced.
+from slab_spec import build_brief_spec as _build_brief_spec
+from quotation import depth_unresolved_on_drawing as _depth_unresolved
+
+_CONFLICT_NOTES = {"depth_mm": {
+    "source": "drawing_states_more_than_one",
+    "note": "STATED ON THE DRAWING as 150, 180, 200 mm for different surfaces"}}
+
+
+def _sheet_job(field_notes, area_m2=2222.5):
+    brief = _build_brief_spec("external_yard", field_notes=field_notes or {})
+    return {
+        "file": "plp_site_a.pdf", "pdf_path": "drawings/plp_site_a.pdf", "area_m2": area_m2,
+        "zones": [{"category": "external_yard", "area_m2": area_m2}],
+        "brief_spec": brief, "brief_specs": {"external_yard": brief},
+        "spec_field_notes": field_notes or {},
+        "costing": {"area_m2": area_m2, "rate": _ZONE_RATE,
+                    "total_gbp": round(area_m2 * _ZONE_RATE, 2), "spec": dict(_SPEC),
+                    "assumed": True, "breakdown": {}},
+    }
+
+
+ck("a thickness the drawing gives several answers for counts as unresolved",
+   _depth_unresolved(_build_brief_spec("external_yard", field_notes=_CONFLICT_NOTES)))
+ck("...while a sheet that simply never mentioned it does NOT change behaviour",
+   not _depth_unresolved(_build_brief_spec("external_yard")))
+
+_q_conflict = generate_quotation(_sheet_job(_CONFLICT_NOTES), project="PLP", client="F", ref="P1")
+_conflict_rows = _concrete_rows(_q_conflict)
+ck("a sheet stating several thicknesses is measured but NOT priced",
+   len(_conflict_rows) == 1 and _conflict_rows[0][2] is None,
+   f"-> {[r[2] for r in _conflict_rows]}")
+ck("...its quantity is still carried, because it WAS measured",
+   bool(_conflict_rows) and abs(float(_conflict_rows[0][1]) - 2222.5) < 0.01,
+   f"-> {_conflict_rows[0][1] if _conflict_rows else None}")
+ck("...its description does not quote the 190mm default beside the blank rate",
+   bool(_conflict_rows) and "190" not in _conflict_rows[0][0],
+   f"-> {_conflict_rows[0][0][:70] if _conflict_rows else None}")
+ck("...and it says why the rate is blank",
+   bool(_conflict_rows) and "more than one thickness" in _conflict_rows[0][0])
+ck("...so no money rests on a thickness nobody chose",
+   not any(isinstance(li.get("value"), (int, float)) and li["value"] > 0
+           for li in _q_conflict["line_items"] if li.get("line_role") == "concrete_slab"))
+
+# THE guard against over-reach: an ordinary sheet with no conflict must price exactly as it
+# did before. This rule may only ever remove a number the drawing never justified.
+_q_ordinary = generate_quotation(_sheet_job(None), project="PLP", client="F", ref="P2")
+_ordinary_rows = _concrete_rows(_q_ordinary)
+ck("a sheet with no thickness conflict still prices exactly as before",
+   len(_ordinary_rows) == 1 and _ordinary_rows[0][2] == _ZONE_RATE,
+   f"-> {[r[2] for r in _ordinary_rows]} vs {_ZONE_RATE}")
+ck("...and still states its thickness in the description",
+   bool(_ordinary_rows) and "200mm" in _ordinary_rows[0][0],
+   f"-> {_ordinary_rows[0][0][:60] if _ordinary_rows else None}")
