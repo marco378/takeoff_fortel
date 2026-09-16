@@ -521,3 +521,60 @@ ck("the plain-text quotation says the same thing",
    "thickness from the drawing" in _text_all and PROVISIONAL_LABEL not in _text_all)
 ck("a sheet with nothing extracted still reads NO DETAILS PROVIDED in HTML",
    PROVISIONAL_LABEL in _quotation_html(_qz_plain))
+
+
+# ── One named area, drawn in two places ──────────────────────────────────────────────────
+# Inderjit, 16 Sep handover call: he measures one footpath with + Area, then wants the SECOND
+# footpath inside that same footpath element rather than in the yard. + Region always went to
+# the main slab, so every footpath became its own element and got its own quotation line --
+# "all the footpaths needs to be together". Aryan approved a destination selector beside
+# + Region; it works by giving the second piece the SAME element id, and the grouping below is
+# what turns that into one priced line. If this stops summing, the selector is a lie.
+def _element_job(elements, area_m2=5000.0):
+    return {
+        "file": "warwick_sfp.pdf", "pdf_path": "drawings/warwick_sfp.pdf", "area_m2": area_m2,
+        "zones": [{"category": "external_yard", "area_m2": area_m2}],
+        "area_elements": elements,
+        "costing": {"area_m2": area_m2, "rate": _ZONE_RATE,
+                    "total_gbp": round(area_m2 * _ZONE_RATE, 2), "spec": dict(_SPEC),
+                    "assumed": True, "breakdown": {}},
+    }
+
+
+_two_pieces = [
+    {"element_id": "area-footpath", "name": "Footpath", "category": "external_yard",
+     "area_m2": 204.39, "boq_scope": "main"},
+    {"element_id": "area-footpath", "name": "Footpath", "category": "external_yard",
+     "area_m2": 198.0, "boq_scope": "main"},
+]
+_q_two = generate_quotation(_element_job(_two_pieces), project="W", client="F", ref="W1")
+_fp_rows = [li for li in _q_two["line_items"]
+            if li.get("line_role") == "concrete_slab" and "Footpath" in li["description"]]
+ck("two pieces of one named area make ONE priced line, not two",
+   len(_fp_rows) == 1, f"-> {len(_fp_rows)} rows")
+ck("...and that line carries the sum of both pieces",
+   bool(_fp_rows) and abs(float(_fp_rows[0]["qty"]) - 402.39) < 0.01,
+   f"-> {_fp_rows[0]['qty'] if _fp_rows else None}")
+
+# And two genuinely different areas must still stay apart — the selector must not merge things
+# the assessor kept separate.
+_two_areas = [
+    {"element_id": "area-fp-100", "name": "Footpath Unit 100", "category": "external_yard",
+     "area_m2": 204.39, "boq_scope": "main"},
+    {"element_id": "area-fp-200", "name": "Footpath Unit 200", "category": "external_yard",
+     "area_m2": 198.0, "boq_scope": "main"},
+]
+_q_sep = generate_quotation(_element_job(_two_areas), project="W", client="F", ref="W2")
+_sep_rows = [li for li in _q_sep["line_items"]
+             if li.get("line_role") == "concrete_slab" and "Footpath Unit" in li["description"]]
+ck("two DIFFERENT named areas still price as two separate lines",
+   len(_sep_rows) == 2, f"-> {[r['description'][:26] for r in _sep_rows]}")
+
+# The control itself.
+_portal_src = open("assessor_portal.html", encoding="utf-8").read()
+ck("the portal offers a destination for the next + Region outline",
+   'id="regionTarget"' in _portal_src)
+ck("...which defaults to the main slab",
+   '<option value="">＋ Region → Main slab</option>' in _portal_src)
+ck("...and a region sent to a named area reuses that area's element id",
+   "elementId: target.elementId" in _portal_src)

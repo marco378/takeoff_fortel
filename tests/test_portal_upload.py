@@ -1449,11 +1449,16 @@ try:
                "(mpp * snapScale) * 72 / 0.0254")))
         ck("...and it no longer calls the scale 'k' at the assessor",
            "Current k (m/px)" not in _portal_html_up)
-        # Inderjit traced a footpath with + Region and it landed in the main slab total.
+        # Inderjit traced a footpath with + Region and it landed in the main slab total. The
+        # buttons had to SAY so. Since 16 Sep + Region's destination is chosen rather than
+        # fixed -- Aryan approved the selector after Inderjit asked for "all the footpaths
+        # together" -- so the guard is now that each control names where the area goes, which
+        # is the same requirement against a control that can do two things.
         ck("the two trace buttons say what they do to the total",
-           "its area is ADDED to the main measured total" in _portal_html_up
+           "joins whatever is chosen in the box to its right" in _portal_html_up
            and "kept out of the main total" in _portal_html_up
-           and "use + Area instead" in _portal_html_up)
+           and 'id="regionTarget"' in _portal_html_up
+           and "＋ Region → Main slab" in _portal_html_up)
         ck("portal renders and captures per-zone quantities/classifications/specs",
            all(marker in _portal_html_up for marker in (
                "Measured zones", "ZONE REVIEW REQUIRED", "classifyZone(",

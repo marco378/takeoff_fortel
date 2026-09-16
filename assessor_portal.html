@@ -373,7 +373,10 @@ canvas{display:block;border:1px solid var(--border);background:transparent;box-s
       <button id="btnTrace" class="on" title="Click to add/move polygon vertices">✏️ Trace</button>
       <button id="btnUndo">↩ Undo</button>
       <button id="btnClear">🗑 Clear</button>
-      <button id="btnNewRegion" title="Another outline of the SAME surface — its area is ADDED to the main measured total, under the same BOQ section">＋ Region</button>
+      <button id="btnNewRegion" title="Another outline that joins whatever is chosen in the box to its right — the main slab by default, or one of your named areas">＋ Region</button>
+      <select id="regionTarget" title="Where the next ＋ Region outline goes. Pick a named area to add another piece to THAT area instead of the main slab." style="max-width:170px">
+        <option value="">＋ Region → Main slab</option>
+      </select>
       <button id="btnNewArea" class="area-element" title="A SEPARATE element with its own name, its own BOQ section and its own quotation line — kept out of the main total (use this for a footpath, duct slab or margin)">＋ Area</button>
       <button id="btnCutout" class="cutout" title="Draw a polygon over unwanted area to subtract it">✂️ Cut-out</button>
       <button id="btnChannel" class="channel" title="Draw a bending channel polyline; click again to finish">📏 Channel</button>
@@ -3372,6 +3375,9 @@ async function saveAreaElement(elementId) {
 }
 
 function renderAreaElementsEditor() {
+  // Every path that adds, renames or deletes a named area already calls this, so it is the
+  // one place the destination selector needs to be kept in step with the areas that exist.
+  refreshRegionTarget();
   const panel = document.getElementById('areaElementsEditor');
   if (!panel) return;
   const entries = areaElements.slice();
@@ -3452,14 +3458,57 @@ function stashActiveRegion() {
   activeAreaElement = null;
 }
 
+function namedAreaTargets() {
+  const seen = new Map();
+  areaElements.forEach(element => {
+    if (element && element.elementId && !seen.has(element.elementId)) {
+      seen.set(element.elementId, element);
+    }
+  });
+  return [...seen.values()];
+}
+
+function refreshRegionTarget() {
+  // Inderjit, 16 Sep: he measures one footpath with + Area, then wants the SECOND footpath in
+  // that same footpath element rather than in the yard. + Region always went to the main slab,
+  // so he had to make every footpath its own element and got a quotation line each. This is the
+  // destination selector Aryan approved: the pieces keep one element id, and the quotation
+  // already groups and sums by element id, so they arrive as one priced line.
+  const select = document.getElementById('regionTarget');
+  if (!select) return;
+  const previous = select.value;
+  const targets = namedAreaTargets();
+  select.innerHTML = '<option value="">＋ Region → Main slab</option>'
+    + targets.map(element =>
+        `<option value="${esc(element.elementId)}">＋ Region → ${esc(element.name)}</option>`).join('');
+  select.value = targets.some(element => element.elementId === previous) ? previous : '';
+  select.style.display = targets.length ? '' : 'none';
+}
+
 function startNewTraceRegion() {
   stashActiveRegion();
+  const select = document.getElementById('regionTarget');
+  const targetId = select ? select.value : '';
+  const target = targetId ? namedAreaTargets().find(el => el.elementId === targetId) : null;
+  if (target) {
+    // Same element id and name as the piece already drawn: the server measures each polygon
+    // on its own and the quotation sums them into that element's single line.
+    activeAreaElement = {
+      elementId: target.elementId, name: target.name,
+      category: target.category, boqScope: target.boqScope,
+    };
+    mode = 'trace';
+    document.getElementById('btnTrace').classList.add('on');
+    draw();
+    toast(`Previous outline kept — the next one joins "${target.name}", not the main slab.`);
+    return;
+  }
   draw();
   // Inderjit traced an L-shaped footpath with + Region on 4 Sep and it went into the main slab:
   // "when I did the plus region, it added this area to the [main] areas... but it should be added
   // in the main footpath really." The two buttons do different things to the total; say which.
-  toast('Previous outline kept — the next one ADDS to the main measured total. For a separately '
-        + 'priced element (footpath, margin, duct slab) use + Area instead.');
+  toast('Previous outline kept — the next one ADDS to the main measured total. To put it in one '
+        + 'of your named areas instead, choose it in the box beside ＋ Region.');
 }
 
 function startNewAreaElement() {
