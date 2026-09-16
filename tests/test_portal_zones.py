@@ -271,13 +271,23 @@ ck("...and any toast can be dismissed by clicking it", "el.onclick" in _toast)
 # The classification control was in the last column of a table wider than the panel holding
 # it, so on the 16 Sep call it sat off the right edge behind a horizontal scrollbar and took
 # forty seconds of spoken directions to reach. It now has its own full-width row.
-_zone_panel = _PORTAL_HTML[_PORTAL_HTML.index("function renderZoneSummary"):][:6000]
+# Slice to the NEXT function, not a fixed byte count: a 6000-char window silently fell short
+# of the markup once the function grew, and the checks below started reading empty text.
+_zone_start = _PORTAL_HTML.index("function renderZoneSummary")
+_zone_panel = _PORTAL_HTML[_zone_start:
+                           _PORTAL_HTML.index("\nasync function classifyZone", _zone_start)]
 ck("the Measured zones table no longer forces a horizontal scrollbar",
    "min-width:570px" not in _zone_panel)
 ck("the classify control has its own full-width row under the zone",
-   'colspan="6"' in _zone_panel and "CLASSIFY THIS ZONE" in _zone_panel)
+   'colspan="3"' in _zone_panel and "CLASSIFY THIS ZONE" in _zone_panel)
 ck("...and the zone's own row points down at it",
-   "below ↓" in _zone_panel)
+   "classify below ↓" in _zone_panel)
+# Six columns overflowed a 280px panel by 100px, which is what pushed the control off the
+# right edge in the first place. Three fit: kind and annotation count moved under the
+# subject, and the action column went away with the control.
+ck("...and the table is three columns, so it fits the panel it lives in",
+   _zone_panel.count('<th style="padding:5px;text-align:') == 3,
+   f"-> {_zone_panel.count(chr(60) + 'th style=')} th cells")
 
 # Inderjit asked for a recentre button after losing the drawing off-screen. One already
 # existed -- zoomFit centres as well as fits -- under an unlabelled ⊞ that nobody on the call

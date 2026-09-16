@@ -1635,7 +1635,7 @@ function renderZoneSummary(job) {
       // horizontal scrollbar, and it took forty seconds of "scroll right... scroll up" to
       // reach. A control you have to be told how to find is a blocked approval.
       classifyRow = `<tr style="background:#fff0ee">
-        <td colspan="6" style="padding:5px 8px 8px;border-bottom:1px solid #d9e0e8">
+        <td colspan="3" style="padding:5px 8px 8px;border-bottom:1px solid #d9e0e8">
           <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
             <span style="font-size:9px;font-weight:700;color:#c0392b">CLASSIFY THIS ZONE →</span>
             <select id="zoneClass-${zoneIndex}" style="max-width:150px;font-size:10px;padding:2px">
@@ -1651,22 +1651,26 @@ function renderZoneSummary(job) {
     const provenance = assumption
       ? `${assumptionBadge(assumption.label, assumption.basis)}${assumption.basis ? `<span class="assumption-basis">${esc(assumption.basis)}</span>` : ''}`
       : '';
+    // Three columns, not six. The panel is 280px wide and six columns overflowed it by 100px,
+    // so the whole table scrolled sideways -- which is how the classify control ended up
+    // somewhere an assessor had to be talked to over a call. Kind, provenance and annotation
+    // count are secondary: they go under the subject rather than into columns of their own.
+    const secondary = [zone.measurement_kind || null,
+                       count != null && Number.isFinite(count) ? `${count} annot${count === 1 ? '' : 's'}` : null]
+      .filter(Boolean).join(' · ');
     return `<tr class="${assumption?'assumption-item':''}" style="background:${category.toLowerCase()==='unclassified'?'#fff0ee':'#fff'}">
       <td style="padding:5px;border-bottom:1px solid #d9e0e8;font-weight:700;color:${category.toLowerCase()==='unclassified'?'#c0392b':'#13294b'}">${esc(labels[category]||category)}</td>
-      <td style="padding:5px;border-bottom:1px solid #d9e0e8">${esc(subjects.length?subjects.join(', '):'—')}</td>
-      <td style="padding:5px;border-bottom:1px solid #d9e0e8">${esc(zone.measurement_kind||'—')}${provenance}</td>
-      <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right;font-variant-numeric:tabular-nums">${esc(quantities.length?quantities.join(' · '):'—')}</td>
-      <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right">${count != null && Number.isFinite(count)?count:'—'}</td>
-      <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right">${classifyControl}</td>
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8;word-break:break-word">${esc(subjects.length?subjects.join(', '):'—')}${secondary?`<div style="font-weight:400;color:#5f6f82;font-size:9px;margin-top:1px">${esc(secondary)}</div>`:''}${provenance}</td>
+      <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right;font-variant-numeric:tabular-nums">${quantities.length?quantities.map(q=>`<div style="white-space:nowrap">${esc(q)}</div>`).join(''):'—'}${classifyControl==='—'?'':`<div style="font-size:9px;color:#c0392b;font-weight:700">classify below ↓</div>`}</td>
     </tr>${classifyRow}`;
   }).join('');
   return `${warning}<div style="margin:8px 0;border:1px solid #c8d3df;border-radius:6px;overflow-x:auto">
     <div style="padding:6px 8px;background:#eaf0f6;color:#13294b;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.4px">Measured zones</div>
     <table style="border-collapse:collapse;width:100%;font-size:10px;table-layout:auto">
       <thead><tr style="background:#f5f7fa;color:#5f6f82">
-        <th style="padding:5px;text-align:left">Zone</th><th style="padding:5px;text-align:left">Bluebeam subject</th>
-        <th style="padding:5px;text-align:left">Kind</th><th style="padding:5px;text-align:right">Quantity</th>
-        <th style="padding:5px;text-align:right">Annots</th><th style="padding:5px;text-align:right">Assessor action</th>
+        <th style="padding:5px;text-align:left">Zone</th>
+        <th style="padding:5px;text-align:left">Bluebeam subject</th>
+        <th style="padding:5px;text-align:right">Quantity</th>
       </tr></thead><tbody>${rows}</tbody>
     </table>
   </div>`;
