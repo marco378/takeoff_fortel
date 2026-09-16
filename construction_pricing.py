@@ -65,12 +65,21 @@ def results_constructions(result) -> list[tuple[dict, list[dict]]]:
 
 
 def spec_for_construction(base_spec: dict, construction: dict) -> tuple[dict, bool]:
-    """Return (spec at this construction's thickness, whether the depth was assumed)."""
+    """Return (spec at this construction's stated thickness, whether it was stated).
+
+    When the legend states no thickness for this construction, the depth is BLANKED, not
+    borrowed from the zone default. Borrowing produced the 16 Sep defect: Radlett's Rail
+    Crossing priced 292.5 m2 at the 190 mm default -- GBP 13,182.98 on the client document at
+    a thickness the drawing never gave -- directly beneath a specification block reading
+    "nothing assumed, nothing priced". Refuse instead of guess: the quantity is real and is
+    still shown, the rate is left for the assessor.
+    """
     spec = dict(base_spec or {})
     depth = construction.get("depth_mm")
     if isinstance(depth, (int, float)) and depth > 0:
         spec["depth_mm"] = depth
         return spec, False
+    spec["depth_mm"] = None
     return spec, True
 
 
@@ -86,13 +95,15 @@ def price_constructions(constructions, base_spec: dict) -> list[dict]:
         spec, depth_assumed = spec_for_construction(base_spec, construction)
         area_m2 = round(float(construction.get("area_m2") or 0), 1)
         rate, parts = None, {}
-        try:
-            rate, parts = rate_buildup(**{key: spec[key] for key in RATE_FIELDS})
-        except Exception:
-            rate, parts = None, {}
+        if not depth_assumed:
+            try:
+                rate, parts = rate_buildup(**{key: spec[key] for key in RATE_FIELDS})
+            except Exception:
+                rate, parts = None, {}
         priced.append({
             "name": str(construction.get("name") or "").strip() or "Construction",
             "depth_mm": spec.get("depth_mm"),
+            "depth_stated": not depth_assumed,
             "depth_assumed": depth_assumed,
             "detail_ref": construction.get("detail_ref"),
             "region_ids": list(construction.get("region_ids") or []),
@@ -117,13 +128,20 @@ def combined(priced) -> dict:
     show one that multiplies out to the real total instead of a single construction's.
     """
     area_m2 = round(sum(float(entry.get("area_m2") or 0) for entry in priced), 1)
-    fully_priced = priced and all(
-        isinstance(entry.get("total_gbp"), (int, float)) for entry in priced)
-    total_gbp = (round(sum(float(entry["total_gbp"]) for entry in priced), 2)
-                 if fully_priced else None)
-    rate = (round(total_gbp / area_m2, 2)
-            if fully_priced and area_m2 > 0 else None)
+    # A construction with no stated thickness is not priced, but it is still MEASURED. Summing
+    # only the priced ones and reporting the rest separately is what lets the portal card and
+    # the quotation agree on a sheet where some constructions price and some cannot -- the
+    # alternative, returning None for the whole job, left the card showing a stale blended
+    # total beside a quotation with a blank row.
+    have_rate = [e for e in priced if isinstance(e.get("total_gbp"), (int, float))]
+    no_rate = [e for e in priced if not isinstance(e.get("total_gbp"), (int, float))]
+    priced_m2 = round(sum(float(e.get("area_m2") or 0) for e in have_rate), 1)
+    total_gbp = round(sum(float(e["total_gbp"]) for e in have_rate), 2) if have_rate else None
+    rate = round(total_gbp / priced_m2, 2) if total_gbp is not None and priced_m2 > 0 else None
     return {"area_m2": area_m2, "total_gbp": total_gbp, "rate": rate,
+            "priced_area_m2": priced_m2,
+            "unpriced_area_m2": round(sum(float(e.get("area_m2") or 0) for e in no_rate), 1),
+            "unpriced_names": [e["name"] for e in no_rate],
             "constructions": priced}
 
 
@@ -132,11 +150,9 @@ def summary_line(entry: dict) -> str:
     text = f"{entry['name']} — {entry['area_m2']:,.1f} m²"
     if entry.get("depth_mm"):
         text += f" at {entry['depth_mm']:g} mm"
-        if entry.get("depth_assumed"):
-            text += " (thickness assumed from the zone specification, not stated for this "
-            text += "construction)"
     if isinstance(entry.get("rate"), (int, float)):
         text += f" @ £{entry['rate']:,.2f}/m² = £{entry['total_gbp']:,.2f}"
     else:
-        text += " — rate for assessor"
+        text += " — NO THICKNESS STATED for this construction on the sheet, so it is measured "
+        text += "but not priced; rate left for the assessor"
     return text

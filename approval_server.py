@@ -3188,10 +3188,14 @@ def _roll_up_constructions(costing: dict, result) -> dict:
         priced.extend(price_constructions(constructions, costing["spec"]))
     rolled = combined(priced)
     if rolled["total_gbp"] is None:
+        # Nothing on this sheet could be priced (no construction states a thickness). Leave the
+        # costing alone rather than zeroing it; the quotation shows the quantities with blank
+        # rates and the assessor supplies the build-up.
         return costing
     costing = dict(costing)
     costing["constructions"] = rolled["constructions"]
     costing["constructions_area_m2"] = rolled["area_m2"]
+    costing["constructions_unpriced_m2"] = rolled["unpriced_area_m2"]
     # The area this costing was called with may include zones with no breakdown (a Dock
     # alongside the Yard). Only the constructions' own share is re-priced; the remainder keeps
     # the single rate it already had rather than being silently repriced or dropped.
@@ -3203,11 +3207,22 @@ def _roll_up_constructions(costing: dict, result) -> dict:
     costing["total_gbp"] = total
     if costing.get("area_m2"):
         costing["rate"] = round(total / float(costing["area_m2"]), 2)
-    costing["constructions_note"] = (
-        "Priced as " + str(len(rolled["constructions"])) + " constructions at their own "
+    note = (
+        "Priced as " + str(len(rolled["constructions"]) - len(rolled["unpriced_names"]))
+        + " of " + str(len(rolled["constructions"])) + " constructions at their own "
         "thicknesses, summed; the rate shown is the average that total implies, not a rate "
         "anything was priced at."
     )
+    if rolled["unpriced_names"]:
+        # Say what is NOT in the total, on the card. A total that silently excludes a measured
+        # construction is the same fault as one that silently includes a guessed thickness.
+        note += (
+            " NOT IN THIS TOTAL: " + "; ".join(rolled["unpriced_names"])
+            + f" — {rolled['unpriced_area_m2']:,.1f} m² measured but not priced, because the "
+            "sheet states no thickness for it. The quotation shows the quantity with a blank "
+            "rate for the assessor."
+        )
+    costing["constructions_note"] = note
     return costing
 
 

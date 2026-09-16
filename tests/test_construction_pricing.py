@@ -18,7 +18,8 @@ from openpyxl import load_workbook as _load_workbook
 from tests import ck
 
 print("per-construction pricing")
-from quotation import generate_quotation, quotation_xlsx, quotation_text
+from quotation import (generate_quotation, quotation_xlsx, quotation_text,
+                       PROVISIONAL_LABEL)
 import construction_pricing as _cp
 
 _SPEC = {"depth_mm": 200, "conc_rate": 120.0, "conc_wastage": 0.05, "mesh": "A393",
@@ -105,10 +106,18 @@ _no_depth = [{"name": "HGV Slab Construction", "depth_mm": 375, "area_m2": 4000.
 _q_nd = generate_quotation(_job(_no_depth, area_m2=4900.0),
                            project="P", client="C", ref="R")
 _nd_priced = _cp.price_constructions(_no_depth, _SPEC)
-ck("a construction with no stated thickness falls back to the zone spec, not a neighbour",
-   _nd_priced[1]["depth_mm"] == _SPEC["depth_mm"] and _nd_priced[1]["depth_assumed"],
+# Until 16 Sep this fell back to the zone thickness and priced on it. That is what put
+# £13,182.98 on Radlett's client document at a thickness the drawing never gave. A construction
+# with no stated thickness now borrows nothing — not the zone's, and certainly not a
+# neighbouring construction's.
+ck("a construction with no stated thickness borrows no thickness at all",
+   _nd_priced[1]["depth_mm"] is None and _nd_priced[1]["depth_assumed"],
    f"-> {_nd_priced[1]['depth_mm']}")
-ck("the assumed thickness is declared on the quotation",
+ck("...so it is not priced", _nd_priced[1]["rate"] is None
+   and _nd_priced[1]["total_gbp"] is None)
+ck("...while the construction that DOES state one is priced normally",
+   isinstance(_nd_priced[0]["rate"], (int, float)) and _nd_priced[0]["depth_mm"] == 375)
+ck("the thickness gap is declared on the quotation",
    any("THICKNESS NOT STATED" in d for d in _q_nd["declarations"]),
    f"-> {[d for d in _q_nd['declarations'] if 'THICKNESS' in d]}")
 
@@ -275,3 +284,84 @@ ck("the zone-less card total matches the quotation's slab rows",
    f"-> {_rolled_z['total_gbp']}")
 ck("the zone-less card is not still the single blended default",
    _rolled_z["total_gbp"] != _zoneless_job(_RADLETT)["costing"]["total_gbp"])
+
+# 16 Sep: Aryan tested production and found two faults in one row. Both are checked here on
+# the shape the real Radlett sheet produces -- a legend that states a thickness for four
+# constructions and NONE for the fifth (Rail Crossing).
+#
+# Fault 1, the one he named: a row whose thickness WAS read off the legend, cited to the sheet
+# and marked confirmed still printed "PROVISIONAL — NO DETAILS PROVIDED" beside its price.
+# Fault 2, the one he did not name and which matters more: the construction with no stated
+# thickness was priced at the 190 mm default -- £13,182.98 on the client document at a
+# thickness the drawing never gave -- directly beneath its own specification block reading
+# "nothing assumed, nothing priced".
+_MIXED = [
+    {"name": "Intermodal Terminal HGV Slab Construction 200mm thick", "depth_mm": 200,
+     "area_m2": 2993.7, "region_ids": ["surface-finish-3"]},
+    {"name": "Intermodal Terminal Rail Crossing Slab Construction", "depth_mm": None,
+     "area_m2": 292.5, "region_ids": ["surface-finish-7"]},
+]
+_q_mixed_depth = generate_quotation(_zoneless_job(_MIXED, area_m2=3286.2),
+                                    project="Radlett", client="Fortel", ref="M")
+_rows_mixed = _concrete_rows(_q_mixed_depth)
+_rail = next((r for r in _rows_mixed if "Rail Crossing" in r[0]), None)
+_hgv = next((r for r in _rows_mixed if "HGV" in r[0]), None)
+
+ck("a construction with no stated thickness is NOT priced", _rail is not None and _rail[2] is None,
+   f"-> {_rail}")
+ck("...and its description does not invent a thickness",
+   _rail is not None and "mm. th" not in _rail[0], f"-> {_rail[0] if _rail else None}")
+ck("...and it says why the rate is blank",
+   _rail is not None and "thickness not stated" in _rail[0].lower())
+ck("...and its quantity is still carried, because it was measured",
+   _rail is not None and _rail[1] == 292.5)
+ck("...and the row asks the assessor for a rate", any(
+    li.get("assessor_rate_required") for li in _q_mixed_depth["line_items"]
+    if li.get("line_role") == "concrete_slab" and "Rail Crossing" in li["description"]))
+ck("a construction WITH a stated thickness still prices", _hgv is not None and _hgv[2] == 59.41,
+   f"-> {_hgv}")
+ck("the unpriced construction contributes no money to the quotation",
+   all(li.get("value") in (None, 0) for li in _q_mixed_depth["line_items"]
+       if "Rail Crossing" in li.get("description", "") and li.get("line_role") == "concrete_slab"))
+ck("the sheet declares the thickness gap as measured-but-not-priced",
+   any("MEASURED BUT NOT PRICED" in d for d in _q_mixed_depth["declarations"]),
+   f"-> {[d for d in _q_mixed_depth['declarations'] if 'THICKNESS' in d]}")
+
+_rolled_mixed = _roll(_zoneless_job(_MIXED, area_m2=3286.2)["costing"],
+                      _zoneless_job(_MIXED, area_m2=3286.2))
+ck("the portal card prices only what can be priced",
+   _rolled_mixed["total_gbp"] == round(2993.7 * 59.41, 2),
+   f"-> {_rolled_mixed['total_gbp']}")
+ck("...and names on the card what is NOT in that total",
+   "NOT IN THIS TOTAL" in _rolled_mixed["constructions_note"]
+   and "Rail Crossing" in _rolled_mixed["constructions_note"])
+ck("...and carries the unpriced quantity",
+   _rolled_mixed.get("constructions_unpriced_m2") == 292.5)
+
+# Fault 1: the reason must name what came off the drawing.
+_reason = next((li["provisional_reason"] for li in _q_mixed_depth["line_items"]
+                if li.get("line_role") == "concrete_slab" and "HGV" in li["description"]), "")
+ck("a row whose thickness came from the drawing does not claim NO DETAILS PROVIDED",
+   _reason != PROVISIONAL_LABEL, f"-> {_reason!r}")
+ck("...it names the thickness as from the drawing", "thickness from the drawing" in _reason)
+ck("...and still names mesh and mix as assumed",
+   "mesh" in _reason and "mix" in _reason and "assumed" in _reason)
+ck("...and the row remains provisional, because the price rests on assumed mesh and mix",
+   any(li["provisional"] for li in _q_mixed_depth["line_items"]
+       if li.get("line_role") == "concrete_slab" and "HGV" in li["description"]))
+
+# The gold guard for the label: nothing confirmed anywhere -> the original string, exactly.
+_q_plain_reason = next(
+    (li["provisional_reason"] for li in _qz_plain["line_items"]
+     if li.get("line_role") == "concrete_slab"), None)
+ck("a row with no extracted detail keeps the original wording byte-for-byte",
+   _q_plain_reason == PROVISIONAL_LABEL, f"-> {_q_plain_reason!r}")
+
+# And the gold guard for money: every construction stating its own thickness is untouched by
+# any of this — same rows, same rates, same subtotal as before the 16 Sep change.
+_q_all_stated = generate_quotation(_zoneless_job(_RADLETT), project="R", client="F", ref="A")
+ck("a sheet where every construction states a thickness still prices all of them",
+   all(r[2] is not None for r in _concrete_rows(_q_all_stated)),
+   f"-> {[r[2] for r in _concrete_rows(_q_all_stated)]}")
+ck("...and none of its rows carries the thickness-not-stated wording",
+   not any("thickness not stated" in r[0].lower() for r in _concrete_rows(_q_all_stated)))

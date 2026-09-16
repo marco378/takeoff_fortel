@@ -72,6 +72,49 @@ _SECTION_RANK = {section: index for index, section in enumerate(SECTION_ORDER)}
 _SECTION_RANK[UNCLASSIFIED_SECTION] = len(SECTION_ORDER)
 PROVISIONAL_LABEL = "PROVISIONAL — NO DETAILS PROVIDED"
 
+# Short names for the reason string. FIELD_LABELS is the assessor's checklist wording ("Type
+# and size of dowel bars- if joint details available…"); a priced row needs something that
+# fits on one line beside the money.
+_PROVISIONAL_FIELD_WORDS = {
+    "depth_mm": "thickness", "conc_mix": "mix", "mesh": "mesh",
+    "layers": "mesh layers", "bay_sizes": "bay sizes", "joint_details": "joint details",
+}
+# Sources that mean "this came off the drawing or from a human", as opposed to a default.
+_CONFIRMED_SOURCES = {"engineer_drawing", "engineer", "architect", "assessor"}
+
+
+def provisional_reason_for(brief_spec) -> str:
+    """Say WHICH details are missing, when some of them are not.
+
+    Aryan, 16 Sep: "the AI actually extracted the relevant details from the PDF, but those
+    details are then being stored/classified under the 'Provisional – no details provided'
+    flag." He was right. A Radlett row whose thickness was read off the legend, cited to the
+    sheet and marked confirmed still printed "NO DETAILS PROVIDED" beside its price. The row
+    IS provisional -- mesh and mix are assumed and the price rests on them -- but the reason
+    given for it was false.
+
+    A row with nothing confirmed keeps the original string exactly, so every job that had no
+    extracted detail reads as it always did.
+    """
+    fields = (brief_spec or {}).get("fields") or {}
+    confirmed, assumed = [], []
+    for key, field in fields.items():
+        if not isinstance(field, dict):
+            continue
+        word = _PROVISIONAL_FIELD_WORDS.get(key, key)
+        if field.get("value") is None:
+            assumed.append(word)
+        elif not field.get("provisional", True) and str(
+                field.get("source") or "") in _CONFIRMED_SOURCES:
+            confirmed.append(word)
+        else:
+            assumed.append(word)
+    if not confirmed:
+        return PROVISIONAL_LABEL
+    head = "PROVISIONAL — " + ", ".join(confirmed) + " from the drawing"
+    return head + ("; " + ", ".join(assumed) + " assumed" if assumed else "")
+
+
 # Flags that say we are not sure WHICH SURFACE we measured, as opposed to how big it is.
 # These used to reach the portal and stop there: on 8 Sep 2026 the Indurent Park quotation
 # exported £335,518.20 under the heading "EXTERNAL YARD SLABS", naming "Service Yard" four
@@ -173,16 +216,27 @@ def _fan_constructions(base_unit, constructions, parent, *, section_label,
         piece_flags = list(parent.get("flags") or [])
         if entry["depth_assumed"]:
             piece_flags.append(
-                f"THICKNESS NOT STATED FOR THIS CONSTRUCTION: {entry['name']} is priced at "
-                f"the drawing's general slab specification because the sheet's legend did not "
-                f"state a thickness for it. ASSUMED — confirm before issue."
+                f"THICKNESS NOT STATED FOR THIS CONSTRUCTION: the sheet's legend gives no "
+                f"thickness for {entry['name']}, so its "
+                f"{entry['area_m2']:,.1f} m² is MEASURED BUT NOT PRICED — the rate is left "
+                f"blank for the assessor rather than taken from the drawing's general slab "
+                f"specification. Supply the thickness (or the detail sheet it refers to) and "
+                f"it prices like the others."
             )
+        piece_declarations = []
+        if entry["depth_assumed"]:
+            # This needs its OWN declaration rather than the generic "ASSUMED" keyword filter
+            # the results loop applies: the text deliberately does not say ASSUMED any more
+            # (nothing is assumed — the rate is blank), so that filter would drop it and the
+            # client document would carry a blank rate with no reason given for it.
+            piece_declarations.append(piece_flags[-1])
         if c_index == 0 and len(priced) > 1:
-            piece["construction_declaration"] = (
+            piece_declarations.append(
                 f"{section_label} are priced as {len(priced)} separate constructions, each at "
                 "its own stated thickness with its own rate build-up; the combined area and "
                 "value are the sum of them, not one slab at a single depth."
             )
+        piece["construction_declarations"] = piece_declarations
         piece["flags"] = piece_flags
         pieces.append(piece)
     return pieces
@@ -688,8 +742,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         if area:
             accumulate_group(unit, costing, spec, rate, section, drawing, brief_spec, area,
                              assumed)
-        if unit.get("construction_declaration"):
-            declarations.append(unit["construction_declaration"])
+        for note in unit.get("construction_declarations") or []:
+            declarations.append(note)
 
         if assumed:
             if all(spec.get(key) is not None for key in ("depth_mm", "mesh")):
@@ -1139,13 +1193,20 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             if len(names) == 1 and names != {""}:
                 scope_prefix = f"{names.pop()} — " 
         slab_desc = scope_prefix + _fortel_concrete_description(spec)
+        if spec.get("depth_mm") is None and group.get("construction_of"):
+            # _fortel_concrete_description already omits the thickness when there is none, but
+            # a row reading "Concrete Slabs" beside a blank rate does not say WHY it is blank.
+            slab_desc += " — thickness not stated on the drawing, rate for assessor"
+        # Name the details that ARE from the drawing. "NO DETAILS PROVIDED" on a row whose
+        # thickness was read off the legend and cited is simply untrue, and the client reads it.
+        group_reason = provisional_reason_for(group["brief_spec"]) if group["assumed"] else ""
         line_items.append({
             **common, "description": slab_desc, "rate": group["rate"],
             "value": (round(area * group["rate"], 2)
                       if isinstance(group.get("rate"), (int, float)) else None),
             "assessor_rate_required": group.get("rate") is None,
             "provisional": group["assumed"],
-            "provisional_reason": PROVISIONAL_LABEL if group["assumed"] else "",
+            "provisional_reason": group_reason,
             "line_role": "concrete_slab",
         })
 
@@ -1165,7 +1226,7 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
                 **common, "description": description, "rate": None, "value": None,
                 "value_status": "Incl.", "assessor_rate_required": False,
                 "provisional": group["assumed"],
-                "provisional_reason": PROVISIONAL_LABEL if group["assumed"] else "",
+                "provisional_reason": group_reason,
                 "line_role": line_role,
             })
 

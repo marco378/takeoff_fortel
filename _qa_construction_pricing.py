@@ -12,7 +12,8 @@ import json, os, shutil, subprocess, sys, tempfile, time, urllib.request, urllib
 
 PORT = int(os.environ.get("QA_PORT", "8791"))
 BASE = f"http://127.0.0.1:{PORT}"
-SHEET = "drawings/inderjit_13sep/radlett_1_Surface_Finishes_Plan.pdf"
+SHEET = os.environ.get("QA_SHEET",
+    "drawings/inderjit_13sep/radlett_1_Surface_Finishes_Plan.pdf")
 SCRATCH = tempfile.mkdtemp(prefix="qa_construction_")
 SHOTS = os.path.join(SCRATCH, "shots")
 os.makedirs(SHOTS, exist_ok=True)
