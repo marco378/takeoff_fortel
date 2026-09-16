@@ -365,3 +365,159 @@ ck("a sheet where every construction states a thickness still prices all of them
    f"-> {[r[2] for r in _concrete_rows(_q_all_stated)]}")
 ck("...and none of its rows carries the thickness-not-stated wording",
    not any("thickness not stated" in r[0].lower() for r in _concrete_rows(_q_all_stated)))
+
+
+# ── The workbook's own arithmetic ────────────────────────────────────────────────────────
+# Aryan, 16 Sep 2026, after reading the exported sheet: "#DIV/0! errors in the 180mm section",
+# "formulas that appear to be using the DPM gauge where the steel rate should be used", "I
+# don't think the final quotation total should be treated as validated yet". He was right on
+# all three. The rate build-up block was a transcription of the reference workbook's LAYOUT at
+# fixed row numbers, written before one measured area could fan into several constructions, so
+# every cross-reference into the take-off pointed at whatever had since moved into that row.
+#
+# Nothing above this line could see it: openpyxl stores a formula as text, so a test that
+# reads cells passes straight through a division by an empty cell. These checks EVALUATE the
+# workbook (tests/_xlsx_eval.py).
+from tests._xlsx_eval import Sheet as _Sheet
+
+_wb_mixed = _load_workbook(_io.BytesIO(quotation_xlsx(_q_mixed_depth)))
+_ws_mixed = _wb_mixed[_wb_mixed.sheetnames[0]]
+_sheet_mixed = _Sheet(_ws_mixed)
+_errors_mixed = _sheet_mixed.error_cells()
+ck("every formula in the exported workbook evaluates — no #DIV/0! anywhere",
+   not _errors_mixed, f"-> {_errors_mixed}")
+
+_wb_all = _load_workbook(_io.BytesIO(quotation_xlsx(_q_all_stated)))
+_ws_all = _wb_all[_wb_all.sheetnames[0]]
+_sheet_all = _Sheet(_ws_all)
+_errors_all = _sheet_all.error_cells()
+ck("...and on the four-construction sheet too", not _errors_all, f"-> {_errors_all}")
+
+
+def _buildup_blocks(ws):
+    """(header row, TOTAL RATE/M2 row) for each rate build-up written into columns G-J."""
+    blocks, header = [], None
+    for row in range(1, ws.max_row + 1):
+        label = ws.cell(row, 7).value
+        if isinstance(label, str) and label.startswith("Rate build-up — "):
+            header = row
+        elif label == "TOTAL RATE/M2" and header:
+            blocks.append((header, row))
+            header = None
+    return blocks
+
+
+_blocks_all = _buildup_blocks(_ws_all)
+ck("one rate build-up is written per priced construction, not per BOQ section",
+   len(_blocks_all) == len(_concrete_rows(_q_all_stated)),
+   f"-> {len(_blocks_all)} blocks for {len(_concrete_rows(_q_all_stated))} priced rows")
+
+# THE invariant. The build-up is Fortel's working for the rate in column D; if the two
+# disagree the sheet contradicts itself, which is exactly why Aryan would not sign off the
+# total. Checked by evaluating the formulas, not by reading the numbers back.
+_rates_all = sorted(r for _d, _q, r in _concrete_rows(_q_all_stated))
+_totals_all = sorted(_sheet_all.value(f"H{total_row}") for _h, total_row in _blocks_all)
+ck("each build-up's TOTAL RATE/M2 equals the rate priced beside it",
+   _totals_all == _rates_all, f"-> {_totals_all} vs {_rates_all}")
+
+# The workbook says so itself, in a cell the assessor can see.
+_checks_all = [_sheet_all.value(f"H{header + 16}") for header, _t in _blocks_all]
+ck("...and the workbook's own agreement cell reads OK for every block",
+   set(_checks_all) == {"OK"}, f"-> {_checks_all}")
+
+# No component may be a negative cost: Total Trimming used to subtract a cell that had become
+# the Joints rate, pricing trimming at -£3.26/m2.
+_components_all = [_sheet_all.value(f"H{row}")
+                   for header, total in _blocks_all for row in range(header + 1, total)]
+ck("no component of any build-up is negative",
+   all(not isinstance(v, (int, float)) or v >= 0 for v in _components_all),
+   f"-> {[v for v in _components_all if isinstance(v, (int, float)) and v < 0]}")
+
+# Steel was zero on every sheet ever exported: the "Steel Rate/T" label was written into
+# column I with column J left empty, so the mesh line multiplied by a blank cell.
+_steel_totals = [_sheet_all.value(f"H{header + 7}") for header, _t in _blocks_all]
+ck("the steel line is priced, not multiplied by an empty input cell",
+   all(isinstance(v, (int, float)) and v > 0 for v in _steel_totals), f"-> {_steel_totals}")
+
+# The construction that could not be priced must not acquire a build-up here by the back door.
+_blocks_mixed = _buildup_blocks(_ws_mixed)
+ck("a construction with no stated thickness gets no rate build-up",
+   len(_blocks_mixed) == 1, f"-> {len(_blocks_mixed)} blocks")
+ck("...and no build-up block names it",
+   not any("Rail Crossing" in str(_ws_mixed.cell(header, 7).value)
+           for header, _t in _blocks_mixed))
+
+# A job with no constructions at all is the shape every other client sheet takes.
+_wb_plain = _load_workbook(_io.BytesIO(quotation_xlsx(_qz_plain)))
+_ws_plain = _wb_plain[_wb_plain.sheetnames[0]]
+_sheet_plain = _Sheet(_ws_plain)
+ck("a sheet with no construction breakdown still exports a workbook that evaluates",
+   not _sheet_plain.error_cells(), f"-> {_sheet_plain.error_cells()}")
+_blocks_plain = _buildup_blocks(_ws_plain)
+ck("...with exactly one build-up, for its one priced slab", len(_blocks_plain) == 1,
+   f"-> {len(_blocks_plain)}")
+ck("...whose TOTAL RATE/M2 is that slab's rate",
+   _sheet_plain.value(f"H{_blocks_plain[0][1]}")
+   == next(r for _d, _q, r in _concrete_rows(_qz_plain)),
+   f"-> {_sheet_plain.value(f'H{_blocks_plain[0][1]}')}")
+
+
+# ── What the sheet SAYS about what it extracted ──────────────────────────────────────────
+# Aryan, 16 Sep: "'PROVISIONAL — NO DETAILS PROVIDED' makes it sound like nothing was
+# extracted" and "the notes say 'no engineer construction-detail drawing supplied' even though
+# the thicknesses are explicitly being taken from the Surface Finishes drawings". Both were
+# fixed for the portal and the HTML on 16 Sep and BOTH SURVIVED IN THE XLSX, which is the
+# output he reads. The fix is only real if it is checked in the workbook.
+def _column_f(ws):
+    return [ws.cell(row, 6).value for row in range(1, ws.max_row + 1)
+            if isinstance(ws.cell(row, 6).value, str) and ws.cell(row, 6).value]
+
+
+_f_all = _column_f(_ws_all)
+ck("the workbook's provisional column names what came off the drawing",
+   any("from the drawing" in text for text in _f_all), f"-> {sorted(set(_f_all))[:2]}")
+ck("...and no row on a sheet with extracted thicknesses claims NO DETAILS PROVIDED",
+   not any(text == PROVISIONAL_LABEL for text in _f_all),
+   f"-> {[t for t in _f_all if t == PROVISIONAL_LABEL]}")
+ck("a sheet with nothing extracted still prints the original wording in the workbook",
+   PROVISIONAL_LABEL in _column_f(_ws_plain))
+
+_titles_all = [_ws_all.cell(row, 1).value for row in range(1, _ws_all.max_row + 1)
+               if isinstance(_ws_all.cell(row, 1).value, str)
+               and "Provisional Cost" in _ws_all.cell(row, 1).value]
+ck("the section heading does not say (No Details) over rows that have them",
+   _titles_all and all("No Details" not in title for title in _titles_all),
+   f"-> {_titles_all}")
+
+_notes_all = " ".join(_q_all_stated["declarations"])
+ck("the notes do not claim no construction detail was supplied for a stated thickness",
+   "no engineer construction-detail drawing supplied)" not in _notes_all)
+ck("...they say which part of the build-up is assumed instead",
+   "PART-ASSUMED" in _notes_all and "ASSUMED" in _notes_all)
+ck("a job with nothing extracted keeps Fortel's original assumption wording",
+   "no engineer construction-detail drawing supplied" in
+   " ".join(_qz_plain["declarations"]))
+
+# One count printed two ways is what produced "4" in one place and "5" in another.
+_counts = [d for d in _q_mixed_depth["declarations"] if "separate constructions" in d]
+ck("the constructions note states measured AND priced, never one of them alone",
+   _counts and "2 separate constructions measured, of which 1 is priced" in _counts[0],
+   f"-> {_counts}")
+ck("...and a sheet where all of them price says so plainly",
+   any("4 separate constructions," in d for d in _q_all_stated["declarations"]),
+   f"-> {[d for d in _q_all_stated['declarations'] if 'separate constructions' in d]}")
+
+# The same label reaches the client through four renderers. On 16 Sep it was fixed in the JSON
+# only, and the XLSX, the HTML and the plain text each went on printing the old constant.
+from quotation import quotation_html as _quotation_html
+
+_html_all = _quotation_html(_q_all_stated)
+ck("the HTML quotation names what came off the drawing, like the workbook",
+   "thickness from the drawing" in _html_all)
+ck("...and no HTML row claims NO DETAILS PROVIDED on a sheet that has them",
+   PROVISIONAL_LABEL not in _html_all)
+_text_all = quotation_text(_q_all_stated)
+ck("the plain-text quotation says the same thing",
+   "thickness from the drawing" in _text_all and PROVISIONAL_LABEL not in _text_all)
+ck("a sheet with nothing extracted still reads NO DETAILS PROVIDED in HTML",
+   PROVISIONAL_LABEL in _quotation_html(_qz_plain))

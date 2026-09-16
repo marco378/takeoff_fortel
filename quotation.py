@@ -231,10 +231,21 @@ def _fan_constructions(base_unit, constructions, parent, *, section_label,
             # client document would carry a blank rate with no reason given for it.
             piece_declarations.append(piece_flags[-1])
         if c_index == 0 and len(priced) > 1:
+            # Two counts are in play -- how many constructions were MEASURED and how many
+            # could be PRICED -- and printing one of them alone in each output is what made
+            # the sheet read "4" here and "5" there (Aryan, 16 Sep). State both, in one place.
+            with_rate = sum(1 for e in priced if not e["depth_assumed"])
+            counted = (f"are priced as {len(priced)} separate constructions"
+                       if with_rate == len(priced) else
+                       f"carry {len(priced)} separate constructions measured, of which "
+                       f"{with_rate} {'is' if with_rate == 1 else 'are'} priced")
             piece_declarations.append(
-                f"{section_label} are priced as {len(priced)} separate constructions, each at "
+                f"{section_label} {counted}, each at "
                 "its own stated thickness with its own rate build-up; the combined area and "
                 "value are the sum of them, not one slab at a single depth."
+                + ("" if with_rate == len(priced) else
+                   " The remaining construction is measured and carried at its own quantity "
+                   "with the rate left blank for the assessor, so it is NOT in the total.")
             )
         piece["construction_declarations"] = piece_declarations
         piece["flags"] = piece_flags
@@ -274,6 +285,32 @@ def _construction_brief_spec(category, entry, zone_brief_spec, parent):
         )
     except (TypeError, ValueError):
         return zone_brief_spec
+
+
+def _build_up_note(spec: dict, brief_spec: dict | None) -> str:
+    """Fortel's standard build-up disclosure, minus the part of it that is not true.
+
+    ``defaults.assumption_note`` says "no engineer construction-detail drawing supplied" for
+    every provisional row. On a Surface Finishes Plan the slab thickness IS on the drawing --
+    read off the legend beside its own hatch and cited to the sheet -- so that sentence sat in
+    the notes directly under "200 mm slab", contradicting itself and the take-off above it
+    (Aryan, 16 Sep). What is still assumed there is the mix and the mesh, and the note now
+    says exactly that. ``defaults.py`` is untouched: the original wording is still what a row
+    with nothing extracted gets, through ``assumption_note`` below.
+    """
+    fields = (brief_spec or {}).get("fields") or {}
+    depth = fields.get("depth_mm") if isinstance(fields.get("depth_mm"), dict) else None
+    depth_from_drawing = bool(
+        depth and depth.get("value") is not None and not depth.get("provisional", True)
+        and str(depth.get("source") or "") in _CONFIRMED_SOURCES)
+    if not depth_from_drawing:
+        return assumption_note(spec)
+    return (
+        f"NOTE — Build-up PART-ASSUMED: {spec['depth_mm']} mm slab thickness taken from the "
+        f"drawing; {spec['mesh']} mesh and {spec.get('conc_mix', 'C32/40')} concrete are "
+        f"ASSUMED, no engineer construction-detail drawing was supplied for those. "
+        f"Rate subject to revision upon receipt of designer specification."
+    )
 
 
 def _expand_zone_results(results: list[dict]) -> list[dict]:
@@ -517,7 +554,9 @@ def _spec_key(costing, brief_spec=None):
 
 
 def _provisional_text(li):
-    return f"{li['description']} [{PROVISIONAL_LABEL}]" if li.get("provisional") else li["description"]
+    if not li.get("provisional"):
+        return li["description"]
+    return f"{li['description']} [{li.get('provisional_reason') or PROVISIONAL_LABEL}]"
 
 
 def _unique_notes(notes):
@@ -747,10 +786,10 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
 
         if assumed:
             if all(spec.get(key) is not None for key in ("depth_mm", "mesh")):
-                declaration = assumption_note(spec)
+                declaration = _build_up_note(spec, brief_spec)
             else:
                 declaration = "zone specification not provided; assessor must complete the slab checklist"
-            declarations.append(f"{PROVISIONAL_LABEL}: {declaration}")
+            declarations.append(f"{provisional_reason_for(brief_spec)}: {declaration}")
         if unit.get("source_discipline") == "architect":
             declarations.append(
                 "Area measured from architect's hard-landscaping drawing — ±5% tolerance applies. "
@@ -1172,6 +1211,14 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
             "area_rows": group["area_rows"],
             "area_m2": area,
             "construction_of": group.get("construction_of"),
+            "provisional_reason": (provisional_reason_for(group["brief_spec"])
+                                   if group["assumed"] else ""),
+            # The effective pricing spec this group was costed from. The XLSX rate build-up
+            # used to look for a "spec" key on the line items, which has never existed, so
+            # every build-up block fell back to its own hardcoded 190mm/120 defaults and
+            # disagreed with the rate printed beside it.
+            "spec": dict(spec),
+            "rate": group["rate"],
         })
         common = {
             "section": group["section"], "qty": area, "unit": "m²",
@@ -1302,7 +1349,8 @@ def generate_quotation(result: dict | list, project: str = "", client: str = "",
         ]
         if provisional_labels:
             declarations.append(
-                f"{PROVISIONAL_LABEL}: {specification['slab_type_label'] or specification['section']} "
+                f"{specification.get('provisional_reason') or PROVISIONAL_LABEL}: "
+                f"{specification['slab_type_label'] or specification['section']} "
                 f"— {', '.join(provisional_labels)}."
             )
 
@@ -1470,7 +1518,8 @@ def quotation_html(q: dict) -> str:
         return html.escape(str(value if value is not None else ""), quote=True)
 
     def _row(li):
-        provisional = (f" <strong style='color:#9a6500'>{PROVISIONAL_LABEL}</strong>"
+        provisional = (" <strong style='color:#9a6500'>"
+                       f"{_h(li.get('provisional_reason') or PROVISIONAL_LABEL)}</strong>"
                        if li.get("provisional") else "")
         rate = (f"£{li['rate']:.2f}" if isinstance(li.get("rate"), (int, float)) else "")
         value = (_h(li.get("value_status")) if li.get("value_status") else
@@ -1516,8 +1565,9 @@ def quotation_html(q: dict) -> str:
     if q.get("measurements"):
         measurement_rows = ""
         for measurement in q["measurements"]:
-            marker = (f" <strong style='color:#9a6500'>{PROVISIONAL_LABEL}</strong>"
-                      if measurement.get("provisional") else "")
+            marker = (" <strong style='color:#9a6500'>"
+                      f"{_h(measurement.get('provisional_reason') or PROVISIONAL_LABEL)}"
+                      "</strong>" if measurement.get("provisional") else "")
             measurement_rows += (
                 f"<tr><td>{_h(measurement['section'])}</td>"
                 f"<td>{_h(measurement['description'])}{marker}</td>"
@@ -1625,53 +1675,55 @@ def _excel_section_title(section, items):
     }
     title = labels.get(section, str(section))
     if section != "Prelims" and any(item.get("provisional") for item in items):
-        title += "- Provisional Cost (No Details)"
+        # "(No Details)" is only true when nothing was extracted. On a Surface Finishes Plan
+        # the thicknesses ARE on the drawing and cited, so the heading contradicted the rows
+        # under it. Say provisional -- which is true, the mix and mesh are still assumed --
+        # without claiming the drawing gave us nothing.
+        extracted = any(item.get("provisional")
+                        and (item.get("provisional_reason") or PROVISIONAL_LABEL)
+                        != PROVISIONAL_LABEL for item in items)
+        title += ("- Provisional Cost (Part Detailed)" if extracted
+                  else "- Provisional Cost (No Details)")
     return title
 
 
-def _write_rate_buildup(ws, q: dict):
-    """Write the detailed rate buildup section in columns G onwards.
+# One rate build-up per priced construction, stacked down columns G-J beside the take-off.
+# sr+0 header .. sr+16 the agreement check, then a blank separator row.
+_BUILDUP_BLOCK_ROWS = 18
 
-    Mirrors the real Fortel costing sheet layout with Excel formulas (not hardcoded values)
-    so the assessor can edit inputs and see recalculated totals.
 
-    Section start rows (matching reference):
-        External Yard = 5   (rows 5-39)
-        Footpath      = 42  (rows 42-76)
-        Dock          = 79  (rows 79-113)
-        Ground Floor  = 116 (rows 116-150)
-        Upper Floor   = 153 (rows 153-187)
+def _write_rate_buildup(ws, q: dict, anchors: dict | None = None):
+    """Write one rate build-up per PRICED construction, in columns G onwards.
 
-    Internal layout within each section (relative offsets from sr):
-        sr+0:  Header (Slab Depth, Rate/m3, Mix/Spec, Supplier)
-        sr+2:  Concrete/m2
-        sr+3:  Wastage/m2
-        sr+4:  Total Concrete/m2
-        sr+7:  Steel Rate/T header
-        sr+8:  Mesh Type Rate/m2
-        sr+9:  Wastage Rate/m2
-        sr+10: Lap Rate/m2
-        sr+11: Total Steel Rate/m2
-        sr+13: DPM Rate/m2 (VLOOKUP)
-        sr+14: Wastage
-        sr+15: Total DPM Rate/m2
-        sr+17: Curing Agent Rate/m2
-        sr+18: (DPM Gauge in VLOOKUP table)
-        sr+19: Labour Rate/m2
-        sr+21: Total Trimming
-        sr+22: Area m2 weekly
-        sr+23: Dowel/Joint header
-        sr+24: LJ 12mm
-        sr+25: Joints/m2, DLJ 12mm
-        sr+26: Price Separate, CJ 25mm
-        sr+27: SCJ 25mm
-        sr+28: Decarbonisation Charge, EJ 25mm
-        sr+29: Timber
-        sr+30: Nett Total, 25mm x600mm
-        sr+31: Margin, 20mm x500mm
-        sr+32: TOTAL RATE/M2, 20mm x600mm
-        sr+33: E/O RATE/M2
-        sr+34: ALL INCL RATE/M2
+    This block is Fortel's own costing working, and the assessor edits its yellow inputs and
+    expects the green cells to recalculate. It must therefore be an Excel transcription of
+    ``costing.rate_buildup`` -- the function that produced the rate printed in column D -- and
+    nothing else. The invariant is exact and tested: for every construction,
+    ``TOTAL RATE/M2`` equals that construction's RATE cell.
+
+    It used to be a transcription of the reference workbook's LAYOUT at fixed row numbers
+    (External yard = 5, Footpath = 42, ...), written before a measured area could fan into
+    several constructions. Every one of its cross-references into the take-off then pointed at
+    whatever had since moved into that row (Aryan, 16 Sep, full formula audit):
+
+      * ``Decarbonisation Charge`` and ``E/O RATE/M2`` divided by ``B12``, once the section's
+        area row and now a blank cell -- the ``#DIV/0!`` beside the 180 mm rows, propagated up
+        through ``Nett Total`` into ``TOTAL RATE/M2``.
+      * ``Total Trimming`` subtracted ``D{sr+14}``, which had become the Joints rate, so
+        trimming priced at a negative number.
+      * ``Steel Rate/T`` was written as a LABEL with no value, so the mesh line multiplied by
+        an empty cell and all steel cost read zero; the DPM line looked up the gauge in a
+        table whose price column was ``=AQ9`` -- also empty -- so DPM read zero too.
+      * The spec's ``dpm`` is Fortel's DPM cost in pounds per m2 (0.46). It was being written
+        into a cell labelled "Gauge" and looked up as if it were 1200G sheeting.
+      * A block was emitted for all five BOQ sections whether the job had them or not, each
+        falling back to a second, divergent set of defaults (190 mm / GBP 120 / 2.5%) that
+        does not match ``defaults.DEFAULT_SPEC``.
+
+    Two rows are deliberately NOT carried over. ``Decarbonisation Charge`` and ``E/O RATE/M2``
+    have no counterpart in ``rate_buildup``: including them would guarantee the block could
+    not equal the rate beside it, and both were the source of the ``#DIV/0!``. They are left
+    out rather than printed broken.
     """
     thin = Side(style="thin")
     medium = Side(style="medium")
@@ -1679,11 +1731,9 @@ def _write_rate_buildup(ws, q: dict):
     font_s = Font(name="Arial", size=8)
     font_sb = Font(name="Arial", size=8, bold=True)
 
-    # Color fills matching reference
-    fill_yellow = PatternFill("solid", fgColor="FFFF00")   # input cells
-    fill_green = PatternFill("solid", fgColor="FF92D050")  # formula/result cells
-    fill_red = PatternFill("solid", fgColor="FF0000")      # joints/m2 row
-    fill_green_dark = PatternFill("solid", fgColor="FF00B050")  # section total labels
+    fill_yellow = PatternFill("solid", fgColor="FFFF00")   # editable input
+    fill_green = PatternFill("solid", fgColor="FF92D050")  # formula/result
+    fill_green_dark = PatternFill("solid", fgColor="FF00B050")  # component totals
 
     def _cell(r, c, v, bold=False):
         cell = ws.cell(r, c, v)
@@ -1691,18 +1741,16 @@ def _write_rate_buildup(ws, q: dict):
         return cell
 
     def _border_gj(r):
-        """Medium borders on G-J columns (left side of rate buildup)."""
         ws.cell(r, 7).border = Border(left=medium, right=no_side,
-                                       top=no_side, bottom=no_side)
+                                      top=no_side, bottom=no_side)
         ws.cell(r, 8).border = Border(left=no_side, right=medium,
-                                       top=no_side, bottom=no_side)
+                                      top=no_side, bottom=no_side)
         ws.cell(r, 9).border = Border(left=medium, right=no_side,
-                                       top=no_side, bottom=no_side)
+                                      top=no_side, bottom=no_side)
         ws.cell(r, 10).border = Border(left=no_side, right=medium,
-                                        top=no_side, bottom=no_side)
+                                       top=no_side, bottom=no_side)
 
     def _border_gj_header(r):
-        """Header row: medium top, thin bottom on G-J."""
         for c in range(7, 11):
             ws.cell(r, c).border = Border(
                 top=medium, bottom=thin,
@@ -1710,406 +1758,173 @@ def _write_rate_buildup(ws, q: dict):
                 right=medium if c in (8, 10) else no_side)
 
     def _border_gj_totals(r):
-        """Total rows: medium bottom on G-J."""
         ws.cell(r, 7).border = Border(left=medium, bottom=medium)
         ws.cell(r, 8).border = Border(right=medium, bottom=medium)
         ws.cell(r, 9).border = Border(left=medium, bottom=medium)
         ws.cell(r, 10).border = Border(right=medium, bottom=medium)
 
-    def _border_lq(r):
-        """Thin borders on L-Q columns (dowel/joint table)."""
-        for c in range(12, 18):
-            b_left = medium if c == 12 else thin
-            b_right = thin
-            ws.cell(r, c).border = Border(
-                top=thin, bottom=thin, left=b_left, right=b_right)
+    anchors = anchors or {}
+    # Only a construction that HAS a rate gets a build-up. The Rail Crossing -- measured, no
+    # stated thickness, rate left blank for the assessor -- must not acquire a priced build-up
+    # here by the back door; that is the whole point of aba682a.
+    blocks = [spec for spec in (q.get("specifications") or [])
+              if isinstance(spec.get("rate"), (int, float)) and spec.get("spec")]
+    if not blocks:
+        return
 
-    # Collect specs per section
-    specs = {}
-    for item in q.get("line_items", []):
-        s = item.get("section") or "External yard slabs"
-        if s not in specs:
-            specs[s] = item.get("spec") or {}
-    for se in q.get("specifications", []):
-        s = se.get("section") or "External yard slabs"
-        if s not in specs:
-            specs[s] = se.get("spec") or {}
+    currency = '£#,##0.00'
+    start_row = 5
+    for block_index, specification in enumerate(blocks):
+        sp = specification.get("spec") or {}
+        anchor = anchors.get(specification.get("id")) or {}
+        rate_row = anchor.get("rate_row")
+        sr = start_row + block_index * _BUILDUP_BLOCK_ROWS
 
-    # Section start rows matching reference layout (37 rows apart)
-    sections = [
-        ("External yard slabs",   5),
-        ("Footpath slabs",       42),
-        ("Dock slabs",           79),
-        ("Ground floor slabs",  116),
-        ("Upper floor slabs",   153),
-    ]
+        depth = sp.get("depth_mm")
+        conc_rate = sp.get("conc_rate")
+        conc_wastage = sp.get("conc_wastage")
+        mesh = sp.get("mesh")
+        mesh_kg = MESH_KG.get(mesh)
+        layers = sp.get("layers")
+        steel_rate_t = sp.get("steel_rate_t")
+        steel_wastage = sp.get("steel_wastage")
+        lap_acc = sp.get("lap_acc")
+        dpm = sp.get("dpm")
+        curing = sp.get("curing")
+        labour = sp.get("labour")
+        trim = sp.get("trim")
+        margin = sp.get("margin")
+        # A block can only be written from the numbers the rate was actually built from. If
+        # any is absent the rate did not come from rate_buildup, and a block reconstructed
+        # around the gap would silently disagree with column D.
+        if any(value is None for value in (
+                depth, conc_rate, conc_wastage, mesh_kg, layers, steel_rate_t,
+                steel_wastage, lap_acc, dpm, curing, labour, trim, margin)):
+            continue
 
-    # BOQ Total Area Take Off B-rows
-    area_b_rows = {
-        "External yard slabs":  12,
-        "Footpath slabs":       29,
-        "Dock slabs":           44,
-        "Ground floor slabs":   71,
-        "Upper floor slabs":    91,
-    }
-
-    for section_name, sr in sections:
-        sp = specs.get(section_name, {})
-        depth = sp.get("depth_mm") or 190
-        rate_m3 = sp.get("conc_rate") or 120
-        mix = sp.get("conc_mix") or "C32/40"
-        mesh = sp.get("mesh") or "A252"
-        mesh_kg = sp.get("mesh_kg") or 3.95
-        layers = sp.get("layers") or 1
-        gauge = sp.get("dpm") or 1200
-        wastage = sp.get("conc_wastage") or 0.025
-        s_wastage = sp.get("steel_wastage") or 0.1
-        lap = sp.get("lap_acc") or 0.18
-        margin = sp.get("margin") or 0.1
-
-        is_dock = section_name == "Dock slabs"
-        conc_wastage_pct = 0.04 if is_dock else wastage
-        title = "Dock Slab Depth (mm)" if is_dock else "Slab Depth (mm)"
-
-        # ── sr+0: Header ──────────────────────────────────────────────
-        _cell(sr, 7, title, True)
-        _cell(sr, 8, depth)
-        ws.cell(sr, 8).fill = fill_yellow  # input
-        _cell(sr, 10, "Rate/m3")
-        _cell(sr, 12, "Mix/Spec")
-        _cell(sr, 14, "Supplier Name")
-        _cell(sr, 15, "Name/Backup ")
+        # Name the CONSTRUCTION, not the BOQ section: four blocks all headed
+        # "External/Service Yard Slabs" tell the assessor nothing about which is which.
+        names = {str(area_row.get("description") or "")
+                 for area_row in specification.get("area_rows") or []}
+        title = (names.pop() if len(names) == 1 and names != {""}
+                 else (specification.get("slab_type_label")
+                       or specification.get("section") or "Slab"))
+        # ── sr+0: what this build-up belongs to, and the depth that drives it ──────
+        _cell(sr, 7, f"Rate build-up — {title}", True)
+        _cell(sr, 9, "Slab Depth (mm)")
+        _cell(sr, 10, depth)
+        ws.cell(sr, 10).fill = fill_yellow
         _border_gj_header(sr)
-        _border_lq(sr)
 
-        # ── sr+2: Concrete/m2 ─────────────────────────────────────────
-        _cell(sr+2, 7, "Concrete/m2")
-        _cell(sr+2, 8, f"=(J{sr+2}*H{sr}/1000)")
-        ws.cell(sr+2, 8).fill = fill_green  # formula
-        _cell(sr+2, 9, "Concrete Rate/m3")
-        _cell(sr+2, 10, rate_m3)
-        ws.cell(sr+2, 10).fill = fill_green  # input
-        _cell(sr+2, 12, mix)
-        _cell(sr+2, 13, rate_m3)
-        _cell(sr+2, 14, "Hanson")
-        _cell(sr+2, 15, "On Phone Will Parker")
+        # ── sr+1..3: concrete ─────────────────────────────────────────────────────
+        _cell(sr+1, 7, "Concrete/m2")
+        _cell(sr+1, 8, f"=J{sr}/1000*J{sr+1}")
+        ws.cell(sr+1, 8).fill = fill_green
+        _cell(sr+1, 9, "Concrete Rate/m3")
+        _cell(sr+1, 10, conc_rate)
+        ws.cell(sr+1, 10).fill = fill_yellow
+        _cell(sr+1, 12, sp.get("conc_mix") or "C32/40")
+        _border_gj(sr+1)
+
+        _cell(sr+2, 7, "Wastage/m2")
+        _cell(sr+2, 8, f"=H{sr+1}*J{sr+2}")
+        ws.cell(sr+2, 8).fill = fill_green
+        _cell(sr+2, 9, "Concrete Wastage %")
+        _cell(sr+2, 10, conc_wastage)
+        ws.cell(sr+2, 10).fill = fill_yellow
         _border_gj(sr+2)
-        _border_lq(sr+2)
 
-        # sr+3: Wastage/m2
-        _cell(sr+3, 7, "Wastage/m2")
-        _cell(sr+3, 8, f"=H{sr+2}*J{sr+3}")
+        _cell(sr+3, 7, "Total Concrete/m2", True)
+        _cell(sr+3, 8, f"=SUM(H{sr+1}:H{sr+2})", True)
+        ws.cell(sr+3, 7).fill = fill_green_dark
         ws.cell(sr+3, 8).fill = fill_green
-        _cell(sr+3, 9, "Wastage %")
-        _cell(sr+3, 10, conc_wastage_pct)
-        ws.cell(sr+3, 10).fill = fill_yellow
         _border_gj(sr+3)
-        _border_lq(sr+3)
 
-        # sr+4: Total Concrete/m2
-        _cell(sr+4, 7, "Total Concrete/m2", True)
-        _cell(sr+4, 8, f"=SUM(H{sr+2}:H{sr+3})", True)
-        ws.cell(sr+4, 7).fill = fill_green_dark
+        # ── sr+4..7: steel ────────────────────────────────────────────────────────
+        _cell(sr+4, 7, "Mesh Rate/m2")
+        _cell(sr+4, 8, f"=J{sr+4}*J{sr+5}*J{sr+6}/1000")
         ws.cell(sr+4, 8).fill = fill_green
+        _cell(sr+4, 9, f"Mesh {mesh} kg/m2")
+        _cell(sr+4, 10, mesh_kg)
+        ws.cell(sr+4, 10).fill = fill_yellow
         _border_gj(sr+4)
-        _border_lq(sr+4)
 
-        # ── sr+7: Steel Rate/T header ─────────────────────────────────
-        _cell(sr+7, 9, "Steel Rate/T")
-        _cell(sr+7, 14, "Rom")
-        _cell(sr+7, 15, "B:S Wt/m2")
-        ws.cell(sr+7, 10).fill = fill_green
+        _cell(sr+5, 7, "Wastage Rate/m2")
+        _cell(sr+5, 8, f"=H{sr+4}*J{sr+7}")
+        ws.cell(sr+5, 8).fill = fill_green
+        _cell(sr+5, 9, "Nr of Layers")
+        _cell(sr+5, 10, layers)
+        ws.cell(sr+5, 10).fill = fill_yellow
+        _border_gj(sr+5)
+
+        _cell(sr+6, 7, "Lap + Accessories Rate/m2")
+        _cell(sr+6, 8, f"=H{sr+4}*J{sr+8}")
+        ws.cell(sr+6, 8).fill = fill_green
+        # The input the old block never wrote: the label sat in column I with column J empty,
+        # so the mesh line multiplied by a blank cell and every steel figure read zero.
+        _cell(sr+6, 9, "Steel Rate/T")
+        _cell(sr+6, 10, steel_rate_t)
+        ws.cell(sr+6, 10).fill = fill_yellow
+        _border_gj(sr+6)
+
+        _cell(sr+7, 7, "Total Steel Rate/m2", True)
+        _cell(sr+7, 8, f"=SUM(H{sr+4}:H{sr+6})", True)
+        ws.cell(sr+7, 7).fill = fill_green_dark
+        ws.cell(sr+7, 8).fill = fill_green
+        _cell(sr+7, 9, "Steel Wastage %")
+        _cell(sr+7, 10, steel_wastage)
+        ws.cell(sr+7, 10).fill = fill_yellow
         _border_gj(sr+7)
-        _border_lq(sr+7)
 
-        # sr+8: Mesh Type Rate/m2
-        _cell(sr+8, 7, "Mesh Type Rate/m2")
-        _cell(sr+8, 8, f"=J{sr+7}*(J{sr+10}*J{sr+11}/1000)")
-        ws.cell(sr+8, 8).fill = fill_green
-        _cell(sr+8, 9, "Wastage %")
-        _cell(sr+8, 10, s_wastage)
-        ws.cell(sr+8, 10).fill = fill_green
-        _cell(sr+8, 12, "Mesh Type")
-        _cell(sr+8, 14, "A142 - 2.22 KG")
-        _cell(sr+8, 15, 2.22)
+        _cell(sr+8, 9, "Lap % + Accessories")
+        _cell(sr+8, 10, lap_acc)
+        ws.cell(sr+8, 10).fill = fill_yellow
         _border_gj(sr+8)
-        _border_lq(sr+8)
 
-        # sr+9: Wastage Rate/m2
-        _cell(sr+9, 7, "Wastage  Rate/m2")
-        _cell(sr+9, 8, f"=H{sr+8}*J{sr+8}")
-        ws.cell(sr+9, 8).fill = fill_green
-        _cell(sr+9, 9, "Lap % + Accessories")
-        _cell(sr+9, 10, lap)
-        ws.cell(sr+9, 10).fill = fill_green
-        _cell(sr+9, 14, "A193 - 3.02 KG")
-        _cell(sr+9, 15, 3.02)
-        _border_gj(sr+9)
-        _border_lq(sr+9)
+        # ── sr+9..12: the fixed per-m2 items, each priced as itself ───────────────
+        for offset, (label, value) in enumerate((
+                ("DPM Rate/m2", dpm), ("Curing Agent Rate/m2", curing),
+                ("Labour Rate/m2", labour), ("Trimming Rate/m2", trim)), start=9):
+            _cell(sr+offset, 7, label)
+            _cell(sr+offset, 8, f"=J{sr+offset}")
+            ws.cell(sr+offset, 8).fill = fill_green
+            _cell(sr+offset, 9, label.replace("/m2", " (GBP/m2)"))
+            _cell(sr+offset, 10, value)
+            ws.cell(sr+offset, 10).fill = fill_yellow
+            _border_gj(sr+offset)
+        _cell(sr+9, 12, "DPM sheeting (excl. tapes and seals to laps)")
 
-        # sr+10: Lap Rate/m2
-        _cell(sr+10, 7, "Lap Rate/m2")
-        _cell(sr+10, 8, f"=H{sr+8}*J{sr+9}")
-        ws.cell(sr+10, 8).fill = fill_green
-        _cell(sr+10, 9, "Mesh Type")
-        _cell(sr+10, 10, mesh_kg)
-        ws.cell(sr+10, 10).fill = fill_yellow
-        _cell(sr+10, 14, f"{mesh} - {mesh_kg} KG")
-        _cell(sr+10, 15, mesh_kg)
-        _border_gj(sr+10)
-        _border_lq(sr+10)
-
-        # sr+11: Total Steel Rate/m2
-        _cell(sr+11, 7, "Total Steel Rate/m2", True)
-        _cell(sr+11, 8, f"=SUM(H{sr+8}:H{sr+10})", True)
-        ws.cell(sr+11, 7).fill = fill_green_dark
-        ws.cell(sr+11, 8).fill = fill_green
-        _cell(sr+11, 9, "Nr of Layer")
-        _cell(sr+11, 10, layers)
-        ws.cell(sr+11, 10).fill = fill_yellow
-        _cell(sr+11, 14, "A393 - 6.16 KG")
-        _cell(sr+11, 15, 6.16)
-        _border_gj(sr+11)
-        _border_lq(sr+11)
-
-        # sr+12: mesh type refs continued
-        _cell(sr+12, 14, "B785 - 8.14 KG")
-        _cell(sr+12, 15, 8.14)
-        _border_gj(sr+12)
-        _border_lq(sr+12)
-
-        # ── sr+13: DPM Rate/m2 ────────────────────────────────────────
-        _cell(sr+13, 7, "DPM Rate/m2")
-        _cell(sr+13, 8, f"=VLOOKUP(J{sr+14},$O$23:$P$24,2,FALSE)")
+        # ── sr+13..15: nett, margin, the rate that must match column D ────────────
+        _cell(sr+13, 7, "Nett Total", True)
+        # NOT rounded per component: costing.rate_buildup rounds ONCE, at the end. Rounding
+        # the concrete and steel subtotals first moved the 375 mm construction to 72.15
+        # against its own priced rate of 72.14.
+        _cell(sr+13, 8, f"=H{sr+3}+H{sr+7}+SUM(H{sr+9}:H{sr+12})", True)
         ws.cell(sr+13, 8).fill = fill_green
-        _cell(sr+13, 9, "DPM Rate")
-        _cell(sr+13, 10, 25.5)
-        ws.cell(sr+13, 10).fill = fill_green
-        _border_gj(sr+13)
-        _border_lq(sr+13)
+        _border_gj_totals(sr+13)
 
-        # sr+14: Wastage
-        _cell(sr+14, 7, "Wastage")
-        _cell(sr+14, 8, f"=H{sr+13}*J{sr+15}")
+        _cell(sr+14, 7, "Margin")
+        _cell(sr+14, 8, f"=H{sr+13}*J{sr+14}")
         ws.cell(sr+14, 8).fill = fill_green
-        _cell(sr+14, 9, "Gauge")
-        _cell(sr+14, 10, gauge)
+        _cell(sr+14, 9, "Margin %")
+        _cell(sr+14, 10, margin)
         ws.cell(sr+14, 10).fill = fill_yellow
-        _cell(sr+14, 12, "Bay Size - 4.9m x 6.5m")
-        _cell(sr+14, 14, "300mm Lap")
-        _cell(sr+14, 15, 0.15)
         _border_gj(sr+14)
-        _border_lq(sr+14)
 
-        # sr+15: Total DPM Rate/m2
-        _cell(sr+15, 7, "Total DPM Rate/m2", True)
-        _cell(sr+15, 8, f"=SUM(H{sr+13}:H{sr+14})", True)
-        ws.cell(sr+15, 7).fill = fill_green_dark
+        _cell(sr+15, 7, "TOTAL RATE/M2", True)
+        _cell(sr+15, 8, f"=ROUND(H{sr+13}*(1+J{sr+14}),2)", True)
         ws.cell(sr+15, 8).fill = fill_green
-        _cell(sr+15, 9, "Lap %")
-        _cell(sr+15, 10, 0.15)
-        ws.cell(sr+15, 10).fill = fill_yellow
-        _cell(sr+15, 14, "400mm Lap")
-        _cell(sr+15, 15, 0.18)
-        _border_gj(sr+15)
-        _border_lq(sr+15)
+        ws.cell(sr+15, 8).number_format = currency
+        _border_gj_totals(sr+15)
 
-        # ── sr+17: Curing Agent Rate/m2 ──────────────────────────────
-        _cell(sr+17, 7, "Curing Agent Rate/m2")
-        _cell(sr+17, 8, f"=(J{sr+17}/32)")
-        ws.cell(sr+17, 8).fill = fill_green
-        _cell(sr+17, 9, "Sika Pro Seal Rate")
-        _cell(sr+17, 10, 7.5)
-        ws.cell(sr+17, 10).fill = fill_yellow
-        _cell(sr+17, 12, "£7.50/Litre covers 35m2 area")
-        _cell(sr+17, 15, "Roll")
-        _cell(sr+17, 16, "m2 cost")
-        _border_gj(sr+17)
-        _border_lq(sr+17)
+        if rate_row:
+            # Say out loud which priced row this build-up is behind, and let the workbook
+            # itself report a disagreement rather than leaving it to be found by eye.
+            _cell(sr+16, 7, "Agrees with RATE in row " + str(rate_row))
+            _cell(sr+16, 8,
+                  f'=IF(ROUND(H{sr+15}-D{rate_row},2)=0,"OK","CHECK")')
+            _border_gj(sr+16)
 
-        # ── sr+18: DPM Gauge row in VLOOKUP table ────────────────────
-        _cell(sr+18, 14, "DPM Gauge")
-        _cell(sr+18, 15, gauge)
-        _cell(sr+18, 16, f"=AQ{sr+1}")
-        _border_gj(sr+18)
-        _border_lq(sr+18)
-
-        # ── sr+19: Labour Rate/m2 ─────────────────────────────────────
-        _cell(sr+19, 7, "Labour Rate/m2")
-        _cell(sr+19, 8, f"=J{sr+19}")
-        ws.cell(sr+19, 8).fill = fill_green
-        _cell(sr+19, 9, "Labour Rate")
-        _cell(sr+19, 10, 10)
-        ws.cell(sr+19, 10).fill = fill_green
-        _cell(sr+19, 15, 2000)
-        _cell(sr+19, 16, f"=AQ{sr+28}")
-        _border_gj(sr+19)
-        _border_lq(sr+19)
-
-        # ── sr+21: Total Trimming ─────────────────────────────────────
-        _cell(sr+21, 7, "Total Trimming")
-        _cell(sr+21, 8, f"=(J{sr+21}/J{sr+22})-D{sr+14}")
-        ws.cell(sr+21, 8).fill = fill_green
-        _cell(sr+21, 9, "Machine/Dump/Lab/Fuel Cost")
-        _cell(sr+21, 10, 3500)
-        ws.cell(sr+21, 10).fill = fill_yellow
-        _cell(sr+21, 12, "Trimming Costs")
-        _cell(sr+21, 13, 4085)
-        _cell(sr+21, 14, 1800)
-        _cell(sr+21, 15, f"=M{sr+21}/N{sr+21}")
-        _border_gj(sr+21)
-        _border_lq(sr+21)
-
-        # sr+22: Area m2 weekly
-        _cell(sr+22, 9, "Area m2 weekly @ 780 m2 a day")
-        _cell(sr+22, 10, 2200)
-        ws.cell(sr+22, 10).fill = fill_yellow
-        _border_gj(sr+22)
-        _border_lq(sr+22)
-
-        # ── sr+23: Dowel/Joint table header ───────────────────────────
-        _cell(sr+23, 12, "Bay Size - 4.9m x 6.5m")
-        _cell(sr+23, 14, "Lengths")
-        _cell(sr+23, 15, "Nr of Dowels")
-        _cell(sr+23, 16, "Unit price")
-        _border_gj(sr+23)
-        _border_lq(sr+23)
-
-        # sr+24: LJ 12mm
-        _cell(sr+24, 9, "Bay Size (4.9m x 6.5m)")
-        _cell(sr+24, 10, 32)
-        ws.cell(sr+24, 10).fill = fill_yellow
-        _cell(sr+24, 12, "LJ 12mm x 900mm @ 600c/c")
-        _cell(sr+24, 13, 600)
-        _cell(sr+24, 14, 6500)
-        _cell(sr+24, 15, f"=N{sr+24}/M{sr+24}")
-        ws.cell(sr+24, 15).fill = fill_green
-        _cell(sr+24, 16, 1.65)
-        ws.cell(sr+24, 16).fill = fill_yellow
-        _cell(sr+24, 17, f"=O{sr+24}*P{sr+24}")
-        ws.cell(sr+24, 17).fill = fill_green
-        _border_gj(sr+24)
-        _border_lq(sr+24)
-
-        # sr+25: Joints/m2, DLJ 12mm
-        _cell(sr+25, 7, "Joints/m2")
-        ws.cell(sr+25, 7).fill = fill_red
-        _cell(sr+25, 8, f"=J{sr+25}/J{sr+24}")
-        ws.cell(sr+25, 8).fill = fill_red
-        _cell(sr+25, 9, "Rate/Bay")
-        _cell(sr+25, 10, f"=SUM(Q{sr+24}:Q{sr+30})")
-        ws.cell(sr+25, 10).fill = fill_yellow
-        _cell(sr+25, 12, "DLJ 12mm x 900mm @ 600c/c")
-        _cell(sr+25, 13, 600)
-        _cell(sr+25, 14, 6500)
-        _cell(sr+25, 15, 0)
-        _cell(sr+25, 16, 1.65)
-        _cell(sr+25, 17, f"=O{sr+25}*P{sr+25}")
-        ws.cell(sr+25, 17).fill = fill_green
-        _border_gj(sr+25)
-        _border_lq(sr+25)
-
-        # sr+26: Price Separate, CJ 25mm
-        _cell(sr+26, 7, "Price Separate - Joints")
-        _cell(sr+26, 12, "CJ 25mm x 500mm @ 300c/c")
-        _cell(sr+26, 13, 300)
-        _cell(sr+26, 14, 4900)
-        _cell(sr+26, 15, f"=N{sr+26}/M{sr+26}")
-        ws.cell(sr+26, 15).fill = fill_green
-        _cell(sr+26, 16, 2.09)
-        ws.cell(sr+26, 16).fill = fill_yellow
-        _cell(sr+26, 17, f"=O{sr+26}*P{sr+26}")
-        ws.cell(sr+26, 17).fill = fill_green
-        _border_gj(sr+26)
-        _border_lq(sr+26)
-
-        # sr+27: SCJ 25mm
-        _cell(sr+27, 12, "SCJ 25mm x 500mm @ 300 c/c")
-        _cell(sr+27, 13, 300)
-        _cell(sr+27, 14, 4900)
-        _cell(sr+27, 15, 0)
-        _cell(sr+27, 16, 2.09)
-        _cell(sr+27, 17, f"=O{sr+27}*P{sr+27}")
-        ws.cell(sr+27, 17).fill = fill_green
-        _border_gj(sr+27)
-        _border_lq(sr+27)
-
-        # sr+28: Decarbonisation Charge, EJ 25mm
-        _cell(sr+28, 7, "Decarbonisation Charge")
-        _cell(sr+28, 8, f"=(((E{sr+28}*0.454)/1000)*25)/B{area_b_rows.get(section_name, 12)}")
-        ws.cell(sr+28, 8).fill = fill_green
-        _cell(sr+28, 12, "EJ - 25mm x 500mm @ 300c/c")
-        _cell(sr+28, 13, 300)
-        _cell(sr+28, 14, 38000)
-        _cell(sr+28, 15, f"=N{sr+28}/M{sr+28}")
-        ws.cell(sr+28, 15).fill = fill_green
-        _cell(sr+28, 16, 0)
-        _cell(sr+28, 17, f"=O{sr+28}*P{sr+28}")
-        ws.cell(sr+28, 17).fill = fill_green
-        _border_gj(sr+28)
-        _border_lq(sr+28)
-
-        # sr+29: Timber
-        _cell(sr+29, 12, "Timber (175mm x 25mm thick)")
-        _cell(sr+29, 14, 23)
-        _cell(sr+29, 15, 1)
-        _cell(sr+29, 16, 4.5)
-        _cell(sr+29, 17, f"=N{sr+29}*P{sr+29}")
-        ws.cell(sr+29, 17).fill = fill_green
-        _border_gj(sr+29)
-        _border_lq(sr+29)
-
-        # sr+30: Nett Total, 25mm x600mm
-        _cell(sr+30, 7, "Nett Total", True)
-        _cell(sr+30, 8, f"=SUM(H{sr+4},H{sr+11},H{sr+15},H{sr+17},H{sr+19},H{sr+21},H{sr+28})", True)
-        _cell(sr+30, 12, "25mm x600mm @ ")
-        _cell(sr+30, 16, 2.52)
-        _cell(sr+30, 17, f"=O{sr+30}*P{sr+30}")
-        ws.cell(sr+30, 17).fill = fill_green
-        _border_gj_totals(sr+30)
-        _border_lq(sr+30)
-
-        # sr+31: Margin, 20mm x500mm
-        _cell(sr+31, 7, "Margin")
-        _cell(sr+31, 8, f"=H{sr+30}*J{sr+31}")
-        ws.cell(sr+31, 8).fill = fill_green
-        _cell(sr+31, 9, "Margin ")
-        _cell(sr+31, 10, margin)
-        ws.cell(sr+31, 10).fill = fill_yellow
-        _cell(sr+31, 12, "20mm x 500mm @ ")
-        _cell(sr+31, 16, 1.35)
-        _border_gj(sr+31)
-        _border_lq(sr+31)
-
-        # sr+32: TOTAL RATE/M2, 20mm x600mm
-        _cell(sr+32, 7, "TOTAL RATE/M2", True)
-        _cell(sr+32, 8, f"=SUM(H{sr+30}:H{sr+31})", True)
-        _cell(sr+32, 12, "20mm x 600mm  @")
-        _cell(sr+32, 16, 1.51)
-        _border_gj_totals(sr+32)
-        _border_lq(sr+32)
-
-        # sr+33: E/O RATE/M2
-        _cell(sr+33, 7, "E/O RATE/M2", True)
-        _cell(sr+33, 8, f"=SUM(E{sr+14}:E{sr+19})/B{area_b_rows.get(section_name, 12)}", True)
-        _border_gj_totals(sr+33)
-        _border_lq(sr+33)
-
-        # sr+34: ALL INCL RATE/M2
-        _cell(sr+34, 7, "ALL INCL RATE/M2", True)
-        _cell(sr+34, 8, f"=SUM(H{sr+32}:H{sr+33})", True)
-        _cell(sr+34, 12, "Name/Person")
-        _border_gj_totals(sr+34)
-        _border_lq(sr+34)
-
-    # ── VLOOKUP table (O23:P24) ───────────────────────────────────────
-    ws.cell(23, 15, 1200)
-    ws.cell(23, 16, "=AQ9")
-    ws.cell(24, 15, 2000)
-    ws.cell(24, 16, "=AQ38")
-    for ri in (23, 24):
-        for ci in (15, 16):
-            ws.cell(ri, ci).font = font_s
 
 
 def quotation_xlsx(q: dict) -> bytes:
@@ -2137,6 +1952,10 @@ def quotation_xlsx(q: dict) -> bytes:
 
     # Exact header shape in the supplied Winvic BOQ.  Project-specific notices remain blank
     # unless explicitly provided; they are never copied into unrelated quotations.
+    # specification_id -> the rows its priced rate and its measured area landed on. The rate
+    # build-up blocks are written after the take-off and point at these, so no formula in the
+    # workbook can reference a row number that was true for a different job.
+    buildup_anchors: dict[str, dict] = {}
     ws["A1"] = _excel_text(f"Project: {q.get('project') or '—'}")
     ws["B1"] = _excel_text(q.get("measurement_basis") or "")
     ws["A2"] = _excel_text(f"Client: {q.get('client') or '—'}")
@@ -2211,6 +2030,11 @@ def quotation_xlsx(q: dict) -> bytes:
 
         def _write_item(item, qty_formula=None):
             nonlocal row
+            if item.get("line_role") == "concrete_slab" and item.get("specification_id"):
+                # Where the priced rate for this construction ends up. The rate build-up block
+                # is checked against it, so it has to be a row number, not an assumption.
+                buildup_anchors[item["specification_id"]] = {
+                    "rate_row": row, "area_row": total_area_row_holder[0]}
             description = (_fortel_eo_description(item.get("description"))
                            or item["description"])
             # The marker used to be appended into DESCRIPTION with a newline, so every
@@ -2219,7 +2043,12 @@ def quotation_xlsx(q: dict) -> bytes:
             # the marker goes there: still impossible to miss, no longer wrapping the label.
             ws.cell(row, 1, _excel_text(description))
             if item.get("provisional"):
-                ws.cell(row, PROVISIONAL_COL, _excel_text(PROVISIONAL_LABEL))
+                # The reason is computed per group from the brief-spec provenance. Writing the
+                # PROVISIONAL_LABEL constant here made the XLSX -- the one output Aryan reads
+                # -- print "NO DETAILS PROVIDED" beside a thickness taken off his own legend,
+                # while the portal and the HTML said what was actually extracted.
+                ws.cell(row, PROVISIONAL_COL, _excel_text(
+                    item.get("provisional_reason") or PROVISIONAL_LABEL))
             ws.cell(row, 2, qty_formula or float(item["qty"]))
             ws.cell(row, 3, _excel_text(_excel_unit(item["unit"])))
             rate = item.get("rate")
@@ -2254,6 +2083,7 @@ def quotation_xlsx(q: dict) -> bytes:
         # Aryan asked: "Total External/Service Yard Slab Area". Keyed by the zone the
         # constructions came from, so a section that never had any renders unchanged.
         construction_total_rows = {}
+        total_area_row_holder = [None]
         for group_id in group_ids:
             specification = specifications.get(group_id) or {}
             source_rows = specification.get("area_rows") or []
@@ -2276,6 +2106,7 @@ def quotation_xlsx(q: dict) -> bytes:
                 row += 1
             else:
                 total_area_row = None
+            total_area_row_holder[0] = total_area_row
 
             display_lines = specification.get("display_lines") or []
             if display_lines:
@@ -2413,7 +2244,8 @@ def quotation_xlsx(q: dict) -> bytes:
             description = f"{_excel_section_title(measurement['section'], [])} — {measurement['description']}"
             ws.cell(row, 1, description)
             if measurement.get("provisional"):
-                ws.cell(row, PROVISIONAL_COL, _excel_text(PROVISIONAL_LABEL))
+                ws.cell(row, PROVISIONAL_COL, _excel_text(
+                    measurement.get("provisional_reason") or PROVISIONAL_LABEL))
             ws.cell(row, 2, float(measurement["qty"]))
             ws.cell(row, 3, _excel_unit(measurement["unit"]))
             ws.cell(row, 2).number_format = '#,##0.##'
@@ -2463,7 +2295,7 @@ def quotation_xlsx(q: dict) -> bytes:
 
     # ── Rate buildup section (columns G onwards) — mirrors the real Fortel costing sheet's
     #    detailed cost breakdown that sits to the right of the BOQ columns.
-    _write_rate_buildup(ws, q)
+    _write_rate_buildup(ws, q, buildup_anchors)
 
     out = io.BytesIO()
     wb.save(out)

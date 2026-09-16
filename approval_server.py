@@ -3207,11 +3207,13 @@ def _roll_up_constructions(costing: dict, result) -> dict:
     costing["total_gbp"] = total
     if costing.get("area_m2"):
         costing["rate"] = round(total / float(costing["area_m2"]), 2)
+    # Same two counts the quotation prints, in the same words, so the card and the sheet
+    # cannot read "4" and "5" at each other (Aryan, 16 Sep).
     note = (
-        "Priced as " + str(len(rolled["constructions"]) - len(rolled["unpriced_names"]))
-        + " of " + str(len(rolled["constructions"])) + " constructions at their own "
-        "thicknesses, summed; the rate shown is the average that total implies, not a rate "
-        "anything was priced at."
+        str(len(rolled["constructions"])) + " constructions measured, "
+        + str(len(rolled["constructions"]) - len(rolled["unpriced_names"]))
+        + " priced at their own thicknesses and summed; the rate shown is the average that "
+        "total implies, not a rate anything was priced at."
     )
     if rolled["unpriced_names"]:
         # Say what is NOT in the total, on the card. A total that silently excludes a measured
