@@ -94,6 +94,46 @@ try:
     print("     offered:", [(r.get("region_id"), r.get("surface_name"),
                              r.get("depth_mm"), r.get("area_m2")) for r in regions])
 
+    # BEFORE deciding: capture what the assessor is actually handed. The 16 Sep handover call
+    # stalled on this panel -- dozens of same-tint rows, each with its own tick, approval
+    # blocked until every one was answered -- and no test had ever looked at it.
+    from playwright.sync_api import sync_playwright as _sp_pre
+    with _sp_pre() as _p_pre:
+        _b_pre = _p_pre.chromium.launch()
+        _pg_pre = _b_pre.new_page(viewport={"width": 1440, "height": 1100})
+        _pg_pre.goto(f"{BASE}/portal", wait_until="networkidle")
+        _pg_pre.wait_for_timeout(1500)
+        _pg_pre.evaluate(f"selectJob({job_id!r})")
+        _pg_pre.wait_for_timeout(3000)
+        # The header is its own 22-character div; the panel is its PARENT. Reading the
+        # header alone made the "largest first" check pass on an empty list -- a vacuous
+        # test, which is the failure mode this file exists to avoid.
+        _panel = _pg_pre.evaluate(
+            "(() => {const h=[...document.querySelectorAll('div')]"
+            ".find(d=>d.textContent.trim().startsWith('MEASURED REGION REVIEW'));"
+            " return h && h.parentElement ? h.parentElement.innerText : '';})()")
+        ck("the region review panel is on the assessor's screen before any decision",
+           "MEASURED REGION REVIEW" in _panel, f"-> {len(_panel)} chars")
+        ck("...it offers Tick all / Untick all instead of only per-row ticks",
+           "Tick all" in _panel and "Untick all" in _panel)
+        # Read the AREA CELL of each region row, not every "m²" in the panel: the intro line
+        # and each row's candidate_reason also carry areas, and scraping the text mixed them
+        # into the sequence so the order check compared the wrong numbers.
+        _areas = _pg_pre.evaluate(
+            "(() => [...document.querySelectorAll('.yard-region-toggle')]"
+            ".map(t => t.closest('tr').children[1].innerText.replace(/[^0-9.]/g,''))"
+            ".map(Number))()")
+        ck("...the panel really lists several regions, so the order check is not vacuous",
+           len(_areas) >= 2, f"-> {len(_areas)} areas")
+        ck("...and the regions are listed largest first",
+           len(_areas) >= 2 and _areas == sorted(_areas, reverse=True),
+           f"-> {_areas[:6]}")
+        _pg_pre.evaluate("document.querySelector('.yard-region-toggle')"
+                         ".scrollIntoView({block:'center'})")
+        _pg_pre.wait_for_timeout(600)
+        _pg_pre.screenshot(path=os.path.join(SHOTS, "04_region_review_before.png"))
+        _b_pre.close()
+
     status, body = post(f"/yard-regions/{job_id}", {"decisions": [
         {"region_id": str(r["region_id"]), "action": "keep"} for r in regions]})
     ck("including every region is accepted", status == 200, f"-> {status} {str(body)[:200]}")
@@ -175,7 +215,7 @@ try:
                         full_page=True)
         browser.close()
     for name in ("01_assessor_after_include.png", "02_quotation_per_construction.png",
-                 "03_assessor_flags.png"):
+                 "03_assessor_flags.png", "04_region_review_before.png"):
         path = os.path.join(SHOTS, name)
         size = os.path.getsize(path) if os.path.exists(path) else 0
         ck(f"screenshot captured: {name}", size > 20000, f"-> {size} bytes")

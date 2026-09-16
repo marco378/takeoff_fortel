@@ -629,8 +629,30 @@ def _zone_block_reason(job: dict) -> str | None:
     if job.get("zone_geometry_overlap") or result.get("zone_geometry_overlap"):
         return ("assessor trace regions overlap, so their per-zone quantities do not reconcile "
                 "to the measured union; edit and resubmit the region outlines")
+    # Name them. "one or more measured markup zones are unclassified" reached an assessor on
+    # 16 Sep 2026 as a bare quotation failure, leaving them to find which zone it meant in the
+    # Measured zones table by eye. The classification control is on that screen; the message
+    # just never said where to point it.
+    unnamed = []
+    for zone in zones:
+        if not isinstance(zone, dict):
+            continue
+        if (zone.get("category") or "").strip().lower() != "unclassified":
+            continue
+        subjects = zone.get("subjects")
+        if not isinstance(subjects, list) or not subjects:
+            subjects = [zone.get("subject")] if zone.get("subject") else []
+        label = ", ".join(str(subject) for subject in subjects if subject) or str(
+            zone.get("zone_key") or "unnamed zone")
+        area = zone.get("area_m2")
+        if isinstance(area, (int, float)):
+            label += f" ({area:,.1f} m²)"
+        unnamed.append(label)
+    named = ("; ".join(unnamed) if unnamed else "")
     return ("one or more measured markup zones are unclassified; assessor must classify "
-            "every zone before approval")
+            "every zone before approval"
+            + (f" — unclassified: {named}. Set each one in the Measured zones table."
+               if named else ""))
 
 
 def _channel_proposal_block_reason(job: dict) -> str | None:
@@ -1320,8 +1342,15 @@ def adjust(job_id):
     if submitted_area_elements:
         if (not isinstance(scale_k, (int, float)) or isinstance(scale_k, bool)
                 or not math.isfinite(scale_k) or scale_k <= 0):
+            # The old wording named the internal scale variable and reached the client verbatim
+            # on the 16 Sep handover call, saying nothing about what to do. It is also the
+            # only hard failure on the named-area path, so it is what silently rejected the
+            # assessor's footpath measurements.
             return jsonify({
-                "error": "a positive scale_k is required to measure named area elements"
+                "error": "Set the scale first, then add the named area. Use Calibrate to "
+                         "draw a line of known length, or type the drawing scale (for "
+                         "example 1:500) in the Scale calibration box on the right. A named "
+                         "area cannot be measured until this drawing has a scale."
             }), 400
         try:
             from geometry import measure_regions, measure_regions_with_cutouts, polygon_perimeter_lm

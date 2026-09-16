@@ -219,3 +219,100 @@ try:
 except (ImportError, FileNotFoundError, AttributeError) as _e:
     print(f"  [SKIP] transition-flag honesty regression — missing dependency or file: {_e}")
 
+
+# The message an assessor actually reads. On 16 Sep 2026 a live handover call hit
+# "QuotationPricingBlocked: one or more measured markup zones are unclassified" with no
+# indication of WHICH zone, so the assessor had to hunt for it in the Measured zones table.
+# The classification control was on that screen all along; the message just never said where.
+_zb_named = _zb_job([("z1", 100.0, "external_yard"), ("z2", 1234.5, "unclassified")],
+                    stale=False)
+_zb_named["zones"][1]["subjects"] = ["Concrete slab for road"]
+_reason_named = _AS_zb._zone_block_reason(_zb_named)
+ck("the unclassified-zone block names the zone it is complaining about",
+   "Concrete slab for road" in str(_reason_named), _reason_named)
+ck("...and its quantity, so it can be picked out of the table",
+   "1,234.5" in str(_reason_named))
+ck("...and points at the control that fixes it",
+   "Measured zones table" in str(_reason_named))
+# A zone with no Bluebeam subject still has to be identifiable.
+_zb_keyed = _zb_job([("z2", 50.0, "unclassified")], stale=False)
+ck("a zone with no subject is named by its key rather than left anonymous",
+   "z2" in str(_AS_zb._zone_block_reason(_zb_keyed)),
+   _AS_zb._zone_block_reason(_zb_keyed))
+
+# The two messages an assessor read on the 16 Sep handover call, both of which sent him the
+# wrong way. Neither is cosmetic: the first is the only hard failure on the named-area path,
+# and it is what silently rejected his footpath measurements.
+import re as _re_msg
+
+_PORTAL_HTML = open("assessor_portal.html", encoding="utf-8").read()
+_SERVER_SRC = open("approval_server.py", encoding="utf-8").read()
+
+ck("no internal variable name reaches the assessor's screen",
+   "positive scale_k is required" not in _SERVER_SRC)
+ck("...the scale error says what to do instead",
+   "Set the scale first" in _SERVER_SRC and "Calibrate" in _SERVER_SRC)
+
+# "AI polygon cleared" read as if it had saved. It clears the canvas and nothing else: the
+# stored measurement is untouched until an adjustment is submitted, so the AI's area was
+# still in the downloaded sheet and the outlines came back on reload.
+_clear_ai = _PORTAL_HTML[_PORTAL_HTML.index("btnClearAi').addEventListener"):][:900]
+ck("Clear AI no longer claims to have cleared the measurement",
+   "'AI polygon cleared'" not in _clear_ai)
+ck("...it says the measurement is unchanged until an adjustment is submitted",
+   "NOT changed" in _clear_ai and "Submit Adjustment" in _clear_ai)
+
+# "It went in a flash" — the quotation failure was on screen for 3.5 seconds and the assessor
+# could not say afterwards what it had told him.
+_toast = _PORTAL_HTML[_PORTAL_HTML.index("function toast(msg"):][:900]
+ck("an error toast holds long enough to be read", "20000" in _toast)
+ck("...and any toast can be dismissed by clicking it", "el.onclick" in _toast)
+
+# The classification control was in the last column of a table wider than the panel holding
+# it, so on the 16 Sep call it sat off the right edge behind a horizontal scrollbar and took
+# forty seconds of spoken directions to reach. It now has its own full-width row.
+_zone_panel = _PORTAL_HTML[_PORTAL_HTML.index("function renderZoneSummary"):][:6000]
+ck("the Measured zones table no longer forces a horizontal scrollbar",
+   "min-width:570px" not in _zone_panel)
+ck("the classify control has its own full-width row under the zone",
+   'colspan="6"' in _zone_panel and "CLASSIFY THIS ZONE" in _zone_panel)
+ck("...and the zone's own row points down at it",
+   "below ↓" in _zone_panel)
+
+# Inderjit asked for a recentre button after losing the drawing off-screen. One already
+# existed -- zoomFit centres as well as fits -- under an unlabelled ⊞ that nobody on the call
+# recognised. Naming it is the fix; a second button would not have been.
+ck("the recentre control says what it does rather than showing a bare glyph",
+   ">Recentre</button>" in _PORTAL_HTML and "btnZoomFit" in _PORTAL_HTML)
+ck("...and zoomFit really does recentre, not only rescale",
+   "panX = Math.max(0, (wrapRect.width - scaledW) / 2)" in _PORTAL_HTML)
+
+# The region review list. Nothing is removed from the offer -- every region is still listed,
+# still tickable, still counted -- but it is ordered largest-first, the long tail is folded,
+# and there is a way to answer it in one action instead of dozens.
+_region_panel = _PORTAL_HTML[_PORTAL_HTML.index("function renderSegmentationComponentSummary"):][:9000]
+ck("the region review lists the largest regions first",
+   "sort((a, b) => (Number(b.area_m2) || 0) - (Number(a.area_m2) || 0))" in _region_panel)
+ck("...folds the small ones away instead of making them the first thing on screen",
+   "yard-region-tail" in _region_panel and "smaller region" in _region_panel)
+ck("...and offers Tick all / Untick all",
+   "setAllYardRegions(true)" in _region_panel and "setAllYardRegions(false)" in _region_panel)
+_set_all = _PORTAL_HTML[_PORTAL_HTML.index("function setAllYardRegions"):][:700]
+ck("Tick all means every region, not only the visible ones",
+   "querySelectorAll('.yard-region-toggle')" in _set_all)
+
+# The portal is one 200 KB inline script and the blank-screen bug of 4 Sep lived only in the
+# browser: a syntax error there takes the whole assessor screen down and no python test sees
+# it. Parse it.
+import re as _re_js, subprocess as _sp_js, tempfile as _tf_js, os as _os_js
+_blocks = _re_js.findall(r"<script[^>]*>(.*?)</script>", _PORTAL_HTML, _re_js.S)
+ck("the portal has exactly one inline script block", len(_blocks) == 1, f"-> {len(_blocks)}")
+_js_path = _os_js.path.join(_tf_js.mkdtemp(prefix="portal_js_"), "portal.js")
+open(_js_path, "w", encoding="utf-8").write(_blocks[0])
+try:
+    _js = _sp_js.run(["node", "--check", _js_path], capture_output=True, text=True, timeout=60)
+    _js_ok, _js_msg = _js.returncode == 0, (_js.stderr or "").strip().splitlines()[:2]
+except FileNotFoundError:
+    _js_ok, _js_msg = False, ["node is not installed — the portal script cannot be parsed, "
+                              "and a syntax error here blanks the assessor's screen"]
+ck("the portal's JavaScript parses", _js_ok, f"-> {_js_msg}")

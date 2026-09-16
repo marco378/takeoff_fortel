@@ -127,6 +127,10 @@ canvas{display:block;border:1px solid var(--border);background:transparent;box-s
 /* ── Zoom controls ─────────────────────────── */
 .zoom-controls{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:4px;background:#fff;border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:10}
 .zoom-controls button{width:32px;height:32px;border:none;background:transparent;border-radius:5px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;transition:background .12s}
+/* The recentre control is the one an assessor has to FIND when the drawing has scrolled off
+   screen, so it is the one that carries a word. A bare glyph was not recognised on the
+   16 Sep handover call. It needs its own width; the 32px icon rule clipped it over 1:1. */
+.zoom-controls button#btnZoomFit{width:auto;padding:0 10px;gap:5px;font-size:12px;font-weight:700;white-space:nowrap;color:var(--blue)}
 .zoom-controls button:hover{background:#f0f2f5}
 .zoom-controls button:active{background:#e0e2e5}
 .zoom-controls .zoom-level{min-width:50px;text-align:center;font-size:12px;font-weight:700;color:var(--blue);display:flex;align-items:center;justify-content:center;border-left:1px solid var(--border);margin-left:4px;padding-left:8px}
@@ -427,7 +431,7 @@ canvas{display:block;border:1px solid var(--border);background:transparent;box-s
       <div class="zoom-controls" id="zoomControls">
         <button id="btnZoomIn" title="Zoom in (Ctrl++)">+</button>
         <button id="btnZoomOut" title="Zoom out (Ctrl+-)">−</button>
-        <button id="btnZoomFit" title="Fit to window">⊞</button>
+        <button id="btnZoomFit" title="Recentre: fit the whole drawing back into view (use this if the drawing has scrolled off screen)"><span style="font-size:15px">⊞</span>Recentre</button>
         <button id="btnZoomReset" title="Reset zoom to 100%">1:1</button>
         <div class="zoom-level" id="zoomLevel">100%</div>
       </div>
@@ -1617,6 +1621,7 @@ function renderZoneSummary(job) {
     const count = zone.annotation_count == null || zone.annotation_count === ''
       ? null : Number(zone.annotation_count);
     let classifyControl = '—';
+    let classifyRow = '';
     if (category === 'unclassified') {
       const allowed = zone.area_m2 != null
         ? [['external_yard','External yard'],['dock','Dock'],['ground_floor','Ground floor'],['upper_floor','Upper floor'],['other','Other / out of scope']]
@@ -1624,13 +1629,24 @@ function renderZoneSummary(job) {
           ? [['channel','Channel'],['transition','Transition'],
              ['construction_joint','Construction joint (CJ)'],['other','Other / out of scope']]
           : [['other','Other / out of scope']];
-      classifyControl = `<div style="display:flex;gap:3px;justify-content:flex-end">
-        <select id="zoneClass-${zoneIndex}" style="max-width:112px;font-size:9px;padding:2px">
-          <option value="">Classify…</option>
-          ${allowed.map(([value,label]) => `<option value="${value}">${esc(label)}</option>`).join('')}
-        </select>
-        <button type="button" onclick="classifyZone(${zoneIndex})" style="font-size:9px;padding:2px 5px;cursor:pointer">Save</button>
-      </div>`;
+      // The control that unblocks approval goes on its OWN full-width row under the zone,
+      // not in the last column of a table wider than the panel holding it. On the 16 Sep
+      // handover call the assessor could not find it: it was off the right edge behind a
+      // horizontal scrollbar, and it took forty seconds of "scroll right... scroll up" to
+      // reach. A control you have to be told how to find is a blocked approval.
+      classifyRow = `<tr style="background:#fff0ee">
+        <td colspan="6" style="padding:5px 8px 8px;border-bottom:1px solid #d9e0e8">
+          <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+            <span style="font-size:9px;font-weight:700;color:#c0392b">CLASSIFY THIS ZONE →</span>
+            <select id="zoneClass-${zoneIndex}" style="max-width:150px;font-size:10px;padding:2px">
+              <option value="">Classify…</option>
+              ${allowed.map(([value,label]) => `<option value="${value}">${esc(label)}</option>`).join('')}
+            </select>
+            <button type="button" onclick="classifyZone(${zoneIndex})" style="font-size:10px;padding:3px 8px;cursor:pointer">Save</button>
+          </div>
+        </td>
+      </tr>`;
+      classifyControl = '<span style="font-size:9px;color:#c0392b;font-weight:700">below ↓</span>';
     }
     const provenance = assumption
       ? `${assumptionBadge(assumption.label, assumption.basis)}${assumption.basis ? `<span class="assumption-basis">${esc(assumption.basis)}</span>` : ''}`
@@ -1642,11 +1658,11 @@ function renderZoneSummary(job) {
       <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right;font-variant-numeric:tabular-nums">${esc(quantities.length?quantities.join(' · '):'—')}</td>
       <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right">${count != null && Number.isFinite(count)?count:'—'}</td>
       <td style="padding:5px;border-bottom:1px solid #d9e0e8;text-align:right">${classifyControl}</td>
-    </tr>`;
+    </tr>${classifyRow}`;
   }).join('');
   return `${warning}<div style="margin:8px 0;border:1px solid #c8d3df;border-radius:6px;overflow-x:auto">
     <div style="padding:6px 8px;background:#eaf0f6;color:#13294b;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.4px">Measured zones</div>
-    <table style="border-collapse:collapse;width:100%;min-width:570px;font-size:10px;table-layout:auto">
+    <table style="border-collapse:collapse;width:100%;font-size:10px;table-layout:auto">
       <thead><tr style="background:#f5f7fa;color:#5f6f82">
         <th style="padding:5px;text-align:left">Zone</th><th style="padding:5px;text-align:left">Bluebeam subject</th>
         <th style="padding:5px;text-align:left">Kind</th><th style="padding:5px;text-align:right">Quantity</th>
@@ -1714,7 +1730,17 @@ function renderSegmentationComponentSummary(job) {
   };
   const reviewRequired = !!(job.yard_region_review_required ||
     (job.result && job.result.yard_region_review_required));
-  const rows = yardRegions.length ? yardRegions.map(region => {
+  // Largest first, and the long tail folded away. On the 16 Sep handover call the assessor
+  // was handed a scrolling list of dozens of these -- entries from 150 m2 down to 12.5 m2 --
+  // each with its own tick, with approval blocked until every one was decided. Nothing is
+  // removed from the offer here: the small ones are still listed, still tickable, still
+  // counted. They are just not the first thing between him and an approval.
+  const SMALL_REGION_TAIL_FROM = 8;
+  const orderedRegions = yardRegions.length
+    ? yardRegions.slice().sort((a, b) => (Number(b.area_m2) || 0) - (Number(a.area_m2) || 0))
+    : [];
+  const tailCount = Math.max(0, orderedRegions.length - SMALL_REGION_TAIL_FROM);
+  const rows = orderedRegions.length ? orderedRegions.map((region, regionIndex) => {
     const bbox = Array.isArray(region.bbox_pdf_pts)
       ? region.bbox_pdf_pts.map(value => Number(value).toFixed(1)).join(', ') : '—';
     const checked = region.included !== false ? 'checked' : '';
@@ -1724,7 +1750,8 @@ function renderSegmentationComponentSummary(job) {
       : (region.chosen_primary ? 'PRIMARY REGION' : 'SAME-TINT REGION'));
     const why = region.candidate === true && region.candidate_reason
       ? `<div style="font-weight:400;color:#8a6d3b;font-size:9px;margin-top:2px">${esc(region.candidate_reason)}</div>` : '';
-    return `<tr style="background:${isCandidate?'#fff3df':(region.included!==false?'#eef7ed':'#f4f4f4')}">
+    const inTail = regionIndex >= SMALL_REGION_TAIL_FROM;
+    return `<tr class="${inTail ? 'yard-region-tail' : ''}" style="${inTail ? 'display:none;' : ''}background:${isCandidate?'#fff3df':(region.included!==false?'#eef7ed':'#f4f4f4')}">
       <td style="padding:4px;border-top:1px solid #e0d8c6;font-weight:700">
         <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
           <input class="yard-region-toggle" type="checkbox" data-region-id="${esc(region.region_id)}" ${checked}>
@@ -1744,8 +1771,34 @@ function renderSegmentationComponentSummary(job) {
     <div style="padding:6px 8px;background:#fff1c9;color:#664700;font-size:11px;font-weight:800">MEASURED REGION REVIEW</div>
     <div style="padding:6px 8px;font-size:10px;color:#6b5730">Every measured region is shown separately with its measured area and bbox. Checked rows feed the candidate Yard total; uncheck neighbouring buildings or out-of-scope regions, then save. Offered areas start unchecked and are out of the total until you tick them. ${reviewRequired?'<strong>Approval is blocked until this review is saved.</strong>':''} Raw largest: ${esc(evidence.raw_largest_component_m2 ?? '—')} m² · all matching-tint pixels: ${esc(evidence.raw_tint_union_m2 ?? '—')} m².</div>
     <table style="width:100%;border-collapse:collapse;font-size:10px"><thead><tr><th style="text-align:left;padding:4px">Status</th><th style="text-align:right;padding:4px">Area</th><th style="text-align:left;padding:4px">BBox (PDF pt)</th></tr></thead><tbody>${rows}${rawRows}</tbody></table>
-    ${yardRegions.length ? '<div style="padding:6px 8px;text-align:right"><button type="button" onclick="saveYardRegionReview()">Save kept/excluded regions</button></div>' : ''}
+    ${yardRegions.length ? `<div style="padding:6px 8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
+      ${tailCount ? `<button type="button" id="yardRegionTailToggle" onclick="toggleYardRegionTail()" style="margin-right:auto">Show ${tailCount} smaller region${tailCount === 1 ? '' : 's'}</button>` : ''}
+      <button type="button" onclick="setAllYardRegions(true)">Tick all</button>
+      <button type="button" onclick="setAllYardRegions(false)">Untick all</button>
+      <button type="button" onclick="saveYardRegionReview()">Save kept/excluded regions</button>
+    </div>` : ''}
   </div>`;
+}
+
+function toggleYardRegionTail() {
+  const rows = Array.from(document.querySelectorAll('.yard-region-tail'));
+  if (!rows.length) return;
+  const hidden = rows[0].style.display === 'none';
+  rows.forEach(row => { row.style.display = hidden ? '' : 'none'; });
+  const button = document.getElementById('yardRegionTailToggle');
+  if (button) {
+    button.textContent = hidden
+      ? `Hide ${rows.length} smaller region${rows.length === 1 ? '' : 's'}`
+      : `Show ${rows.length} smaller region${rows.length === 1 ? '' : 's'}`;
+  }
+}
+
+function setAllYardRegions(keep) {
+  // Applies to EVERY region, including the folded tail -- otherwise "Tick all" would quietly
+  // mean "tick the eight you can see" and the saved total would not be what the button said.
+  const toggles = Array.from(document.querySelectorAll('.yard-region-toggle'));
+  toggles.forEach(toggle => { toggle.checked = keep; });
+  toast(`${toggles.length} region${toggles.length === 1 ? '' : 's'} ${keep ? 'ticked' : 'unticked'} — press Save kept/excluded regions to apply`);
 }
 
 async function saveYardRegionReview() {
@@ -4303,7 +4356,17 @@ function setupButtons() {
     }
   });
   document.getElementById('btnClearAi').addEventListener('click', () => {
-    aiPoly = null; aiRegions = []; draw(); toast('AI polygon cleared');
+    // This clears the PICTURE, not the measurement. Inderjit pressed it on the 16 Sep
+    // handover call, saw "AI polygon cleared", and reasonably read that as saved -- then
+    // found the AI's area still in the downloaded sheet and the outlines back on reload.
+    // Say what it actually did, and what is still needed.
+    const had = (aiPoly && aiPoly.length >= 3) || aiRegions.length;
+    aiPoly = null; aiRegions = [];
+    draw();
+    toast(had
+      ? 'AI outlines hidden. The measurement is NOT changed yet — trace your own area and '
+        + 'press Submit Adjustment to replace it.'
+      : 'No AI outlines to clear.', had ? 'warn' : 'info');
   });
   document.getElementById('btnCalSet').addEventListener('click', () => {
     calAction = 'scale';
@@ -4588,7 +4651,14 @@ function toast(msg, type='info') {
   el.style.background = type === 'error' ? '#c0392b' : type === 'warn' ? '#e67e22' : '#13294b';
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+  // An error that vanishes in 3.5 seconds is an error nobody read. On the 16 Sep handover
+  // call the quotation failure "went in a flash" and the assessor could not say what it
+  // had told him. Errors now hold long enough to read and copy, warnings a little less,
+  // and any toast can be dismissed by clicking it.
+  const hold = type === 'error' ? 20000 : type === 'warn' ? 10000 : 3500;
+  el.style.cursor = 'pointer';
+  el.onclick = () => { clearTimeout(toastTimer); el.classList.remove('show'); };
+  toastTimer = setTimeout(() => el.classList.remove('show'), hold);
 }
 
 // ─────────────────────────────────────────────────
