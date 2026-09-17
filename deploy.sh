@@ -8,7 +8,12 @@
 # Reading a number you do not act on is not a check. This exits non-zero instead.
 set -euo pipefail
 PROD="${PROD:-https://takeofffortel-production.up.railway.app}"
-REMOTE="${REMOTE:-marco378}"
+# The deploy remote is `origin`. It was `marco378` until the 16 Sep 2026 move to
+# sarabloh-1, where that remote does not exist at all -- `git ls-remote marco378` fails
+# outright, so this script died at the push with the pre-flight already passed. Nothing
+# reached Railway (set -e), but the deploy path was broken and would have been found at
+# the worst moment: the next time a fix was cleared to ship.
+REMOTE="${REMOTE:-origin}"
 status=$(curl -fsS "$PROD/status")
 echo "pre-flight: $status"
 proc=$(printf '%s' "$status" | sed -n 's/.*"processing_count":\([0-9]*\).*/\1/p')
