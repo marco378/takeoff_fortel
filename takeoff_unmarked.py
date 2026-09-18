@@ -138,7 +138,72 @@ BAND_LOCKED_TO_LEGEND = "locked to this sheet's own legend swatch"
 BAND_GUESS_SWATCH_IMPLAUSIBLE = "guess: legend swatch is near-black/near-white"
 BAND_GUESS_SWATCH_UNREADABLE = "guess: legend found but its swatch could not be read"
 BAND_GUESS_NO_LEGEND = "guess: no legend label on the sheet at all"
+# The raster sampler returned a colour that the drawing's own vector layer does not contain.
+# PLP Warwick, 17 Sep 2026: the Concrete Service Yard legend entry is a RED CROSS-HATCH, and
+# the sampler returned (118,118,118). Zero objects on either sheet are stroked or filled
+# anywhere near that value -- it is the anti-aliased fringe of the chip's BLACK BORDER, which
+# survives _choose_raster_swatch's "not ink-black" filter precisely because anti-aliasing
+# lifts it off black. Segmenting a colour that is not in the drawing finds only fringe pixels,
+# the plausibility gate then fires, and the generic-grey fallback substitutes an unrelated
+# surface. Aryan: "do not use a generic grey fallback simply because it produces a
+# larger/more believable area."
+BAND_SWATCH_NOT_IN_DRAWING = "refused: sampled swatch colour is not present in the drawing"
 BAND_GUESSES = (BAND_GUESS_SWATCH_IMPLAUSIBLE, BAND_GUESS_SWATCH_UNREADABLE, BAND_GUESS_NO_LEGEND)
+
+
+def _band_vector_tints(pdf, band_display, page=0):
+    """Plausible surface tints actually PRESENT in the vector layer of the legend chip band.
+
+    ``band_display`` is in rendered/display coordinates (what get_pixmap draws and what the
+    raster sampler measures); get_drawings() reports unrotated coordinates, so it is mapped
+    back through the inverse rotation. Getting that wrong on a 270-degree page reads a strip
+    of empty paper and silently returns nothing.
+
+    Returns [(rgb, count), ...] most common first. Pure black fails _is_plausible_surface_tint
+    and so can never be offered as a surface colour.
+    """
+    counts = {}
+    try:
+        with fitz.open(pdf) as doc:
+            pg = doc[page]
+            band_raw = fitz.Rect(band_display) * ~pg.rotation_matrix
+            for drawing in pg.get_drawings():
+                if not fitz.Rect(drawing["rect"]).intersects(band_raw):
+                    continue
+                for key in ("color", "fill"):
+                    channel = drawing.get(key)
+                    if not channel:
+                        continue
+                    rgb = tuple(int(round(value * 255)) for value in channel)
+                    if not _is_plausible_surface_tint(rgb):
+                        continue
+                    counts[rgb] = counts.get(rgb, 0) + 1
+    except Exception:
+        return []
+    return sorted(counts.items(), key=lambda item: -item[1])
+
+
+def _legend_chip_band(pdf, im=None, S=2.0, page=0):
+    """The display-space window _find_surface_swatch_rgb samples its swatch from.
+
+    Kept as one function so the verification below cannot drift from the thing it verifies.
+    """
+    found = None
+    for labels in (YARD_LABELS, DOCK_APRON_LABELS):
+        found = _label_bbox_for(pdf, labels, page)
+        if found:
+            break
+    if not found:
+        return None
+    bbox, _text = found
+    try:
+        with fitz.open(pdf) as doc:
+            pg = doc[page]
+            rendered = fitz.Rect(bbox) * pg.rotation_matrix
+    except Exception:
+        return None
+    cy = (rendered.y0 + rendered.y1) / 2
+    return fitz.Rect(max(0.0, rendered.x0 - 175), cy - 7, rendered.x0 - 3, cy + 7)
 
 
 def _choose_surface_band(pdf, im, S, flags):
@@ -150,6 +215,25 @@ def _choose_surface_band(pdf, im, S, flags):
     """
     swatch, label = find_concrete_swatch_rgb(pdf, im=im, S=S)
     if label and swatch:
+        # Does the sampled colour actually EXIST in this drawing? The raster sampler reads a
+        # dominant colour out of anti-aliased pixels, so it can return a value no pen on the
+        # sheet ever drew. Checking it against the vector layer costs one pass and is the
+        # difference between "this is the legend's colour" and "this is a rendering artefact".
+        # Only ever consulted when the sampler already produced a plausible tint, so a sheet
+        # whose sampled colour IS in its vectors takes the identical path it always did.
+        band = _legend_chip_band(pdf, im=im, S=S)
+        present = _band_vector_tints(pdf, band) if band is not None else []
+        if present and not any(
+                max(abs(a - b) for a, b in zip(swatch, rgb)) <= GREY_TOL for rgb, _n in present):
+            real = present[0][0]
+            flags.append(
+                f"legend '{label}': the sampled swatch {swatch} does NOT exist in this "
+                f"drawing — no object on the sheet is stroked or filled within {GREY_TOL} of "
+                f"it. It is a rendering artefact of the chip's border, not a surface colour. "
+                f"The chip's own ink is {real}, drawn as a PATTERN rather than a solid fill, "
+                f"so solid-fill colour segmentation does not apply and NO substitute colour "
+                f"is used. Route to hatch-mode / assessor trace.")
+            return real, swatch, label, BAND_SWATCH_NOT_IN_DRAWING, False, "low"
         if _is_plausible_surface_tint(swatch):
             # LOCK the full RGB band to the legend-confirmed tint. Other surfaces on the sheet
             # that render at a different tint fall outside the locked band and are excluded.
@@ -2789,6 +2873,28 @@ def takeoff(pdf, source="architect", use_api=False, S=2.0, out_dir=None):
     rgb, swatch, label, band_outcome, swatch_locked, region_confidence = \
         _choose_surface_band(pdf, im, S, flags)
     legend_found = bool(label)
+
+    # Half two of the PLP Warwick fix, and the half that actually changes the number. Knowing
+    # the real colour is useless on its own: feed a RED CROSS-HATCH colour to solid-fill
+    # segmentation and it matches only the strokes, the plausibility gate fires, and the
+    # fallback substitutes grey exactly as before -- the same 822 m2. A patterned surface must
+    # leave this path entirely rather than be given a substitute colour.
+    #
+    # This is NOT "changing the fallback to produce a number". It is declining to measure a
+    # colour the legend never named. A clean refusal is a success state (CLAUDE.md #5), and an
+    # assessor trace beats a confident wrong area.
+    if band_outcome == BAND_SWATCH_NOT_IN_DRAWING:
+        _bound_regions, _bounds, _bd_k, _bd_src = _offer_boundaries(pdf, flags)
+        return {"pdf": os.path.basename(pdf), "area_m2": None, "style": style,
+                "price_gbp": None, "measurement_state": sanity.UNMEASURED,
+                "needs_assessor": True, "legend_found": True,
+                "candidate_polygons": _bound_regions or [],
+                "flags": flags + [
+                    "NO AREA EMITTED — the priced surface on this sheet is drawn as a PATTERN "
+                    "(hatch), and the only colour that could be sampled from its legend chip "
+                    "is a rendering artefact that appears nowhere in the drawing. Measuring "
+                    "any other colour would measure a different surface. Trace the surface, "
+                    "or supply a sheet whose legend chip is a solid fill."]}
 
     # Runs AFTER the branch above, never inside it: identifying a surface is not the same as
     # classifying it. A dock apron carries its own build-up on its own sheet, so say so rather
