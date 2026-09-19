@@ -148,6 +148,8 @@ BAND_GUESS_NO_LEGEND = "guess: no legend label on the sheet at all"
 # surface. Aryan: "do not use a generic grey fallback simply because it produces a
 # larger/more believable area."
 BAND_SWATCH_NOT_IN_DRAWING = "refused: sampled swatch colour is not present in the drawing"
+# A real surface covers a meaningful share of the sheet; an anti-aliasing fringe cannot.
+ARTEFACT_MAX_COVERAGE = 0.02
 BAND_GUESSES = (BAND_GUESS_SWATCH_IMPLAUSIBLE, BAND_GUESS_SWATCH_UNREADABLE, BAND_GUESS_NO_LEGEND)
 
 
@@ -254,7 +256,23 @@ def _choose_surface_band(pdf, im, S, flags):
         # refused Tanro, whose sampled 173 grey is simply its own 90 grey drawn thin and which
         # measures to within 5% of Aryan's markup. Full CI caught that; a two-sheet check had
         # not. Only refuse when NOTHING on the sheet explains the sampled colour.
+        # Third condition, and the one that makes this safe to ship. get_drawings() does NOT
+        # expose every fill: on 64426-111 the Concrete Service Yard chip is a SOLID MAGENTA
+        # block, the sampler reads it correctly, and the vector layer reports only greys and
+        # a red -- so "absent from the vectors" was a false positive that would have thrown
+        # away a correct 12,794 m2 yard. Aryan asked for the evidence before approving, and
+        # the evidence overturned my own recommendation.
+        #
+        # Physical check instead of a structural one: an anti-aliased fringe covers almost
+        # nothing (PLP Warwick 0.246% of the page), while a real surface covers a lot
+        # (64426-111 20.2%). Only a colour that is nearly absent from the sheet can be an
+        # artefact, so refusal now requires all three to hold.
+        coverage = None
+        if im is not None and swatch:
+            distance = np.abs(im.astype(int) - np.array(swatch, int)).max(axis=2)
+            coverage = float((distance <= GREY_TOL).mean())
         if (present
+                and coverage is not None and coverage <= ARTEFACT_MAX_COVERAGE
                 and not any(max(abs(a - b) for a, b in zip(swatch, rgb)) <= GREY_TOL
                             for rgb, _n in present)
                 and _explained_by_thin_ink(swatch, present) is None):
