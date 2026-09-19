@@ -183,6 +183,33 @@ def _band_vector_tints(pdf, band_display, page=0):
     return sorted(counts.items(), key=lambda item: -item[1])
 
 
+def _explained_by_thin_ink(sampled, inks, tol=GREY_TOL):
+    """Can ``sampled`` be one of ``inks`` drawn thin, i.e. blended toward white?
+
+    The raster sampler averages a chip, so a surface drawn as fine lines legitimately reads
+    LIGHTER than its own ink -- Tanro's 90 grey samples as 173, and segmenting 173 matches
+    Aryan's markup to within 5%. That is not an artefact and must keep working.
+
+    An artefact looks different: PLP Warwick samples a neutral (118,118,118) while the chip's
+    only surface ink is a RED cross-hatch. No amount of whitening turns red into neutral grey,
+    so nothing on the sheet explains the sample and it is the black border's fringe.
+
+    Blending is linear per channel: c = ink + t*(255 - ink). The least-squares t is closed
+    form, clamped to [0,1], and the fit is judged on the worst channel.
+    """
+    for ink, _count in inks:
+        span = [255 - channel for channel in ink]
+        denominator = sum(value * value for value in span)
+        if denominator <= 0:                      # pure white ink: nothing to blend
+            continue
+        t = sum((a - b) * c for a, b, c in zip(sampled, ink, span)) / denominator
+        t = max(0.0, min(1.0, t))
+        blended = [b + t * c for b, c in zip(ink, span)]
+        if max(abs(a - b) for a, b in zip(sampled, blended)) <= tol:
+            return ink
+    return None
+
+
 def _legend_chip_band(pdf, im=None, S=2.0, page=0):
     """The display-space window _find_surface_swatch_rgb samples its swatch from.
 
@@ -223,8 +250,14 @@ def _choose_surface_band(pdf, im, S, flags):
         # whose sampled colour IS in its vectors takes the identical path it always did.
         band = _legend_chip_band(pdf, im=im, S=S)
         present = _band_vector_tints(pdf, band) if band is not None else []
-        if present and not any(
-                max(abs(a - b) for a, b in zip(swatch, rgb)) <= GREY_TOL for rgb, _n in present):
+        # Two conditions, and the second one exists because the first alone is too blunt: it
+        # refused Tanro, whose sampled 173 grey is simply its own 90 grey drawn thin and which
+        # measures to within 5% of Aryan's markup. Full CI caught that; a two-sheet check had
+        # not. Only refuse when NOTHING on the sheet explains the sampled colour.
+        if (present
+                and not any(max(abs(a - b) for a, b in zip(swatch, rgb)) <= GREY_TOL
+                            for rgb, _n in present)
+                and _explained_by_thin_ink(swatch, present) is None):
             real = present[0][0]
             flags.append(
                 f"legend '{label}': the sampled swatch {swatch} does NOT exist in this "
