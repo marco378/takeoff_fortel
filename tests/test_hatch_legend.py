@@ -241,3 +241,69 @@ try:
 except (ImportError, FileNotFoundError, KeyError) as _e:
     print(f"  [SKIP] hatch-legend regression — missing dependency or file: {_e}")
 
+
+
+# ── A swatch colour that is not in the drawing cannot measure a surface ───────────────────
+# PLP Warwick, reported by Inderjit on the 16 Sep 2026 call as "not giving correct areas":
+# Site A returned 822 m2 and Site B 1,400 m2 for the Concrete Service Yard. The yard's legend
+# entry is a RED CROSS-HATCH; _choose_raster_swatch reduced the rasterised chip to one
+# "dominant non-white colour" and returned (118,118,118), which is the anti-aliased fringe of
+# the chip's BLACK BORDER -- it survives that function's "not ink-black" filter (max > 30)
+# precisely because anti-aliasing lifts it off black. No object on either sheet is stroked or
+# filled within GREY_TOL of it. Segmenting a colour the drawing does not contain found only
+# fringe pixels, the plausibility gate called that implausible, and the generic-grey fallback
+# substituted an unrelated surface. That substitution was the 822 m2.
+#
+# These run on the REAL sheets but only touch the legend helpers, so they cost seconds rather
+# than the ~8 minutes a full takeoff of these sheets needs. The full-pipeline refusal is
+# guarded once, below, on Site A only.
+try:
+    import takeoff_unmarked as _tu_pw
+    import fitz as _fitz_pw, numpy as _np_pw, os as _os_pw
+
+    _PLP = ("drawings/plp_warwick/plp13_13_LNGB-BED-00-00-DR-C-3205-"
+            "Construction-Thicknesses-Site-A.pdf")
+    if not _os_pw.path.exists(_PLP):
+        print(f"  [SKIP] PLP Warwick artefact-swatch guards — fixture not present ({_PLP})")
+    else:
+        _d_pw = _fitz_pw.open(_PLP); _pg_pw = _d_pw[0]
+        _px_pw = _pg_pw.get_pixmap(matrix=_fitz_pw.Matrix(2.0, 2.0))
+        _im_pw = _np_pw.frombuffer(_px_pw.samples, _np_pw.uint8).reshape(
+            _px_pw.height, _px_pw.width, _px_pw.n)[..., :3]
+
+        _sw_pw, _lab_pw = _tu_pw.find_concrete_swatch_rgb(_PLP, im=_im_pw, S=2.0)
+        ck("PLP Warwick: the yard legend label is still found",
+           _lab_pw == "concrete service yard:-", f"-> {_lab_pw!r}")
+        ck("...and the raster sampler still returns the artefact colour (the fault is upstream)",
+           _sw_pw == (118, 118, 118), f"-> {_sw_pw}")
+
+        _band_pw = _tu_pw._legend_chip_band(_PLP, im=_im_pw, S=2.0)
+        _tints_pw = _tu_pw._band_vector_tints(_PLP, _band_pw)
+        ck("...the chip band DOES carry real ink in the vector layer", bool(_tints_pw),
+           f"-> {_tints_pw[:3]}")
+        ck("...and that ink is the legend's red cross-hatch, not a grey",
+           bool(_tints_pw) and _tints_pw[0][0] == (255, 92, 92), f"-> {_tints_pw[:1]}")
+        ck("...while the sampled colour appears NOWHERE in the drawing's vectors",
+           not any(max(abs(a - b) for a, b in zip(_sw_pw, _rgb)) <= _tu_pw.GREY_TOL
+                   for _rgb, _n in _tints_pw))
+
+        # The band helper must agree with the window the sampler actually reads, or the check
+        # verifies a different patch of paper than the one that produced the colour.
+        ck("the verification window is the sampler's own window",
+           _band_pw is not None and abs(_band_pw.width - 172) < 2,
+           f"-> {None if _band_pw is None else round(_band_pw.width, 1)}")
+        _d_pw.close()
+
+        # End to end: no area, and not a crash. This is the behaviour Aryan asked for -- do
+        # not substitute a colour just because it yields a bigger, more believable number.
+        _r_pw = _tu_pw.takeoff(_PLP, source="engineer")
+        ck("PLP Warwick Site A emits NO area rather than the substituted 822 m2",
+           _r_pw.get("area_m2") is None, f"-> {_r_pw.get('area_m2')}")
+        ck("...and lands in UNMEASURED for an assessor, not a crash",
+           _r_pw.get("measurement_state") == _sanity_hl.UNMEASURED
+           if "_sanity_hl" in dir() else _r_pw.get("measurement_state") == "UNMEASURED",
+           f"-> {_r_pw.get('measurement_state')}")
+        ck("...and says the sampled colour is not in the drawing",
+           any("does NOT exist in this drawing" in str(_f) for _f in (_r_pw.get("flags") or [])))
+except (ImportError, FileNotFoundError, KeyError) as _e_pw:
+    print(f"  [SKIP] PLP Warwick artefact-swatch guards — missing dependency or file: {_e_pw}")
